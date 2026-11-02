@@ -97,10 +97,15 @@ de commitar.
   empresa.
 - Endpoint novo exige token e isolamento por cliente (um cliente nunca vê leitura de outro).
 
-## Git
+## Git e versões
 
-- `main` é a branch de integração e de release. Mudança entra por commit pequeno e testado.
-- Release: subir a versão em `pyproject.toml` e `VERSAO` (`src/lince/leitor.py`), commitar e criar a tag
-  `vX.Y.Z`; o workflow `publicar` gera a imagem no GHCR e a release.
+- `dev` é a branch de integração; `main` só recebe release. Trabalho novo sai de `dev`, em branch própria, e volta
+  por PR para `dev` com `changelog/unreleased/<slug>.md` (formato em `scripts/changelog.py`; o job `fluxo` confere).
+- Merge em `dev`: o bot (`versao-dev.yml`) carimba `X.Y.(Z+1).devTIMESTAMP` no `pyproject.toml` e publica
+  `ghcr.io/yefclub/lince:dev`. Não edite a versão à mão.
+- Release: PR de `dev` para `main` com exatamente uma label `release:patch`, `release:minor` ou `release:major`. No
+  merge, o bot (`release.yml`) junta o changelog no `CHANGELOG.md`, carimba a versão, cria a tag, publica a imagem
+  e a release, e sincroniza `main` de volta em `dev`.
+- A versão em runtime vem do pacote instalado (`importlib.metadata`), nunca de constante no código.
 - Nunca reescreva histórico publicado, nunca use `--no-verify`, nunca pule teste para ficar verde.
 - Commits e documentação em português brasileiro, com acentuação.
