@@ -32,6 +32,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from . import antivirus
 from . import codigo as codigo_doc
 from .leitor import VERSAO, Leitor
 from .limites import DocumentoRecusado
@@ -150,6 +151,7 @@ class Servico:
         self.tokens = [t for t in tokens if t]
         self.sessoes: dict[str, dict] = {}
         self.idempotencia: dict[tuple[str, str], str] = {}
+        self.clamav: tuple[str, int] | None = None  # LINCE_CLAMAV: todo arquivo recebido passa pelo antivírus
         self.edicoes: dict[str, dict] = {}  # arquivo editado esperando download (entrega única, como as sessões)
         self.vagas: dict[str, int] = {}  # documentos pendentes por cliente, reservados antes do upload
         self.retidos: dict[str, int] = {}  # bytes de resultado em memória por cliente (sessões em curso e concluídas)
@@ -396,8 +398,9 @@ class _Envelope:
 
 
 # -------------------------------------------------------------------- rotas
-def criar_app(tokens: list[str]) -> Starlette:
+def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None) -> Starlette:
     s = Servico(tokens)
+    s.clamav = clamav
 
     async def saude(request):
         return JSONResponse({"status": "ok", "versao": VERSAO, "contrato": CONTRATO["info"]["version"]})
@@ -571,6 +574,7 @@ def criar_app(tokens: list[str]) -> Starlette:
             dados = await arquivo.read(TAMANHO_MAX + 1)
             if len(dados) > TAMANHO_MAX:
                 raise Problema(413, "envio-grande", "Envio grande demais")
+            await _varrer(s, arquivo.filename, dados)
             try:
                 novo, relatorio = await asyncio.to_thread(
                     codigo_doc.editar, dados, nome, pedido.get("operacoes"), pedido.get("base_sha256")
@@ -654,6 +658,27 @@ def criar_app(tokens: list[str]) -> Starlette:
     return app
 
 
+async def _varrer(s: Servico, nome, arquivo):
+    """Com ClamAV configurado, arquivo infectado nunca chega aos parsers; sem veredito, nada é lido."""
+    if not s.clamav:
+        return
+    try:
+        await antivirus.varrer(s.clamav, arquivo)
+    except antivirus.Infectado as e:
+        raise Problema(
+            422, "arquivo-infectado", "Arquivo recusado pelo antivírus", f"{nome!r}: {e.assinatura}"
+        ) from None
+    except antivirus.Indisponivel as e:
+        log.warning("antivírus sem veredito: %s", e)  # detalhe interno fica no log, não na resposta
+        raise Problema(
+            503,
+            "antivirus-indisponivel",
+            "Antivírus indisponível",
+            "Tente de novo em instantes.",
+            {"Retry-After": "30"},
+        ) from None
+
+
 async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=False):
     """Grava o lote, calcula hash e tamanho, aplica a idempotência e põe os documentos na fila."""
     pasta = tempfile.mkdtemp(prefix="lince-api-")
@@ -686,6 +711,18 @@ async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave
         conteudo = [referencia, esforco, provedor, codigo, [(d["nome"], d["sha256"]) for d in itens]]
         impressao = hashlib.sha256(json.dumps(conteudo).encode()).hexdigest()
         s.limpar()
+        if chave_idem:  # repetição ou chave reusada: responde antes de varrer (o envio aceito já foi varrido)
+            with s.trava:
+                sid = s.idempotencia.get((cliente, chave_idem))
+                if sid in s.sessoes:
+                    if s.sessoes[sid]["impressao"] != impressao:
+                        raise Problema(
+                            422, "idempotency-key-reutilizada", "Idempotency-Key já usada com outro conteúdo"
+                        )
+                    shutil.rmtree(pasta, ignore_errors=True)
+                    return {"repetida": True, "original": s.sessoes[sid]}
+        for d, a in zip(itens, arquivos, strict=True):  # antes de qualquer leitura
+            await _varrer(s, a.filename, d["arquivo"])
         with s.trava:
             if chave_idem and (sid := s.idempotencia.get((cliente, chave_idem))) and sid in s.sessoes:
                 original = s.sessoes[sid]
@@ -734,11 +771,15 @@ def main():
     ap.add_argument("--sem-autenticacao", action="store_true", help="só para uso local: aceita pedido sem token")
     a = ap.parse_args()
     tokens = [t.strip() for t in os.environ.get("LINCE_TOKENS", "").split(",") if t.strip()]
+    try:
+        clamav = antivirus.endereco(os.environ.get("LINCE_CLAMAV"))
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
     if not tokens and not a.sem_autenticacao:
         raise SystemExit("Defina LINCE_TOKENS (tokens aceitos, separados por vírgula) ou use --sem-autenticacao.")
     import uvicorn
 
-    uvicorn.run(criar_app(tokens), host=a.host, port=a.porta, proxy_headers=True, log_level="info")
+    uvicorn.run(criar_app(tokens, clamav), host=a.host, port=a.porta, proxy_headers=True, log_level="info")
 
 
 if __name__ == "__main__":

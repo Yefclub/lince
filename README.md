@@ -158,6 +158,31 @@ services:
 
 Coloque atrás de um proxy reverso com TLS e timeout de leitura acima de 300 s.
 
+### Antivírus (opcional)
+
+Com `LINCE_CLAMAV=host:porta`, todo arquivo recebido passa pelo [ClamAV](https://www.clamav.net/) antes de ser
+lido ou editado. Arquivo infectado recusa o envio inteiro (`422 arquivo-infectado`, com o nome da assinatura); antivírus fora
+do ar recusa com `503` em vez de ler sem varrer. Sem a variável, nada muda. O ClamAV roda como serviço à parte: o
+Lince só fala o protocolo do `clamd` pela rede. As variáveis estão em [`.env.example`](.env.example).
+
+```yaml
+services:
+  lince:
+    image: ghcr.io/yefclub/lince:0.1
+    env_file: .env            # LINCE_TOKENS e LINCE_CLAMAV=clamav:3310
+    depends_on: [clamav]
+    ports: ["8000:8000"]
+    read_only: true
+    tmpfs: [/tmp]
+  clamav:
+    image: clamav/clamav:stable  # baixa e atualiza as assinaturas sozinho
+    volumes: [clamav-db:/var/lib/clamav]
+volumes:
+  clamav-db:
+```
+
+No `clamd.conf`, `StreamMaxLength` precisa ser pelo menos `100M`, que é o teto de envio do Lince.
+
 ## Formatos
 
 PDF (nativo, escaneado, misto), DOCX, DOC, PPTX, PPT, XLSX, XLS, ODT, ODS, ODP, RTF, EPUB, CSV, imagens
