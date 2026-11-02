@@ -32,7 +32,6 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from . import codigo as codigo_doc
 from .leitor import VERSAO, Leitor
 from .provedores import OpenAICompativel
 
@@ -96,7 +95,7 @@ class Fila:
 class Problema(Exception):
     """Erro de contrato: vira application/problem+json (RFC 9457)."""
 
-    def __init__(self, status, codigo, titulo, detalhe=None, cabecalhos=None, extras=None):
+    def __init__(self, status, codigo, titulo, detalhe=None, cabecalhos=None):
         super().__init__(titulo)
         self.status, self.codigo, self.titulo, self.detalhe, self.cabecalhos = (
             status,
@@ -105,7 +104,6 @@ class Problema(Exception):
             detalhe,
             cabecalhos,
         )
-        self.extras = extras or {}
 
 
 def _limite_pendentes():
@@ -191,8 +189,6 @@ class Servico:
                 "alertas_injecao": r.alertas_injecao,
                 "uso": [asdict(u) for u in r.uso],
             }
-            if sessao.get("codigo"):
-                doc["resultado"].update(_codigo_do_documento(doc))
             estado = "pronto"
         except Exception as e:  # noqa: BLE001 — o erro vira estado do documento, nunca derruba o serviço
             doc["erro"] = f"{type(e).__name__}: {str(e)[:300]}"
@@ -272,16 +268,6 @@ class Servico:
 def _contagem(x):
     estados = [d["estado"] for d in x["itens"]]
     return {"total": len(estados), "prontos": estados.count("pronto"), "falhos": estados.count("falhou")}
-
-
-def _codigo_do_documento(doc) -> dict:
-    """O código (estrutura editável) do documento, quando o formato tem; senão, o motivo."""
-    try:
-        return {"codigo": codigo_doc.extrair(Path(doc["arquivo"]).read_bytes(), doc["nome"]), "codigo_motivo": None}
-    except codigo_doc.FormatoNaoSuportado as e:
-        return {"codigo": None, "codigo_motivo": str(e)}
-    except Exception as e:  # noqa: BLE001 — a leitura já saiu; o código é um extra
-        return {"codigo": None, "codigo_motivo": f"{type(e).__name__}: {str(e)[:200]}"}
 
 
 def _vencida(x, agora):
@@ -423,17 +409,12 @@ def criar_app(tokens: list[str]) -> Starlette:
             esforco = str(form.get("esforco") or "padrao")
             if esforco not in ESFORCOS:
                 raise Problema(400, "esforco-invalido", "esforco deve ser 'padrao' ou 'max'")
-            pedir_codigo = str(form.get("codigo") or "nao")
-            if pedir_codigo not in ("sim", "nao"):
-                raise Problema(400, "codigo-invalido", "codigo deve ser 'sim' ou 'nao'")
             for a in arquivos:
                 if not re.fullmatch(r"\.[a-z0-9]{1,8}", Path(a.filename or "").suffix.lower()):
                     raise Problema(
                         400, "extensao-ausente", "Todo arquivo precisa de nome com extensão", a.filename or ""
                     )
-            sessao = await _receber(
-                s, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=pedir_codigo == "sim"
-            )
+            sessao = await _receber(s, cliente, arquivos, referencia, esforco, ia, chave_idem)
         finally:
             if form is not None:
                 await form.close()  # o spool do multipart sai do disco já: o documento foi copiado
@@ -491,7 +472,6 @@ def criar_app(tokens: list[str]) -> Starlette:
         if p.detalhe:
             corpo["detail"] = p.detalhe
         corpo["instance"] = request.scope.get("state", {}).get("request_id", "")
-        corpo.update(p.extras)
         return JSONResponse(corpo, status_code=p.status, media_type="application/problem+json", headers=p.cabecalhos)
 
     async def erro_http(request, exc: HTTPException):
@@ -541,7 +521,7 @@ def criar_app(tokens: list[str]) -> Starlette:
     return app
 
 
-async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=False):
+async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave_idem):
     """Grava o lote, calcula hash e tamanho, aplica a idempotência e põe os documentos na fila."""
     pasta = tempfile.mkdtemp(prefix="lince-api-")
     try:
@@ -570,7 +550,7 @@ async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave
         if sum(d["bytes"] for d in itens) > TAMANHO_MAX:
             raise Problema(413, "envio-grande", "Envio grande demais", f"Teto de {TAMANHO_MAX // 2**20} MB por envio.")
         provedor = getattr(ia, "identidade", None)
-        conteudo = [referencia, esforco, provedor, codigo, [(d["nome"], d["sha256"]) for d in itens]]
+        conteudo = [referencia, esforco, provedor, [(d["nome"], d["sha256"]) for d in itens]]
         impressao = hashlib.sha256(json.dumps(conteudo).encode()).hexdigest()
         s.limpar()
         with s.trava:
@@ -589,7 +569,6 @@ async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave
                 "cliente": cliente,
                 "referencia": referencia,
                 "esforco": esforco,
-                "codigo": codigo,
                 "ia": ia,
                 "criada_em": time.time(),
                 "concluida_em": None,
