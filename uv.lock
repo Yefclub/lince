@@ -498,6 +498,7 @@ source = { editable = "." }
 dependencies = [
     { name = "defusedxml" },
     { name = "firecrawl-anydoc" },
+    { name = "lxml" },
     { name = "openpyxl" },
     { name = "pdf-inspector" },
     { name = "pillow" },
@@ -528,6 +529,7 @@ dev = [
 requires-dist = [
     { name = "defusedxml", specifier = ">=0.7" },
     { name = "firecrawl-anydoc", specifier = "==0.2.4" },
+    { name = "lxml", specifier = ">=6.1" },
     { name = "openpyxl", specifier = ">=3.1.5,<4" },
     { name = "pdf-inspector", specifier = "==1.25.2" },
     { name = "pillow", specifier = ">=13" },

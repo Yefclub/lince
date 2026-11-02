@@ -13,6 +13,7 @@ dependencies = [
   "python-pptx>=1.0.2,<2",     # MIT — setas de fluxograma em PPTX
   "Pillow>=13",                # MIT-CMU — imagem
   "defusedxml>=0.7",           # PSF — o openpyxl só lê XML com proteção se ele estiver instalado
+  "lxml>=6.1",                 # BSD-3 — edição cirúrgica de OOXML (documento como código)
 ]
 
 [project.optional-dependencies]
