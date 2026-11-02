@@ -1,0 +1,47 @@
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3 # igual ao exclude-newer do pyproject
+    groups:
+      dependencias:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: deps
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    ignore:
+      # Python 4 seria decisão manual; versões 3.x novas entram (o job docker do CI testa a imagem)
+      - dependency-name: python
+        update-types: [version-update:semver-major]
+    commit-message:
+      prefix: docker
+
+  - package-ecosystem: docker
+    directory: /.github/ferramentas/gitleaks
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    commit-message:
+      prefix: ci

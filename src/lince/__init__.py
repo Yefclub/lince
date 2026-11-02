@@ -1,0 +1,31 @@
+"""Lince — leitor único de documentos para bases de conhecimento e IA.
+
+Extração nativa quando o texto é bom; o modelo de visão da plataforma só onde precisa
+(imagem, gráfico, diagrama, tabela duvidosa, página escaneada), com cache, custo por leitura,
+metadados corporativos e proteção contra texto oculto e prompt injection.
+
+    import lince
+    r = lince.ler("relatorio.pdf", ia=lince.OpenAICompativel(url, modelo, chave))
+    r.markdown, r.metadados, r.cobertura, r.alertas_injecao
+"""
+
+from .cache import CacheDisco, CacheMemoria
+from .leitor import VERSAO as __version__
+from .leitor import Leitor, ler
+from .provedores import FuncaoLeitor, LeitorVisual, OpenAICompativel
+from .tipos import Cobertura, RespostaIA, Resultado, Uso
+
+__all__ = [
+    "Leitor",
+    "ler",
+    "OpenAICompativel",
+    "FuncaoLeitor",
+    "LeitorVisual",
+    "CacheMemoria",
+    "CacheDisco",
+    "Resultado",
+    "Cobertura",
+    "Uso",
+    "RespostaIA",
+    "__version__",
+]

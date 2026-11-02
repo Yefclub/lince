@@ -1,0 +1,793 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Lince",
+    "version": "1.0.0",
+    "summary": "Leitor único de documentos para bases de conhecimento e IA.",
+    "description": "Cada envio (um documento ou um lote) cria uma **sessão**. Quem chama marca a sessão com uma `referencia` própria (o id do usuário ou do processo no sistema de origem) e recupera os resultados pela sessão ou pela referência.\n\nNada é guardado. O arquivo é apagado assim que lido. O resultado fica em memória só até ser **entregue**: a primeira resposta que traz a sessão `concluida` (o `POST` com `Prefer: wait` ou um `GET`) é a entrega. Depois dela, a sessão fica 60 s para o cliente repetir o pedido se a resposta se perdeu, e então some; `DELETE` confirma o recebimento e apaga na hora. Resultado não buscado é descartado 15 min depois de concluída. `expira_em` sempre diz até quando a sessão existe. Cada token pode ter até 256 MB de resultado esperando entrega; acima disso, novos envios recebem 429 até buscar o que é dele.\n\nO modelo de visão é de quem chama, informado em cada envio (`X-IA-URL`, `X-IA-Modelo`, `X-IA-Chave`); a chave não é guardada nem registrada.\n\nErros seguem a RFC 9457 (`application/problem+json`). Toda resposta traz `X-Request-Id`.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    }
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "security": [
+    {
+      "token": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "sessoes"
+    },
+    {
+      "name": "servico"
+    }
+  ],
+  "paths": {
+    "/v1/sessoes": {
+      "post": {
+        "tags": [
+          "sessoes"
+        ],
+        "operationId": "criarSessao",
+        "summary": "Envia um documento ou um lote e cria a sessão",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Prefer"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/RequestId"
+          },
+          {
+            "name": "X-IA-URL",
+            "in": "header",
+            "description": "Endpoint compatível com OpenAI (`/v1` ou `/v1/chat/completions`). Só http(s), sem query nem fragmento. Sem ele, só a extração nativa.",
+            "schema": {
+              "type": "string",
+              "format": "uri",
+              "maxLength": 2048
+            }
+          },
+          {
+            "name": "X-IA-Modelo",
+            "in": "header",
+            "description": "Modelo de visão. Obrigatório junto com X-IA-URL.",
+            "schema": {
+              "type": "string",
+              "maxLength": 200
+            }
+          },
+          {
+            "name": "X-IA-Chave",
+            "in": "header",
+            "description": "Chave do provedor. Usada só nas chamadas desta sessão; não é guardada.",
+            "schema": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "arquivo"
+                ],
+                "properties": {
+                  "arquivo": {
+                    "description": "Um ou mais arquivos (repita o campo para um lote). O nome precisa ter extensão.",
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "items": {
+                      "type": "string",
+                      "contentMediaType": "application/octet-stream"
+                    }
+                  },
+                  "referencia": {
+                    "$ref": "#/components/schemas/Referencia"
+                  },
+                  "esforco": {
+                    "$ref": "#/components/schemas/Esforco"
+                  }
+                }
+              },
+              "encoding": {
+                "arquivo": {
+                  "contentType": "application/octet-stream"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Sessão criada. Se ela já concluiu (com `Prefer: wait`), esta resposta é a entrega.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "URL da sessão.",
+                "required": true
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Sessao"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Repetição com a mesma `Idempotency-Key` e o mesmo conteúdo: devolve a sessão já criada.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Sessao"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problema"
+          },
+          "401": {
+            "$ref": "#/components/responses/NaoAutorizado"
+          },
+          "411": {
+            "$ref": "#/components/responses/Problema"
+          },
+          "413": {
+            "$ref": "#/components/responses/Problema"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problema"
+          },
+          "429": {
+            "$ref": "#/components/responses/Limite"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problema"
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "sessoes"
+        ],
+        "operationId": "listarSessoes",
+        "summary": "Lista as sessões do token ainda não entregues, da mais nova para a mais antiga",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RequestId"
+          },
+          {
+            "name": "referencia",
+            "in": "query",
+            "description": "Só as sessões com esta referência.",
+            "schema": {
+              "$ref": "#/components/schemas/Referencia"
+            }
+          },
+          {
+            "name": "limite",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Resumo das sessões (sem o conteúdo lido).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "sessoes"
+                  ],
+                  "properties": {
+                    "sessoes": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/SessaoResumo"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problema"
+          },
+          "401": {
+            "$ref": "#/components/responses/NaoAutorizado"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problema"
+          }
+        }
+      }
+    },
+    "/v1/sessoes/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Id"
+          }
+        },
+        {
+          "$ref": "#/components/parameters/RequestId"
+        }
+      ],
+      "get": {
+        "tags": [
+          "sessoes"
+        ],
+        "operationId": "obterSessao",
+        "summary": "Estado da sessão; concluída, entrega o resultado",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Prefer"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sessão com o resultado dos documentos já lidos.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Sessao"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/NaoAutorizado"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problema"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problema"
+          }
+        },
+        "description": "Enquanto processa, devolve o estado de cada documento. Quando a sessão está `concluida`, esta resposta é a entrega: traz os resultados, e a sessão pode ser pedida de novo por 60 s (se a resposta se perdeu) antes de sumir. HEAD não conta como entrega."
+      },
+      "delete": {
+        "tags": [
+          "sessoes"
+        ],
+        "operationId": "apagarSessao",
+        "summary": "Confirma o recebimento (ou cancela o que ainda não foi lido) e apaga a sessão",
+        "responses": {
+          "204": {
+            "description": "Apagada.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/NaoAutorizado"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problema"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problema"
+          }
+        }
+      }
+    },
+    "/v1/openapi.json": {
+      "get": {
+        "tags": [
+          "servico"
+        ],
+        "operationId": "contrato",
+        "summary": "Este contrato",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "OpenAPI 3.1.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problema"
+          }
+        }
+      }
+    },
+    "/saude": {
+      "get": {
+        "tags": [
+          "servico"
+        ],
+        "operationId": "saude",
+        "summary": "Vivo",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Serviço no ar.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "status",
+                    "versao",
+                    "contrato"
+                  ],
+                  "properties": {
+                    "status": {
+                      "const": "ok"
+                    },
+                    "versao": {
+                      "type": "string"
+                    },
+                    "contrato": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problema"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "token": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Um dos tokens de `LINCE_TOKENS`. Cada token só enxerga as próprias sessões."
+      }
+    },
+    "parameters": {
+      "Prefer": {
+        "name": "Prefer",
+        "in": "header",
+        "description": "`wait=N` (RFC 7240): espera até N segundos (máximo 300) a sessão terminar antes de responder.",
+        "schema": {
+          "type": "string",
+          "pattern": "wait=\\d+",
+          "examples": [
+            "wait=120"
+          ]
+        }
+      },
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "description": "Chave única do envio no sistema de origem. Repetir a chave com o mesmo conteúdo devolve a sessão já criada (200); com conteúdo diferente, 422. Vale enquanto a sessão existir.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        }
+      },
+      "RequestId": {
+        "name": "X-Request-Id",
+        "in": "header",
+        "description": "Id do pedido para rastreio. Se ausente ou inválido, o serviço gera um.",
+        "schema": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]{1,128}$"
+        }
+      }
+    },
+    "headers": {
+      "RequestId": {
+        "description": "Id do pedido (o enviado ou um gerado).",
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "responses": {
+      "Problema": {
+        "description": "Erro (RFC 9457). Inclui 404 de rota inexistente, 405 e 500.",
+        "headers": {
+          "X-Request-Id": {
+            "$ref": "#/components/headers/RequestId"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problema"
+            }
+          }
+        }
+      },
+      "NaoAutorizado": {
+        "description": "Token ausente ou inválido (RFC 9457).",
+        "headers": {
+          "X-Request-Id": {
+            "$ref": "#/components/headers/RequestId"
+          },
+          "WWW-Authenticate": {
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "Bearer"
+            }
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problema"
+            }
+          }
+        }
+      },
+      "Limite": {
+        "description": "Limite do token (RFC 9457): documentos pendentes (`limite-pendentes`) ou resultado em memória (`limite-retencao`). Tente de novo depois de Retry-After.",
+        "headers": {
+          "X-Request-Id": {
+            "$ref": "#/components/headers/RequestId"
+          },
+          "Retry-After": {
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problema"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Id": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{32}$"
+      },
+      "Referencia": {
+        "description": "Identificador opaco do sistema de origem (usuário, conversa, processo). Não use dado pessoal em claro.",
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._:@/-]{1,200}$"
+      },
+      "Esforco": {
+        "description": "`max` relê com mais resolução o que saiu ilegível ou estimado (mais chamadas à IA).",
+        "type": "string",
+        "enum": [
+          "padrao",
+          "max"
+        ],
+        "default": "padrao"
+      },
+      "EstadoDocumento": {
+        "type": "string",
+        "enum": [
+          "na_fila",
+          "lendo",
+          "pronto",
+          "falhou",
+          "cancelado"
+        ]
+      },
+      "EstadoSessao": {
+        "type": "string",
+        "enum": [
+          "processando",
+          "concluida"
+        ]
+      },
+      "Contagem": {
+        "type": "object",
+        "required": [
+          "total",
+          "prontos",
+          "falhos"
+        ],
+        "properties": {
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "prontos": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "falhos": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "SessaoResumo": {
+        "type": "object",
+        "required": [
+          "id",
+          "estado",
+          "referencia",
+          "criada_em",
+          "documentos"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "estado": {
+            "$ref": "#/components/schemas/EstadoSessao"
+          },
+          "referencia": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "criada_em": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "concluida_em": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "expira_em": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Até quando a sessão existe: 15 min depois de concluída sem ser buscada, ou 60 s depois da entrega. Nulo enquanto processa."
+          },
+          "documentos": {
+            "$ref": "#/components/schemas/Contagem"
+          }
+        }
+      },
+      "Sessao": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SessaoResumo"
+          },
+          {
+            "type": "object",
+            "required": [
+              "esforco",
+              "itens"
+            ],
+            "properties": {
+              "esforco": {
+                "$ref": "#/components/schemas/Esforco"
+              },
+              "itens": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Documento"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "Documento": {
+        "type": "object",
+        "required": [
+          "id",
+          "nome",
+          "bytes",
+          "sha256",
+          "estado"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "nome": {
+            "type": "string",
+            "description": "Nome do arquivo como enviado (sem caminho)."
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "estado": {
+            "$ref": "#/components/schemas/EstadoDocumento"
+          },
+          "segundos": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "erro": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resultado": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Resultado"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "Resultado": {
+        "type": "object",
+        "required": [
+          "markdown",
+          "metadados",
+          "cobertura",
+          "alertas_injecao",
+          "uso"
+        ],
+        "properties": {
+          "markdown": {
+            "type": "string"
+          },
+          "metadados": {
+            "type": "object"
+          },
+          "cobertura": {
+            "type": "object",
+            "required": [
+              "paginas",
+              "rotas",
+              "leituras_ia",
+              "leituras_cache",
+              "pendentes"
+            ],
+            "properties": {
+              "paginas": {
+                "type": "integer"
+              },
+              "rotas": {
+                "type": "object"
+              },
+              "leituras_ia": {
+                "type": "integer"
+              },
+              "leituras_cache": {
+                "type": "integer"
+              },
+              "pendentes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "alertas_injecao": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "uso": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "modelo",
+                "tokens_entrada",
+                "tokens_saida",
+                "cache",
+                "tarefa"
+              ],
+              "properties": {
+                "modelo": {
+                  "type": "string"
+                },
+                "tokens_entrada": {
+                  "type": "integer"
+                },
+                "tokens_saida": {
+                  "type": "integer"
+                },
+                "cache": {
+                  "type": "boolean"
+                },
+                "tarefa": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Problema": {
+        "type": "object",
+        "required": [
+          "type",
+          "title",
+          "status"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "`urn:lince:erro:<codigo>`, estável para tratar no código (ex.: nao-autorizado, limite-pendentes, sessao-nao-encontrada, idempotency-key-reutilizada, rota-inexistente, metodo-nao-permitido, interno)."
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "instance": {
+            "type": "string",
+            "description": "X-Request-Id do pedido."
+          }
+        }
+      }
+    }
+  }
+}

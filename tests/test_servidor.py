@@ -1,0 +1,481 @@
+"""API HTTP: cada resposta é conferida contra o contrato OpenAPI; os testes provam sessão, lote, referência,
+entrega única (nada fica guardado), idempotência, isolamento entre tokens, limites e a proteção do provedor."""
+
+import json
+import threading
+from importlib.resources import files
+
+import pytest
+from jsonschema import Draft202012Validator
+from openapi_spec_validator import validate as validar_openapi
+from referencing import Registry, Resource
+from referencing.jsonschema import DRAFT202012
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from starlette.testclient import TestClient
+
+from lince.servidor import PENDENTES_POR_CLIENTE, Fila, Servico, criar_app
+
+CONTRATO = json.loads(files("lince").joinpath("openapi.json").read_text(encoding="utf-8"))
+REGISTRO = Registry().with_resource("urn:contrato", Resource.from_contents(CONTRATO, default_specification=DRAFT202012))
+A = {"Authorization": "Bearer token-a"}
+B = {"Authorization": "Bearer token-b"}
+ESPERA = {"Prefer": "wait=30"}
+
+
+def conforme(resp, caminho, metodo):
+    """A resposta tem de estar no contrato: status declarado, tipo de conteúdo e corpo válidos."""
+    op = CONTRATO["paths"][caminho][metodo]
+    status = str(resp.status_code)
+    if status not in op["responses"]:
+        assert resp.status_code >= 400, f"{metodo.upper()} {caminho} devolveu {status}, que não está no contrato"
+        status = "default"  # erro não listado tem de seguir a resposta padrão (problem+json)
+    declarada = op["responses"][status]
+    ponteiro = ["paths", caminho, metodo, "responses", status]
+    if "$ref" in declarada:
+        ponteiro = declarada["$ref"].lstrip("#/").split("/")
+        declarada = CONTRATO["components"]["responses"][ponteiro[-1]]
+    assert resp.headers.get("x-request-id")
+    for nome, h in declarada.get("headers", {}).items():
+        assert not h.get("required") or nome.lower() in resp.headers, f"cabeçalho {nome} obrigatório ausente"
+    if "content" not in declarada:
+        assert not resp.content
+        return resp
+    tipo = resp.headers["content-type"].split(";")[0]
+    assert tipo in declarada["content"], f"tipo {tipo} fora do contrato"
+    # valida pelo ponteiro dentro do contrato: os $ref internos do esquema resolvem contra o documento inteiro
+    partes = [*ponteiro, "content", tipo, "schema"]
+    esquema = {"$ref": "urn:contrato#/" + "/".join(x.replace("~", "~0").replace("/", "~1") for x in partes)}
+    Draft202012Validator(esquema, registry=REGISTRO).validate(resp.json())
+    return resp
+
+
+@pytest.fixture
+def api():
+    return TestClient(criar_app(["token-a", "token-b"]))
+
+
+def _pdf_texto(tmp_path, texto, nome="aviso.pdf"):
+    p = tmp_path / nome
+    c = canvas.Canvas(str(p), pagesize=A4)
+    c.drawString(60, 780, texto)
+    c.save()
+    return p.read_bytes()
+
+
+@pytest.fixture
+def pdf(tmp_path):
+    return _pdf_texto(tmp_path, "Aviso de manutenção da balança rodoviária em 12/11.")
+
+
+def parado(monkeypatch):
+    """Documentos ficam na fila sem terminar: para testar o que acontece antes da entrega."""
+    monkeypatch.setattr(Servico, "_ler", lambda self, doc: None)
+
+
+def concluida(api, sid):
+    """Espera a sessão terminar sem buscá-la (buscar é entregar)."""
+    assert api.app.state.servico.sessoes[sid]["pronta"].wait(30)
+
+
+def enviar(api, arquivos, cab, **campos):
+    if not isinstance(arquivos, list):
+        arquivos = [arquivos]
+    return api.post("/v1/sessoes", files=[("arquivo", a) for a in arquivos], data=campos, headers=cab)
+
+
+# ------------------------------------------------------------------ contrato
+def test_contrato_e_openapi_valido_e_cobre_todas_as_rotas(api):
+    validar_openapi(CONTRATO)
+    servido = api.get("/v1/openapi.json")
+    assert servido.status_code == 200 and servido.json() == CONTRATO
+    rotas = {r.path.replace("{id:str}", "{id}") for r in api.app.routes}
+    assert rotas == set(CONTRATO["paths"])
+
+
+def test_saude_informa_versao_do_contrato(api):
+    r = conforme(api.get("/saude"), "/saude", "get")
+    assert r.json()["contrato"] == CONTRATO["info"]["version"]
+
+
+# ------------------------------------------------------------------ sessão
+def test_envio_com_espera_entrega_o_resultado_e_nao_guarda_nada(api, pdf):
+    r = conforme(enviar(api, ("a.pdf", pdf), {**A, **ESPERA}, referencia="usuario:42"), "/v1/sessoes", "post")
+    assert r.status_code == 201 and r.headers["location"].endswith(r.json()["id"])
+    s = r.json()
+    assert s["estado"] == "concluida" and s["referencia"] == "usuario:42"
+    assert s["documentos"] == {"total": 1, "prontos": 1, "falhos": 0}
+    assert "balança rodoviária em 12/11" in s["itens"][0]["resultado"]["markdown"]
+    # entregue: dá para pedir de novo enquanto dura a janela; o DELETE confirma e apaga na hora
+    assert api.get(f"/v1/sessoes/{s['id']}", headers=A).status_code == 200
+    assert api.delete(f"/v1/sessoes/{s['id']}", headers=A).status_code == 204
+    assert api.get(f"/v1/sessoes/{s['id']}", headers=A).status_code == 404
+    assert api.app.state.servico.sessoes == {} and api.app.state.servico.retidos == {}
+
+
+def test_lote_vira_uma_sessao_com_um_item_por_arquivo(api, tmp_path):
+    lote = [(f"doc{k}.pdf", _pdf_texto(tmp_path, f"Documento número {k}.", f"d{k}.pdf")) for k in range(3)]
+    s = conforme(enviar(api, lote, {**A, **ESPERA}), "/v1/sessoes", "post").json()
+    assert [i["nome"] for i in s["itens"]] == ["doc0.pdf", "doc1.pdf", "doc2.pdf"]
+    assert all(f"Documento número {k}" in i["resultado"]["markdown"] for k, i in enumerate(s["itens"]))
+    assert len({i["sha256"] for i in s["itens"]}) == 3
+
+
+def test_sem_espera_a_entrega_acontece_na_consulta(api, pdf):
+    import lince.servidor as srv
+
+    sid = conforme(enviar(api, ("a.pdf", pdf), A), "/v1/sessoes", "post").json()["id"]
+    concluida(api, sid)
+    final = conforme(api.get(f"/v1/sessoes/{sid}", headers=A), "/v1/sessoes/{id}", "get")
+    assert final.json()["estado"] == "concluida" and final.json()["itens"][0]["resultado"]
+    # resposta perdida: a repetição dentro da janela recebe o mesmo resultado
+    repetida = conforme(api.get(f"/v1/sessoes/{sid}", headers=A), "/v1/sessoes/{id}", "get")
+    assert repetida.json()["itens"] == final.json()["itens"]
+    api.app.state.servico.sessoes[sid]["entregue_em"] -= srv.REENTREGA + 1  # passou a janela
+    assert conforme(api.get(f"/v1/sessoes/{sid}", headers=A), "/v1/sessoes/{id}", "get").status_code == 404
+    assert api.app.state.servico.retidos == {}
+
+
+def test_sessoes_nao_entregues_sao_achadas_pela_referencia_do_sistema_de_origem(api, pdf):
+    ids = [
+        enviar(api, ("a.pdf", pdf), A, referencia=ref).json()["id"] for ref in ("usuario:1", "usuario:2", "usuario:1")
+    ]
+    for sid in ids:
+        concluida(api, sid)
+    r = conforme(api.get("/v1/sessoes", params={"referencia": "usuario:1"}, headers=A), "/v1/sessoes", "get")
+    sessoes = r.json()["sessoes"]
+    assert len(sessoes) == 2 and {x["referencia"] for x in sessoes} == {"usuario:1"}
+    assert "itens" not in sessoes[0]  # a lista é resumo: não entrega nem apaga
+    assert api.get(f"/v1/sessoes/{sessoes[0]['id']}", headers=A).status_code == 200
+
+
+def test_apagar_cancela_a_sessao(api, pdf, monkeypatch):
+    parado(monkeypatch)
+    api = TestClient(criar_app(["token-a"]))
+    sid = enviar(api, ("a.pdf", pdf), A).json()["id"]
+    conforme(api.delete(f"/v1/sessoes/{sid}", headers=A), "/v1/sessoes/{id}", "delete")
+    assert conforme(api.get(f"/v1/sessoes/{sid}", headers=A), "/v1/sessoes/{id}", "get").status_code == 404
+    assert api.app.state.servico.retidos == {}
+
+
+def test_documento_que_falha_vira_estado_e_o_lote_continua(api, pdf):
+    s = enviar(api, [("ruim.pdf", b"isto nao e um pdf"), ("bom.pdf", pdf)], {**A, **ESPERA}).json()
+    assert [i["estado"] for i in s["itens"]] == ["falhou", "pronto"]
+    assert s["itens"][0]["erro"] and s["documentos"]["falhos"] == 1
+
+
+# ------------------------------------------------------------------ idempotência
+def test_repeticao_com_a_mesma_chave_devolve_a_mesma_sessao(pdf, monkeypatch):
+    parado(monkeypatch)
+    api = TestClient(criar_app(["token-a"]))
+    cab = {**A, "Idempotency-Key": "envio-123"}
+    primeira = conforme(enviar(api, ("a.pdf", pdf), cab), "/v1/sessoes", "post")
+    segunda = conforme(enviar(api, ("a.pdf", pdf), cab), "/v1/sessoes", "post")
+    assert primeira.status_code == 201 and segunda.status_code == 200
+    assert segunda.json()["id"] == primeira.json()["id"]
+    assert len(api.get("/v1/sessoes", headers=A).json()["sessoes"]) == 1
+
+
+def test_mesma_chave_com_outro_conteudo_e_recusada(pdf, tmp_path, monkeypatch):
+    parado(monkeypatch)
+    api = TestClient(criar_app(["token-a"]))
+    cab = {**A, "Idempotency-Key": "envio-123"}
+    enviar(api, ("a.pdf", pdf), cab)
+    r = conforme(enviar(api, ("b.pdf", _pdf_texto(tmp_path, "Outro.", "b.pdf")), cab), "/v1/sessoes", "post")
+    assert r.status_code == 422 and r.json()["type"] == "urn:lince:erro:idempotency-key-reutilizada"
+
+
+# ------------------------------------------------------------------ isolamento e erros
+def test_sem_token_valido_nao_entra(api, pdf):
+    r = conforme(enviar(api, ("a.pdf", pdf), {}), "/v1/sessoes", "post")
+    assert r.status_code == 401 and r.headers["www-authenticate"] == "Bearer"
+    assert (
+        conforme(enviar(api, ("a.pdf", pdf), {"Authorization": "Bearer x"}), "/v1/sessoes", "post").status_code == 401
+    )
+    especial = {"Authorization": "Bearer é".encode("latin-1")}
+    assert conforme(enviar(api, ("a.pdf", pdf), especial), "/v1/sessoes", "post").status_code == 401
+
+
+def test_token_nao_ve_sessao_nem_referencia_de_outro(api, pdf):
+    sid = enviar(api, ("a.pdf", pdf), A, referencia="usuario:1").json()["id"]
+    concluida(api, sid)
+    assert conforme(api.get(f"/v1/sessoes/{sid}", headers=B), "/v1/sessoes/{id}", "get").status_code == 404
+    assert conforme(api.delete(f"/v1/sessoes/{sid}", headers=B), "/v1/sessoes/{id}", "delete").status_code == 404
+    assert api.get("/v1/sessoes", params={"referencia": "usuario:1"}, headers=B).json()["sessoes"] == []
+    assert api.get(f"/v1/sessoes/{sid}", headers=A).status_code == 200  # a tentativa de B não entregou nada
+
+
+@pytest.mark.parametrize(
+    ("arquivos", "campos", "cab", "codigo"),
+    [
+        ([("documento", b"x")], {}, {}, "extensao-ausente"),
+        ([("a.pdf", b"x")], {"esforco": "turbo"}, {}, "esforco-invalido"),
+        ([("a.pdf", b"x")], {"referencia": "nome com espaço"}, {}, "referencia-invalida"),
+        ([("a.pdf", b"x")], {}, {"X-IA-URL": "http://x/v1"}, "provedor-incompleto"),
+        ([("a.pdf", b"x")], {}, {"X-IA-URL": "file:///etc/passwd", "X-IA-Modelo": "m"}, "provedor-invalido"),
+        ([("a.pdf", b"x")], {}, {"X-IA-URL": "http://interno:8080/admin?x=", "X-IA-Modelo": "m"}, "provedor-invalido"),
+    ],
+)
+def test_pedido_invalido_explica_o_motivo_no_formato_do_contrato(api, arquivos, campos, cab, codigo):
+    r = conforme(enviar(api, arquivos, {**A, **cab}, **campos), "/v1/sessoes", "post")
+    assert r.status_code == 400
+    assert r.headers["content-type"].startswith("application/problem+json")
+    assert r.json()["type"] == f"urn:lince:erro:{codigo}" and r.json()["instance"] == r.headers["x-request-id"]
+
+
+def test_request_id_enviado_volta_na_resposta(api):
+    assert api.get("/saude", headers={"X-Request-Id": "orbital-abc.1"}).headers["x-request-id"] == "orbital-abc.1"
+    assert api.get("/saude", headers={"X-Request-Id": "invalido com espaco"}).headers["x-request-id"] != ""
+
+
+def test_resposta_nao_fica_em_cache_intermediario(api, pdf):
+    r = enviar(api, ("a.pdf", pdf), {**A, **ESPERA})
+    assert r.headers["cache-control"] == "no-store"
+
+
+# ------------------------------------------------------------------ limites e fila
+def test_envios_paralelos_nao_furam_o_teto_de_pendentes():
+    from concurrent.futures import ThreadPoolExecutor
+
+    s = Servico(["t"])
+    with ThreadPoolExecutor(32) as ex:
+        aceitos = sum(ex.map(lambda _: s.reservar("c"), range(PENDENTES_POR_CLIENTE * 3)))
+    assert aceitos == PENDENTES_POR_CLIENTE
+    assert s.reservar("outro")  # o teto é por token
+
+
+def test_pedido_recusado_devolve_a_vaga(api, pdf):
+    for _ in range(PENDENTES_POR_CLIENTE + 10):  # se a vaga vazasse, viria 429
+        assert enviar(api, ("sem_extensao", pdf), A).status_code == 400
+    assert enviar(api, ("a.pdf", pdf), A).status_code == 201
+
+
+def test_fila_justa_nao_deixa_um_cliente_travar_o_outro():
+    ordem, liberar = [], threading.Event()
+
+    def executar(t):
+        if t == "primeiro":
+            liberar.wait(5)
+        ordem.append(t)
+
+    fila = Fila(executar, 1)
+    fila.por("a", "primeiro")
+    for k in range(5):
+        fila.por("a", f"a{k}")
+    fila.por("b", "b0")
+    liberar.set()
+    for _ in range(100):
+        if len(ordem) == 7:
+            break
+        threading.Event().wait(0.02)
+    assert ordem.index("b0") <= 2  # b entra logo, não depois dos 5 de a
+
+
+# ------------------------------------------------------------------ provedor de IA
+def _provedor(texto, status=200, local=None):
+    """Provedor OpenAI-compatível falso que responde sempre o mesmo texto (ou um redirect)."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        chamadas = 0
+
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            type(self).chamadas += 1
+            if status != 200:
+                self.send_response(status)
+                self.send_header("Location", local or "/")
+                self.end_headers()
+                return
+            out = json.dumps({"choices": [{"message": {"content": texto}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, H, f"http://127.0.0.1:{srv.server_port}/v1"
+
+
+@pytest.fixture
+def pdf_com_figura(tmp_path):
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (900, 500), "white")
+    ImageDraw.Draw(img).rectangle([100, 100, 300, 450], fill="navy")
+    img.save(tmp_path / "g.png")
+    p = tmp_path / "grafico.pdf"
+    c = canvas.Canvas(str(p), pagesize=A4)
+    c.drawString(60, 780, "Produção anual por unidade.")
+    c.drawImage(str(tmp_path / "g.png"), 60, 400, width=450, height=250)
+    c.save()
+    return p.read_bytes()
+
+
+def test_redirect_do_provedor_nao_e_seguido(pdf_com_figura):
+    destino, chamado, url_destino = _provedor("não devia chegar aqui")
+    origem, _, url_origem = _provedor("", status=302, local=url_destino + "/chat/completions")
+    api = TestClient(criar_app(["token-a"]))
+    r = enviar(api, ("g.pdf", pdf_com_figura), {**A, **ESPERA, "X-IA-URL": url_origem, "X-IA-Modelo": "m"})
+    origem.shutdown()
+    destino.shutdown()
+    assert chamado.chamadas == 0
+    assert r.json()["itens"][0]["resultado"]["cobertura"]["pendentes"]
+
+
+def test_retry_after_do_provedor_tem_teto():
+    from lince.provedores import ESPERA_MAX_PROVEDOR, _retry_after
+
+    assert _retry_after("99999999") == ESPERA_MAX_PROVEDOR
+    assert _retry_after("Wed, 21 Oct 2026 07:28:00 GMT") == 0
+    assert _retry_after("2") == 2
+
+
+# ------------------------------------------------------------------ retenção, expiração e erros fora das rotas
+
+
+def test_resultado_nao_buscado_no_prazo_e_descartado(api, pdf):
+    import lince.servidor as srv
+
+    sid = enviar(api, ("a.pdf", pdf), A).json()["id"]
+    concluida(api, sid)
+    api.app.state.servico.sessoes[sid]["concluida_em"] -= srv.ENTREGA_PRAZO + 1
+    assert conforme(api.get(f"/v1/sessoes/{sid}", headers=A), "/v1/sessoes/{id}", "get").status_code == 404
+    assert api.app.state.servico.retidos == {}
+
+
+def test_metodo_errado_informa_todos_os_metodos_aceitos(api):
+    r = conforme(api.put("/v1/sessoes", headers=A), "/v1/sessoes", "get")
+    assert r.status_code == 405 and {"GET", "POST"} <= set(r.headers["allow"].replace(" ", "").split(","))
+    assert r.json()["type"] == "urn:lince:erro:metodo-nao-permitido"
+
+
+def test_rota_inexistente_e_erro_interno_saem_no_formato_do_contrato(api, monkeypatch):
+    r = api.get("/v1/nada")
+    assert r.status_code == 404 and r.json()["type"] == "urn:lince:erro:rota-inexistente"
+    assert r.headers["content-type"].startswith("application/problem+json")
+
+    def quebra(self, request):
+        raise RuntimeError("defeito")
+
+    monkeypatch.setattr(Servico, "cliente", quebra)
+    falha = TestClient(api.app, raise_server_exceptions=False).get("/v1/sessoes", headers={"X-Request-Id": "rid-9"})
+    assert falha.status_code == 500 and falha.headers["x-request-id"] == "rid-9"
+    assert falha.json() == {
+        "type": "urn:lince:erro:interno",
+        "title": "Erro interno",
+        "status": 500,
+        "instance": "rid-9",
+    }
+    assert "defeito" not in falha.text  # detalhe interno não vaza
+
+
+def test_mesma_chave_com_outro_modelo_e_recusada(pdf, monkeypatch):
+    parado(monkeypatch)
+    srv_ia, _, url = _provedor("lido")
+    api = TestClient(criar_app(["token-a"]))
+    cab = {**A, "Idempotency-Key": "k1", "X-IA-URL": url}
+    enviar(api, ("a.pdf", pdf), {**cab, "X-IA-Modelo": "modelo-1"})
+    r = enviar(api, ("a.pdf", pdf), {**cab, "X-IA-Modelo": "modelo-2"})
+    srv_ia.shutdown()
+    assert r.status_code == 422
+
+
+def test_prefer_so_aceita_a_preferencia_wait_exata(api, pdf):
+    from lince.servidor import _espera
+
+    class P:
+        def __init__(self, v):
+            self.headers = {"prefer": v}
+
+    assert _espera(P("wait=10")) == 10
+    assert _espera(P("respond-async, wait=5")) == 5
+    assert _espera(P("x-nowait=3")) == 0
+    assert _espera(P("wait=abc")) == 0
+
+
+def test_cabecalho_do_provedor_grande_demais_e_recusado(api, pdf):
+    r = enviar(api, ("a.pdf", pdf), {**A, "X-IA-URL": "http://x/v1", "X-IA-Modelo": "m" * 201})
+    assert conforme(r, "/v1/sessoes", "post").status_code == 400
+
+
+def test_head_nao_conta_como_entrega_nem_apaga(api, pdf):
+    sid = enviar(api, ("a.pdf", pdf), A).json()["id"]
+    concluida(api, sid)
+    assert api.head(f"/v1/sessoes/{sid}", headers=A).status_code == 200
+    assert api.get(f"/v1/sessoes/{sid}", headers=A).json()["itens"][0]["resultado"]
+
+
+def test_resultado_esperando_entrega_acima_do_teto_trava_novos_envios_do_token(monkeypatch, pdf):
+    import lince.servidor as srv
+
+    api = TestClient(criar_app(["token-a", "token-b"]))
+    sid = enviar(api, ("a.pdf", pdf), A).json()["id"]
+    concluida(api, sid)
+    monkeypatch.setattr(srv, "BYTES_RETIDOS_POR_CLIENTE", 1)  # o resultado não buscado passa a estar acima do teto
+    recusada = conforme(enviar(api, ("a.pdf", pdf), A), "/v1/sessoes", "post")
+    assert recusada.status_code == 429 and recusada.json()["type"] == "urn:lince:erro:limite-retencao"
+    assert api.get("/v1/sessoes", headers=B).status_code == 200  # o outro token segue normal
+    entrega = enviar(api, ("a.pdf", pdf), {**A, "Idempotency-Key": "k"})  # repetição idempotente não é barrada
+    assert entrega.status_code == 429  # (esta chave é nova, então cai no teto conferido sob a trava)
+    api.get(f"/v1/sessoes/{sid}", headers=A)
+    api.delete(f"/v1/sessoes/{sid}", headers=A)  # buscou e confirmou: a memória voltou
+    assert api.app.state.servico.retidos == {}
+
+
+def test_rajada_de_envios_conta_no_teto_antes_de_terminar(monkeypatch, pdf):
+    import lince.servidor as srv
+
+    monkeypatch.setattr(srv, "BYTES_RETIDOS_POR_CLIENTE", len(pdf) * 3 // 2)
+    monkeypatch.setattr(srv.Servico, "_ler", lambda self, doc: None)  # documentos que nunca terminam
+    api = TestClient(criar_app(["token-a"]))
+    assert enviar(api, ("a.pdf", pdf), A).status_code == 201
+    # a checagem da entrada (antes do upload) ainda deixaria passar; a da reserva, sob a trava, recusa
+    r = enviar(api, ("b.pdf", pdf), A)
+    assert r.status_code == 429 and r.json()["type"] == "urn:lince:erro:limite-retencao"
+    assert api.app.state.servico.retidos[next(iter(api.app.state.servico.retidos))] == len(pdf)
+    assert api.app.state.servico.vagas == {next(iter(api.app.state.servico.vagas)): 1}  # a recusada devolveu a vaga
+
+
+def test_contabilidade_de_retencao_volta_a_zero(api, tmp_path, pdf):
+    ids = [enviar(api, ("a.pdf", pdf), {**A, **ESPERA}).json()["id"] for _ in range(3)]
+    ids.append(enviar(api, [("r.pdf", b"nao e pdf"), ("b.pdf", pdf)], {**A, **ESPERA}).json()["id"])
+    for sid in ids:
+        api.delete(f"/v1/sessoes/{sid}", headers=A)
+    assert api.app.state.servico.retidos == {}
+
+
+def test_apagar_durante_a_espera_nao_entrega_depois(pdf, monkeypatch):
+    parado(monkeypatch)
+    api = TestClient(criar_app(["token-a"]))
+    servico = api.app.state.servico
+    sid = enviar(api, ("a.pdf", pdf), A).json()["id"]
+    sessao = servico.sessoes[sid]
+    api.delete(f"/v1/sessoes/{sid}", headers=A)
+    with pytest.raises(Exception) as erro:
+        servico.entregar(sessao)
+    assert getattr(erro.value, "status", None) == 404
+
+
+def test_repeticao_idempotente_passa_mesmo_acima_do_teto_e_entrega(monkeypatch, pdf):
+    import lince.servidor as srv
+
+    api = TestClient(criar_app(["token-a"]))
+    cab = {**A, "Idempotency-Key": "envio-1"}
+    sid = enviar(api, ("a.pdf", pdf), cab).json()["id"]
+    concluida(api, sid)
+    monkeypatch.setattr(srv, "BYTES_RETIDOS_POR_CLIENTE", 1)
+    r = conforme(enviar(api, ("a.pdf", pdf), cab), "/v1/sessoes", "post")
+    assert r.status_code == 200 and r.json()["id"] == sid and r.json()["itens"][0]["resultado"]
+
+
+def test_lista_mostra_so_o_que_ainda_nao_foi_entregue(api, pdf):
+    a, b = (enviar(api, ("a.pdf", pdf), A).json()["id"] for _ in range(2))
+    concluida(api, a)
+    concluida(api, b)
+    api.get(f"/v1/sessoes/{a}", headers=A)
+    assert [x["id"] for x in api.get("/v1/sessoes", headers=A).json()["sessoes"]] == [b]

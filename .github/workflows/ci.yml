@@ -1,0 +1,165 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualidade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Lock em dia com o pyproject
+        run: uv lock --check
+      - name: Lint
+        run: uv run --frozen --only-group dev ruff check src tests scripts
+      - name: Formatação
+        run: uv run --frozen --only-group dev ruff format --check src tests scripts
+
+  contrato:
+    # PR que quebra o contrato da API (remove rota, campo obrigatório novo, tipo trocado...) não passa;
+    # mudança compatível exige subir info.version do openapi.json.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      BASE: ${{ github.base_ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: base
+        name: A base já tem contrato?
+        run: |
+          git rev-parse --verify "origin/${BASE}" > /dev/null
+          if git cat-file -e "origin/${BASE}:src/lince/openapi.json" 2>/dev/null; then
+            echo "existe=sim" >> "$GITHUB_OUTPUT"
+            git show "origin/${BASE}:src/lince/openapi.json" > base.json
+          else
+            echo "A base ainda não tem contrato: nada a comparar."
+          fi
+      - name: Sem quebra de contrato (oasdiff, Apache-2.0)
+        if: steps.base.outputs.existe == 'sim'
+        uses: oasdiff/oasdiff-action/breaking@9e56cf8b3aff7edb326d5767d3d23f96127e20c3 # v0.1.21
+        with:
+          base: base.json
+          revision: src/lince/openapi.json
+          fail-on: ERR
+          review: "false" # nada do contrato sai do CI
+      - name: Contrato mudou, versão subiu
+        if: steps.base.outputs.existe == 'sim'
+        run: |
+          cmp -s base.json src/lince/openapi.json && exit 0
+          python3 - <<'EOF'
+          import json, re, sys
+          def v(f):
+              texto = json.load(open(f))["info"]["version"]
+              m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", texto)
+              if not m:
+                  print(f"::error::{f}: info.version '{texto}' fora do formato X.Y.Z")
+                  sys.exit(1)
+              return tuple(map(int, m.groups()))
+          base, novo = v("base.json"), v("src/lince/openapi.json")
+          if novo <= base:
+              print(f"::error::o contrato mudou: info.version precisa subir (base {base}, PR {novo})")
+              sys.exit(1)
+          EOF
+
+  testes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.15"] # a mínima suportada e a da imagem
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - name: Fonte da folha de recortes
+        run: sudo apt-get install -y --no-install-recommends fonts-dejavu-core
+      - name: Testes
+        run: uv run --frozen --extra servidor pytest -q
+
+  licencas:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Só dependências de produção
+        run: uv sync --frozen --no-dev --extra servidor --no-editable
+      - name: Licenças permissivas
+        run: .venv/bin/python -I scripts/licencas.py --checar
+
+  auditoria:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Vulnerabilidades conhecidas nas dependências de produção
+        run: |
+          uv export --frozen --no-dev --extra servidor --no-emit-project --format requirements-txt > producao.txt
+          uv run --frozen --only-group dev pip-audit --strict --disable-pip --require-hashes -r producao.txt
+
+  segredos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Gitleaks em todo o histórico (imagem em .github/ferramentas, atualizada pelo Dependabot)
+        run: |
+          docker build -q -t gitleaks-ci .github/ferramentas/gitleaks
+          docker run --rm -v "$PWD:/repo" -w /repo -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/repo gitleaks-ci git --redact --no-banner --exit-code 1 .
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build da imagem
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: lince:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Sobe, responde e exige token
+        run: |
+          TOKEN="ci-$RANDOM$RANDOM"
+          docker run -d --name lince -p 8000:8000 -e LINCE_TOKENS="$TOKEN" lince:ci
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8000/saude && break; sleep 1; done
+          printf '%s' 'Documento de teste do CI.' > teste.txt
+          test "$(curl -s -o /dev/null -w '%{http_code}' -F arquivo=@teste.txt http://127.0.0.1:8000/v1/sessoes)" = 401
+          curl -sf -H "Authorization: Bearer $TOKEN" -H 'Prefer: wait=30' -F arquivo=@teste.txt \
+            http://127.0.0.1:8000/v1/sessoes | grep -q "Documento de teste do CI"
+          test "$(docker inspect -f '{{.Config.User}}' lince)" = lince
