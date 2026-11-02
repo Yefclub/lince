@@ -556,16 +556,20 @@ async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave
         conteudo = [referencia, esforco, provedor, [(d["nome"], d["sha256"]) for d in itens]]
         impressao = hashlib.sha256(json.dumps(conteudo).encode()).hexdigest()
         s.limpar()
-        if chave_idem:  # repetição de um envio já aceito (e já varrido) devolve a sessão sem varrer de novo
+        if chave_idem:  # repetição ou chave reusada: responde antes de varrer (o envio aceito já foi varrido)
             with s.trava:
                 sid = s.idempotencia.get((cliente, chave_idem))
-                if sid in s.sessoes and s.sessoes[sid]["impressao"] == impressao:
+                if sid in s.sessoes:
+                    if s.sessoes[sid]["impressao"] != impressao:
+                        raise Problema(
+                            422, "idempotency-key-reutilizada", "Idempotency-Key já usada com outro conteúdo"
+                        )
                     shutil.rmtree(pasta, ignore_errors=True)
                     return {"repetida": True, "original": s.sessoes[sid]}
         if s.clamav:  # antes de qualquer leitura: arquivo infectado nunca chega aos parsers
             for d, a in zip(itens, arquivos, strict=True):
                 try:
-                    await asyncio.to_thread(antivirus.varrer, s.clamav, d["arquivo"])
+                    await antivirus.varrer(s.clamav, d["arquivo"])
                 except antivirus.Infectado as e:
                     raise Problema(
                         422, "arquivo-infectado", "Arquivo recusado pelo antivírus", f"{a.filename!r}: {e.assinatura}"

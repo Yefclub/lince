@@ -128,6 +128,9 @@ def test_repeticao_idempotente_nao_varre_de_novo(clamd_falso):
     segunda = api.post("/v1/sessoes", files=[("arquivo", ("a.txt", b"oi"))], headers=cab)
     assert segunda.status_code == 200 and segunda.json()["id"] == primeira.json()["id"]
     assert len(recebidos) == 1
+    outra = api.post("/v1/sessoes", files=[("arquivo", ("b.txt", b"tchau"))], headers=cab)
+    assert outra.status_code == 422 and "idempotency-key-reutilizada" in outra.json()["type"]
+    assert len(recebidos) == 1  # chave reusada é recusada sem varrer
 
 
 def test_endereco_ipv6():

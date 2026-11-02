@@ -5,14 +5,17 @@ Liga com LINCE_CLAMAV=host:porta. Sem a variável, nada muda. Ligado, falha fech
 (não há biblioteca nem código do ClamAV no Lince).
 """
 
+import asyncio
 import socket
 import struct
-import threading
+from concurrent.futures import ThreadPoolExecutor
 
 BLOCO = 64 * 1024
 TIMEOUT = 120  # segundos por arquivo; 100 MB num clamd comum leva poucos segundos
 SIMULTANEAS = 8  # varreduras ao mesmo tempo; abaixo do MaxThreads padrão do clamd (10), que enfileira o excedente
-_VAGAS = threading.BoundedSemaphore(SIMULTANEAS)
+ESPERA_MAX = 2 * TIMEOUT  # fila mais a varredura; passou disso, o envio é recusado em vez de esperar sem fim
+# executor próprio: quem espera vaga do antivírus não ocupa as threads do executor padrão (cópia dos uploads)
+_EXECUTOR = ThreadPoolExecutor(SIMULTANEAS, thread_name_prefix="clamav")
 
 
 class Infectado(Exception):
@@ -37,14 +40,13 @@ def endereco(valor: str | None) -> tuple[str, int] | None:
     return host, int(porta)
 
 
-def varrer(alvo: tuple[str, int], caminho: str) -> None:
+async def varrer(alvo: tuple[str, int], caminho: str) -> None:
     """Envia o arquivo ao clamd. Limpo: retorna. Vírus: Infectado. Sem resposta válida: Indisponivel."""
-    if not _VAGAS.acquire(timeout=TIMEOUT):
-        raise Indisponivel("fila do antivírus cheia")
+    tarefa = asyncio.get_running_loop().run_in_executor(_EXECUTOR, _varrer, alvo, caminho)
     try:
-        return _varrer(alvo, caminho)
-    finally:
-        _VAGAS.release()
+        await asyncio.wait_for(tarefa, ESPERA_MAX)
+    except TimeoutError:
+        raise Indisponivel("fila do antivírus cheia") from None
 
 
 def _varrer(alvo, caminho):
