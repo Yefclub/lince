@@ -19,4 +19,7 @@ servidor faz requisições. Por isso:
 - Dê tokens só a plataformas confiáveis. Em rede com serviços internos sensíveis, isole o contêiner
   (rede própria, saída só para os provedores usados).
 
+**Antivírus.** Com `LINCE_CLAMAV`, todo arquivo passa pelo ClamAV antes de qualquer parser; sem veredito
+(clamd fora do ar, limite de tamanho do clamd), o envio é recusado.
+
 Só a última versão publicada recebe correções.

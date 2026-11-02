@@ -32,6 +32,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from . import antivirus
 from .leitor import VERSAO, Leitor
 from .provedores import OpenAICompativel
 
@@ -141,6 +142,7 @@ class Servico:
         self.tokens = [t for t in tokens if t]
         self.sessoes: dict[str, dict] = {}
         self.idempotencia: dict[tuple[str, str], str] = {}
+        self.clamav: tuple[str, int] | None = None  # LINCE_CLAMAV: todo arquivo recebido passa pelo antivírus
         self.vagas: dict[str, int] = {}  # documentos pendentes por cliente, reservados antes do upload
         self.retidos: dict[str, int] = {}  # bytes de resultado em memória por cliente (sessões em curso e concluídas)
         self.trava = threading.Lock()
@@ -355,8 +357,9 @@ class _Envelope:
 
 
 # -------------------------------------------------------------------- rotas
-def criar_app(tokens: list[str]) -> Starlette:
+def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None) -> Starlette:
     s = Servico(tokens)
+    s.clamav = clamav
 
     async def saude(request):
         return JSONResponse({"status": "ok", "versao": VERSAO, "contrato": CONTRATO["info"]["version"]})
@@ -547,6 +550,18 @@ async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave
                     "estado": "na_fila",
                 }
             )
+        if s.clamav:  # antes de qualquer leitura: arquivo infectado nunca chega aos parsers
+            for d, a in zip(itens, arquivos, strict=True):
+                try:
+                    await asyncio.to_thread(antivirus.varrer, s.clamav, d["arquivo"])
+                except antivirus.Infectado as e:
+                    raise Problema(
+                        422, "arquivo-infectado", "Arquivo recusado pelo antivírus", f"{a.filename!r}: {e.assinatura}"
+                    ) from None
+                except antivirus.Indisponivel as e:
+                    raise Problema(
+                        503, "antivirus-indisponivel", "Antivírus indisponível", str(e), {"Retry-After": "30"}
+                    ) from None
         if sum(d["bytes"] for d in itens) > TAMANHO_MAX:
             raise Problema(413, "envio-grande", "Envio grande demais", f"Teto de {TAMANHO_MAX // 2**20} MB por envio.")
         provedor = getattr(ia, "identidade", None)
@@ -600,11 +615,12 @@ def main():
     ap.add_argument("--sem-autenticacao", action="store_true", help="só para uso local: aceita pedido sem token")
     a = ap.parse_args()
     tokens = [t.strip() for t in os.environ.get("LINCE_TOKENS", "").split(",") if t.strip()]
+    clamav = antivirus.endereco(os.environ.get("LINCE_CLAMAV"))
     if not tokens and not a.sem_autenticacao:
         raise SystemExit("Defina LINCE_TOKENS (tokens aceitos, separados por vírgula) ou use --sem-autenticacao.")
     import uvicorn
 
-    uvicorn.run(criar_app(tokens), host=a.host, port=a.porta, proxy_headers=True, log_level="info")
+    uvicorn.run(criar_app(tokens, clamav), host=a.host, port=a.porta, proxy_headers=True, log_level="info")
 
 
 if __name__ == "__main__":
