@@ -35,7 +35,7 @@ lince = "lince.cli:main"
 lince-servidor = "lince.servidor:main"
 
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.package-data]
