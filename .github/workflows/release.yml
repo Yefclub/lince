@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   release:
-    if: github.repository == 'Yefclub/lince' && github.actor != 'github-actions[bot]'
+    if: github.repository == 'Yefclub/lince' && !(endsWith(github.event.head_commit.author.name, '[bot]') && (startsWith(github.event.head_commit.message, 'chore(versao)') || startsWith(github.event.head_commit.message, 'chore(release)')))
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
@@ -27,8 +27,15 @@ jobs:
       attestations: write
       pull-requests: read
     steps:
+      - id: bot
+        name: Token do bot do Lince (GitHub App com exceção nas regras de dev, main e tags)
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.LINCE_BOT_APP_ID }}
+          private-key: ${{ secrets.LINCE_BOT_CHAVE }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          token: ${{ steps.bot.outputs.token }} # o push sai como o bot, que passa pelas regras
           ref: ${{ github.sha }} # exatamente o commit do merge, não o que chegou depois
           fetch-depth: 0
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -40,7 +47,7 @@ jobs:
         run: |
           git fetch -q origin main --tags
           # re-run: se o bot já carimbou e marcou esta release, segue dela (sem subir a versão de novo)
-          if [ "$(git log -1 --format=%an origin/main)" = "github-actions[bot]" ] && tag=$(git describe --tags --exact-match origin/main 2>/dev/null); then
+          if git log -1 --format=%s origin/main | grep -q '^chore(release): v' && tag=$(git describe --tags --exact-match origin/main 2>/dev/null); then
             echo "versao=${tag#v}" >> "$GITHUB_OUTPUT"
             echo "retomada=sim" >> "$GITHUB_OUTPUT"
             echo "Retomando a release ${tag}"
@@ -69,18 +76,21 @@ jobs:
       - name: Changelog, versão e commit do bot
         if: steps.versao.outputs.retomada != 'sim'
         env:
+          BOT_NOME: ${{ steps.bot.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
           VERSAO: ${{ steps.versao.outputs.versao }}
         run: |
           python3 scripts/changelog.py --consumir "$VERSAO" "$RUNNER_TEMP/notas.md"
           sed -i -E "0,/^version = \".*\"/s//version = \"${VERSAO}\"/" pyproject.toml
           uv lock
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "${BOT_NOME}[bot]"
+          bot_id=$(gh api "/users/${BOT_NOME}%5Bbot%5D" --jq .id)
+          git config user.email "${bot_id}+${BOT_NOME}[bot]@users.noreply.github.com"
           git add -A pyproject.toml uv.lock CHANGELOG.md changelog
           git commit -m "chore(release): v${VERSAO}"
           git tag -a "v${VERSAO}" -m "Lince ${VERSAO}"
           # main não anda fora da release (só a PR dev -> main entra nela); se andou, falha em vez de sobrescrever
-          git push origin "HEAD:main" "v${VERSAO}"
+          git push --atomic origin "HEAD:main" "v${VERSAO}"
 
       - name: Notas da release retomada
         if: steps.versao.outputs.retomada == 'sim'
@@ -134,10 +144,13 @@ jobs:
 
       - name: Main de volta na dev
         env:
+          BOT_NOME: ${{ steps.bot.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
           VERSAO: ${{ steps.versao.outputs.versao }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "${BOT_NOME}[bot]"
+          bot_id=$(gh api "/users/${BOT_NOME}%5Bbot%5D" --jq .id)
+          git config user.email "${bot_id}+${BOT_NOME}[bot]@users.noreply.github.com"
           # se a dev andou durante a sincronização, refaz o merge sobre a ponta nova
           for tentativa in 1 2 3 4; do
             git fetch -q origin dev main
@@ -157,7 +170,11 @@ jobs:
               git add pyproject.toml CHANGELOG.md uv.lock
               git commit -q --no-edit
             fi
-            git push origin HEAD:dev && exit 0
+            if saida=$(git push origin HEAD:dev 2>&1); then exit 0; fi
+            echo "$saida"
+            case "$saida" in
+              *"rule violations"*) echo "::error::as regras da dev recusaram o bot: confira a exceção do GitHub App no ruleset"; exit 1 ;;
+            esac
             echo "Tentativa ${tentativa}: a dev andou, sincronizando de novo"
           done
           echo "::error::não consegui sincronizar a main na dev depois de 4 tentativas"
