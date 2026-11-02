@@ -550,6 +550,18 @@ async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave
                     "estado": "na_fila",
                 }
             )
+        if sum(d["bytes"] for d in itens) > TAMANHO_MAX:
+            raise Problema(413, "envio-grande", "Envio grande demais", f"Teto de {TAMANHO_MAX // 2**20} MB por envio.")
+        provedor = getattr(ia, "identidade", None)
+        conteudo = [referencia, esforco, provedor, [(d["nome"], d["sha256"]) for d in itens]]
+        impressao = hashlib.sha256(json.dumps(conteudo).encode()).hexdigest()
+        s.limpar()
+        if chave_idem:  # repetição de um envio já aceito (e já varrido) devolve a sessão sem varrer de novo
+            with s.trava:
+                sid = s.idempotencia.get((cliente, chave_idem))
+                if sid in s.sessoes and s.sessoes[sid]["impressao"] == impressao:
+                    shutil.rmtree(pasta, ignore_errors=True)
+                    return {"repetida": True, "original": s.sessoes[sid]}
         if s.clamav:  # antes de qualquer leitura: arquivo infectado nunca chega aos parsers
             for d, a in zip(itens, arquivos, strict=True):
                 try:
@@ -559,15 +571,14 @@ async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave
                         422, "arquivo-infectado", "Arquivo recusado pelo antivírus", f"{a.filename!r}: {e.assinatura}"
                     ) from None
                 except antivirus.Indisponivel as e:
+                    log.warning("antivírus sem veredito: %s", e)  # detalhe interno fica no log, não na resposta
                     raise Problema(
-                        503, "antivirus-indisponivel", "Antivírus indisponível", str(e), {"Retry-After": "30"}
+                        503,
+                        "antivirus-indisponivel",
+                        "Antivírus indisponível",
+                        "Tente de novo em instantes.",
+                        {"Retry-After": "30"},
                     ) from None
-        if sum(d["bytes"] for d in itens) > TAMANHO_MAX:
-            raise Problema(413, "envio-grande", "Envio grande demais", f"Teto de {TAMANHO_MAX // 2**20} MB por envio.")
-        provedor = getattr(ia, "identidade", None)
-        conteudo = [referencia, esforco, provedor, [(d["nome"], d["sha256"]) for d in itens]]
-        impressao = hashlib.sha256(json.dumps(conteudo).encode()).hexdigest()
-        s.limpar()
         with s.trava:
             if chave_idem and (sid := s.idempotencia.get((cliente, chave_idem))) and sid in s.sessoes:
                 original = s.sessoes[sid]
@@ -615,7 +626,10 @@ def main():
     ap.add_argument("--sem-autenticacao", action="store_true", help="só para uso local: aceita pedido sem token")
     a = ap.parse_args()
     tokens = [t.strip() for t in os.environ.get("LINCE_TOKENS", "").split(",") if t.strip()]
-    clamav = antivirus.endereco(os.environ.get("LINCE_CLAMAV"))
+    try:
+        clamav = antivirus.endereco(os.environ.get("LINCE_CLAMAV"))
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
     if not tokens and not a.sem_autenticacao:
         raise SystemExit("Defina LINCE_TOKENS (tokens aceitos, separados por vírgula) ou use --sem-autenticacao.")
     import uvicorn

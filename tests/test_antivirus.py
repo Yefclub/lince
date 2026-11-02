@@ -21,6 +21,7 @@ def clamd_falso():
     srv.bind(("127.0.0.1", 0))
     srv.listen()
     recebidos = []
+    respostas = []  # se preenchida, a próxima resposta sai daqui (em pedaços, como pode chegar pela rede)
 
     def atender():
         while True:
@@ -44,15 +45,20 @@ def clamd_falso():
                         buf += c.recv(65536)
                     dados, buf = dados + buf[:n], buf[n:]
                 recebidos.append(dados)
-                c.sendall(b"stream: Teste-Assinatura FOUND\0" if MARCA in dados else b"stream: OK\0")
+                if respostas:
+                    for pedaco in respostas.pop(0):
+                        c.sendall(pedaco)
+                        threading.Event().wait(0.01)
+                else:
+                    c.sendall(b"stream: Teste-Assinatura FOUND\0" if MARCA in dados else b"stream: OK\0")
 
     threading.Thread(target=atender, daemon=True).start()
-    yield srv.getsockname(), recebidos
+    yield srv.getsockname(), recebidos, respostas
     srv.close()
 
 
 def test_arquivo_limpo_e_varrido_e_lido(clamd_falso):
-    alvo, recebidos = clamd_falso
+    alvo, recebidos, _ = clamd_falso
     api = TestClient(criar_app(["t"], alvo))
     r = api.post("/v1/sessoes", files=[("arquivo", ("nota.txt", b"Texto limpo."))], headers=H)
     assert r.status_code == 201 and r.json()["estado"] == "concluida"
@@ -60,7 +66,7 @@ def test_arquivo_limpo_e_varrido_e_lido(clamd_falso):
 
 
 def test_arquivo_infectado_e_recusado_e_o_lote_nao_entra(clamd_falso):
-    alvo, _ = clamd_falso
+    alvo, _, _ = clamd_falso
     api = TestClient(criar_app(["t"], alvo))
     lote = [("arquivo", ("bom.txt", b"ok")), ("arquivo", ("mau.txt", b"xx" + MARCA))]
     r = api.post("/v1/sessoes", files=lote, headers=H)
@@ -91,3 +97,38 @@ def test_endereco_do_clamav():
     assert antivirus.endereco("tcp://10.0.0.5:3310") == ("10.0.0.5", 3310)
     with pytest.raises(ValueError):
         antivirus.endereco("clamav")
+
+
+def test_resposta_em_pedacos_e_limite_do_clamd(clamd_falso):
+    alvo, _, respostas = clamd_falso
+    api = TestClient(criar_app(["t"], alvo))
+    respostas.append([b"stream: O", b"K\0"])
+    assert api.post("/v1/sessoes", files=[("arquivo", ("a.txt", b"oi"))], headers=H).status_code == 201
+    respostas.append([b"INSTREAM size limit exceeded. ERROR\0"])
+    r = api.post("/v1/sessoes", files=[("arquivo", ("b.txt", b"oi"))], headers=H)
+    assert r.status_code == 503 and "INSTREAM" not in r.text  # detalhe interno do clamd não vaza
+    assert api.app.state.servico.vagas == {}
+
+
+def test_envio_grande_demais_nem_chega_ao_antivirus(clamd_falso, monkeypatch):
+    import lince.servidor as srv
+
+    alvo, recebidos, _ = clamd_falso
+    monkeypatch.setattr(srv, "TAMANHO_MAX", 10)
+    api = TestClient(criar_app(["t"], alvo))
+    r = api.post("/v1/sessoes", files=[("arquivo", ("a.txt", b"x" * 50))], headers={"Authorization": "Bearer t"})
+    assert r.status_code == 413 and recebidos == []
+
+
+def test_repeticao_idempotente_nao_varre_de_novo(clamd_falso):
+    alvo, recebidos, _ = clamd_falso
+    api = TestClient(criar_app(["t"], alvo))
+    cab = {"Authorization": "Bearer t", "Idempotency-Key": "envio-1"}
+    primeira = api.post("/v1/sessoes", files=[("arquivo", ("a.txt", b"oi"))], headers=cab)
+    segunda = api.post("/v1/sessoes", files=[("arquivo", ("a.txt", b"oi"))], headers=cab)
+    assert segunda.status_code == 200 and segunda.json()["id"] == primeira.json()["id"]
+    assert len(recebidos) == 1
+
+
+def test_endereco_ipv6():
+    assert antivirus.endereco("[::1]:3310") == ("::1", 3310)

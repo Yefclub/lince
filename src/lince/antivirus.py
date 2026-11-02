@@ -7,9 +7,12 @@ Liga com LINCE_CLAMAV=host:porta. Sem a variável, nada muda. Ligado, falha fech
 
 import socket
 import struct
+import threading
 
 BLOCO = 64 * 1024
 TIMEOUT = 120  # segundos por arquivo; 100 MB num clamd comum leva poucos segundos
+SIMULTANEAS = 8  # varreduras ao mesmo tempo; abaixo do MaxThreads padrão do clamd (10), que enfileira o excedente
+_VAGAS = threading.BoundedSemaphore(SIMULTANEAS)
 
 
 class Infectado(Exception):
@@ -28,6 +31,7 @@ def endereco(valor: str | None) -> tuple[str, int] | None:
         return None
     valor = valor.removeprefix("tcp://").strip()
     host, _, porta = valor.rpartition(":")
+    host = host[1:-1] if host.startswith("[") and host.endswith("]") else host  # IPv6: [::1]:3310
     if not host or not porta.isdigit():
         raise ValueError("LINCE_CLAMAV deve ser host:porta, por exemplo clamav:3310")
     return host, int(porta)
@@ -35,6 +39,15 @@ def endereco(valor: str | None) -> tuple[str, int] | None:
 
 def varrer(alvo: tuple[str, int], caminho: str) -> None:
     """Envia o arquivo ao clamd. Limpo: retorna. Vírus: Infectado. Sem resposta válida: Indisponivel."""
+    if not _VAGAS.acquire(timeout=TIMEOUT):
+        raise Indisponivel("fila do antivírus cheia")
+    try:
+        return _varrer(alvo, caminho)
+    finally:
+        _VAGAS.release()
+
+
+def _varrer(alvo, caminho):
     try:
         with socket.create_connection(alvo, timeout=TIMEOUT) as s, open(caminho, "rb") as f:
             s.sendall(b"zINSTREAM\0")
@@ -50,9 +63,9 @@ def varrer(alvo: tuple[str, int], caminho: str) -> None:
     except OSError as e:
         raise Indisponivel(f"clamd não respondeu: {type(e).__name__}") from None
     texto = resposta.rstrip(b"\0").decode("utf-8", "replace").strip()
-    if texto.endswith("OK"):
+    if texto == "stream: OK":
         return
-    if texto.endswith("FOUND"):
+    if texto.startswith("stream:") and texto.endswith(" FOUND"):
         raise Infectado(texto.removeprefix("stream:").removesuffix("FOUND").strip())
     # "INSTREAM size limit exceeded", erro de leitura etc.: sem veredito não há leitura
     raise Indisponivel(f"clamd sem veredito: {texto[:120]}")
