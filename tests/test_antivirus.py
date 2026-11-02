@@ -45,12 +45,15 @@ def clamd_falso():
                         buf += c.recv(65536)
                     dados, buf = dados + buf[:n], buf[n:]
                 recebidos.append(dados)
-                if respostas:
-                    for pedaco in respostas.pop(0):
-                        c.sendall(pedaco)
-                        threading.Event().wait(0.01)
-                else:
-                    c.sendall(b"stream: Teste-Assinatura FOUND\0" if MARCA in dados else b"stream: OK\0")
+                try:
+                    if respostas:
+                        for pedaco in respostas.pop(0):
+                            c.sendall(pedaco)
+                            threading.Event().wait(0.01)
+                    else:
+                        c.sendall(b"stream: Teste-Assinatura FOUND\0" if MARCA in dados else b"stream: OK\0")
+                except OSError:  # o cliente desistiu (prazo esgotado)
+                    pass
 
     threading.Thread(target=atender, daemon=True).start()
     yield srv.getsockname(), recebidos, respostas
@@ -135,3 +138,14 @@ def test_repeticao_idempotente_nao_varre_de_novo(clamd_falso):
 
 def test_endereco_ipv6():
     assert antivirus.endereco("[::1]:3310") == ("::1", 3310)
+
+
+def test_clamd_que_responde_aos_pingos_esgota_o_prazo_total(clamd_falso, monkeypatch, tmp_path):
+    alvo, _, respostas = clamd_falso
+    monkeypatch.setattr(antivirus, "TIMEOUT", 0.2)
+    # cada pedaço chega antes do timeout por operação e o veredito final é OK, mas o total passa do prazo
+    respostas.append([b" "] * 100 + [b"stream: OK\0"])
+    arquivo = tmp_path / "a.txt"
+    arquivo.write_bytes(b"oi")
+    with pytest.raises(antivirus.Indisponivel):
+        antivirus._varrer(alvo, str(arquivo))

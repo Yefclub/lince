@@ -8,6 +8,7 @@ Liga com LINCE_CLAMAV=host:porta. Sem a variável, nada muda. Ligado, falha fech
 import asyncio
 import socket
 import struct
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 BLOCO = 64 * 1024
@@ -50,15 +51,24 @@ async def varrer(alvo: tuple[str, int], caminho: str) -> None:
 
 
 def _varrer(alvo, caminho):
+    prazo = time.monotonic() + TIMEOUT  # total, não por operação: clamd lento não segura uma thread do pool sem fim
+
+    def resta(s):
+        restante = prazo - time.monotonic()
+        if restante <= 0:
+            raise TimeoutError
+        s.settimeout(restante)
+        return s
+
     try:
         with socket.create_connection(alvo, timeout=TIMEOUT) as s, open(caminho, "rb") as f:
-            s.sendall(b"zINSTREAM\0")
+            resta(s).sendall(b"zINSTREAM\0")
             while bloco := f.read(BLOCO):
-                s.sendall(struct.pack("!L", len(bloco)) + bloco)
-            s.sendall(struct.pack("!L", 0))
+                resta(s).sendall(struct.pack("!L", len(bloco)) + bloco)
+            resta(s).sendall(struct.pack("!L", 0))
             resposta = b""
             while not resposta.endswith(b"\0"):
-                parte = s.recv(4096)
+                parte = resta(s).recv(4096)
                 if not parte:
                     break
                 resposta += parte
