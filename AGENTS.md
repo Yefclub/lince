@@ -17,6 +17,8 @@ precisa. Biblioteca Python (`src/lince/`) e API HTTP (`lince.servidor`), empacot
 | Montagem do Markdown e metadados | `src/lince/montagem.py`, `src/lince/metadados.py` |
 | Texto oculto e prompt injection | `src/lince/seguranca.py` |
 | Prompt de leitura | `src/lince/prompts/leitura.md` (`VERSAO_PROMPT` em `instrucoes.py`) |
+| Documento como código e edição cirúrgica | `src/lince/codigo/` (`pacote.py`, `pptx.py`) |
+| Limites contra arquivo hostil | `src/lince/limites.py` |
 | Contrato da API (OpenAPI 3.1) | `src/lince/openapi.json` |
 | API HTTP, sessões e fila justa | `src/lince/servidor.py` |
 
@@ -62,6 +64,17 @@ antes de commitar.
   `contrato` do CI reprova com `oasdiff`.
 - Erro sempre como `Problema` (RFC 9457) com código estável `urn:lince:erro:<codigo>`; nunca mude um código
   existente.
+
+## Documento como código
+
+- O arquivo original é a fonte; o código é uma visão. A edição nunca regenera o pacote: só as partes tocadas são
+  reescritas (`Pacote.salvar`), o resto sai idêntico em bytes. `aplicar(arquivo, [])` tem de devolver todas as
+  partes idênticas.
+- Ids vêm do próprio arquivo (`sld:<sldId>/sp:<cNvPr>`) e precisam sobreviver a reordenar e editar.
+- Operação nova: tudo ou nada, erro com `OperacaoInvalida(codigo, …)` e teste de comportamento. Leitura e edição
+  usam o mesmo extrator.
+- Teste com arquivos de produtores diferentes (PowerPoint, LibreOffice, python-pptx); arquivo real de empresa nunca
+  entra no repositório.
 
 ## Nada fica guardado
 
