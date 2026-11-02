@@ -120,10 +120,14 @@ antes de commitar.
 - Achado válido no escopo é corrigido na mesma PR, seja qual for o rótulo ("menor", "sugestão"). Não vira TODO
   nem "outra PR".
 - **Merge em `dev` está autorizado ao agente**, sem pedir de novo, quando: o review independente aprovou o diff
-  final, todos os checks obrigatórios estão verdes no head atual e a PR está no escopo pedido. Head mudou:
-  revalide. Na `dev` o merge é squash.
-- **`main` não é do agente.** A PR `dev` → `main` (release) e o merge dela são decisão do mantenedor; na `main`
-  o merge é merge commit (squash quebraria a sincronização da release).
-- Nunca faça commit direto em `dev` ou `main`; só o bot de versão escreve nelas fora de PR.
+  final, a PR está no escopo pedido e todos os checks estão verdes no head atual: os jobs do `ci.yml`
+  (`qualidade`, `contrato`, `testes`, `licencas`, `auditoria`, `segredos`, `docker`) e o `fluxo`. Check pendente
+  ou ausente não é verde. Head mudou: revalide. Na `dev` o merge é squash.
+- **PR do Dependabot:** patch e minor o próprio bot mergeia com o CI verde. Major o agente só mergeia se o
+  mantenedor pedir, depois de review e CI verdes.
+- **`main` não é do agente.** O agente só abre a PR `dev` → `main` (release) se o mantenedor pedir, e nunca faz o
+  merge nem liga auto-merge nela. Na `main` o merge é merge commit (squash quebraria a sincronização da release).
+- Nunca faça commit direto em `dev` ou `main`; fora de PR, só os bots `versao-dev` (na `dev`) e `release` (na
+  `main`, nas tags e na sincronização de volta para a `dev`) escrevem nelas.
 - Nunca reescreva histórico publicado, nunca use `--no-verify`, nunca pule teste para ficar verde.
 - Commits e documentação em português brasileiro, com acentuação.

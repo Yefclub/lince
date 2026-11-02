@@ -1,7 +1,7 @@
 name: dependabot-automerge
 
-# Patch e minor do Dependabot entram sozinhos depois que o CI passa (auto-merge do GitHub espera os checks
-# obrigatórios da proteção da main). Major fica para revisão manual.
+# Patch e minor do Dependabot entram sozinhos na dev depois que o CI passa (auto-merge do GitHub espera os checks
+# obrigatórios do ruleset da dev). Major fica para revisão manual.
 on: pull_request
 
 permissions: {}
