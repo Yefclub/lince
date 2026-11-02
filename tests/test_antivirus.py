@@ -1,5 +1,6 @@
 """Antivírus (clamd INSTREAM): limpo passa, infectado é recusado antes de ser lido, clamd fora recusa."""
 
+import json
 import socket
 import struct
 import threading
@@ -149,3 +150,13 @@ def test_clamd_que_responde_aos_pingos_esgota_o_prazo_total(clamd_falso, monkeyp
     arquivo.write_bytes(b"oi")
     with pytest.raises(antivirus.Indisponivel):
         antivirus._varrer(alvo, str(arquivo))
+
+
+def test_edicao_tambem_passa_pelo_antivirus(clamd_falso):
+    alvo, recebidos, _ = clamd_falso
+    api = TestClient(criar_app(["t"], alvo))
+    pedido = {"operacoes": json.dumps({"operacoes": [{"op": "ordem", "slides": []}]})}
+    r = api.post("/v1/edicoes", files=[("arquivo", ("d.pptx", b"PK" + MARCA))], data=pedido, headers=H)
+    assert r.status_code == 422 and r.json()["type"] == "urn:lince:erro:arquivo-infectado"  # recusado antes de abrir
+    assert recebidos == [b"PK" + MARCA]
+    assert api.app.state.servico.edicoes == {} and api.app.state.servico.vagas == {}

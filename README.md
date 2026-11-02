@@ -105,6 +105,39 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
 - **Escala**: as sessões ficam na memória da instância. Para várias réplicas, use `Prefer: wait` (resposta na
   mesma conexão) ou afinidade por id da sessão no balanceador.
 
+## Documento como código (edição por IA)
+
+Para uma IA editar um documento sem estragar layout, mestres, animações e gráficos, ela precisa da estrutura com
+endereços estáveis. Com `codigo=sim` no envio, cada PPTX traz `resultado.codigo`: slides, formas, parágrafos,
+células de tabela e séries de gráfico, cada um com um id tirado do próprio arquivo (`sld:258/sp:2/p:0`).
+
+`POST /v1/edicoes` recebe o arquivo e as operações, aplica tudo ou nada e devolve o relatório: o que mudou, o diff
+por parte, avisos (texto que pode transbordar) e o código novo. O arquivo editado sai em `GET /v1/edicoes/{id}/arquivo`.
+
+```bash
+curl -H "Authorization: Bearer $LINCE_TOKEN" -F arquivo=@deck.pptx \
+     -F 'operacoes={"base_sha256":"<codigo.sha256>","operacoes":[
+           {"op":"texto","alvo":"sld:258/sp:2/p:0","se_texto":"Título antigo","texto":"Título novo"},
+           {"op":"valor_grafico","alvo":"sld:260/sp:5/ser:0","ponto":2,"valor":12.5},
+           {"op":"ordem","slides":["sld:256","sld:259","sld:258","sld:260"]}]}' \
+     http://localhost:8000/v1/edicoes
+```
+
+| Operação | O que faz |
+| --- | --- |
+| `texto` | Troca o texto de uma forma (uma linha por parágrafo) ou de um parágrafo, mantendo a formatação |
+| `substituir` | Busca e troca num slide ou numa forma, mesmo com o texto partido em vários trechos de formatação |
+| `notas` | Troca as notas do apresentador |
+| `celula_tabela` | Troca o texto de uma célula |
+| `valor_grafico` | Muda um ponto da série no gráfico e na planilha embutida dele |
+| `ordem`, `remover_slide` | Reordena ou tira slides |
+
+- **Nada se perde:** só as partes tocadas são reescritas; o resto do arquivo (mídia, mestres, partes que o Lince
+  não conhece) sai idêntico em bytes. No deck real de uma empresa, com 16 slides, gráficos com planilha embutida e
+  tabela, 5 edições alteraram 6 das 97 partes, e a renderização antes e depois mostrou o layout intacto.
+- **Concorrência:** `se_texto` e `base_sha256` recusam a edição (409) se o documento mudou desde a leitura.
+- **Formatos:** PPTX hoje.
+
 ## Deploy
 
 A imagem roda sem root, tem healthcheck em `/saude` e não grava nada (não precisa de volume). Tags publicadas:
@@ -128,7 +161,7 @@ Coloque atrás de um proxy reverso com TLS e timeout de leitura acima de 300 s.
 ### Antivírus (opcional)
 
 Com `LINCE_CLAMAV=host:porta`, todo arquivo recebido passa pelo [ClamAV](https://www.clamav.net/) antes de ser
-lido. Arquivo infectado recusa o envio inteiro (`422 arquivo-infectado`, com o nome da assinatura); antivírus fora
+lido ou editado. Arquivo infectado recusa o envio inteiro (`422 arquivo-infectado`, com o nome da assinatura); antivírus fora
 do ar recusa com `503` em vez de ler sem varrer. Sem a variável, nada muda. O ClamAV roda como serviço à parte: o
 Lince só fala o protocolo do `clamd` pela rede. As variáveis estão em [`.env.example`](.env.example).
 

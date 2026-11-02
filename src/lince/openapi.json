@@ -2,9 +2,9 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Lince",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "summary": "Leitor único de documentos para bases de conhecimento e IA.",
-    "description": "Cada envio (um documento ou um lote) cria uma **sessão**. Quem chama marca a sessão com uma `referencia` própria (o id do usuário ou do processo no sistema de origem) e recupera os resultados pela sessão ou pela referência.\n\nNada é guardado. O arquivo é apagado assim que lido. O resultado fica em memória só até ser **entregue**: a primeira resposta que traz a sessão `concluida` (o `POST` com `Prefer: wait` ou um `GET`) é a entrega. Depois dela, a sessão fica 60 s para o cliente repetir o pedido se a resposta se perdeu, e então some; `DELETE` confirma o recebimento e apaga na hora. Resultado não buscado é descartado 15 min depois de concluída. `expira_em` sempre diz até quando a sessão existe. Cada token pode ter até 256 MB de resultado esperando entrega; acima disso, novos envios recebem 429 até buscar o que é dele.\n\nO modelo de visão é de quem chama, informado em cada envio (`X-IA-URL`, `X-IA-Modelo`, `X-IA-Chave`); a chave não é guardada nem registrada.\n\nErros seguem a RFC 9457 (`application/problem+json`). Toda resposta traz `X-Request-Id`.\n\n**Antivírus.** Se o serviço estiver configurado com ClamAV, todo arquivo é varrido antes de ser lido: arquivo infectado recusa o envio inteiro (422 `arquivo-infectado`) e antivírus fora do ar recusa com 503 `antivirus-indisponivel` (nunca lê sem varrer).",
+    "description": "Cada envio (um documento ou um lote) cria uma **sessão**. Quem chama marca a sessão com uma `referencia` própria (o id do usuário ou do processo no sistema de origem) e recupera os resultados pela sessão ou pela referência.\n\nNada é guardado. O arquivo é apagado assim que lido. O resultado fica em memória só até ser **entregue**: a primeira resposta que traz a sessão `concluida` (o `POST` com `Prefer: wait` ou um `GET`) é a entrega. Depois dela, a sessão fica 60 s para o cliente repetir o pedido se a resposta se perdeu, e então some; `DELETE` confirma o recebimento e apaga na hora. Resultado não buscado é descartado 15 min depois de concluída. `expira_em` sempre diz até quando a sessão existe. Cada token pode ter até 256 MB de resultado esperando entrega; acima disso, novos envios recebem 429 até buscar o que é dele.\n\nO modelo de visão é de quem chama, informado em cada envio (`X-IA-URL`, `X-IA-Modelo`, `X-IA-Chave`); a chave não é guardada nem registrada.\n\nErros seguem a RFC 9457 (`application/problem+json`). Toda resposta traz `X-Request-Id`.\n\n**Documento como código.** Com `codigo=sim`, cada documento de formato editável traz também `resultado.codigo`: a estrutura do documento com ids estáveis tirados do próprio arquivo (slide, forma, parágrafo, célula, série de gráfico). Com esses ids, `POST /v1/edicoes` aplica operações nomeadas e devolve o arquivo novo, alterando só as partes tocadas; o resto do pacote sai idêntico em bytes.\n\n**Antivírus.** Se o serviço estiver configurado com ClamAV, todo arquivo é varrido antes de ser lido ou editado: arquivo infectado recusa o envio inteiro ou a edição (422 `arquivo-infectado`) e antivírus fora do ar recusa com 503 `antivirus-indisponivel` (nunca lê sem varrer).",
     "license": {
       "name": "MIT",
       "identifier": "MIT"
@@ -26,6 +26,9 @@
     },
     {
       "name": "servico"
+    },
+    {
+      "name": "edicoes"
     }
   ],
   "paths": {
@@ -100,6 +103,15 @@
                   },
                   "esforco": {
                     "$ref": "#/components/schemas/Esforco"
+                  },
+                  "codigo": {
+                    "description": "`sim` devolve também `resultado.codigo` nos formatos que têm (hoje: PPTX).",
+                    "type": "string",
+                    "enum": [
+                      "nao",
+                      "sim"
+                    ],
+                    "default": "nao"
                   }
                 }
               },
@@ -382,6 +394,175 @@
                 }
               }
             }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problema"
+          }
+        }
+      }
+    },
+    "/v1/edicoes": {
+      "post": {
+        "tags": [
+          "edicoes"
+        ],
+        "operationId": "editarDocumento",
+        "summary": "Aplica operações a um documento e devolve o arquivo novo",
+        "description": "Tudo ou nada: se uma operação falha, nada é aplicado e o erro diz qual (`operacao`, `alvo`). Só as partes tocadas são reescritas. Hoje: PPTX.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RequestId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "arquivo",
+                  "operacoes"
+                ],
+                "properties": {
+                  "arquivo": {
+                    "type": "string",
+                    "contentMediaType": "application/octet-stream",
+                    "description": "O documento original."
+                  },
+                  "operacoes": {
+                    "type": "string",
+                    "contentMediaType": "application/json",
+                    "description": "JSON: {\"base_sha256\": \"<codigo.sha256 lido>\", \"operacoes\": [Operacao, ...]} (até 500)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Aplicado. `Location` aponta para o arquivo novo.",
+            "headers": {
+              "Location": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Edicao"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problema"
+          },
+          "401": {
+            "$ref": "#/components/responses/NaoAutorizado"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problema"
+          },
+          "411": {
+            "$ref": "#/components/responses/Problema"
+          },
+          "413": {
+            "$ref": "#/components/responses/Problema"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problema"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problema"
+          },
+          "429": {
+            "$ref": "#/components/responses/Limite"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problema"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problema"
+          }
+        }
+      }
+    },
+    "/v1/edicoes/{id}/arquivo": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Id"
+          }
+        },
+        {
+          "$ref": "#/components/parameters/RequestId"
+        }
+      ],
+      "get": {
+        "tags": [
+          "edicoes"
+        ],
+        "operationId": "baixarEdicao",
+        "summary": "Baixa o arquivo editado (entrega; repete por 60 s)",
+        "responses": {
+          "200": {
+            "description": "O arquivo.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            },
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "contentMediaType": "application/octet-stream"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/NaoAutorizado"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problema"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problema"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "edicoes"
+        ],
+        "operationId": "apagarEdicao",
+        "summary": "Confirma o recebimento e apaga",
+        "responses": {
+          "204": {
+            "description": "Apagada.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/NaoAutorizado"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problema"
           },
           "default": {
             "$ref": "#/components/responses/Problema"
@@ -761,6 +942,24 @@
                 }
               }
             }
+          },
+          "codigo": {
+            "description": "Presente com `codigo=sim`. Nulo se o formato não tem código.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Codigo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "codigo_motivo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Por que `codigo` é nulo."
           }
         }
       },
@@ -788,6 +987,161 @@
           "instance": {
             "type": "string",
             "description": "X-Request-Id do pedido."
+          },
+          "operacao": {
+            "type": "integer",
+            "description": "Índice da operação que falhou (erros de edição)."
+          },
+          "alvo": {
+            "type": "string",
+            "description": "Alvo da operação que falhou."
+          }
+        }
+      },
+      "Codigo": {
+        "type": "object",
+        "description": "Estrutura editável. PPTX: `slides[]` com `id` (sld:<n>), `formas[]` (sld:<n>/sp:<n>) com `paragrafos[]`, `celulas[][]`, `grafico.series[]`, `midia`; mais `sha256` (base das edições), `links_externos` e `macros`.",
+        "required": [
+          "formato",
+          "esquema",
+          "sha256"
+        ],
+        "properties": {
+          "formato": {
+            "type": "string"
+          },
+          "esquema": {
+            "type": "integer"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      },
+      "Operacao": {
+        "type": "object",
+        "required": [
+          "op"
+        ],
+        "description": "Operações PPTX: `texto` {alvo (forma ou parágrafo), texto, se_texto?}, `substituir` {alvo (slide ou forma), buscar, trocar}, `notas` {slide, texto, se_texto?}, `ordem` {slides[]}, `remover_slide` {slide}, `celula_tabela` {alvo (sld/sp/c:l,c), texto, se_texto?}, `valor_grafico` {alvo (forma ou série), serie?, ponto, valor}. `se_texto` é concorrência otimista: se o texto atual for outro, nada é aplicado (409).",
+        "properties": {
+          "op": {
+            "type": "string",
+            "enum": [
+              "texto",
+              "substituir",
+              "notas",
+              "ordem",
+              "remover_slide",
+              "celula_tabela",
+              "valor_grafico"
+            ]
+          }
+        }
+      },
+      "Edicao": {
+        "type": "object",
+        "required": [
+          "id",
+          "nome",
+          "arquivo_url",
+          "expira_em",
+          "base_sha256",
+          "sha256",
+          "bytes",
+          "aplicadas",
+          "diff",
+          "avisos",
+          "codigo"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "nome": {
+            "type": "string"
+          },
+          "arquivo_url": {
+            "type": "string",
+            "description": "GET entrega o arquivo novo (pode repetir por 60 s); DELETE confirma e apaga."
+          },
+          "expira_em": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "base_sha256": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "bytes": {
+            "type": "integer"
+          },
+          "aplicadas": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "op"
+              ],
+              "properties": {
+                "op": {
+                  "type": "string"
+                },
+                "alvo": {
+                  "type": "string"
+                },
+                "partes": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "diff": {
+            "type": "object",
+            "required": [
+              "partes_identicas",
+              "partes_alteradas",
+              "partes_novas",
+              "partes_removidas"
+            ],
+            "properties": {
+              "partes_identicas": {
+                "type": "integer"
+              },
+              "partes_alteradas": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "partes_novas": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "partes_removidas": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "avisos": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "codigo": {
+            "$ref": "#/components/schemas/Codigo"
           }
         }
       }

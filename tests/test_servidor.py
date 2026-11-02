@@ -479,3 +479,76 @@ def test_lista_mostra_so_o_que_ainda_nao_foi_entregue(api, pdf):
     concluida(api, b)
     api.get(f"/v1/sessoes/{a}", headers=A)
     assert [x["id"] for x in api.get("/v1/sessoes", headers=A).json()["sessoes"]] == [b]
+
+
+# ------------------------------------------------------------------ documento como código
+@pytest.fixture
+def deck():
+    from pptx import Presentation
+
+    prs = Presentation()
+    s = prs.slides.add_slide(prs.slide_layouts[0])
+    s.shapes.title.text = "Relatório trimestral"
+    buf = __import__("io").BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def test_leitura_com_codigo_traz_a_estrutura_editavel(api, deck, pdf):
+    r = enviar(api, [("d.pptx", deck), ("a.pdf", pdf)], {**A, **ESPERA}, codigo="sim")
+    itens = conforme(r, "/v1/sessoes", "post").json()["itens"]
+    cod = itens[0]["resultado"]["codigo"]
+    assert (
+        cod["formato"] == "pptx" and cod["slides"][0]["formas"][0]["paragrafos"][0]["texto"] == "Relatório trimestral"
+    )
+    assert itens[1]["resultado"]["codigo"] is None and "pptx" in itens[1]["resultado"]["codigo_motivo"]
+
+
+def _editar(api, cab, arquivo, pedido):
+    return api.post("/v1/edicoes", files=[("arquivo", arquivo)], data={"operacoes": json.dumps(pedido)}, headers=cab)
+
+
+def test_edicao_devolve_relatorio_e_o_arquivo_uma_vez(api, deck):
+    import io
+
+    from pptx import Presentation
+
+    cod = enviar(api, ("d.pptx", deck), {**A, **ESPERA}, codigo="sim").json()["itens"][0]["resultado"]["codigo"]
+    titulo = cod["slides"][0]["formas"][0]["id"]
+    pedido = {
+        "base_sha256": cod["sha256"],
+        "operacoes": [{"op": "texto", "alvo": titulo, "se_texto": "Relatório trimestral", "texto": "Q3 2026"}],
+    }
+    r = conforme(_editar(api, A, ("d.pptx", deck), pedido), "/v1/edicoes", "post")
+    assert r.status_code == 201 and r.json()["diff"]["partes_alteradas"] == ["/ppt/slides/slide1.xml"]
+    url = r.headers["location"]
+    assert api.get(url, headers=B).status_code == 404  # outro token não baixa
+    baixado = api.get(url, headers=A)
+    assert baixado.status_code == 200 and baixado.headers["x-request-id"]
+    assert Presentation(io.BytesIO(baixado.content)).slides[0].shapes.title.text == "Q3 2026"
+    assert api.get(url, headers=A).status_code == 200  # repetir dentro da janela
+    assert api.delete(url, headers=A).status_code == 204
+    assert api.get(url, headers=A).status_code == 404
+    assert api.app.state.servico.edicoes == {}  # o arquivo editado saiu da memória
+
+
+def test_edicao_em_conflito_diz_qual_operacao_e_nao_aplica(api, deck):
+    pedido = {"operacoes": [{"op": "texto", "alvo": "sld:256/sp:2", "se_texto": "outro texto", "texto": "x"}]}
+    r = conforme(_editar(api, A, ("d.pptx", deck), pedido), "/v1/edicoes", "post")
+    assert r.status_code == 409 and r.json()["type"] == "urn:lince:erro:conflito"
+    assert r.json()["operacao"] == 0 and r.json()["alvo"] == "sld:256/sp:2"
+    assert api.app.state.servico.edicoes == {}
+
+
+def test_edicao_de_formato_sem_suporte_e_pedido_malformado(api, pdf, deck):
+    r = conforme(_editar(api, A, ("a.pdf", pdf), {"operacoes": [{"op": "ordem", "slides": []}]}), "/v1/edicoes", "post")
+    assert r.status_code == 415
+    ruim = api.post("/v1/edicoes", files=[("arquivo", ("d.pptx", deck))], data={"operacoes": "{nao"}, headers=A)
+    assert conforme(ruim, "/v1/edicoes", "post").status_code == 400
+    assert conforme(_editar(api, {}, ("d.pptx", deck), {"operacoes": []}), "/v1/edicoes", "post").status_code == 401
+
+
+def test_operacao_malformada_vira_422_e_nao_500(api, deck):
+    pedido = {"operacoes": [{"op": "valor_grafico", "alvo": "sld:256/sp:2", "ponto": "a", "valor": "nan"}]}
+    r = conforme(_editar(api, A, ("d.pptx", deck), pedido), "/v1/edicoes", "post")
+    assert r.status_code == 422 and r.json()["operacao"] == 0

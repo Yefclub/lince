@@ -33,7 +33,9 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from . import antivirus
+from . import codigo as codigo_doc
 from .leitor import VERSAO, Leitor
+from .limites import DocumentoRecusado
 from .provedores import OpenAICompativel
 
 CONTRATO = json.loads(files("lince").joinpath("openapi.json").read_text(encoding="utf-8"))
@@ -55,6 +57,12 @@ CABECALHOS_MAX = {"x-ia-url": 2048, "x-ia-modelo": 200, "x-ia-chave": 4096}
 ERROS_HTTP = {400: "requisicao-invalida", 404: "rota-inexistente", 405: "metodo-nao-permitido"}
 LISTA_MAX = 200
 ESFORCOS = {"padrao", "max"}
+MIDIA = {
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".pptm": "application/vnd.ms-powerpoint.presentation.macroEnabled.12",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
 REFERENCIA = re.compile(r"[A-Za-z0-9._:@/-]{1,200}")
 REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,128}")
 log = logging.getLogger("lince")
@@ -96,7 +104,7 @@ class Fila:
 class Problema(Exception):
     """Erro de contrato: vira application/problem+json (RFC 9457)."""
 
-    def __init__(self, status, codigo, titulo, detalhe=None, cabecalhos=None):
+    def __init__(self, status, codigo, titulo, detalhe=None, cabecalhos=None, extras=None):
         super().__init__(titulo)
         self.status, self.codigo, self.titulo, self.detalhe, self.cabecalhos = (
             status,
@@ -105,6 +113,7 @@ class Problema(Exception):
             detalhe,
             cabecalhos,
         )
+        self.extras = extras or {}
 
 
 def _limite_pendentes():
@@ -143,6 +152,7 @@ class Servico:
         self.sessoes: dict[str, dict] = {}
         self.idempotencia: dict[tuple[str, str], str] = {}
         self.clamav: tuple[str, int] | None = None  # LINCE_CLAMAV: todo arquivo recebido passa pelo antivírus
+        self.edicoes: dict[str, dict] = {}  # arquivo editado esperando download (entrega única, como as sessões)
         self.vagas: dict[str, int] = {}  # documentos pendentes por cliente, reservados antes do upload
         self.retidos: dict[str, int] = {}  # bytes de resultado em memória por cliente (sessões em curso e concluídas)
         self.trava = threading.Lock()
@@ -191,6 +201,8 @@ class Servico:
                 "alertas_injecao": r.alertas_injecao,
                 "uso": [asdict(u) for u in r.uso],
             }
+            if sessao.get("codigo"):
+                doc["resultado"].update(_codigo_do_documento(doc))
             estado = "pronto"
         except Exception as e:  # noqa: BLE001 — o erro vira estado do documento, nunca derruba o serviço
             doc["erro"] = f"{type(e).__name__}: {str(e)[:300]}"
@@ -243,6 +255,25 @@ class Servico:
             vencidas = [k for k, x in self.sessoes.items() if _vencida(x, agora)]
             for sid in vencidas:
                 self._remover(sid)
+            for eid in [k for k, x in self.edicoes.items() if _vencida(x, agora)]:
+                self._remover_edicao(eid)
+
+    def _remover_edicao(self, eid):
+        """Chamar com a trava."""
+        x = self.edicoes.pop(eid)
+        self._reter(x["cliente"], -len(x["dados"]))
+
+    def da_edicao(self, cliente, eid) -> dict:
+        """Chamar com a trava."""
+        x = self.edicoes.get(eid)
+        if x is not None and _vencida(x, time.time()):
+            self._remover_edicao(eid)
+            x = None
+        if x is None or x["cliente"] != cliente:
+            raise Problema(
+                404, "edicao-nao-encontrada", "Edição não encontrada", "Não existe, expirou ou é de outro token."
+            )
+        return x
 
     def _remover(self, sid):
         """Chamar com a trava."""
@@ -270,6 +301,16 @@ class Servico:
 def _contagem(x):
     estados = [d["estado"] for d in x["itens"]]
     return {"total": len(estados), "prontos": estados.count("pronto"), "falhos": estados.count("falhou")}
+
+
+def _codigo_do_documento(doc) -> dict:
+    """O código (estrutura editável) do documento, quando o formato tem; senão, o motivo."""
+    try:
+        return {"codigo": codigo_doc.extrair(Path(doc["arquivo"]).read_bytes(), doc["nome"]), "codigo_motivo": None}
+    except codigo_doc.FormatoNaoSuportado as e:
+        return {"codigo": None, "codigo_motivo": str(e)}
+    except Exception as e:  # noqa: BLE001 — a leitura já saiu; o código é um extra
+        return {"codigo": None, "codigo_motivo": f"{type(e).__name__}: {str(e)[:200]}"}
 
 
 def _vencida(x, agora):
@@ -412,12 +453,17 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None) -> Starl
             esforco = str(form.get("esforco") or "padrao")
             if esforco not in ESFORCOS:
                 raise Problema(400, "esforco-invalido", "esforco deve ser 'padrao' ou 'max'")
+            pedir_codigo = str(form.get("codigo") or "nao")
+            if pedir_codigo not in ("sim", "nao"):
+                raise Problema(400, "codigo-invalido", "codigo deve ser 'sim' ou 'nao'")
             for a in arquivos:
                 if not re.fullmatch(r"\.[a-z0-9]{1,8}", Path(a.filename or "").suffix.lower()):
                     raise Problema(
                         400, "extensao-ausente", "Todo arquivo precisa de nome com extensão", a.filename or ""
                     )
-            sessao = await _receber(s, cliente, arquivos, referencia, esforco, ia, chave_idem)
+            sessao = await _receber(
+                s, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=pedir_codigo == "sim"
+            )
         finally:
             if form is not None:
                 await form.close()  # o spool do multipart sai do disco já: o documento foi copiado
@@ -475,6 +521,7 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None) -> Starl
         if p.detalhe:
             corpo["detail"] = p.detalhe
         corpo["instance"] = request.scope.get("state", {}).get("request_id", "")
+        corpo.update(p.extras)
         return JSONResponse(corpo, status_code=p.status, media_type="application/problem+json", headers=p.cabecalhos)
 
     async def erro_http(request, exc: HTTPException):
@@ -498,6 +545,91 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None) -> Starl
         # despacho explícito: HEAD (que o Starlette aceita junto com GET) nunca pode cair em apagar
         return await {"GET": obter, "HEAD": obter, "DELETE": apagar}[request.method](request)
 
+    async def editar(request: Request):
+        cliente = s.cliente(request)
+        tamanho = request.headers.get("content-length")
+        if not tamanho or not tamanho.isdigit():
+            raise Problema(411, "tamanho-ausente", "Content-Length obrigatório", "Upload chunked não é aceito.")
+        if int(tamanho) > TAMANHO_MAX + 1024 * 1024:
+            raise Problema(413, "envio-grande", "Envio grande demais", f"Teto de {TAMANHO_MAX // 2**20} MB por envio.")
+        with s.trava:
+            cheio = s.acima_do_teto(cliente)
+        if cheio:
+            raise _limite_retencao()
+        if not s.reservar(cliente, 1):  # edição em andamento conta como documento pendente
+            raise _limite_pendentes()
+        form = None
+        try:
+            form = await request.form(max_files=1, max_fields=3)
+            arquivo = form.get("arquivo")
+            if arquivo is None or not hasattr(arquivo, "read"):
+                raise Problema(400, "arquivo-ausente", "Envie o documento no campo multipart 'arquivo'")
+            nome = Path(arquivo.filename or "").name[:255]
+            try:
+                pedido = json.loads(str(form.get("operacoes") or ""))
+            except json.JSONDecodeError as e:
+                raise Problema(400, "operacoes-invalidas", "operacoes precisa ser JSON", str(e)) from None
+            if not isinstance(pedido, dict):
+                raise Problema(400, "operacoes-invalidas", "operacoes precisa ser um objeto JSON")
+            dados = await arquivo.read(TAMANHO_MAX + 1)
+            if len(dados) > TAMANHO_MAX:
+                raise Problema(413, "envio-grande", "Envio grande demais")
+            await _varrer(s, arquivo.filename, dados)
+            try:
+                novo, relatorio = await asyncio.to_thread(
+                    codigo_doc.editar, dados, nome, pedido.get("operacoes"), pedido.get("base_sha256")
+                )
+            except codigo_doc.FormatoNaoSuportado as e:
+                raise Problema(415, "formato-nao-editavel", "Formato não editável", str(e)) from None
+            except codigo_doc.OperacaoInvalida as e:
+                status = 409 if e.codigo in ("conflito", "base-divergente") else 422
+                extras = {k: v for k, v in (("operacao", e.indice), ("alvo", e.alvo)) if v is not None}
+                raise Problema(status, e.codigo, "Operação não aplicada", str(e), extras=extras) from None
+            except DocumentoRecusado as e:
+                raise Problema(422, "documento-recusado", "Documento recusado", str(e)) from None
+        finally:
+            if form is not None:
+                await form.close()
+            s.liberar(cliente)
+        eid = uuid.uuid4().hex
+        agora = time.time()
+        edicao = {"id": eid, "cliente": cliente, "nome": nome, "dados": novo, "criada_em": agora, "concluida_em": agora}
+        with s.trava:
+            if s.retidos.get(cliente, 0) + len(novo) > BYTES_RETIDOS_POR_CLIENTE:
+                raise _limite_retencao()
+            s._reter(cliente, len(novo))
+            s.edicoes[eid] = edicao
+        url = str(request.url_for("edicao_arquivo", id=eid))
+        corpo = {"id": eid, "nome": nome, "arquivo_url": url, "expira_em": _iso(agora + ENTREGA_PRAZO), **relatorio}
+        return JSONResponse(corpo, status_code=201, headers={"Location": url})
+
+    async def edicao_arquivo(request: Request):
+        cliente = s.cliente(request)
+        with s.trava:
+            x = s.da_edicao(cliente, request.path_params["id"])
+            if request.method == "GET" and not x.get("entregue_em"):
+                x["entregue_em"] = time.time()  # entregue: some depois de REENTREGA (ou no DELETE)
+        tipo = MIDIA.get(Path(x["nome"]).suffix.lower(), "application/octet-stream")
+        nome_seguro = re.sub(r"[^A-Za-z0-9._-]", "_", x["nome"]) or "documento"
+        return Response(
+            x["dados"] if request.method == "GET" else b"",
+            media_type=tipo,
+            headers={
+                "Content-Disposition": f'attachment; filename="{nome_seguro}"',
+                "Content-Length": str(len(x["dados"])),
+            },
+        )
+
+    async def edicao_apagar(request: Request):
+        cliente = s.cliente(request)
+        with s.trava:
+            x = s.da_edicao(cliente, request.path_params["id"])
+            s._remover_edicao(x["id"])
+        return Response(status_code=204)
+
+    async def edicao(request: Request):
+        return await {"GET": edicao_arquivo, "HEAD": edicao_arquivo, "DELETE": edicao_apagar}[request.method](request)
+
     async def limpeza(app):
         async def laco():
             while True:
@@ -515,6 +647,8 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None) -> Starl
             # uma rota por caminho: o 405 informa no Allow todos os métodos aceitos
             Route("/v1/sessoes", sessoes, methods=["GET", "POST"]),
             Route("/v1/sessoes/{id:str}", sessao, methods=["GET", "DELETE"], name="sessao"),
+            Route("/v1/edicoes", editar, methods=["POST"]),
+            Route("/v1/edicoes/{id:str}/arquivo", edicao, methods=["GET", "DELETE"], name="edicao_arquivo"),
         ],
         exception_handlers={Problema: erro_de_contrato, HTTPException: erro_http, Exception: erro_interno},
         lifespan=_vida(limpeza),
@@ -524,7 +658,28 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None) -> Starl
     return app
 
 
-async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave_idem):
+async def _varrer(s: Servico, nome, arquivo):
+    """Com ClamAV configurado, arquivo infectado nunca chega aos parsers; sem veredito, nada é lido."""
+    if not s.clamav:
+        return
+    try:
+        await antivirus.varrer(s.clamav, arquivo)
+    except antivirus.Infectado as e:
+        raise Problema(
+            422, "arquivo-infectado", "Arquivo recusado pelo antivírus", f"{nome!r}: {e.assinatura}"
+        ) from None
+    except antivirus.Indisponivel as e:
+        log.warning("antivírus sem veredito: %s", e)  # detalhe interno fica no log, não na resposta
+        raise Problema(
+            503,
+            "antivirus-indisponivel",
+            "Antivírus indisponível",
+            "Tente de novo em instantes.",
+            {"Retry-After": "30"},
+        ) from None
+
+
+async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=False):
     """Grava o lote, calcula hash e tamanho, aplica a idempotência e põe os documentos na fila."""
     pasta = tempfile.mkdtemp(prefix="lince-api-")
     try:
@@ -553,7 +708,7 @@ async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave
         if sum(d["bytes"] for d in itens) > TAMANHO_MAX:
             raise Problema(413, "envio-grande", "Envio grande demais", f"Teto de {TAMANHO_MAX // 2**20} MB por envio.")
         provedor = getattr(ia, "identidade", None)
-        conteudo = [referencia, esforco, provedor, [(d["nome"], d["sha256"]) for d in itens]]
+        conteudo = [referencia, esforco, provedor, codigo, [(d["nome"], d["sha256"]) for d in itens]]
         impressao = hashlib.sha256(json.dumps(conteudo).encode()).hexdigest()
         s.limpar()
         if chave_idem:  # repetição ou chave reusada: responde antes de varrer (o envio aceito já foi varrido)
@@ -566,23 +721,8 @@ async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave
                         )
                     shutil.rmtree(pasta, ignore_errors=True)
                     return {"repetida": True, "original": s.sessoes[sid]}
-        if s.clamav:  # antes de qualquer leitura: arquivo infectado nunca chega aos parsers
-            for d, a in zip(itens, arquivos, strict=True):
-                try:
-                    await antivirus.varrer(s.clamav, d["arquivo"])
-                except antivirus.Infectado as e:
-                    raise Problema(
-                        422, "arquivo-infectado", "Arquivo recusado pelo antivírus", f"{a.filename!r}: {e.assinatura}"
-                    ) from None
-                except antivirus.Indisponivel as e:
-                    log.warning("antivírus sem veredito: %s", e)  # detalhe interno fica no log, não na resposta
-                    raise Problema(
-                        503,
-                        "antivirus-indisponivel",
-                        "Antivírus indisponível",
-                        "Tente de novo em instantes.",
-                        {"Retry-After": "30"},
-                    ) from None
+        for d, a in zip(itens, arquivos, strict=True):  # antes de qualquer leitura
+            await _varrer(s, a.filename, d["arquivo"])
         with s.trava:
             if chave_idem and (sid := s.idempotencia.get((cliente, chave_idem))) and sid in s.sessoes:
                 original = s.sessoes[sid]
@@ -599,6 +739,7 @@ async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave
                 "cliente": cliente,
                 "referencia": referencia,
                 "esforco": esforco,
+                "codigo": codigo,
                 "ia": ia,
                 "criada_em": time.time(),
                 "concluida_em": None,

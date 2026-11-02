@@ -6,6 +6,7 @@ Liga com LINCE_CLAMAV=host:porta. Sem a variável, nada muda. Ligado, falha fech
 """
 
 import asyncio
+import io
 import socket
 import struct
 import time
@@ -41,16 +42,16 @@ def endereco(valor: str | None) -> tuple[str, int] | None:
     return host, int(porta)
 
 
-async def varrer(alvo: tuple[str, int], caminho: str) -> None:
-    """Envia o arquivo ao clamd. Limpo: retorna. Vírus: Infectado. Sem resposta válida: Indisponivel."""
-    tarefa = asyncio.get_running_loop().run_in_executor(_EXECUTOR, _varrer, alvo, caminho)
+async def varrer(alvo: tuple[str, int], arquivo: str | bytes) -> None:
+    """Envia ao clamd (caminho ou conteúdo). Limpo: retorna. Vírus: Infectado. Sem resposta válida: Indisponivel."""
+    tarefa = asyncio.get_running_loop().run_in_executor(_EXECUTOR, _varrer, alvo, arquivo)
     try:
         await asyncio.wait_for(tarefa, ESPERA_MAX)
     except TimeoutError:
         raise Indisponivel("fila do antivírus cheia") from None
 
 
-def _varrer(alvo, caminho):
+def _varrer(alvo, arquivo):
     prazo = time.monotonic() + TIMEOUT  # total, não por operação: clamd lento não segura uma thread do pool sem fim
 
     def resta(s):
@@ -61,7 +62,10 @@ def _varrer(alvo, caminho):
         return s
 
     try:
-        with socket.create_connection(alvo, timeout=TIMEOUT) as s, open(caminho, "rb") as f:
+        with (
+            socket.create_connection(alvo, timeout=TIMEOUT) as s,
+            open(arquivo, "rb") if isinstance(arquivo, str) else io.BytesIO(arquivo) as f,
+        ):
             resta(s).sendall(b"zINSTREAM\0")
             while bloco := f.read(BLOCO):
                 resta(s).sendall(struct.pack("!L", len(bloco)) + bloco)
