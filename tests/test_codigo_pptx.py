@@ -290,3 +290,33 @@ def test_remover_slide_com_notas_leva_as_notas_junto(deck):
     novo, rel = codigo.editar(deck, "d.pptx", [{"op": "remover_slide", "slide": "sld:256"}])
     assert "/ppt/notesSlides/notesSlide1.xml" in rel["aplicadas"][0]["removidas"]
     assert pptx.integridade(novo) == []
+
+
+def test_remover_slide_limpa_secoes_e_apresentacoes_personalizadas(deck):
+    p14 = b"http://schemas.microsoft.com/office/powerpoint/2010/main"
+
+    def troca(x):
+        mostras = (
+            b'<p:custShowLst><p:custShow name="Curta" id="0"><p:sldLst><p:sld r:id="rId10"/><p:sld r:id="rId11"/>'
+            b'</p:sldLst></p:custShow><p:custShow name="So o grafico" id="1"><p:sldLst><p:sld r:id="rId11"/>'
+            b"</p:sldLst></p:custShow></p:custShowLst>"
+        )
+        secoes = (
+            b'<p:extLst><p:ext uri="{521415D9-36F7-43E2-AB2F-B90AF26B5E84}"><p14:sectionLst xmlns:p14="' + p14 + b'">'
+            b'<p14:section name="Inicio" id="{00000000-0000-0000-0000-000000000001}"><p14:sldIdLst>'
+            b'<p14:sldId id="256"/><p14:sldId id="257"/></p14:sldIdLst></p14:section>'
+            b'<p14:section name="Numeros" id="{00000000-0000-0000-0000-000000000002}"><p14:sldIdLst>'
+            b'<p14:sldId id="258"/><p14:sldId id="259"/></p14:sldIdLst></p14:section></p14:sectionLst>'
+            b"</p:ext></p:extLst>"
+        )
+        x = x.replace(b"<p:defaultTextStyle>", mostras + b"<p:defaultTextStyle>")
+        return x.replace(b"</p:presentation>", secoes + b"</p:presentation>")
+
+    com_secoes = _paragrafo_xml(deck, "ppt/presentation.xml", troca)
+    assert pptx.integridade(com_secoes) == []
+    novo, _ = codigo.editar(com_secoes, "d.pptx", [{"op": "remover_slide", "slide": "sld:259"}])
+    pres = zipfile.ZipFile(io.BytesIO(novo)).read("ppt/presentation.xml")
+    assert b'id="259"' not in pres and b'r:id="rId11"' not in pres
+    assert b'<p14:sldId id="258"/>' in pres  # o resto da seção fica
+    assert b'name="Curta"' in pres and b"So o grafico" not in pres  # a mostra que ficou vazia sai
+    assert pptx.integridade(novo) == [] and len(Presentation(io.BytesIO(novo)).slides) == 3

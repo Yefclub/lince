@@ -16,6 +16,8 @@ from lxml import etree
 
 from .pacote import R_EMBED, R_ID, Pacote, sha
 
+R_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
 NS = {
     "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
@@ -357,6 +359,8 @@ def _op_substituir(ed: _Editor, op, rel):
     busca, troca = _campo_texto(op, "buscar"), _campo_texto(op, "trocar")
     if not busca:
         raise OperacaoInvalida("operacao-invalida", "buscar não pode ser vazio")
+    if "\n" in busca or "\n" in troca:
+        raise OperacaoInvalida("operacao-invalida", "substituir trabalha dentro do parágrafo: use \\v, não \\n")
     alvo = op.get("alvo")
     casado = _casar_alvo(alvo)
     if not casado or casado[2]:
@@ -460,6 +464,25 @@ def _op_remover_slide(ed: _Editor, op, rel):
             "operacao-invalida", f"{sid} é alvo de link em /{outros[0]}: tire o link antes", alvo=sid
         )
     ed.lista.remove(alvo)
+    numero = alvo.get("id")
+    for el in list(ed.pres.iter()):  # seções (p14:sldId) e apresentações personalizadas (p:sld r:id) que o citam
+        nome = etree.QName(el).localname
+        if (
+            nome == "sldId"
+            and el.get("id") == numero
+            and el.getparent() is not None
+            and etree.QName(el.getparent()).localname == "sldIdLst"
+            and el.getparent() is not ed.lista
+        ):
+            el.getparent().remove(el)
+        elif nome == "sld" and el.get(R_ID) == rid:
+            lista = el.getparent()
+            lista.remove(el)
+            if len(lista) == 0:  # apresentação personalizada que ficou vazia sai inteira
+                mostra = lista.getparent()
+                mostra.getparent().remove(mostra)
+    for vazia in [e for e in ed.pres.iter(P + "custShowLst") if len(e) == 0]:
+        vazia.getparent().remove(vazia)
     rels_pres = pk.arvore(pk.caminho_rels("ppt/presentation.xml"))
     for r in rels_pres.findall("rel:Relationship", NS):
         if r.get("Id") == rid:
@@ -680,4 +703,12 @@ def integridade(dados: bytes) -> list[str]:
             for rid, (tipo, alvo) in pk.rels(dono).items():
                 if not tipo.startswith("externo") and alvo not in pk.partes:
                     problemas.append(f"/{dono} {rid} aponta para /{alvo}, que não existe")
+        elif nome.endswith(".xml") and nome.startswith("ppt/"):
+            # todo atributo r:* (id, embed, link…) precisa existir nas relações da parte; senão o PowerPoint repara
+            ids = set(pk.rels(nome))
+            for el in pk.arvore(nome).iter():
+                for chave, valor in el.attrib.items():
+                    if chave.startswith(R_NS) and valor and valor not in ids:
+                        problemas.append(f"/{nome} cita {valor}, que não está nas relações")
+                        break
     return problemas
