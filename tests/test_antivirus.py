@@ -88,6 +88,10 @@ def test_antivirus_fora_do_ar_recusa_em_vez_de_ler_sem_varrer():
     r = api.post("/v1/sessoes", files=[("arquivo", ("a.txt", b"oi"))], headers=H)
     assert r.status_code == 503 and r.json()["type"] == "urn:lince:erro:antivirus-indisponivel"
     assert r.headers["retry-after"] == "30"
+    pedido = {"operacoes": json.dumps({"operacoes": [{"op": "ordem", "slides": []}]})}
+    e = api.post("/v1/edicoes", files=[("arquivo", ("d.pptx", b"PK"))], data=pedido, headers=H)
+    assert e.status_code == 503 and e.json()["type"] == "urn:lince:erro:antivirus-indisponivel"
+    assert api.app.state.servico.vagas == {} and api.app.state.servico.edicoes == {}
 
 
 def test_sem_antivirus_configurado_nada_muda():
