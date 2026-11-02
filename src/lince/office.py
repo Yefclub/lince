@@ -200,31 +200,58 @@ def planejar_office(path, pasta):
             seguranca.append(
                 {"tecnicas": sorted({m for m, _ in ocultos}), "texto": " ".join(t for _, t in ocultos)[:500]}
             )
-    extras = []
+    extras, ilegiveis = [], []
     if ext == ".xlsx":  # o anydoc não extrai imagem de planilha: openpyxl, com aba e célula
         from openpyxl import load_workbook
 
-        for ws in load_workbook(path).worksheets:
-            for im in getattr(ws, "_images", []):
-                a = im.anchor._from
-                onde = f"aba {ws.title}, célula {chr(65 + a.col) if a.col < 26 else a.col}{a.row + 1}"
-                md += f"\n\n**Imagem ({onde}):**\n\n" + ler_imagem(im._data(), "image/png", onde)
+        def imagens_planilha():
+            nonlocal md
+            for ws in load_workbook(path).worksheets:
+                for im in getattr(ws, "_images", []):
+                    a = im.anchor._from
+                    onde = f"aba {ws.title}, célula {chr(65 + a.col) if a.col < 26 else a.col}{a.row + 1}"
+                    md += f"\n\n**Imagem ({onde}):**\n\n" + ler_imagem(im._data(), "image/png", onde)
+
+        _complemento(imagens_planilha, "imagens da planilha", ilegiveis)
     if ext in (".xlsx", ".docx"):
-        for g in graficos_ooxml(path):
-            extras.append(grafico_md(g))
+        _complemento(lambda: extras.extend(grafico_md(g) for g in graficos_ooxml(path)), "gráficos", ilegiveis)
     if ext == ".pptx":
-        for n, arestas in fluxos_pptx(path).items():
-            extras.append(
-                f"**Diagrama do slide {n}:**\n\n"
-                + mermaid_do_fluxo(arestas)
-                + "\n\n"
-                + "\n".join(f"- {a}" for a in arestas)
-            )
-    if ext == ".pptx":
+
+        def diagramas():
+            for n, arestas in fluxos_pptx(path).items():
+                extras.append(
+                    f"**Diagrama do slide {n}:**\n\n"
+                    + mermaid_do_fluxo(arestas)
+                    + "\n\n"
+                    + "\n".join(f"- {a}" for a in arestas)
+                )
+
+        _complemento(diagramas, "diagramas de formas", ilegiveis)
         # gráfico do pptx: anydoc já entrega os dados; acrescenta tipo e título
-        for g in graficos_ooxml(path):
-            extras.append(f"_(gráfico de {g['tipo']} acima: {g['titulo'] or 'sem título'})_")
-    return {"tipo": "office", "md": md, "extras": extras, "tarefas": tarefas, "texto_oculto": seguranca}
+        _complemento(
+            lambda: extras.extend(
+                f"_(gráfico de {g['tipo']} acima: {g['titulo'] or 'sem título'})_" for g in graficos_ooxml(path)
+            ),
+            "gráficos",
+            ilegiveis,
+        )
+    return {
+        "tipo": "office",
+        "md": md,
+        "extras": extras,
+        "tarefas": tarefas,
+        "texto_oculto": seguranca,
+        "ilegiveis": ilegiveis,
+    }
+
+
+def _complemento(funcao, nome, ilegiveis):
+    """Enriquecimento além do texto (gráficos, diagramas, imagens de planilha). Se a parte for malformada ou
+    hostil, o documento segue sem ele e o que ficou de fora é registrado; o corpo lido nunca se perde por isso."""
+    try:
+        funcao()
+    except Exception as e:  # noqa: BLE001
+        ilegiveis.append(f"{nome}: {type(e).__name__}")
 
 
 def _tam(data):

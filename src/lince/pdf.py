@@ -11,6 +11,7 @@ from xml.etree import ElementTree as ET  # noqa: F401
 
 import pypdfium2.raw as c  # noqa: F401
 
+from .limites import escala
 from .seguranca import remover_ocultos, texto_oculto_pdf
 from .texto import densidade_matematica, desifenizar, limpar_tabelas, lixo
 
@@ -295,16 +296,17 @@ def planejar_pdf(path, pasta):
                 )
                 info["tarefas"].append(tid)
         elif rota == "regioes":
-            full = page.render(scale=2.0).to_pil().convert("RGB")
+            fator = escala(W, H, 2.0)
+            full = page.render(scale=fator).to_pil().convert("RGB")
             itens = [t for t in itens_pg if not t.text.startswith("[Image:")]
             for j, (tipo, cx) in enumerate(regioes, 1):
                 l, b, r, t = cx
                 m = 6
                 box = (
-                    max(0, int((l - m) * 2)),
-                    max(0, int((H - t - m) * 2)),
-                    min(full.width, int((r + m) * 2)),
-                    min(full.height, int((H - b + m) * 2)),
+                    max(0, int((l - m) * fator)),
+                    max(0, int((H - t - m) * fator)),
+                    min(full.width, int((r + m) * fator)),
+                    min(full.height, int((H - b + m) * fator)),
                 )
                 tid = f"p{i + 1:03d}-r{j}"
                 recorte = full.crop(box)

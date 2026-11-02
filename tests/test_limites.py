@@ -67,3 +67,67 @@ def test_xml_com_expansao_de_entidades_nao_explode(tmp_path):
     r = lince.ler(hostil)
     assert "Relatório trimestral" in r.markdown
     assert r.metadados["partes_ilegiveis"] == ["docProps/app.xml"]  # ficou de fora, mas registrado
+
+
+def test_parte_grande_demais_e_recusada(tmp_path, monkeypatch):
+    import lince.limites as limites
+
+    monkeypatch.setattr(limites, "PARTE_MAX", 1024)
+    with pytest.raises(DocumentoRecusado, match="descompacta"):
+        conferir_zip(_docx_com_parte(tmp_path, "word/media/grande.bin", b"x" * 2048, zipfile.ZIP_STORED))
+
+
+def test_pacote_grande_demais_e_recusado(tmp_path, monkeypatch):
+    import lince.limites as limites
+
+    monkeypatch.setattr(limites, "DESCOMPACTADO_MAX", 4096)
+    with pytest.raises(DocumentoRecusado, match="pacote descompacta"):
+        conferir_zip(_docx_com_parte(tmp_path, "word/media/grande.bin", b"x" * 8192, zipfile.ZIP_STORED))
+
+
+def test_muitas_partes_pequenas_comprimidas_demais_sao_recusadas(tmp_path):
+    p = tmp_path / "muitas.docx"
+    with zipfile.ZipFile(p, "w", zipfile.ZIP_DEFLATED) as z:
+        for k in range(8):  # cada parte abaixo do limite individual, o conjunto passa da razão
+            z.writestr(f"word/media/m{k}.bin", b"\0" * (1024 * 1024 - 1))
+    with pytest.raises(DocumentoRecusado, match="no conjunto"):
+        conferir_zip(p)
+
+
+def test_grafico_hostil_nao_derruba_a_leitura_do_pptx(tmp_path):
+    from pptx import Presentation
+    from pptx.chart.data import CategoryChartData
+    from pptx.enum.chart import XL_CHART_TYPE
+    from pptx.util import Inches
+
+    prs = Presentation()
+    s = prs.slides.add_slide(prs.slide_layouts[5])
+    s.shapes.title.text = "Produção anual"
+    dados = CategoryChartData()
+    dados.categories = ["2025", "2026"]
+    dados.add_series("t", (1, 2))
+    s.shapes.add_chart(XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(1), Inches(2), Inches(6), Inches(4), dados)
+    original = tmp_path / "g.pptx"
+    prs.save(original)
+    hostil = tmp_path / "hostil.pptx"
+    with zipfile.ZipFile(original) as o, zipfile.ZipFile(hostil, "w", zipfile.ZIP_DEFLATED) as z:
+        for i in o.infolist():
+            dados_parte = o.read(i)
+            if i.filename.startswith("ppt/charts/chart"):
+                dados_parte = b'<?xml version="1.0"?><!DOCTYPE c [<!ENTITY a "x">]><c>&a;<'  # malformado e com DTD
+            z.writestr(i, dados_parte)
+    assert "Produção anual" in lince.ler(hostil).markdown
+
+
+def test_corpo_hostil_nao_quebra_a_busca_de_texto_oculto(tmp_path):
+    from lince.seguranca import texto_oculto_docx
+
+    hostil = _docx_com_parte(tmp_path, "word/document.xml", b"<w:document><nao-fecha>")
+    assert texto_oculto_docx(hostil) == []
+
+
+def test_pagina_gigante_nao_vira_imagem_gigante():
+    from lince.limites import LADO_MAX_PX, escala
+
+    assert escala(595, 842, 2.0) == 2.0  # A4 segue igual
+    assert 14400 * escala(14400, 14400, 2.0) <= LADO_MAX_PX
