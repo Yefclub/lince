@@ -8,6 +8,7 @@ import re  # noqa: F401
 import zipfile  # noqa: F401
 from xml.etree import ElementTree as ET  # noqa: F401
 
+from .limites import xml_ou_nada
 from .seguranca import remover_ocultos, texto_oculto_docx
 
 NS = {
@@ -54,7 +55,9 @@ def graficos_ooxml(path):
 
     with zipfile.ZipFile(path) as z:
         for nome in sorted(n for n in z.namelist() if re.search(r"/charts/chart\d+\.xml$", n)):
-            root = ET.fromstring(z.read(nome))
+            root = xml_ou_nada(z.read(nome))
+            if root is None or root.find(".//c:plotArea", NS) is None:
+                continue  # gráfico malformado ou hostil: a leitura segue sem ele
             titulo = " ".join(t.text or "" for t in root.findall(".//c:title//a:t", NS)).strip()
             plot = root.find(".//c:plotArea", NS)
             for tipo_el in list(plot):

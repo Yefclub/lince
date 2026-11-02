@@ -8,6 +8,8 @@ import re  # noqa: F401
 import zipfile  # noqa: F401
 from xml.etree import ElementTree as ET  # noqa: F401
 
+from .limites import xml_ou_nada
+
 PADROES_INJECAO = [
     r"ignor\w*\s+(all|todas?|as|the)?\s*(previous|prior|anteriores|acima)?\s*(instru\w+|regras|rules)",
     r"(system|sistema)\s*prompt|prompt\s+do\s+sistema",
@@ -72,7 +74,10 @@ def texto_oculto_docx(path):
     with zipfile.ZipFile(path) as z:
         if "word/document.xml" not in z.namelist():
             return out
-        for r in ET.fromstring(z.read("word/document.xml")).iter(f"{W}r"):
+        raiz = xml_ou_nada(z.read("word/document.xml"))
+        if raiz is None:  # corpo malformado ou hostil: o anydoc recusa o documento de qualquer forma
+            return out
+        for r in raiz.iter(f"{W}r"):
             rpr = r.find(f"{W}rPr")
             if rpr is None:
                 continue

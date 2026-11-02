@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import zipfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import PackageNotFoundError, version
@@ -12,6 +13,7 @@ from ._trava import PDFIUM
 from .agrupamento import agrupar, distribuir_lotes
 from .cache import Cache, chave
 from .instrucoes import PROMPT_PADRAO, VERSAO_PROMPT, instrucao
+from .limites import conferir_zip
 from .metadados import metadados_arquivo
 from .montagem import montar
 from .office import planejar_office
@@ -67,6 +69,8 @@ class Leitor:
         elif ext in TEXTO:
             plano = {"tipo": "texto", "md": _texto(caminho), "tarefas": []}
         else:
+            if zipfile.is_zipfile(caminho):  # Office, ODF, EPUB: conferido antes de qualquer descompactação
+                conferir_zip(caminho)
             plano = planejar_office(caminho, pasta)
         plano["arquivo"] = os.path.basename(caminho)
         plano["meta_arquivo"] = metadados_arquivo(caminho)
