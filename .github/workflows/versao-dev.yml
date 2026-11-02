@@ -1,8 +1,8 @@
 name: versao-dev
 
 # Todo merge em dev ganha uma versão de desenvolvimento carimbada pelo bot (próximo patch + .devTIMESTAMP, PEP 440)
-# e a imagem ghcr.io/<repo>:dev, para testar antes da release. O push do bot usa o GITHUB_TOKEN, que não
-# dispara outro workflow: não há laço.
+# e a imagem ghcr.io/<repo>:dev, para testar antes da release. O push sai pelo GitHub App do Lince, que dispara
+# workflows: o `if:` ignora commit de bot com prefixo chore(versao)/chore(release), e não há laço.
 on:
   push:
     branches: [dev]
@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   versao:
-    if: github.repository == 'Yefclub/lince' && !startsWith(github.event.head_commit.message, 'chore(versao)') && !startsWith(github.event.head_commit.message, 'chore(release)')
+    if: github.repository == 'Yefclub/lince' && !(endsWith(github.event.head_commit.author.name, '[bot]') && (startsWith(github.event.head_commit.message, 'chore(versao)') || startsWith(github.event.head_commit.message, 'chore(release)')))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -42,7 +42,8 @@ jobs:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
         run: |
           git config user.name "${BOT_NOME}[bot]"
-          git config user.email "$(gh api "/users/${BOT_NOME}%5Bbot%5D" --jq .id)+${BOT_NOME}[bot]@users.noreply.github.com"
+          bot_id=$(gh api "/users/${BOT_NOME}%5Bbot%5D" --jq .id)
+          git config user.email "${bot_id}+${BOT_NOME}[bot]@users.noreply.github.com"
           # se a dev andou (merge ou release) enquanto isto rodava, recalcula e carimba de novo sobre a ponta nova
           for tentativa in 1 2 3 4; do
             git fetch -q --tags origin dev

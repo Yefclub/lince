@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   release:
-    if: github.repository == 'Yefclub/lince' && !startsWith(github.event.head_commit.message, 'chore(versao)') && !startsWith(github.event.head_commit.message, 'chore(release)')
+    if: github.repository == 'Yefclub/lince' && !(endsWith(github.event.head_commit.author.name, '[bot]') && (startsWith(github.event.head_commit.message, 'chore(versao)') || startsWith(github.event.head_commit.message, 'chore(release)')))
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
@@ -84,12 +84,13 @@ jobs:
           sed -i -E "0,/^version = \".*\"/s//version = \"${VERSAO}\"/" pyproject.toml
           uv lock
           git config user.name "${BOT_NOME}[bot]"
-          git config user.email "$(gh api "/users/${BOT_NOME}%5Bbot%5D" --jq .id)+${BOT_NOME}[bot]@users.noreply.github.com"
+          bot_id=$(gh api "/users/${BOT_NOME}%5Bbot%5D" --jq .id)
+          git config user.email "${bot_id}+${BOT_NOME}[bot]@users.noreply.github.com"
           git add -A pyproject.toml uv.lock CHANGELOG.md changelog
           git commit -m "chore(release): v${VERSAO}"
           git tag -a "v${VERSAO}" -m "Lince ${VERSAO}"
           # main não anda fora da release (só a PR dev -> main entra nela); se andou, falha em vez de sobrescrever
-          git push origin "HEAD:main" "v${VERSAO}"
+          git push --atomic origin "HEAD:main" "v${VERSAO}"
 
       - name: Notas da release retomada
         if: steps.versao.outputs.retomada == 'sim'
@@ -148,7 +149,8 @@ jobs:
           VERSAO: ${{ steps.versao.outputs.versao }}
         run: |
           git config user.name "${BOT_NOME}[bot]"
-          git config user.email "$(gh api "/users/${BOT_NOME}%5Bbot%5D" --jq .id)+${BOT_NOME}[bot]@users.noreply.github.com"
+          bot_id=$(gh api "/users/${BOT_NOME}%5Bbot%5D" --jq .id)
+          git config user.email "${bot_id}+${BOT_NOME}[bot]@users.noreply.github.com"
           # se a dev andou durante a sincronização, refaz o merge sobre a ponta nova
           for tentativa in 1 2 3 4; do
             git fetch -q origin dev main
