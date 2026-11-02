@@ -546,3 +546,9 @@ def test_edicao_de_formato_sem_suporte_e_pedido_malformado(api, pdf, deck):
     ruim = api.post("/v1/edicoes", files=[("arquivo", ("d.pptx", deck))], data={"operacoes": "{nao"}, headers=A)
     assert conforme(ruim, "/v1/edicoes", "post").status_code == 400
     assert conforme(_editar(api, {}, ("d.pptx", deck), {"operacoes": []}), "/v1/edicoes", "post").status_code == 401
+
+
+def test_operacao_malformada_vira_422_e_nao_500(api, deck):
+    pedido = {"operacoes": [{"op": "valor_grafico", "alvo": "sld:256/sp:2", "ponto": "a", "valor": "nan"}]}
+    r = conforme(_editar(api, A, ("d.pptx", deck), pedido), "/v1/edicoes", "post")
+    assert r.status_code == 422 and r.json()["operacao"] == 0

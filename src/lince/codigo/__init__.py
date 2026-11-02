@@ -46,13 +46,12 @@ def editar(dados: bytes, nome: str, operacoes: list, base_sha256: str | None = N
         raise OperacaoInvalida(
             "base-divergente", "o arquivo enviado não é o que foi lido (sha256 diferente): leia de novo antes de editar"
         )
-    novo, aplicadas = modulo.aplicar(dados, operacoes)
+    novo, aplicadas, avisos = modulo.aplicar(dados, operacoes)
     problemas = modulo.integridade(novo)
     if problemas:  # nunca devolve pacote quebrado
         raise OperacaoInvalida(
             "validacao-falhou", "o arquivo resultante ficaria inconsistente: " + "; ".join(problemas[:5])
         )
-    avisos = []
     for a in aplicadas:
         if a["op"] in ("texto", "celula_tabela"):
             razao = len(str(a.get("depois", ""))) / max(len(str(a.get("antes", ""))), 1)

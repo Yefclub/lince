@@ -61,7 +61,7 @@ def test_codigo_expoe_a_estrutura_com_ids_do_arquivo(deck):
 
 
 def test_ida_e_volta_sem_operacoes_preserva_todas_as_partes(deck):
-    novo, _ = pptx.aplicar(deck, [])
+    novo, _, _ = pptx.aplicar(deck, [])
     assert codigo.comparar(deck, novo)["partes_alteradas"] == []
 
 
@@ -184,3 +184,109 @@ def test_formato_sem_edicao_e_xml_hostil_sao_recusados(deck, tmp_path):
             z.writestr(i, dados)
     with pytest.raises(DocumentoRecusado, match="DOCTYPE"):
         pptx.extrair(hostil.getvalue())
+
+
+def test_substituir_encadeado_nao_amplifica_sem_limite(deck):
+    c = pptx.extrair(deck)
+    corpo = c["slides"][1]["formas"][1]["id"]
+    novo, _, _ = pptx.aplicar(deck, [{"op": "texto", "alvo": corpo, "texto": "e" * 50}])
+    with pytest.raises(OperacaoInvalida) as e:
+        codigo.editar(novo, "d.pptx", [{"op": "substituir", "alvo": corpo, "buscar": "e", "trocar": "e" * 5000}] * 3)
+    assert e.value.codigo == "texto-grande"
+
+
+@pytest.mark.parametrize(
+    "op",
+    [
+        {"op": "texto", "alvo": "sld:256/sp:2"},  # sem texto
+        {"op": "texto", "alvo": "sld:256/sp:2/p:1,2", "texto": "x"},  # alvo mal formado
+        {"op": "texto", "alvo": 256, "texto": "x"},  # alvo de outro tipo
+        {"op": "celula_tabela", "alvo": "sld:258/sp:4/c:1", "texto": "x"},
+        {"op": "valor_grafico", "alvo": "sld:259/sp:3/ser:0", "ponto": "a", "valor": 1},
+        {"op": "valor_grafico", "alvo": "sld:259/sp:3/ser:0", "ponto": 0, "valor": "nan"},
+        {"op": "valor_grafico", "alvo": "sld:256/sp:2", "ponto": 0, "valor": 1},  # forma que não é gráfico
+        {"op": "notas", "slide": ["sld:256"], "texto": "x"},
+        {"op": "ordem", "slides": "sld:256"},
+        {"op": "texto", "alvo": "sld:256/sp:2", "texto": "x" * 200_000},
+    ],
+)
+def test_pedido_malformado_vira_operacao_invalida_e_nao_erro_interno(deck, op):
+    with pytest.raises(OperacaoInvalida) as e:
+        codigo.editar(deck, "d.pptx", [op])
+    assert e.value.indice == 0
+
+
+def _paragrafo_xml(deck, parte, troca):
+    saida = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(deck)) as o, zipfile.ZipFile(saida, "w") as z:
+        for i in o.infolist():
+            dados = o.read(i)
+            if i.filename == parte:
+                dados = troca(dados)
+            z.writestr(i, dados)
+    return saida.getvalue()
+
+
+def test_quebra_de_linha_e_campo_sao_tratados(deck):
+    # título com quebra de linha (a:br) e um parágrafo que só tem campo (número do slide)
+    def troca(x):
+        x = x.replace(
+            b"<a:t>Relat\xc3\xb3rio trimestral</a:t></a:r>",
+            b"<a:t>Relat\xc3\xb3rio</a:t></a:r><a:br/><a:r><a:t>trimestral</a:t></a:r>",
+        )
+        return x
+
+    com_quebra = _paragrafo_xml(deck, "ppt/slides/slide1.xml", troca)
+    c = pptx.extrair(com_quebra)
+    titulo = c["slides"][0]["formas"][0]["paragrafos"][0]
+    assert titulo["texto"] == "Relatório\vtrimestral"
+    novo, rel = codigo.editar(
+        com_quebra,
+        "d.pptx",
+        [
+            {"op": "substituir", "alvo": "sld:256", "buscar": "trimestral", "trocar": "anual"},
+            {"op": "texto", "alvo": titulo["id"], "texto": "Linha 1\vLinha 2"},
+        ],
+    )
+    assert rel["codigo"]["slides"][0]["formas"][0]["paragrafos"][0]["texto"] == "Linha 1\vLinha 2"
+    assert b"<a:br" in zipfile.ZipFile(io.BytesIO(novo)).read("ppt/slides/slide1.xml")
+
+
+def test_remover_slide_apaga_o_conteudo_do_arquivo(deck):
+    antes = set(zipfile.ZipFile(io.BytesIO(deck)).namelist())
+    novo, rel = codigo.editar(deck, "d.pptx", [{"op": "remover_slide", "slide": "sld:259"}])
+    depois = set(zipfile.ZipFile(io.BytesIO(novo)).namelist())
+    sumiram = antes - depois
+    assert "ppt/slides/slide4.xml" in sumiram
+    assert any(n.startswith("ppt/charts/") for n in sumiram)  # o gráfico só dele saiu
+    assert any(n.startswith("ppt/embeddings/") for n in sumiram)  # e a planilha embutida também
+    assert not any(n.startswith("ppt/slideLayouts/") for n in sumiram)  # layout compartilhado fica
+    assert pptx.integridade(novo) == [] and len(Presentation(io.BytesIO(novo)).slides) == 3
+
+
+def test_grupo_de_formas_nao_herda_conteudo_dos_filhos(deck):
+    prs = Presentation(io.BytesIO(deck))
+    s = prs.slides[0]
+    grupo = s.shapes.add_group_shape()
+    caixa = grupo.shapes.add_textbox(Inches(1), Inches(5), Inches(3), Inches(1))
+    caixa.text_frame.text = "Dentro do grupo"
+    buf = io.BytesIO()
+    prs.save(buf)
+    c = pptx.extrair(buf.getvalue())
+    tipos = {f["tipo"] for f in c["slides"][0]["formas"]}
+    assert "grupo" in tipos
+    dentro = next(
+        f for f in c["slides"][0]["formas"] if f["tipo"] == "texto" and f["paragrafos"][0]["texto"] == "Dentro do grupo"
+    )
+    novo, rel = codigo.editar(
+        buf.getvalue(), "d.pptx", [{"op": "texto", "alvo": dentro["id"], "texto": "Editado no grupo"}]
+    )
+    assert any(
+        f.get("paragrafos", [{}])[0].get("texto") == "Editado no grupo" for f in rel["codigo"]["slides"][0]["formas"]
+    )
+
+
+def test_remover_slide_com_notas_leva_as_notas_junto(deck):
+    novo, rel = codigo.editar(deck, "d.pptx", [{"op": "remover_slide", "slide": "sld:256"}])
+    assert "/ppt/notesSlides/notesSlide1.xml" in rel["aplicadas"][0]["removidas"]
+    assert pptx.integridade(novo) == []

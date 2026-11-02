@@ -25,7 +25,10 @@ def sha(dados: bytes) -> str:
 
 def xml(dados: bytes):
     """XML de uma parte OOXML. O padrão não usa DTD: qualquer DOCTYPE é recusado (fecha XXE e expansão)."""
-    if b"<!DOCTYPE" in dados[:4096] or b"<!ENTITY" in dados[:4096]:
+    if any(
+        m in dados
+        for m in (b"<!DOCTYPE", b"<!ENTITY", "<!DOCTYPE".encode("utf-16-le"), "<!DOCTYPE".encode("utf-16-be"))
+    ):
         raise DocumentoRecusado("parte XML com DOCTYPE ou ENTITY não é aceita")
     try:
         return etree.fromstring(dados, PARSER)
@@ -39,6 +42,15 @@ class Pacote:
         self.infos: list[zipfile.ZipInfo] = []
         self.partes: dict[str, bytes] = {}
         nomes_vistos = set()
+        try:
+            self._ler(dados, nomes_vistos)
+        except (zipfile.BadZipFile, zipfile.LargeZipFile, EOFError) as e:  # CRC errado, entrada truncada
+            raise DocumentoRecusado(f"pacote corrompido: {type(e).__name__}") from None
+        self.arvores: dict = {}
+        self.tocadas: set[str] = set()
+        self.removidas: set[str] = set()
+
+    def _ler(self, dados, nomes_vistos):
         with zipfile.ZipFile(io.BytesIO(dados)) as z:
             for i in z.infolist():
                 chave = i.filename.lower()
@@ -47,9 +59,6 @@ class Pacote:
                 nomes_vistos.add(chave)
                 self.infos.append(i)
                 self.partes[i.filename] = z.read(i)
-        self.arvores: dict = {}
-        self.tocadas: set[str] = set()
-        self.removidas: set[str] = set()
 
     def arvore(self, nome: str):
         if nome not in self.arvores:

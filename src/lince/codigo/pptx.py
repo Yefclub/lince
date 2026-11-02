@@ -9,6 +9,7 @@ Ids (vêm do próprio arquivo, sobrevivem a reordenar e editar):
 """
 
 import copy
+import math
 import re
 
 from lxml import etree
@@ -36,8 +37,14 @@ class OperacaoInvalida(ValueError):
         self.codigo, self.indice, self.alvo = codigo, indice, alvo
 
 
+QUEBRA = "\v"  # quebra de linha dentro do parágrafo (a:br), como no python-pptx; "\n" separa parágrafos
+
+
 def _texto(el) -> str:
-    return "".join(t.text or "" for t in el.iter(A + "t"))
+    partes = []
+    for x in el.iter(A + "t", A + "br"):
+        partes.append(QUEBRA if x.tag == A + "br" else (x.text or ""))
+    return "".join(partes)
 
 
 # ------------------------------------------------------------------ leitura
@@ -103,6 +110,10 @@ def _forma(pk, parte, arvore, sp, srels, base) -> dict:
         off, ext = sp.find("./p:xfrm/a:off", NS), sp.find("./p:xfrm/a:ext", NS)
     if off is not None and ext is not None:
         f["caixa_emu"] = [int(off.get("x")), int(off.get("y")), int(ext.get("cx")), int(ext.get("cy"))]
+    if f["tipo"] == "grpSp":  # o grupo em si não tem conteúdo: as formas de dentro aparecem na lista com id próprio
+        f["tipo"] = "grupo"
+        f["xpath"] = arvore.getroottree().getpath(sp)
+        return f
     tx = sp.find("p:txBody", NS)
     if tx is not None:
         f["tipo"] = "texto"
@@ -197,7 +208,19 @@ def _corpo_notas(arvore_notas):
 
 
 # ------------------------------------------------------------------ edição
-_ALVO = re.compile(r"(sld:\d+)(?:/sp:(\d+)(?:/(p|c|ser):([\d,]+))?)?")
+_ALVO = re.compile(r"(sld:\d{1,10})(?:/sp:(\d{1,10})(?:/(?:(p|ser):(\d{1,6})|(c):(\d{1,4},\d{1,4})))?)?")
+TEXTO_MAX = 100_000  # caracteres num campo de texto de uma operação
+PARAGRAFO_MAX = 200_000  # caracteres num parágrafo depois de uma troca (substituir não amplifica sem limite)
+CRESCIMENTO_MAX = 5_000_000  # caracteres acrescentados somando todas as operações de um pedido
+
+
+def _casar_alvo(alvo):
+    """(slide, forma, tipo, n) de um id, ou None. tipo: p | ser | c."""
+    m = _ALVO.fullmatch(alvo) if isinstance(alvo, str) else None
+    if not m:
+        return None
+    tipo = m.group(3) or m.group(5)
+    return m.group(1), m.group(2), tipo, m.group(4) or m.group(6)
 
 
 class _Editor:
@@ -206,22 +229,31 @@ class _Editor:
         self.pres = self.pk.arvore("ppt/presentation.xml")
         self.prels = self.pk.rels("ppt/presentation.xml")
         self.lista = self.pres.find("p:sldIdLst", NS)
+        self.crescimento = 0
+        self.avisos: list[str] = []
 
     def slides(self) -> dict[str, str]:
         return {f"sld:{s.get('id')}": self.prels[s.get(R_ID)][1] for s in self.lista}
 
-    def forma(self, alvo: str):
-        m = _ALVO.fullmatch(alvo or "")
-        if not m or not m.group(2):
-            raise OperacaoInvalida("alvo-invalido", f"alvo de forma inválido: {alvo!r}", alvo=alvo)
-        parte = self.slides().get(m.group(1))
+    def forma(self, alvo):
+        casado = _casar_alvo(alvo)
+        if not casado or not casado[1]:
+            raise OperacaoInvalida("alvo-invalido", f"alvo de forma inválido: {alvo!r}", alvo=str(alvo))
+        slide, forma, tipo, n = casado
+        parte = self.slides().get(slide)
         if parte is None:
-            raise OperacaoInvalida("alvo-inexistente", f"slide {m.group(1)} não existe", alvo=alvo)
-        sl = self.pk.arvore(parte)
-        nv = next((x for x in sl.iter(P + "cNvPr") if x.get("id") == m.group(2)), None)
-        if nv is None:
+            raise OperacaoInvalida("alvo-inexistente", f"slide {slide} não existe", alvo=alvo)
+        achados = [x for x in self.pk.arvore(parte).iter(P + "cNvPr") if x.get("id") == forma]
+        if not achados:
             raise OperacaoInvalida("alvo-inexistente", f"forma {alvo} não existe", alvo=alvo)
-        return parte, nv.getparent().getparent(), m.group(3), m.group(4)
+        if len(achados) > 1:  # arquivo com id repetido no slide: editar o primeiro seria um chute
+            raise OperacaoInvalida("alvo-ambiguo", f"mais de uma forma com o id de {alvo} neste slide", alvo=alvo)
+        return parte, achados[0].getparent().getparent(), tipo, n
+
+    def crescer(self, antes: str, depois: str):
+        self.crescimento += max(0, len(depois) - len(antes))
+        if len(depois) > PARAGRAFO_MAX or self.crescimento > CRESCIMENTO_MAX:
+            raise OperacaoInvalida("texto-grande", "o texto resultante passa do limite de tamanho do documento")
 
 
 def _conferir(op, atual: str, alvo: str):
@@ -230,44 +262,83 @@ def _conferir(op, atual: str, alvo: str):
         raise OperacaoInvalida("conflito", f"o texto atual de {alvo} não é o esperado: {atual[:80]!r}", alvo=alvo)
 
 
-def _trocar_paragrafo(p, texto: str):
-    """Troca o texto mantendo pPr e a formatação do primeiro run (e o endParaRPr)."""
+def _run_modelo(p):
+    """Run que dá a formatação ao texto novo: o primeiro run, senão o rPr de um campo ou do fim do parágrafo."""
     runs = p.findall("a:r", NS)
-    modelo = runs[0] if runs else None
+    if runs:
+        return copy.deepcopy(runs[0])
+    novo = etree.Element(A + "r")
+    origem = p.find("a:fld/a:rPr", NS)
+    if origem is None:
+        origem = p.find("a:endParaRPr", NS)
+    if origem is not None:
+        rpr = copy.deepcopy(origem)
+        rpr.tag = A + "rPr"
+        novo.append(rpr)
+    return novo
+
+
+def _por(p, el):
+    end = p.find("a:endParaRPr", NS)
+    if end is not None:
+        end.addprevious(el)
+    else:
+        p.append(el)
+
+
+def _trocar_paragrafo(p, texto: str):
+    """Troca o texto mantendo pPr e a formatação do primeiro run (e o endParaRPr). QUEBRA vira a:br."""
+    modelo = _run_modelo(p)
     for e in list(p):
         if etree.QName(e).localname in ("r", "br", "fld"):
             p.remove(e)
-    novo = copy.deepcopy(modelo) if modelo is not None else etree.Element(A + "r")
-    t = novo.find("a:t", NS)
-    if t is None:
-        t = etree.SubElement(novo, A + "t")
-    t.text = texto
-    if texto != texto.strip():
-        t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-    end = p.find("a:endParaRPr", NS)
-    if end is not None:
-        end.addprevious(novo)
-    else:
-        p.append(novo)
+    for k, trecho in enumerate(texto.split(QUEBRA)):
+        if k:
+            br = etree.Element(A + "br")
+            if modelo.find("a:rPr", NS) is not None:
+                br.append(copy.deepcopy(modelo.find("a:rPr", NS)))
+            _por(p, br)
+        run = copy.deepcopy(modelo)
+        t = run.find("a:t", NS)
+        if t is None:
+            t = etree.SubElement(run, A + "t")
+        t.text = trecho
+        _por(p, run)
+
+
+def _campo_texto(op, nome="texto") -> str:
+    valor = op.get(nome)
+    if not isinstance(valor, str):
+        raise OperacaoInvalida("operacao-invalida", f"{nome} precisa ser texto", alvo=op.get("alvo"))
+    if len(valor) > TEXTO_MAX:
+        raise OperacaoInvalida("texto-grande", f"{nome} passa de {TEXTO_MAX} caracteres", alvo=op.get("alvo"))
+    return valor
 
 
 def _op_texto(ed: _Editor, op, rel):
+    texto = _campo_texto(op)
     parte, sp, tipo, n = ed.forma(op.get("alvo"))
     corpo = sp.find("p:txBody", NS)
     if corpo is None:
         raise OperacaoInvalida("operacao-invalida", f"{op['alvo']} não tem texto", alvo=op["alvo"])
     ps = corpo.findall("a:p", NS)
+    if tipo not in (None, "p"):
+        raise OperacaoInvalida("alvo-invalido", "texto aceita forma ou parágrafo (…/p:<n>)", alvo=op["alvo"])
     if tipo == "p":
         i = int(n)
         if i >= len(ps):
             raise OperacaoInvalida("alvo-inexistente", f"parágrafo {n} não existe em {op['alvo']}", alvo=op["alvo"])
-        _conferir(op, _texto(ps[i]), op["alvo"])
+        if "\n" in texto:
+            raise OperacaoInvalida("operacao-invalida", "num parágrafo, quebra de linha é \\v (\\n separa parágrafos)")
         antes = _texto(ps[i])
-        _trocar_paragrafo(ps[i], str(op["texto"]))
+        _conferir(op, antes, op["alvo"])
+        ed.crescer(antes, texto)
+        _trocar_paragrafo(ps[i], texto)
     else:
         antes = "\n".join(_texto(p) for p in ps)
         _conferir(op, antes, op["alvo"])
-        linhas = str(op["texto"]).split("\n")
+        ed.crescer(antes, texto)
+        linhas = texto.split("\n")
         for p in ps[len(linhas) :]:
             corpo.remove(p)
         for k, linha in enumerate(linhas):
@@ -278,33 +349,44 @@ def _op_texto(ed: _Editor, op, rel):
                 corpo.append(novo)
                 _trocar_paragrafo(novo, linha)
     ed.pk.tocar(parte)
-    rel.update(antes=antes, depois=op["texto"], partes=["/" + parte])
+    rel.update(antes=antes, depois=texto, partes=["/" + parte])
 
 
 def _op_substituir(ed: _Editor, op, rel):
     """Busca e troca dentro de uma forma (ou do slide todo), juntando runs do mesmo parágrafo."""
-    busca, troca = str(op.get("buscar", "")), str(op.get("trocar", ""))
+    busca, troca = _campo_texto(op, "buscar"), _campo_texto(op, "trocar")
     if not busca:
         raise OperacaoInvalida("operacao-invalida", "buscar não pode ser vazio")
-    alvo = op.get("alvo", "")
-    m = _ALVO.fullmatch(alvo)
-    if not m:
-        raise OperacaoInvalida("alvo-invalido", f"alvo inválido: {alvo!r}", alvo=alvo)
-    if m.group(2):
+    alvo = op.get("alvo")
+    casado = _casar_alvo(alvo)
+    if not casado or casado[2]:
+        raise OperacaoInvalida("alvo-invalido", f"substituir aceita slide ou forma: {alvo!r}", alvo=str(alvo))
+    if casado[1]:
         parte, sp, _, _ = ed.forma(alvo)
         raizes = [sp]
     else:
-        parte = ed.slides().get(m.group(1))
+        parte = ed.slides().get(casado[0])
         if parte is None:
-            raise OperacaoInvalida("alvo-inexistente", f"slide {m.group(1)} não existe", alvo=alvo)
+            raise OperacaoInvalida("alvo-inexistente", f"slide {casado[0]} não existe", alvo=alvo)
         raizes = [ed.pk.arvore(parte)]
     trocas = 0
     for raiz in raizes:
         for p in raiz.iter(A + "p"):
             atual = _texto(p)
-            if busca in atual:
-                trocas += atual.count(busca)
+            if busca not in atual:
+                continue
+            n = atual.count(busca)
+            ed.crescer(atual, atual.replace(busca, troca))
+            trocas += n
+            # dentro de um run só: troca ali e preserva a formatação mista do resto do parágrafo
+            runs_t = [r.find("a:t", NS) for r in p.findall("a:r", NS)]
+            if sum((t.text or "").count(busca) for t in runs_t if t is not None) == n:
+                for t in runs_t:
+                    if t is not None and t.text and busca in t.text:
+                        t.text = t.text.replace(busca, troca)
+            else:  # o trecho cruza runs: o parágrafo fica com a formatação do primeiro
                 _trocar_paragrafo(p, atual.replace(busca, troca))
+                ed.avisos.append(f"{alvo}: '{busca[:40]}' cruzava trechos de formatação; o parágrafo ficou uniforme")
     if trocas == 0:
         raise OperacaoInvalida("conflito", f"{busca[:60]!r} não aparece em {alvo}", alvo=alvo)
     ed.pk.tocar(parte)
@@ -313,32 +395,38 @@ def _op_substituir(ed: _Editor, op, rel):
 
 def _op_notas(ed: _Editor, op, rel):
     sid = op.get("slide")
-    parte = ed.slides().get(sid)
+    parte = ed.slides().get(sid) if isinstance(sid, str) else None
     if parte is None:
-        raise OperacaoInvalida("alvo-inexistente", f"slide {sid} não existe", alvo=sid)
+        raise OperacaoInvalida("alvo-inexistente", f"slide {sid!r} não existe", alvo=str(sid))
     notas = next((t for (k, t) in ed.pk.rels(parte).values() if k == "notesSlide"), None)
     corpo = _corpo_notas(ed.pk.arvore(notas)) if notas else None
     if corpo is None:
         raise OperacaoInvalida("operacao-invalida", f"{sid} não tem página de notas para editar", alvo=sid)
+    texto = _campo_texto(op)
     tx = corpo.find("p:txBody", NS)
-    ps = tx.findall("a:p", NS)
+    ps = tx.findall("a:p", NS) if tx is not None else []
+    if not ps:
+        raise OperacaoInvalida("operacao-invalida", f"as notas de {sid} não têm corpo de texto", alvo=sid)
     antes = "\n".join(_texto(p) for p in ps)
     _conferir(op, antes, sid)
+    ed.crescer(antes, texto)
     for p in ps[1:]:
         tx.remove(p)
-    linhas = str(op["texto"]).split("\n")
+    linhas = texto.split("\n")
     _trocar_paragrafo(ps[0], linhas[0])
     for linha in linhas[1:]:
         novo = copy.deepcopy(ps[0])
         tx.append(novo)
         _trocar_paragrafo(novo, linha)
     ed.pk.tocar(notas)
-    rel.update(antes=antes, depois=op["texto"], partes=["/" + notas])
+    rel.update(antes=antes, depois=texto, partes=["/" + notas])
 
 
 def _op_ordem(ed: _Editor, op, rel):
     atual = [f"sld:{s.get('id')}" for s in ed.lista]
-    nova = list(op.get("slides") or [])
+    nova = op.get("slides")
+    if not isinstance(nova, list) or not all(isinstance(x, str) for x in nova):
+        raise OperacaoInvalida("operacao-invalida", "slides precisa ser uma lista de ids")
     if sorted(atual) != sorted(nova):
         raise OperacaoInvalida("operacao-invalida", "ordem precisa listar exatamente os slides atuais, uma vez cada")
     por_id = {f"sld:{s.get('id')}": s for s in ed.lista}
@@ -351,20 +439,79 @@ def _op_ordem(ed: _Editor, op, rel):
 
 
 def _op_remover_slide(ed: _Editor, op, rel):
-    """Tira o slide da apresentação. A parte fica no pacote sem referência (o PowerPoint a ignora e limpa ao salvar);
-    apagar partes exigiria reescrever relações de notas e mídia compartilhada, com mais risco do que ganho."""
+    """Tira o slide e apaga do pacote o que só ele usava (slide, notas, gráficos, mídia). Conteúdo removido não pode
+    continuar escondido dentro do arquivo entregue."""
     sid = op.get("slide")
-    alvo = next((s for s in ed.lista if f"sld:{s.get('id')}" == sid), None)
+    alvo = next((s for s in ed.lista if f"sld:{s.get('id')}" == sid), None) if isinstance(sid, str) else None
     if alvo is None:
-        raise OperacaoInvalida("alvo-inexistente", f"slide {sid} não existe", alvo=sid)
+        raise OperacaoInvalida("alvo-inexistente", f"slide {sid!r} não existe", alvo=str(sid))
     if len(ed.lista) == 1:
         raise OperacaoInvalida("operacao-invalida", "a apresentação ficaria sem slides", alvo=sid)
+    pk, rid = ed.pk, alvo.get(R_ID)
+    parte = ed.prels[rid][1]
+    proprias = _alvos(pk, parte)  # as notas do slide apontam de volta para ele: isso não é link de outro slide
+    outros = [
+        dono
+        for dono in _donos_de_rels(pk)
+        if dono not in ("ppt/presentation.xml", parte) and dono not in proprias and parte in _alvos(pk, dono)
+    ]
+    if outros:
+        raise OperacaoInvalida(
+            "operacao-invalida", f"{sid} é alvo de link em /{outros[0]}: tire o link antes", alvo=sid
+        )
     ed.lista.remove(alvo)
-    ed.pk.tocar("ppt/presentation.xml")
-    rel.update(partes=["/ppt/presentation.xml"])
+    rels_pres = pk.arvore(pk.caminho_rels("ppt/presentation.xml"))
+    for r in rels_pres.findall("rel:Relationship", NS):
+        if r.get("Id") == rid:
+            rels_pres.remove(r)
+    pk.tocar(pk.caminho_rels("ppt/presentation.xml"))
+    pk.tocar("ppt/presentation.xml")
+    removidas = _remover_orfas(pk, parte)
+    ed.prels = pk.rels("ppt/presentation.xml")
+    rel.update(partes=["/ppt/presentation.xml"], removidas=["/" + x for x in sorted(removidas)])
+
+
+def _donos_de_rels(pk: Pacote):
+    return [
+        n.replace("_rels/", "").removesuffix(".rels")
+        for n in pk.partes
+        if n.endswith(".rels") and n not in pk.removidas
+    ]
+
+
+def _alvos(pk: Pacote, dono: str) -> set[str]:
+    return {t for k, t in pk.rels(dono).values() if not k.startswith("externo")}
+
+
+def _remover_orfas(pk: Pacote, inicio: str) -> set[str]:
+    """Remove `inicio` e, em cascata, as partes que só ele (direta ou indiretamente) referenciava."""
+    removidas, fila = set(), [inicio]
+    nucleo = {"ppt/presentation.xml", "[Content_Types].xml"}
+    while fila:
+        parte = fila.pop()
+        if parte in removidas or parte in nucleo or parte not in pk.partes:
+            continue
+        candidatos = _alvos(pk, parte) if pk.caminho_rels(parte) in pk.partes else set()
+        removidas.add(parte)
+        pk.removidas.add(parte)
+        if pk.caminho_rels(parte) in pk.partes:
+            pk.removidas.add(pk.caminho_rels(parte))
+        ainda = set().union(*(_alvos(pk, d) for d in _donos_de_rels(pk) if d not in removidas))
+        fila += [
+            c
+            for c in candidatos
+            if c not in ainda and not c.startswith(("ppt/slideLayouts/", "ppt/slideMasters/", "ppt/theme/"))
+        ]
+    ct = pk.arvore("[Content_Types].xml")
+    for o in ct.findall("ct:Override", NS):
+        if o.get("PartName", "").lstrip("/") in removidas:
+            ct.remove(o)
+    pk.tocar("[Content_Types].xml")
+    return removidas
 
 
 def _op_celula_tabela(ed: _Editor, op, rel):
+    texto = _campo_texto(op)
     parte, sp, tipo, n = ed.forma(op.get("alvo"))
     if tipo != "c":
         raise OperacaoInvalida("alvo-invalido", "use o id da célula: sld:<id>/sp:<id>/c:<linha>,<coluna>")
@@ -374,35 +521,47 @@ def _op_celula_tabela(ed: _Editor, op, rel):
         raise OperacaoInvalida("alvo-inexistente", f"célula {n} não existe", alvo=op["alvo"])
     tc = linhas[i].findall("a:tc", NS)[j]
     ps = tc.findall("a:txBody/a:p", NS)
+    if not ps:
+        raise OperacaoInvalida("operacao-invalida", f"a célula {n} não tem corpo de texto", alvo=op["alvo"])
     antes = "\n".join(_texto(p) for p in ps)
     _conferir(op, antes, op["alvo"])
+    ed.crescer(antes, texto)
     for p in ps[1:]:
         p.getparent().remove(p)
-    _trocar_paragrafo(ps[0], str(op["texto"]))
+    _trocar_paragrafo(ps[0], texto.replace("\n", QUEBRA))
     ed.pk.tocar(parte)
-    rel.update(antes=antes, depois=op["texto"], partes=["/" + parte])
+    rel.update(antes=antes, depois=texto, partes=["/" + parte])
 
 
 def _op_valor_grafico(ed: _Editor, op, rel):
     """Muda um ponto da série no gráfico (cache que o PowerPoint mostra) e na planilha embutida (fonte ao editar)."""
+    try:
+        valor = float(op["valor"])
+        ponto = int(op.get("ponto", -1))
+    except (KeyError, TypeError, ValueError):
+        raise OperacaoInvalida("operacao-invalida", "valor e ponto precisam ser números", alvo=op.get("alvo")) from None
+    if not math.isfinite(valor) or isinstance(op.get("ponto"), bool):
+        raise OperacaoInvalida("operacao-invalida", "valor precisa ser um número finito", alvo=op.get("alvo"))
     parte, sp, tipo, n = ed.forma(op.get("alvo"))
+    if tipo not in (None, "ser"):
+        raise OperacaoInvalida("alvo-invalido", "valor_grafico aceita a forma ou a série (…/ser:<n>)", alvo=op["alvo"])
     chart = sp.find(".//c:chart", NS)
-    if chart is None:
-        raise OperacaoInvalida("operacao-invalida", f"{op['alvo']} não é gráfico", alvo=op["alvo"])
-    parte_ch = ed.pk.rels(parte)[chart.get(R_ID)][1]
+    rid = chart.get(R_ID) if chart is not None else None
+    rels = ed.pk.rels(parte)
+    if rid not in rels or rels[rid][0].startswith("externo") or rels[rid][1] not in ed.pk.partes:
+        raise OperacaoInvalida("operacao-invalida", f"{op['alvo']} não é gráfico editável", alvo=op["alvo"])
+    parte_ch = rels[rid][1]
     ch = ed.pk.arvore(parte_ch)
     idx = str(n if tipo == "ser" else op.get("serie"))
-    ser = next((s for s in ch.iter(C + "ser") if s.find("c:idx", NS).get("val") == idx), None)
+    ser = next(
+        (s for s in ch.iter(C + "ser") if s.find("c:idx", NS) is not None and s.find("c:idx", NS).get("val") == idx),
+        None,
+    )
     if ser is None:
         raise OperacaoInvalida("alvo-inexistente", f"série {idx} não existe", alvo=op["alvo"])
-    ponto = int(op.get("ponto", -1))
     pt = ser.find(f"c:val//c:pt[@idx='{ponto}']/c:v", NS)
     if pt is None:
         raise OperacaoInvalida("alvo-inexistente", f"ponto {ponto} não existe na série {idx}", alvo=op["alvo"])
-    try:
-        valor = float(op["valor"])
-    except (KeyError, TypeError, ValueError):
-        raise OperacaoInvalida("operacao-invalida", "valor precisa ser número", alvo=op["alvo"]) from None
     antes = _numero(pt.text)
     pt.text = repr(valor) if valor != int(valor) else str(int(valor))
     ed.pk.tocar(parte_ch)
@@ -410,16 +569,19 @@ def _op_valor_grafico(ed: _Editor, op, rel):
     planilha = next((t for (k, t) in ed.pk.rels(parte_ch).values() if k == "package"), None)
     celula = None
     ref = ser.findtext("c:val//c:f", namespaces=NS)
-    if planilha and ref:
-        celula = _celula_embutida(ed.pk, planilha, ref, ponto, valor)
-        partes.append("/" + planilha)
+    if planilha and ref and planilha in ed.pk.partes:
+        celula = _celula_embutida(ed.pk, planilha, ref, ponto, valor, ed.avisos)
+        if celula:
+            partes.append("/" + planilha)
+    if celula is None:
+        ed.avisos.append(f"{op['alvo']}: só o gráfico mudou; a planilha embutida não foi atualizada")
     rel.update(antes=antes, depois=valor, celula=celula, partes=partes)
 
 
-def _celula_embutida(pk: Pacote, planilha: str, ref: str, deslocamento: int, valor: float) -> str | None:
+def _celula_embutida(pk: Pacote, planilha: str, ref: str, deslocamento: int, valor: float, avisos) -> str | None:
     """Atualiza a célula na planilha embutida no gráfico (zip dentro do zip), editando só o XML da aba."""
     aba, faixa = ref.replace("$", "").rsplit("!", 1)
-    aba = aba.strip("'")
+    aba = aba[1:-1].replace("''", "'") if aba.startswith("'") and aba.endswith("'") else aba
     m = re.fullmatch(r"([A-Z]+)(\d+)", faixa.split(":")[0])
     if not m:
         return None
@@ -432,9 +594,14 @@ def _celula_embutida(pk: Pacote, planilha: str, ref: str, deslocamento: int, val
     folha = next((s for s in wb.findall("s:sheets/s:sheet", NS) if s.get("name") == aba), None)
     if folha is None:
         return None
-    parte_aba = interno.rels("xl/workbook.xml")[folha.get(R_ID)][1]
+    parte_aba = interno.rels("xl/workbook.xml").get(folha.get(R_ID), (None, None))[1]
+    if parte_aba not in interno.partes:
+        return None
     c = interno.arvore(parte_aba).find(f".//s:c[@r='{celula}']", NS)
     if c is None or c.find("s:v", NS) is None:
+        return None
+    if c.find("s:f", NS) is not None:  # célula calculada: trocar o valor apagaria a fórmula
+        avisos.append(f"{aba}!{celula} tem fórmula; só o gráfico mudou")
         return None
     c.attrib.pop("t", None)
     c.find("s:v", NS).text = repr(valor) if valor != int(valor) else str(int(valor))
@@ -467,8 +634,10 @@ OPERACOES = {
 }
 
 
-def aplicar(dados: bytes, operacoes: list[dict]) -> tuple[bytes, list[dict]]:
-    """Tudo ou nada: aplica as operações em ordem; a primeira que falha cancela todas."""
+def aplicar(dados: bytes, operacoes: list[dict]) -> tuple[bytes, list[dict], list[str]]:
+    """Tudo ou nada: aplica as operações em ordem; a primeira que falha cancela todas.
+
+    Devolve o arquivo novo, o que cada operação fez e os avisos (o que foi aplicado com ressalva)."""
     ed = _Editor(dados)
     relatorio = []
     for k, op in enumerate(operacoes):
@@ -484,8 +653,13 @@ def aplicar(dados: bytes, operacoes: list[dict]) -> tuple[bytes, list[dict]]:
         except OperacaoInvalida as e:
             e.indice = k
             raise
+        except (KeyError, IndexError, ValueError, TypeError, AttributeError) as e:
+            # arquivo fora do esperado para esta operação: erro do pedido, nunca 500
+            raise OperacaoInvalida(
+                "operacao-invalida", f"não foi possível aplicar ({type(e).__name__})", indice=k, alvo=op.get("alvo")
+            ) from None
         relatorio.append(rel)
-    return ed.pk.salvar(), relatorio
+    return ed.pk.salvar(), relatorio, ed.avisos
 
 
 def integridade(dados: bytes) -> list[str]:
