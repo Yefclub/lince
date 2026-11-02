@@ -250,6 +250,8 @@ def _complemento(funcao, nome, ilegiveis):
     hostil, o documento segue sem ele e o que ficou de fora é registrado; o corpo lido nunca se perde por isso."""
     try:
         funcao()
+    except MemoryError:  # falta de memória não é parte ruim: derruba o documento
+        raise
     except Exception as e:  # noqa: BLE001
         ilegiveis.append(f"{nome}: {type(e).__name__}")
 
