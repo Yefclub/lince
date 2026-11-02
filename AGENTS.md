@@ -32,8 +32,9 @@ docker build -t lince .                    # imagem (o build reprova licença fo
 ```
 
 O CI (`.github/workflows/ci.yml`) roda lock, lint, formatação, testes em 3.11 e 3.15, licenças, auditoria de
-vulnerabilidades, varredura de segredos e a imagem Docker de ponta a ponta. Rode o equivalente local antes
-de commitar.
+vulnerabilidades, varredura de segredos, a imagem Docker de ponta a ponta e, em PR, a quebra de contrato
+(`contrato`). O `fluxo.yml` confere changelog, branch de origem e label de release. Rode o equivalente local
+antes de commitar.
 
 ## Como trabalhar
 
@@ -74,6 +75,8 @@ de commitar.
   desenvolvimento no `uv.lock` (grupo `dev`), actions por SHA, imagens base por digest, e o gitleaks pelo
   Dockerfile em `.github/ferramentas/gitleaks/`. Ferramenta nova entra por um desses caminhos, nunca por
   versão solta num workflow.
+- O Dependabot abre PR contra `dev`, com espera de 3 dias depois de cada publicação; patch e minor entram
+  sozinhos com o CI verde (`dependabot-automerge.yml`). Major fica para revisão.
 
 ## Configuração
 
@@ -107,5 +110,24 @@ de commitar.
   merge, o bot (`release.yml`) junta o changelog no `CHANGELOG.md`, carimba a versão, cria a tag, publica a imagem
   e a release, e sincroniza `main` de volta em `dev`.
 - A versão em runtime vem do pacote instalado (`importlib.metadata`), nunca de constante no código.
+
+## Review e merge
+
+- Antes do push, a mudança passa por review independente: de preferência um revisor de outra família de modelo,
+  ou um agente revisor somente leitura com o diff completo. Quem implementa não aprova a própria entrega; toda
+  correção volta ao revisor. No máximo 3 ou 4 rodadas: se o mesmo tipo de problema volta, o desenho é que precisa
+  mudar.
+- Achado válido no escopo é corrigido na mesma PR, seja qual for o rótulo ("menor", "sugestão"). Não vira TODO
+  nem "outra PR".
+- **Merge em `dev` está autorizado ao agente**, sem pedir de novo, quando: o review independente aprovou o diff
+  final, a PR está no escopo pedido e todos os checks estão verdes no head atual: os jobs do `ci.yml`
+  (`qualidade`, `contrato`, `testes`, `licencas`, `auditoria`, `segredos`, `docker`) e o `fluxo`. Check pendente
+  ou ausente não é verde. Head mudou: revalide. Na `dev` o merge é squash.
+- **PR do Dependabot:** patch e minor o próprio bot mergeia com o CI verde. Major o agente só mergeia se o
+  mantenedor pedir, depois de review e CI verdes.
+- **`main` não é do agente.** O agente só abre a PR `dev` → `main` (release) se o mantenedor pedir, e nunca faz o
+  merge nem liga auto-merge nela. Na `main` o merge é merge commit (squash quebraria a sincronização da release).
+- Nunca faça commit direto em `dev` ou `main`; fora de PR, só os bots `versao-dev` (na `dev`) e `release` (na
+  `main`, nas tags e na sincronização de volta para a `dev`) escrevem nelas.
 - Nunca reescreva histórico publicado, nunca use `--no-verify`, nunca pule teste para ficar verde.
 - Commits e documentação em português brasileiro, com acentuação.
