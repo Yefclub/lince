@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import zipfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import PackageNotFoundError, version
@@ -12,6 +13,7 @@ from ._trava import PDFIUM
 from .agrupamento import agrupar, distribuir_lotes
 from .cache import Cache, chave
 from .instrucoes import PROMPT_PADRAO, VERSAO_PROMPT, instrucao
+from .limites import LADO_MAX_PX, conferir_zip
 from .metadados import metadados_arquivo
 from .montagem import montar
 from .office import planejar_office
@@ -67,9 +69,13 @@ class Leitor:
         elif ext in TEXTO:
             plano = {"tipo": "texto", "md": _texto(caminho), "tarefas": []}
         else:
+            if zipfile.is_zipfile(caminho):  # Office, ODF, EPUB: conferido antes de qualquer descompactação
+                conferir_zip(caminho)
             plano = planejar_office(caminho, pasta)
         plano["arquivo"] = os.path.basename(caminho)
         plano["meta_arquivo"] = metadados_arquivo(caminho)
+        if plano.get("ilegiveis"):
+            plano["meta_arquivo"].setdefault("partes_ilegiveis", []).extend(plano["ilegiveis"])
         plano["tarefas_originais"] = list(plano.get("tarefas", []))
         if self.agrupar and plano["tipo"] in ("pdf", "office"):
             plano["tarefas"], plano["lotes"] = agrupar(plano["tarefas"], pasta)
@@ -202,7 +208,7 @@ def _recortes_ampliados(doc, t, io):
     l, b, r, tp = t["caixa"]
     l, b, r, tp = max(0, l), max(0, b), min(W, r), min(H, tp)
     lado = max(r - l, tp - b) or 1
-    esc = min(8.0, max(4.0, 3000 / lado))
+    esc = min(min(8.0, max(4.0, 3000 / lado)), LADO_MAX_PX / lado)
     img = page.render(scale=esc, crop=(l, b, W - r, H - tp)).to_pil().convert("RGB")
     partes, n = [], max(1, -(-max(img.width, img.height) // 1500))
     for k in range(n):

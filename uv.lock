@@ -496,6 +496,7 @@ name = "lince"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "defusedxml" },
     { name = "firecrawl-anydoc" },
     { name = "openpyxl" },
     { name = "pdf-inspector" },
@@ -525,6 +526,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "defusedxml", specifier = ">=0.7" },
     { name = "firecrawl-anydoc", specifier = "==0.2.4" },
     { name = "openpyxl", specifier = ">=3.1.5,<4" },
     { name = "pdf-inspector", specifier = "==1.25.2" },
