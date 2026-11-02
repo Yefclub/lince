@@ -465,7 +465,7 @@ def _op_remover_slide(ed: _Editor, op, rel):
         )
     ed.lista.remove(alvo)
     numero = alvo.get("id")
-    for el in list(ed.pres.iter()):  # seções (p14:sldId) e apresentações personalizadas (p:sld r:id) que o citam
+    for el in list(ed.pres.iter(etree.Element)):  # seções e custShow que o citam
         nome = etree.QName(el).localname
         if (
             nome == "sldId"

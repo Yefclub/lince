@@ -309,7 +309,7 @@ def test_remover_slide_limpa_secoes_e_apresentacoes_personalizadas(deck):
             b'<p14:sldId id="258"/><p14:sldId id="259"/></p14:sldIdLst></p14:section></p14:sectionLst>'
             b"</p:ext></p:extLst>"
         )
-        x = x.replace(b"<p:defaultTextStyle>", mostras + b"<p:defaultTextStyle>")
+        x = x.replace(b"<p:defaultTextStyle>", mostras + b"<!-- comentario --><p:defaultTextStyle>")
         return x.replace(b"</p:presentation>", secoes + b"</p:presentation>")
 
     com_secoes = _paragrafo_xml(deck, "ppt/presentation.xml", troca)
