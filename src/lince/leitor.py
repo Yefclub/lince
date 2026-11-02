@@ -5,6 +5,7 @@ import os
 import tempfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from ._trava import PDFIUM
@@ -20,7 +21,10 @@ from .tipos import Cobertura, Resultado, Uso
 
 TEXTO = {".txt", ".md", ".json", ".yaml", ".yml", ".tex", ".xml"}
 IMAGEM = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
-VERSAO = "0.1.0"
+try:  # a versão vem do pacote instalado (pyproject), carimbada pelos workflows de versão
+    VERSAO = version("lince")
+except PackageNotFoundError:  # rodando direto do código-fonte, sem instalar
+    VERSAO = "0+fonte"
 
 
 class Leitor:

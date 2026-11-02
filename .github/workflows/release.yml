@@ -1,0 +1,164 @@
+name: release
+
+# A PR dev → main com a label release:patch|minor|major é a release. No merge, o bot:
+# 1. calcula a versão (última tag + label; sem label, patch);
+# 2. junta changelog/unreleased/ no CHANGELOG.md e carimba a versão no pyproject;
+# 3. commita na main, cria a tag, publica a imagem (amd64 + arm64, com atestado) e a release;
+# 4. traz a main de volta para a dev.
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: release # o push na dev tenta de novo se o versao-dev empurrar ao mesmo tempo
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'Yefclub/lince' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }} # exatamente o commit do merge, não o que chegou depois
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - id: versao
+        name: Versão nova pela label da PR (ou retomada de uma release que falhou)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git fetch -q origin main --tags
+          # re-run: se o bot já carimbou e marcou esta release, segue dela (sem subir a versão de novo)
+          if [ "$(git log -1 --format=%an origin/main)" = "github-actions[bot]" ] && tag=$(git describe --tags --exact-match origin/main 2>/dev/null); then
+            echo "versao=${tag#v}" >> "$GITHUB_OUTPUT"
+            echo "retomada=sim" >> "$GITHUB_OUTPUT"
+            echo "Retomando a release ${tag}"
+            exit 0
+          fi
+          pr=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" --jq '[.[] | select(.base.ref == "main")][0].number // empty')
+          [ -n "$pr" ] || { echo "::error::o commit ${GITHUB_SHA} não veio de uma PR para main: release só pela PR dev -> main"; exit 1; }
+          rotulos=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${pr}/labels" --jq '.[].name')
+          case "$rotulos" in
+            *release:major*) salto=major ;;
+            *release:minor*) salto=minor ;;
+            *release:patch*) salto=patch ;;
+            *) echo "::error::PR #${pr} sem label release:*"; exit 1 ;;
+          esac
+          ultima=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)
+          ultima=${ultima#v}
+          IFS=. read -r ma mi pa <<< "${ultima:-0.0.0}"
+          case "$salto" in
+            major) nova="$((ma + 1)).0.0" ;;
+            minor) nova="${ma}.$((mi + 1)).0" ;;
+            *) nova="${ma}.${mi}.$((pa + 1))" ;;
+          esac
+          echo "versao=$nova" >> "$GITHUB_OUTPUT"
+          echo "PR #${pr}, salto $salto: ${ultima:-0.0.0} -> $nova"
+
+      - name: Changelog, versão e commit do bot
+        if: steps.versao.outputs.retomada != 'sim'
+        env:
+          VERSAO: ${{ steps.versao.outputs.versao }}
+        run: |
+          python3 scripts/changelog.py --consumir "$VERSAO" "$RUNNER_TEMP/notas.md"
+          sed -i -E "0,/^version = \".*\"/s//version = \"${VERSAO}\"/" pyproject.toml
+          uv lock
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A pyproject.toml uv.lock CHANGELOG.md changelog
+          git commit -m "chore(release): v${VERSAO}"
+          git tag -a "v${VERSAO}" -m "Lince ${VERSAO}"
+          # main não anda fora da release (só a PR dev -> main entra nela); se andou, falha em vez de sobrescrever
+          git push origin "HEAD:main" "v${VERSAO}"
+
+      - name: Notas da release retomada
+        if: steps.versao.outputs.retomada == 'sim'
+        env:
+          VERSAO: ${{ steps.versao.outputs.versao }}
+        run: |
+          git checkout -q "v${VERSAO}"
+          awk -v v="## ${VERSAO} " 'index($0, v) == 1 {on = 1; next} on && /^## / {exit} on' CHANGELOG.md > "$RUNNER_TEMP/notas.md"
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=v${{ steps.versao.outputs.versao }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ steps.versao.outputs.versao }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.version=${{ steps.versao.outputs.versao }}
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Release no GitHub
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSAO: ${{ steps.versao.outputs.versao }}
+        run: |
+          gh release view "v${VERSAO}" > /dev/null 2>&1 && { echo "Release v${VERSAO} já existe"; exit 0; }
+          gh release create "v${VERSAO}" --title "Lince ${VERSAO}" --notes-file "$RUNNER_TEMP/notas.md" --verify-tag
+
+      - name: Main de volta na dev
+        env:
+          VERSAO: ${{ steps.versao.outputs.versao }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # se a dev andou durante a sincronização, refaz o merge sobre a ponta nova
+          for tentativa in 1 2 3 4; do
+            git fetch -q origin dev main
+            git checkout -q -f -B sincroniza origin/dev
+            if ! git merge --no-edit origin/main -m "chore(release): sincroniza v${VERSAO} na dev"; then
+              # só versão, changelog e lock podem divergir. pyproject: o da dev, só com a versão da release;
+              # changelog: o da main; lock: refeito, nunca escolhido por lado
+              outros=$(git diff --name-only --diff-filter=U | grep -vxE 'pyproject.toml|CHANGELOG.md|uv.lock' || true)
+              if [ -n "$outros" ]; then
+                echo "::error::conflito na sincronização main -> dev em: ${outros}. Resolva à mão com um merge de main na dev."
+                exit 1
+              fi
+              git checkout --ours -- pyproject.toml uv.lock 2>/dev/null || true
+              git checkout --theirs -- CHANGELOG.md 2>/dev/null || true
+              sed -i -E "0,/^version = \".*\"/s//version = \"${VERSAO}\"/" pyproject.toml
+              uv lock
+              git add pyproject.toml CHANGELOG.md uv.lock
+              git commit -q --no-edit
+            fi
+            git push origin HEAD:dev && exit 0
+            echo "Tentativa ${tentativa}: a dev andou, sincronizando de novo"
+          done
+          echo "::error::não consegui sincronizar a main na dev depois de 4 tentativas"
+          exit 1

@@ -1,0 +1,41 @@
+name: fluxo
+
+# Separado do CI para reagir a label sem rodar a suíte inteira de novo.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fluxo-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  fluxo:
+    # PR para dev traz changelog/unreleased/<slug>.md (Dependabot é isento); PR para main só sai da dev,
+    # com uma label release:patch|minor|major.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      BASE: ${{ github.base_ref }}
+      CABECA: ${{ github.head_ref }}
+      AUTOR: ${{ github.event.pull_request.user.login }}
+      ROTULOS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Regras de branch, changelog e label
+        run: |
+          python3 scripts/changelog.py --conferir
+          if [ "$BASE" = main ]; then
+            [ "$CABECA" = dev ] || { echo "::error::PR para main só sai da dev (veio de $CABECA)"; exit 1; }
+            n=$(printf '%s\n' $ROTULOS | grep -cE '^release:(patch|minor|major)$' || true)
+            [ "$n" = 1 ] || { echo "::error::marque exatamente uma label release:patch, release:minor ou release:major"; exit 1; }
+          elif [ "$BASE" = dev ] && [ "$AUTOR" != "dependabot[bot]" ]; then
+            novos=$(git diff --name-only --diff-filter=A "origin/${BASE}...HEAD" -- 'changelog/unreleased/*.md' | wc -l)
+            [ "$novos" -ge 1 ] || { echo "::error::adicione changelog/unreleased/<slug>.md (formato em scripts/changelog.py)"; exit 1; }
+          fi
