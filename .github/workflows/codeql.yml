@@ -1,0 +1,42 @@
+name: codeql
+
+# Análise estática (SAST) do código Python e dos próprios workflows; os alertas vão para a aba Security.
+# A action entra por SHA e, com `tools: linked`, o CLI e as consultas são os travados nesse SHA: tudo sobe junto,
+# pelo Dependabot. O CodeQL não tem licença permissiva: os termos do GitHub CodeQL liberam o uso em projeto open
+# source público no GitHub, como este.
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1" # toda segunda reanalisa a dev, inclusive commit que entrou sem disparar push
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write # envia o resultado para a aba Security
+    strategy:
+      fail-fast: false
+      matrix:
+        linguagem: [python, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.linguagem }}
+          build-mode: none
+          tools: linked # CLI e consultas da versão travada no SHA, nunca a mais nova do dia
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: /language:${{ matrix.linguagem }}

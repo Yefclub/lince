@@ -18,6 +18,7 @@ jobs:
     if: github.repository == 'Yefclub/lince' && !(endsWith(github.event.head_commit.author.name, '[bot]') && (startsWith(github.event.head_commit.message, 'chore(versao)') || startsWith(github.event.head_commit.message, 'chore(release)')))
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    environment: lince-bot # a chave do bot só existe neste environment, que só libera dev e main
     permissions:
       contents: write
       packages: write
