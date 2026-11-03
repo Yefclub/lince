@@ -139,7 +139,9 @@ estática do Python e dos workflows. Rode o equivalente local antes de commitar.
 - **Merge em `dev` está autorizado ao agente**, sem pedir de novo, quando: o review independente aprovou o diff
   final, a PR está no escopo pedido e todos os checks estão verdes no head atual: os jobs do `ci.yml`
   (`qualidade`, `contrato`, `testes`, `licencas`, `auditoria`, `segredos`, `docker`), o `fluxo` e o `codeql`
-  (`python` e `actions`). Check pendente ou ausente não é verde. Head mudou: revalide. Na `dev` o merge é squash.
+  (`python` e `actions`). Check pendente ou ausente não é verde. Head mudou: revalide. Na `dev` o merge é squash,
+  menos na PR que sincroniza a `main` depois de conflito na release: ela é do mantenedor, entra com merge commit e
+  o `fluxo` reprova nela por falta de changelog novo.
   Alerta novo do CodeQL de segurança alta ou crítica, ou de erro, bloqueia o merge (regra de code scanning do
   ruleset da `dev`): corrija na PR, nunca dispense o alerta para passar e nunca faça merge com bypass das regras
   (`gh pr merge --admin`).
