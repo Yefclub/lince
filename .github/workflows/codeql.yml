@@ -2,8 +2,8 @@ name: codeql
 
 # Análise estática (SAST) do código Python e dos próprios workflows; os alertas vão para a aba Security.
 # A action entra por SHA e, com `tools: linked`, o CLI e as consultas são os travados nesse SHA: tudo sobe junto,
-# pelo Dependabot. O CodeQL não tem licença permissiva: os termos do GitHub CodeQL liberam o uso em projeto open
-# source público no GitHub, como este.
+# pelo Dependabot. O CLI do CodeQL não tem licença permissiva (a action e as consultas são MIT): os termos do
+# GitHub CodeQL liberam o uso em projeto open source público no GitHub, como este.
 on:
   push:
     branches: [main, dev]

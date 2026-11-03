@@ -161,7 +161,8 @@ jobs:
               # changelog: o da main; lock: refeito, nunca escolhido por lado
               outros=$(git diff --name-only --diff-filter=U | grep -vxE 'pyproject.toml|CHANGELOG.md|uv.lock' || true)
               if [ -n "$outros" ]; then
-                echo "::error::conflito na sincronização main -> dev em: ${outros}. Resolva à mão com um merge de main na dev."
+                echo "::error::conflito na sincronização main -> dev em: ${outros}. Resolva numa PR de main para a dev."
+                echo "Mergeie essa PR com merge commit: o squash perde o vínculo com a main."
                 exit 1
               fi
               git checkout --ours -- pyproject.toml uv.lock 2>/dev/null || true
