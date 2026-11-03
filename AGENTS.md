@@ -35,8 +35,8 @@ docker build -t lince .                    # imagem (o build reprova licença fo
 
 O CI (`.github/workflows/ci.yml`) roda lock, lint, formatação, testes em 3.11 e 3.15, licenças, auditoria de
 vulnerabilidades, varredura de segredos, a imagem Docker de ponta a ponta e, em PR, a quebra de contrato
-(`contrato`). O `fluxo.yml` confere changelog, branch de origem e label de release. Rode o equivalente local
-antes de commitar.
+(`contrato`). O `fluxo.yml` confere changelog, branch de origem e label de release, e o `codeql.yml` faz a análise
+estática do Python e dos workflows. Rode o equivalente local antes de commitar.
 
 ## Como trabalhar
 
@@ -112,6 +112,10 @@ antes de commitar.
 - Nunca exponha segredo em código, commit, log, teste ou saída. Fixtures não usam dado real de pessoa ou
   empresa.
 - Endpoint novo exige token e isolamento por cliente (um cliente nunca vê leitura de outro).
+- A chave do bot (`LINCE_BOT_CHAVE`) fica só no environment `lince-bot`, que libera apenas `dev` e `main`. Job que
+  pede o token do bot declara o environment `lince-bot` e roda só em `push`: `pull_request_target`, `workflow_run`
+  e `issue_comment` também rodam na ref da `dev` ou da `main` e dariam a chave a um job que processa entrada de
+  terceiros. A chave nunca volta a ser segredo do repositório.
 
 ## Git e versões
 
@@ -134,8 +138,13 @@ antes de commitar.
   nem "outra PR".
 - **Merge em `dev` está autorizado ao agente**, sem pedir de novo, quando: o review independente aprovou o diff
   final, a PR está no escopo pedido e todos os checks estão verdes no head atual: os jobs do `ci.yml`
-  (`qualidade`, `contrato`, `testes`, `licencas`, `auditoria`, `segredos`, `docker`) e o `fluxo`. Check pendente
-  ou ausente não é verde. Head mudou: revalide. Na `dev` o merge é squash.
+  (`qualidade`, `contrato`, `testes`, `licencas`, `auditoria`, `segredos`, `docker`), o `fluxo` e o `codeql`
+  (`python` e `actions`). Check pendente ou ausente não é verde. Head mudou: revalide. Na `dev` o merge é squash,
+  menos na PR que sincroniza a `main` depois de conflito na release: ela é do mantenedor, entra com merge commit e
+  o `fluxo` reprova nela por falta de changelog novo.
+  Alerta novo do CodeQL de segurança alta ou crítica, ou de erro, bloqueia o merge (regra de code scanning do
+  ruleset da `dev`): corrija na PR, nunca dispense o alerta para passar e nunca faça merge com bypass das regras
+  (`gh pr merge --admin`).
 - **PR do Dependabot:** patch e minor o próprio bot mergeia com o CI verde. Major o agente só mergeia se o
   mantenedor pedir, depois de review e CI verdes.
 - **`main` não é do agente.** O agente só abre a PR `dev` → `main` (release) se o mantenedor pedir, e nunca faz o
