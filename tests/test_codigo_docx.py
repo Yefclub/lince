@@ -520,3 +520,65 @@ def test_paragrafo_sem_troca_valida_nao_fica_marcado(contrato):
     )
     assert rel["aplicadas"][0]["trocas"] == 2 and _texto(rel["codigo"], ids[-1]) == "Encerramento"
     assert any("1 ocorrência" in a for a in rel["avisos"])
+
+
+def test_run_com_muitos_textos_e_paragrafo_alternado_sao_lineares(contrato):
+    import time
+
+    picado = b"<w:p><w:r>" + b"<w:t>a</w:t><w:t>x</w:t>" * 10_000 + b"</w:r></w:p>"  # 20 mil w:t num run
+    alternado = b"<w:p>" + b"<w:r><w:rPr><w:b/></w:rPr><w:t>a</w:t></w:r><w:r><w:t>b</w:t></w:r>" * 5_000 + b"</w:p>"
+    dados = _com_paragrafos(contrato, picado, alternado)
+    ps = _paragrafos(docx.extrair(dados))[-2:]
+    inicio = time.monotonic()
+    _, rel = codigo.editar(
+        dados,
+        "c.docx",
+        [
+            {"op": "substituir", "alvo": ps[0]["id"], "buscar": "a", "trocar": "b"},
+            {"op": "texto", "alvo": ps[1]["id"], "texto": "Resumo"},  # revisão: 10 mil runs viram w:del
+        ],
+    )
+    assert time.monotonic() - inicio < 10
+    assert _texto(rel["codigo"], ps[0]["id"]) == "bx" * 10_000 and _texto(rel["codigo"], ps[1]["id"]) == "Resumo"
+
+
+def test_conteudo_de_run_desconhecido_e_objeto(contrato):
+    ruby = (
+        b"<w:p><w:r><w:t>Nome </w:t></w:r><w:r><w:ruby><w:rubyBase><w:r><w:t>X</w:t></w:r></w:rubyBase></w:ruby>"
+        b"</w:r><w:r><w:t> fim</w:t></w:r></w:p>"
+    )
+    dados = _com_paragrafos(contrato, ruby)
+    p = _paragrafos(docx.extrair(dados))[-1]
+    assert p["objetos"]
+    with pytest.raises(OperacaoInvalida):
+        codigo.editar(dados, "c.docx", [{"op": "texto", "alvo": p["id"], "texto": "x", "revisao": False}])
+
+
+def test_texto_com_revisao_nao_vira_link(contrato):
+    def com_link(x):
+        return x.replace(
+            b"<w:t>Fim.</w:t></w:r>",
+            b'<w:t xml:space="preserve">Fim. </w:t></w:r><w:hyperlink w:anchor="x"><w:r><w:t>ver</w:t></w:r>'
+            b"</w:hyperlink>",
+        )
+
+    dados = _trocar_xml(contrato, com_link)
+    alvo = _paragrafos(docx.extrair(dados))[-1]["id"]
+    novo, _ = codigo.editar(dados, "c.docx", [{"op": "texto", "alvo": alvo, "texto": "Encerramento"}])
+    assert re.search(r"</w:hyperlink><w:ins [^>]*><w:r><w:t[^>]*>Encerramento", _xml(novo))
+
+
+def test_edicao_que_passa_do_prazo_nao_aplica_nada(contrato, monkeypatch):
+    monkeypatch.setattr(docx, "EDICAO_PRAZO", -1)
+    with pytest.raises(OperacaoInvalida) as e:
+        codigo.editar(contrato, "c.docx", [{"op": "comentar", "alvo": "p:n0", "texto": "x"}])
+    assert "divida" in str(e.value)
+
+
+def test_paragrafo_complexo_demais_e_recusado(contrato):
+    enorme = b"<w:p>" + b"<w:r><w:rPr><w:b/></w:rPr><w:t>a</w:t></w:r>" * 15_000 + b"</w:p>"
+    dados = _com_paragrafos(contrato, enorme)
+    alvo = _paragrafos(docx.extrair(dados))[-1]["id"]
+    with pytest.raises(OperacaoInvalida) as e:
+        codigo.editar(dados, "c.docx", [{"op": "texto", "alvo": alvo, "texto": "x"}])
+    assert e.value.codigo == "texto-grande"

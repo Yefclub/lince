@@ -13,6 +13,7 @@ import bisect
 import copy
 import random
 import re
+import time
 from datetime import UTC, datetime
 
 from lxml import etree
@@ -67,6 +68,9 @@ REVISOES = {  # alterações controladas: texto, formatação, numeração, tabe
     )
 }
 TROCAS_MAX = 10_000  # ocorrências trocadas por operação substituir
+ELEMENTOS_MAX = 50_000  # elementos XML num parágrafo editado: acima disso, nenhum algoritmo por parágrafo é barato
+EDICAO_PRAZO = 60  # segundos por pedido de edição: passou, nada é aplicado (o servidor não fica preso)
+_LARGURA_ZERO = {"rPr", "lastRenderedPageBreak", "softHyphen"}  # filhos de run sem texto e sem conteúdo próprio
 AUTOR_PADRAO = "Lince"
 OBJETO = "￼"  # imagem, campo, nota: ocupa uma posição no texto para que nenhuma troca o atravesse
 CONTEUDO_OPACO = {
@@ -182,7 +186,7 @@ def _unidade(x) -> str:
         return OBJETO  # quebra de página e de coluna mudam o layout: trocar por \v estragaria
     if nome == "noBreakHyphen":
         return "-"
-    return OBJETO if nome in CONTEUDO_OPACO else ""
+    return "" if nome in _LARGURA_ZERO else OBJETO  # o que não é texto conhecido nunca é cortado nem apagado
 
 
 def _texto_run(r) -> str:
@@ -329,6 +333,11 @@ class _Editor:
         self.documento = _documento(self.pk)
         self.corpo = _corpo(self.pk, self.documento)
         self.ids = dict(_ids(self.corpo))  # resolvidos no arquivo original: inserir não muda o alvo das próximas
+        self.por_para_id: dict[str, list] = {}
+        for pid, p in self.ids.items():
+            if not pid.startswith("p:n"):
+                self.por_para_id.setdefault(pid, []).append(p)
+        self.prazo_final = time.monotonic() + EDICAO_PRAZO
         self.campos = _campos(self.corpo)
         self.para_ids = {p.get(PARA_ID) for p in self.corpo.iter(W + "p") if p.get(PARA_ID)}
         self.usa_para_id = bool(self.para_ids)
@@ -368,7 +377,7 @@ class _Editor:
     def paragrafo(self, alvo):
         if not isinstance(alvo, str) or not _ALVO_P.fullmatch(alvo):
             raise OperacaoInvalida("alvo-invalido", f"alvo de parágrafo inválido: {alvo!r}", alvo=str(alvo))
-        achados = [p for pid, p in _ids(self.corpo) if pid == alvo] if not alvo.startswith("p:n") else []
+        achados = [p for p in self.por_para_id.get(alvo, []) if p.getparent() is not None]
         if alvo.startswith("p:n"):
             p = self.ids.get(alvo)
             achados = [p] if p is not None else []
@@ -378,8 +387,16 @@ class _Editor:
             raise OperacaoInvalida("alvo-inexistente", f"parágrafo {alvo} não existe", alvo=alvo)
         return achados[0]
 
+    def no_prazo(self):
+        if time.monotonic() > self.prazo_final:
+            raise OperacaoInvalida("texto-grande", f"a edição passou de {EDICAO_PRAZO} s: divida em pedidos menores")
+
     def tocar_texto(self, p, alvo):
         """Uma operação de texto por parágrafo por pedido, e nunca sobre revisões que já estavam no arquivo."""
+        if sum(1 for _ in p.iter()) > ELEMENTOS_MAX:
+            raise OperacaoInvalida(
+                "texto-grande", f"{alvo} é complexo demais para editar (XML muito grande)", alvo=alvo
+            )
         if p in self.tocados:
             raise OperacaoInvalida("conflito", f"{alvo} já foi alterado neste pedido: junte as mudanças", alvo=alvo)
         if _revisoes(p):
@@ -425,7 +442,11 @@ def _fatiar(r, pontos: list[int]) -> list:
     atomos, posicao = [], 0  # (começo, elemento) com os w:t já cortados nos pontos que caem dentro deles
     for x in filhos:
         tamanho = len(_unidade(x))
-        dentro = [q - posicao for q in pontos if posicao < q < posicao + tamanho] if x.tag == W + "t" else []
+        if x.tag == W + "t" and tamanho > 1:  # os cortes que caem dentro deste w:t (pontos está em ordem)
+            lo, hi = bisect.bisect_right(pontos, posicao), bisect.bisect_left(pontos, posicao + tamanho)
+            dentro = [q - posicao for q in pontos[lo:hi]]
+        else:
+            dentro = []
         if not dentro:
             atomos.append((posicao, x))
         else:
@@ -442,7 +463,8 @@ def _fatiar(r, pontos: list[int]) -> list:
         r.remove(x)
     pedacos, atual, k = [r], r, 0
     for comeco, el in atomos:
-        while k < len(pontos) and comeco >= pontos[k]:  # passou de um ponto de corte: run novo
+        while k < len(pontos) and (comeco > pontos[k] or (comeco == pontos[k] and len(_unidade(el)))):
+            # passou de um ponto de corte: run novo (filho de largura zero no ponto fica do lado de antes)
             novo = etree.Element(W + "r", r.attrib)
             if rpr is not None:
                 novo.append(copy.deepcopy(rpr))
@@ -508,7 +530,7 @@ def _rpr_limpo(r):
 
 def _excluir(ed: _Editor, runs: list, rev):
     """Tira os runs: direto, ou embrulhados em w:del (w:t vira w:delText) quando é revisão."""
-    marca = None
+    marca, marcas = None, []
     for r in runs:
         if rev is None:
             r.getparent().remove(r)
@@ -520,8 +542,10 @@ def _excluir(ed: _Editor, runs: list, rev):
         if marca is None or r.getprevious() is not marca:  # runs vizinhos ficam no mesmo w:del
             marca = ed.marca("del", rev)
             r.addprevious(marca)
+            marcas.append(marca)
         marca.append(r)
-        _juntar_filhos(marca, W + "delText")
+    for m in marcas:  # uma passada por w:del no fim (juntar a cada run seria quadrático)
+        _juntar_filhos(m, W + "delText")
     return marca
 
 
@@ -578,6 +602,8 @@ def _op_texto(ed: _Editor, op, rel):
             p.insert(posicao + k, novo)
     else:
         ultima = _excluir(ed, runs, rev) if runs else None
+        while ultima is not None and ultima.getparent() is not p:  # fora do link, como no modo direto
+            ultima = ultima.getparent()
         _incluir(ed, ultima, texto, rpr, rev, pai=p)
     rel.update(antes=atual, depois=texto, partes=["/" + ed.documento])
 
@@ -664,14 +690,17 @@ def _trocar_no_paragrafo(ed: _Editor, p, busca: str, troca: str, rev, restantes:
         else:
             pedacos.append((a, b, r))
     comecos = [x[0] for x in pedacos]
-    for k in reversed(validas):
+    for n, k in enumerate(reversed(validas)):
+        if n % 256 == 0:
+            ed.no_prazo()
         fim = k + len(busca)
         j = bisect.bisect_left(comecos, k)
         while j < len(pedacos) and pedacos[j][1] == pedacos[j][0] and pedacos[j][0] == k:
             j += 1  # pula runs vazios que começam no mesmo ponto: ficam fora da troca
         i = bisect.bisect_left(comecos, fim) - 1
-        trecho = [pedacos[x][2] for x in range(j, i + 1)]
-        modelo = next((r for r in trecho if _texto_run(r)), trecho[0])
+        modelo = next((pedacos[x][2] for x in range(j, i + 1) if pedacos[x][1] > pedacos[x][0]), pedacos[j][2])
+        pai = modelo.getparent()  # run vazio de outro pai (link, controle) no meio fica onde está
+        trecho = [pedacos[x][2] for x in range(j, i + 1) if pedacos[x][2].getparent() is pai]
         rpr = _rpr_limpo(modelo)
         if rev is None:
             for novo in _run(troca, rpr):
@@ -751,6 +780,7 @@ def _op_inserir(ed: _Editor, op, rel):
     _incluir(ed, None, texto, rpr, rev, pai=novo)
     if ed.usa_para_id:
         novo.set(PARA_ID, ed.novo_para_id())
+        ed.por_para_id[f"p:{novo.get(PARA_ID)}"] = [novo]
     p.addnext(novo)
     ed.tocados.add(novo)
     ed.pk.tocar(ed.documento)
@@ -770,6 +800,10 @@ def _op_remover(ed: _Editor, op, rel):
         raise OperacaoInvalida("operacao-invalida", f"{op['alvo']} é o parágrafo que fecha uma tabela", alvo=op["alvo"])
     if p.find("w:pPr/w:sectPr", NS) is not None:
         raise OperacaoInvalida("operacao-invalida", f"{op['alvo']} fecha uma seção do documento", alvo=op["alvo"])
+    if any(el.tag == W + "fldChar" for el in p.iter()):
+        raise OperacaoInvalida(
+            "operacao-invalida", f"{op['alvo']} abre ou fecha um campo (sumário, índice…)", alvo=op["alvo"]
+        )
     if any(el.tag in (W + "commentRangeStart", W + "commentReference") for el in p.iter()):
         raise OperacaoInvalida("operacao-invalida", f"{op['alvo']} tem comentário: resolva antes", alvo=op["alvo"])
     atual = ed.texto(p)
@@ -891,6 +925,7 @@ def aplicar(dados: bytes, operacoes: list[dict]) -> tuple[bytes, list[dict], lis
             )
         rel = {"op": op["op"], **({"alvo": op["alvo"]} if "alvo" in op else {})}
         try:
+            ed.no_prazo()
             OPERACOES[op["op"]](ed, op, rel)
         except OperacaoInvalida as e:
             e.indice = k
