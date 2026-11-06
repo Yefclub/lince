@@ -570,3 +570,21 @@ def test_nomes_curtos_e_com_acento_funcoes_novas_e_texto_com_escape():
     )
     aba = _parte(novo, "xl/worksheets/sheet1.xml")
     assert "<f>B2*ISS+Preço</f>" in aba and "_xlfn.TEXTBEFORE" in aba and "<t>_x005F_x0041_</t>" in aba
+
+
+@pytest.mark.parametrize("texto", ["_x0041_x0042_", "_x0041_", "a_x000D_b", "__x0041__"])
+def test_texto_com_escape_volta_igual_na_leitura(texto):
+    novo, rel = codigo.editar(_livro(), "p.xlsx", [{"op": "celula", "alvo": "Dados!A11", "valor": texto}])
+    assert _celula(rel["codigo"], "Dados!A11")["valor"] == texto
+    copia, _ = codigo.editar(novo, "p.xlsx", [{"op": "celula", "alvo": "Dados!A11", "valor": texto, "se_valor": texto}])
+    assert _celula(xlsx.extrair(copia), "Dados!A11")["valor"] == texto
+
+
+def test_retorno_de_carro_do_excel_e_lido_como_caractere():
+    dados = _trocar(_livro(), "xl/sharedStrings.xml", lambda x: x.replace("<t>Rota</t>", "<t>Ro_x000D_ta</t>"))
+    assert _celula(xlsx.extrair(dados), "Dados!A1")["valor"] == "Ro\rta"
+
+
+def test_matriz_nao_entra_em_uniao():
+    with pytest.raises(OperacaoInvalida):
+        codigo.editar(_livro(), "p.xlsx", [{"op": "celula", "alvo": "Dados!A9", "formula": "=SUM(({1,2},A1))"}])

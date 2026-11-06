@@ -126,7 +126,9 @@ class _Livro:
         self.compartilhadas = []
         if alvo in pk.partes:
             for si in pk.arvore(alvo).findall("s:si", NS):
-                self.compartilhadas.append("".join(t.text or "" for t in si.iter(S + "t") if _fora_de_fonetica(t)))
+                self.compartilhadas.append(
+                    _decodificar("".join(t.text or "" for t in si.iter(S + "t") if _fora_de_fonetica(t)))
+                )
         pr = self.raiz.find("s:workbookPr", NS)
         self.data1904 = pr is not None and pr.get("date1904") in ("1", "true")
         self.datas = self._estilos_de_data()
@@ -164,7 +166,7 @@ class _Livro:
         """Valor exibível da célula: número, texto, booleano, erro (#N/A), data ISO (t="d") ou None."""
         t = c.get("t", "n")
         if t == "inlineStr":
-            return "".join(x.text or "" for x in c.iter(S + "t") if _fora_de_fonetica(x))
+            return _decodificar("".join(x.text or "" for x in c.iter(S + "t") if _fora_de_fonetica(x)))
         v = c.find("s:v", NS)
         if v is None or v.text is None:
             return None
@@ -200,6 +202,19 @@ class _Livro:
             base = datetime(1899, 12, 30)
         momento = base + timedelta(days=float(valor))
         return momento.date().isoformat() if float(valor).is_integer() else momento.isoformat(timespec="seconds")
+
+
+_ESCAPE = re.compile(r"_x([0-9A-Fa-f]{4})_")
+
+
+def _decodificar(texto: str) -> str:
+    """O Excel guarda caractere especial como _xHHHH_ (ex.: _x000D_ é o retorno de carro): o código mostra o texto."""
+    return _ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), texto)
+
+
+def _codificar(texto: str) -> str:
+    """O inverso: todo _ que começaria um _xHHHH_ vira _x005F_, então o Excel mostra exatamente o texto pedido."""
+    return re.sub(r"_(?=x[0-9A-Fa-f]{4}_)", "_x005F_", texto)
 
 
 def _fora_de_fonetica(t) -> bool:
@@ -502,8 +517,8 @@ def _dentro_dos_limites(ref: str) -> bool:
 
 
 def _referencia(v: str, ctx: _Contexto, erro):
-    """Lista branca de operando de referência: [aba!]A1, A1:B2, A:A, 1:1, Aba!A1:Aba!B2, nome definido existente ou
-    referência estruturada de tabela existente. Qualquer outra coisa é recusada (o Excel repararia o arquivo)."""
+    """Lista branca de operando de referência: [aba!]A1, A1:B2, A:A, 1:1, Aba!A1:Aba!B2 ou nome definido existente.
+    Qualquer outra coisa, inclusive referência estruturada de tabela, é recusada (o Excel repararia o arquivo)."""
     m = _PREFIXO.match(v)
     resto = v
     if m:
@@ -647,7 +662,11 @@ def _formula(texto: str, alvo: str, ctx: _Contexto) -> str:
             if espera_valor or em_matriz:
                 raise erro("operador sem valor antes")
             if v == "," and not (
-                pilha and pilha[-1][0] == "PAREN" and anterior is not None and anterior.subtype in ("RANGE", "CLOSE")
+                pilha
+                and pilha[-1][0] == "PAREN"
+                and anterior is not None
+                and anterior.subtype in ("RANGE", "CLOSE")
+                and anterior.type != "ARRAY"  # constante de matriz nunca é referência
             ):
                 raise erro("vírgula fora de função: use ponto como separador decimal (1.5)")
             uniao = v == ","  # união (A1,B1): o operando seguinte também precisa ser referência
@@ -728,7 +747,7 @@ def _escrever(ed: _Editor, aba: _Aba, col: int, lin: int, alvo: str, valor=None,
     elif isinstance(valor, str):
         c.set("t", "inlineStr")  # não mexe na tabela de textos compartilhados, que outras células usam
         t = etree.SubElement(etree.SubElement(c, S + "is"), S + "t")
-        t.text = re.sub(r"_(x[0-9A-Fa-f]{4}_)", r"_x005F_\1", valor)  # _xHHHH_ é escape no Excel: mantém o literal
+        t.text = _codificar(valor)  # _xHHHH_ é escape no Excel: o literal pedido continua literal
         if valor != valor.strip():
             t.set(XML_SPACE, "preserve")
         ed.crescimento += len(valor)
