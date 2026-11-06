@@ -599,3 +599,16 @@ def test_controle_e_emoji_em_duas_metades_vindos_do_arquivo():
     novo, rel = codigo.editar(dados, "p.xlsx", [{"op": "celula", "alvo": "Dados!A2", "valor": lido}])
     assert "_x0001_" in _parte(novo, "xl/worksheets/sheet1.xml")
     assert _celula(rel["codigo"], "Dados!A2")["valor"] == lido
+
+
+def test_codificacao_de_texto_volta_igual_para_todo_texto_curto():
+    import itertools
+
+    from lince.codigo.xlsx import _codificar, _decodificar
+
+    alfabeto = ["_", "x", "A", "0", "\x01", "b"]
+    for n in range(1, 8):  # 7 cobre "_x" + 4 dígitos + o caractere seguinte
+        for letras in itertools.product(alfabeto, repeat=n):
+            texto = "".join(letras)
+            assert _decodificar(_codificar(texto)) == texto, texto
+    assert _decodificar(_codificar("_xABCD\x01")) == "_xABCD\x01"

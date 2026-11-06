@@ -215,12 +215,15 @@ def _decodificar(texto: str) -> str:
 
 
 _FORA_DO_XML = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
+_ABRE_ESCAPE = re.compile("_(?=x[0-9A-Fa-f]{4}(?:_|[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]))")
 
 
 def _codificar(texto: str) -> str:
     """O inverso: todo _ que começaria um _xHHHH_ vira _x005F_, e o caractere que o XML não aceita (controle) vira
     _xHHHH_, então o Excel mostra exatamente o texto pedido e o que foi lido pode ser gravado de volta."""
-    texto = re.sub(r"_(?=x[0-9A-Fa-f]{4}_)", "_x005F_", texto)
+    # numa passada só: o _ é escapado quando o que vem depois, já codificado, formaria _xHHHH_ (inclusive quando o
+    # caractere seguinte é de controle, cuja forma codificada começa com _)
+    texto = _ABRE_ESCAPE.sub("_x005F_", texto)
     return _FORA_DO_XML.sub(lambda m: f"_x{ord(m.group(0)):04X}_", texto)
 
 
