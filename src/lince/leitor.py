@@ -103,9 +103,9 @@ class Leitor:
         else:
             if zipfile.is_zipfile(caminho):  # Office, ODF, EPUB: conferido antes de qualquer descompactação
                 conferir_zip(caminho)
-            plano = planejar_office(caminho, pasta)
+            plano = planejar_office(caminho, pasta, ext)
         plano["arquivo"] = os.path.basename(caminho)
-        plano["meta_arquivo"] = metadados_arquivo(caminho)
+        plano["meta_arquivo"] = metadados_arquivo(caminho, ext)
         if plano.get("ilegiveis"):
             plano["meta_arquivo"].setdefault("partes_ilegiveis", []).extend(plano["ilegiveis"])
         plano["tarefas_originais"] = list(plano.get("tarefas", []))

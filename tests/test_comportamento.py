@@ -84,10 +84,13 @@ def test_texto_oculto_do_word_sai_do_corpo(tmp_path):
 
 def test_formato_vem_do_conteudo_quando_a_extensao_nao_diz(tmp_path, pdf_tres_paginas):
     d = Document()
-    d.add_paragraph("Contrato de fornecimento de soja.")
+    p = d.add_paragraph("Contrato de fornecimento de soja. ")
+    p.add_run(INJECAO).font.hidden = True
     sem_extensao = tmp_path / "anexo"
     d.save(sem_extensao)
-    assert "fornecimento de soja" in lince.ler(sem_extensao).markdown
+    r = lince.ler(sem_extensao)
+    assert "fornecimento de soja" in r.markdown
+    assert "IGNORE TODAS" not in r.markdown and r.alertas_injecao  # a proteção do .docx vale sem a extensão
     pdf = tmp_path / "relatorio.bin"
     pdf.write_bytes(open(pdf_tres_paginas, "rb").read())
     assert lince.ler(pdf).cobertura.rotas == lince.ler(pdf_tres_paginas).cobertura.rotas != {}  # roteado como PDF

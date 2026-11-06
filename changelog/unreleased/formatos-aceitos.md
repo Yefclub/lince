@@ -11,4 +11,5 @@ na hora com `415 formato-nao-suportado`, dizendo qual arquivo e quais extensões
 fila. Na biblioteca, um arquivo sem extensão conhecida é lido pelo conteúdo quando ele traz o marcador do formato
 (PDF, RTF, Office, OpenDocument); sem marcador, a leitura falha com `lince.FormatoNaoSuportado`.
 
-**Lista exata.** O README traz a tabela dos formatos aceitos, por tipo, conferida arquivo a arquivo.
+**Lista exata.** O README traz a tabela dos formatos aceitos, por tipo. Cada extensão foi conferida com um arquivo real,
+menos o `.xlsb`, que entra pela lista de formatos do leitor de Office e já era lido antes.
