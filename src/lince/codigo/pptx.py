@@ -14,9 +14,19 @@ import re
 
 from lxml import etree
 
-from .pacote import R_EMBED, R_ID, Pacote, sha
-
-R_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+from .pacote import (
+    CRESCIMENTO_MAX,
+    PARAGRAFO_MAX,
+    QUEBRA,
+    R_EMBED,
+    R_ID,
+    OperacaoInvalida,
+    Pacote,
+    sha,
+)
+from .pacote import campo_texto as _campo_texto
+from .pacote import conferir as _conferir
+from .pacote import integridade as _integridade
 
 NS = {
     "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
@@ -29,17 +39,6 @@ NS = {
 }
 A, P, C = (f"{{{NS[k]}}}" for k in ("a", "p", "c"))
 FORMAS = ("sp", "pic", "graphicFrame", "grpSp", "cxnSp")
-
-
-class OperacaoInvalida(ValueError):
-    """Operação que não pode ser aplicada; `codigo` é estável para a IA tratar."""
-
-    def __init__(self, codigo: str, mensagem: str, indice: int | None = None, alvo: str | None = None):
-        super().__init__(mensagem)
-        self.codigo, self.indice, self.alvo = codigo, indice, alvo
-
-
-QUEBRA = "\v"  # quebra de linha dentro do parágrafo (a:br), como no python-pptx; "\n" separa parágrafos
 
 
 def _texto(el) -> str:
@@ -211,9 +210,6 @@ def _corpo_notas(arvore_notas):
 
 # ------------------------------------------------------------------ edição
 _ALVO = re.compile(r"(sld:\d{1,10})(?:/sp:(\d{1,10})(?:/(?:(p|ser):(\d{1,6})|(c):(\d{1,4},\d{1,4})))?)?")
-TEXTO_MAX = 100_000  # caracteres num campo de texto de uma operação
-PARAGRAFO_MAX = 200_000  # caracteres num parágrafo depois de uma troca (substituir não amplifica sem limite)
-CRESCIMENTO_MAX = 5_000_000  # caracteres acrescentados somando todas as operações de um pedido
 
 
 def _casar_alvo(alvo):
@@ -258,12 +254,6 @@ class _Editor:
             raise OperacaoInvalida("texto-grande", "o texto resultante passa do limite de tamanho do documento")
 
 
-def _conferir(op, atual: str, alvo: str):
-    """Concorrência otimista: se a operação diz o texto que espera encontrar, ele precisa estar lá."""
-    if "se_texto" in op and op["se_texto"] != atual:
-        raise OperacaoInvalida("conflito", f"o texto atual de {alvo} não é o esperado: {atual[:80]!r}", alvo=alvo)
-
-
 def _run_modelo(p):
     """Run que dá a formatação ao texto novo: o primeiro run, senão o rPr de um campo ou do fim do parágrafo."""
     runs = p.findall("a:r", NS)
@@ -306,15 +296,6 @@ def _trocar_paragrafo(p, texto: str):
             t = etree.SubElement(run, A + "t")
         t.text = trecho
         _por(p, run)
-
-
-def _campo_texto(op, nome="texto") -> str:
-    valor = op.get(nome)
-    if not isinstance(valor, str):
-        raise OperacaoInvalida("operacao-invalida", f"{nome} precisa ser texto", alvo=op.get("alvo"))
-    if len(valor) > TEXTO_MAX:
-        raise OperacaoInvalida("texto-grande", f"{nome} passa de {TEXTO_MAX} caracteres", alvo=op.get("alvo"))
-    return valor
 
 
 def _op_texto(ed: _Editor, op, rel):
@@ -664,7 +645,7 @@ def aplicar(dados: bytes, operacoes: list[dict]) -> tuple[bytes, list[dict], lis
     ed = _Editor(dados)
     relatorio = []
     for k, op in enumerate(operacoes):
-        if not isinstance(op, dict) or op.get("op") not in OPERACOES:
+        if not isinstance(op, dict) or not isinstance(op.get("op"), str) or op["op"] not in OPERACOES:
             raise OperacaoInvalida(
                 "operacao-invalida",
                 f"op desconhecida: {op.get('op') if isinstance(op, dict) else op!r}; use uma de {', '.join(OPERACOES)}",
@@ -686,29 +667,4 @@ def aplicar(dados: bytes, operacoes: list[dict]) -> tuple[bytes, list[dict], lis
 
 
 def integridade(dados: bytes) -> list[str]:
-    """Problemas estruturais do pacote: relação apontando para parte que não existe, parte sem content type."""
-    pk = Pacote(dados)
-    problemas = []
-    ct = pk.arvore("[Content_Types].xml")
-    padrao = {d.get("Extension").lower() for d in ct.findall("ct:Default", NS)}
-    explicito = {o.get("PartName").lstrip("/") for o in ct.findall("ct:Override", NS)}
-    for nome in pk.partes:
-        if nome.endswith("/") or nome == "[Content_Types].xml":
-            continue
-        extensao = nome.rsplit("/", 1)[-1].rsplit(".", 1)[-1].lower() if "." in nome.rsplit("/", 1)[-1] else ""
-        if nome not in explicito and extensao not in padrao:
-            problemas.append(f"/{nome} sem content type")
-        if nome.endswith(".rels"):
-            dono = nome.replace("_rels/", "").removesuffix(".rels")
-            for rid, (tipo, alvo) in pk.rels(dono).items():
-                if not tipo.startswith("externo") and alvo not in pk.partes:
-                    problemas.append(f"/{dono} {rid} aponta para /{alvo}, que não existe")
-        elif nome.endswith(".xml") and nome.startswith("ppt/"):
-            # todo atributo r:* (id, embed, link…) precisa existir nas relações da parte; senão o PowerPoint repara
-            ids = set(pk.rels(nome))
-            for el in pk.arvore(nome).iter():
-                for chave, valor in el.attrib.items():
-                    if chave.startswith(R_NS) and valor and valor not in ids:
-                        problemas.append(f"/{nome} cita {valor}, que não está nas relações")
-                        break
-    return problemas
+    return _integridade(dados, "ppt/")

@@ -590,7 +590,7 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None) -> Starl
             except codigo_doc.FormatoNaoSuportado as e:
                 raise Problema(415, "formato-nao-editavel", "Formato não editável", str(e)) from None
             except codigo_doc.OperacaoInvalida as e:
-                status = 409 if e.codigo in ("conflito", "base-divergente") else 422
+                status = 409 if e.codigo in ("conflito", "base-divergente", "revisoes-pendentes") else 422
                 extras = {k: v for k, v in (("operacao", e.indice), ("alvo", e.alvo)) if v is not None}
                 raise Problema(status, e.codigo, "Operação não aplicada", str(e), extras=extras) from None
             except DocumentoRecusado as e:

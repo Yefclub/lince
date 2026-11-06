@@ -8,12 +8,11 @@ Leitura e edição usam o mesmo extrator, então os ids que a IA lê são os que
 
 import os
 
-from . import pptx
-from .pacote import comparar, sha
-from .pptx import OperacaoInvalida
+from . import docx, pptx
+from .pacote import OperacaoInvalida, comparar, sha
 
-EXTRATORES = {".pptx": pptx, ".pptm": pptx, ".ppsx": pptx}
-EDITAVEIS = {".pptx": pptx, ".pptm": pptx}
+EXTRATORES = {".pptx": pptx, ".pptm": pptx, ".ppsx": pptx, ".docx": docx, ".docm": docx}
+EDITAVEIS = {".pptx": pptx, ".pptm": pptx, ".docx": docx, ".docm": docx}
 OPERACOES_MAX = 500  # por pedido de edição
 CRESCIMENTO_AVISO = 1.3  # texto 30% maior que o original pode transbordar a caixa (autoajuste não é recalculado)
 
@@ -52,7 +51,7 @@ def editar(dados: bytes, nome: str, operacoes: list, base_sha256: str | None = N
         raise OperacaoInvalida(
             "validacao-falhou", "o arquivo resultante ficaria inconsistente: " + "; ".join(problemas[:5])
         )
-    for a in aplicadas:
+    for a in aplicadas if modulo is pptx else []:  # caixa de tamanho fixo só existe no slide
         if a["op"] in ("texto", "celula_tabela"):
             razao = len(str(a.get("depois", ""))) / max(len(str(a.get("antes", ""))), 1)
             if razao > CRESCIMENTO_AVISO:
