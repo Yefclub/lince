@@ -17,7 +17,7 @@ precisa. Biblioteca Python (`src/lince/`) e API HTTP (`lince.servidor`), empacot
 | Montagem do Markdown e metadados | `src/lince/montagem.py`, `src/lince/metadados.py` |
 | Texto oculto e prompt injection | `src/lince/seguranca.py` |
 | Prompt de leitura | `src/lince/prompts/leitura.md` (`VERSAO_PROMPT` em `instrucoes.py`) |
-| Documento como código e edição cirúrgica | `src/lince/codigo/` (`pacote.py`, `pptx.py`, `docx.py`) |
+| Documento como código e edição cirúrgica | `src/lince/codigo/` (`pacote.py`, `pptx.py`, `docx.py`, `xlsx.py`) |
 | Limites contra arquivo hostil | `src/lince/limites.py` |
 | Contrato da API (OpenAPI 3.1) | `src/lince/openapi.json` |
 | API HTTP, sessões e fila justa | `src/lince/servidor.py` |
@@ -77,7 +77,9 @@ estática do Python e dos workflows. Rode o equivalente local antes de commitar.
   é o que deixa a pessoa aceitar ou rejeitar o que a IA fez.
 - Operação nova: tudo ou nada, erro com `OperacaoInvalida(codigo, …)` e teste de comportamento. Leitura e edição
   usam o mesmo extrator.
-- Teste com arquivos de produtores diferentes (PowerPoint, Word, LibreOffice, python-pptx, python-docx); arquivo real
+- No XLSX, a escrita nunca passa pelo openpyxl (ele perde imagens e gráficos ao salvar um arquivo existente); ele
+  serve só para conferir o resultado nos testes.
+- Teste com arquivos de produtores diferentes (PowerPoint, Word, Excel, LibreOffice, python-pptx, python-docx, openpyxl); arquivo real
   de empresa nunca entra no repositório.
 
 ## Nada fica guardado
