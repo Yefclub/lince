@@ -22,6 +22,7 @@ Word vê exatamente o que a IA propôs e aceita ou rejeita cada trecho. Para apl
 #### Cuidados
 
 - **Formatação:** a troca de texto corta no caractere exato, então negrito, itálico e links em volta ficam como estavam.
-- **Objetos:** imagens, campos e notas no meio do parágrafo nunca são apagados.
+- **Objetos:** imagens, campos, notas, caixas de texto e controles de conteúdo no meio do parágrafo nunca são
+  apagados.
 - **Arquivo:** só as partes tocadas são reescritas, e o resto sai idêntico em bytes.
 - **Testes:** passou em contratos, currículos e relatórios gerados pelo LibreOffice e pelo python-docx, e todos reabriram sem erro.

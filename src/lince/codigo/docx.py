@@ -9,12 +9,15 @@ Toda operação de texto entra como revisão (w:ins/w:del, w:pPrChange) por padr
 propôs e aceita ou rejeita. `"revisao": false` aplica direto; `"revisao": {"autor": "…"}` troca o autor.
 """
 
+import bisect
 import copy
+import random
 import re
 from datetime import UTC, datetime
 
 from lxml import etree
 
+from ..limites import DocumentoRecusado
 from .pacote import (
     CRESCIMENTO_MAX,
     PARAGRAFO_MAX,
@@ -36,11 +39,34 @@ NS = {
     "ct": "http://schemas.openxmlformats.org/package/2006/content-types",
 }
 W = f"{{{NS['w']}}}"
+XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 PARA_ID = f"{{{NS['w14']}}}paraId"
 TIPO_DOCUMENTO = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
 TIPO_COMENTARIOS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
 CT_COMENTARIOS = "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"
-REVISOES = {W + "ins", W + "del", W + "moveFrom", W + "moveTo"}
+REVISOES = {  # alterações controladas: texto, formatação, numeração, tabela e seção
+    W + n
+    for n in (
+        "ins",
+        "del",
+        "moveFrom",
+        "moveTo",
+        "moveFromRangeStart",
+        "moveToRangeStart",
+        "rPrChange",
+        "pPrChange",
+        "numberingChange",
+        "sectPrChange",
+        "tblPrChange",
+        "trPrChange",
+        "tcPrChange",
+        "tblGridChange",
+        "cellIns",
+        "cellDel",
+        "cellMerge",
+    )
+}
+TROCAS_MAX = 10_000  # ocorrências trocadas por operação substituir
 AUTOR_PADRAO = "Lince"
 OBJETO = "￼"  # imagem, campo, nota: ocupa uma posição no texto para que nenhuma troca o atravesse
 CONTEUDO_OPACO = {
@@ -54,6 +80,7 @@ CONTEUDO_OPACO = {
     "commentReference",
     "sym",
     "ptab",
+    "AlternateContent",  # caixa de texto, forma e WordArt dentro do run
 }
 _ALVO_P = re.compile(r"p:(n\d{1,7}|[0-9A-Fa-f]{8})")
 _ALVO_T = re.compile(r"t:(\d{1,6})")
@@ -61,11 +88,12 @@ _ALVO_T = re.compile(r"t:(\d{1,6})")
 
 # ------------------------------------------------------------------ leitura
 def _documento(pk: Pacote) -> str:
-    rels = pk.arvore("_rels/.rels")
-    for r in rels.findall("rel:Relationship", NS):
-        if r.get("Type") == TIPO_DOCUMENTO:
-            return r.get("Target").lstrip("/")
-    raise OperacaoInvalida("operacao-invalida", "pacote sem documento principal")
+    if "_rels/.rels" in pk.partes:
+        for r in pk.arvore("_rels/.rels").findall("rel:Relationship", NS):
+            alvo = (r.get("Target") or "").lstrip("/")
+            if r.get("Type") == TIPO_DOCUMENTO and alvo in pk.partes:
+                return alvo
+    raise OperacaoInvalida("operacao-invalida", "pacote sem documento principal: não é um DOCX válido")
 
 
 def _corpo(pk: Pacote, parte: str):
@@ -91,45 +119,67 @@ def _ids(corpo) -> list[tuple[str, object]]:
     return out
 
 
-def _runs(p):
-    """Runs visíveis do parágrafo, em ordem: os de dentro de hyperlink, campo simples, smartTag e controles de conteúdo
-    contam; os de revisão excluída (w:del, moveFrom) não. Não entra em parágrafos aninhados (caixas de texto)."""
+def _runs(p, campos=False):
+    """Runs visíveis do parágrafo, em ordem: os de dentro de hyperlink, smartTag e controles de conteúdo contam; os de
+    revisão excluída (w:del, moveFrom) não. O campo simples (w:fldSimple) vem inteiro, como um objeto, salvo com
+    `campos=True` (os runs de dentro dele). Não entra em parágrafos aninhados (caixas de texto)."""
     for el in p:
         nome = etree.QName(el).localname
         if nome == "r":
             yield el
+        elif nome == "fldSimple" and not campos:
+            yield el
         elif nome in ("hyperlink", "smartTag", "fldSimple", "ins", "moveTo", "customXml"):
-            yield from _runs(el)
+            yield from _runs(el, campos)
         elif nome == "sdt":
             conteudo = el.find("w:sdtContent", NS)
             if conteudo is not None:
-                yield from _runs(conteudo)
+                yield from _runs(conteudo, campos)
+
+
+def _unidade(x) -> str:
+    """O texto que um filho de run ocupa (OBJETO para o que não é texto e não pode ser cortado)."""
+    nome = etree.QName(x).localname
+    if nome == "t":
+        return x.text or ""
+    if nome == "tab":
+        return "\t"
+    if nome in ("br", "cr"):
+        return QUEBRA
+    if nome == "noBreakHyphen":
+        return "-"
+    return OBJETO if nome in CONTEUDO_OPACO else ""
 
 
 def _texto_run(r) -> str:
-    partes = []
-    for x in r:
-        nome = etree.QName(x).localname
-        if nome == "t":
-            partes.append(x.text or "")
-        elif nome == "tab":
-            partes.append("\t")
-        elif nome in ("br", "cr"):
-            partes.append(QUEBRA)
-        elif nome == "noBreakHyphen":
-            partes.append("-")
-        elif nome in CONTEUDO_OPACO:
-            partes.append(OBJETO)
-    return "".join(partes)
+    return "".join(_unidade(x) for x in r)
+
+
+def _conteudo(p) -> list[tuple[object, str]]:
+    """(run, texto) na ordem. Campo inteiro (simples ou complexo, inclusive o resultado mostrado) vira OBJETO: o
+    resultado é recalculado pelo Word, então trocar ali não teria efeito duradouro."""
+    out, campo = [], 0
+    for r in _runs(p):
+        if r.tag == W + "fldSimple":
+            out.append((r, OBJETO))
+            continue
+        tipos = [f.get(W + "fldCharType") for f in r.findall("w:fldChar", NS)]
+        if "begin" in tipos:
+            campo += 1
+        texto = _texto_run(r)
+        out.append((r, OBJETO * len(texto) if campo else texto))
+        if "end" in tipos:
+            campo = max(0, campo - 1)
+    return out
 
 
 def _texto(p, com_objetos=False) -> str:
-    t = "".join(_texto_run(r) for r in _runs(p))
+    t = "".join(texto for _, texto in _conteudo(p))
     return t if com_objetos else t.replace(OBJETO, "")
 
 
 def _revisoes(p) -> bool:
-    return any(el.tag in REVISOES for el in p.iter()) or p.find("w:pPr/w:pPrChange", NS) is not None
+    return any(el.tag in REVISOES for el in p.iter())
 
 
 def _estilos(pk: Pacote, documento: str) -> dict[str, str]:
@@ -157,7 +207,9 @@ def _paragrafo(pid: str, p) -> dict:
             "nivel": int(nivel.get(W + "val")) if nivel is not None else 0,
         }
     if OBJETO in _texto(p, com_objetos=True):
-        out["objetos"] = True  # imagem, campo ou nota: `texto` recusa, `substituir` trabalha em volta
+        out["objetos"] = True  # imagem, campo, nota, caixa de texto: `texto` recusa, `substituir` trabalha em volta
+    if p.find("w:sdt", NS) is not None:
+        out["controles"] = True  # controle de conteúdo no parágrafo: `texto` recusa, `substituir` troca dentro dele
     if _revisoes(p):
         out["revisoes"] = True
     return out
@@ -181,7 +233,7 @@ def extrair(dados: bytes) -> dict:
                 )
             blocos.append({"tipo": "tabela", "id": f"t:{tabelas}", "linhas": linhas})
             tabelas += 1
-        elif nome == "sdt":  # controle de conteúdo no nível do corpo: os parágrafos dele entram em ordem
+        else:  # controle de conteúdo, customXml…: os parágrafos de dentro entram em ordem
             for p in el.iter(W + "p"):
                 if p in ids:
                     blocos.append({"tipo": "paragrafo", **_paragrafo(ids[p], p)})
@@ -222,8 +274,8 @@ class _Editor:
         self.documento = _documento(self.pk)
         self.corpo = _corpo(self.pk, self.documento)
         self.ids = dict(_ids(self.corpo))  # resolvidos no arquivo original: inserir não muda o alvo das próximas
-        self.tabelas = [t for t in self.corpo.iter(W + "tbl")]
-        self.usa_para_id = any(pid.startswith("p:") and not pid.startswith("p:n") for pid in self.ids)
+        self.para_ids = {p.get(PARA_ID) for p in self.corpo.iter(W + "p") if p.get(PARA_ID)}
+        self.usa_para_id = bool(self.para_ids)
         self.tocados: set = set()  # elementos (o set mantém os proxies vivos)
         self.crescimento = 0
         self.avisos: list[str] = []
@@ -241,6 +293,14 @@ class _Editor:
     def _parte_comentarios(self):
         alvo = next((a for t, a in self.pk.rels(self.documento).values() if t == "comments"), None)
         return [alvo] if alvo in self.pk.partes else []
+
+    def novo_para_id(self) -> str:
+        """paraId novo, único no documento e abaixo de 0x80000000, como o Word exige."""
+        while True:
+            pid = f"{random.randrange(1, 0x80000000):08X}"
+            if pid not in self.para_ids:
+                self.para_ids.add(pid)
+                return pid
 
     def novo_id(self) -> str:
         self._proximo_id += 1
@@ -272,9 +332,11 @@ class _Editor:
         self.tocados.add(p)
         self.pk.tocar(self.documento)
 
-    def crescer(self, antes: str, depois: str):
-        self.crescimento += max(0, len(depois) - len(antes))
-        if len(depois) > PARAGRAFO_MAX or self.crescimento > CRESCIMENTO_MAX:
+    def crescer(self, antes: str | int, depois: str | int):
+        """Confere o tamanho do parágrafo resultante e o crescimento do pedido (aceita textos ou tamanhos)."""
+        antes, depois = (x if isinstance(x, int) else len(x) for x in (antes, depois))
+        self.crescimento += max(0, depois - antes)
+        if depois > PARAGRAFO_MAX or self.crescimento > CRESCIMENTO_MAX:
             raise OperacaoInvalida("texto-grande", "o texto resultante passa do limite de tamanho do documento")
 
     def revisao(self, op) -> dict | None:
@@ -295,44 +357,41 @@ class _Editor:
         return etree.Element(W + nome, {W + "id": self.novo_id(), W + "author": rev["autor"], W + "date": self.agora})
 
 
-def _atomizar(p):
-    """Divide os runs do parágrafo em runs de um conteúdo só (um w:t, um w:tab…), cada um com cópia do rPr. A
-    formatação não muda; só assim um trecho pode ser cortado em qualquer caractere sem perder a dos vizinhos."""
-    for r in list(_runs(p)):
-        rpr = r.find("w:rPr", NS)
-        conteudo = [x for x in r if x is not rpr]
-        if len(conteudo) <= 1 and not (conteudo and conteudo[0].tag == W + "t" and len(conteudo[0].text or "") > 1):
+def _dividir(r, o: int):
+    """Corta o run no deslocamento `o` (em unidades de _unidade) e devolve o run novo com o resto, logo depois dele.
+    O run novo leva cópia do rPr: a formatação dos dois lados não muda."""
+    rpr = r.find("w:rPr", NS)
+    filhos = [x for x in r if x is not rpr]
+    acumulado, corte = 0, None
+    for k, x in enumerate(filhos):
+        tamanho = len(_unidade(x))
+        if acumulado + tamanho <= o:
+            acumulado += tamanho
             continue
-        anterior = r
-        for x in conteudo:
-            if x.tag == W + "t":
-                pedacos = list(x.text or "") or [""]
-            else:
-                pedacos = [None]
-            for ch in pedacos:
-                novo = etree.Element(W + "r", r.attrib)
-                if rpr is not None:
-                    novo.append(copy.deepcopy(rpr))
-                if ch is None:
-                    novo.append(copy.deepcopy(x))
-                else:
-                    t = etree.SubElement(novo, W + "t")
-                    t.text = ch
-                    if ch.isspace():
-                        t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-                anterior.addnext(novo)
-                anterior = novo
-        r.getparent().remove(r)
-
-
-def _juntar(p):
-    """Junta de volta runs vizinhos de um caractere com o mesmo rPr e o mesmo pai (desfaz o _atomizar)."""
-    for pai in list(dict.fromkeys(r.getparent() for r in _runs(p))):
-        _juntar_filhos(pai, W + "t")
+        if acumulado < o:  # o corte cai dentro deste w:t
+            resto = etree.Element(W + "t")
+            resto.text = x.text[o - acumulado :]
+            x.text = x.text[: o - acumulado]
+            for t in (x, resto):
+                if t.text != t.text.strip():
+                    t.set(XML_SPACE, "preserve")
+            x.addnext(resto)
+            filhos.insert(k + 1, resto)
+            corte = k + 1
+        else:
+            corte = k
+        break
+    novo = etree.Element(W + "r", r.attrib)
+    if rpr is not None:
+        novo.append(copy.deepcopy(rpr))
+    for x in filhos[corte:] if corte is not None else []:
+        novo.append(x)
+    r.addnext(novo)
+    return novo
 
 
 def _juntar_filhos(pai, tag):
-    """Junta runs vizinhos de `pai` que só têm um `tag` (w:t ou w:delText) e o mesmo rPr."""
+    """Junta runs vizinhos de `pai` que só têm um `tag` (w:delText) e o mesmo rPr."""
     anterior = None
     for r in list(pai):
         if r.tag != W + "r" or len([x for x in r if x.tag != W + "rPr"]) != 1 or r.find(tag) is None:
@@ -342,7 +401,7 @@ def _juntar_filhos(pai, tag):
             ta, tb = anterior.find(tag), r.find(tag)
             ta.text = (ta.text or "") + (tb.text or "")
             if ta.text != ta.text.strip():
-                ta.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                ta.set(XML_SPACE, "preserve")
             pai.remove(r)
         else:
             anterior = r
@@ -369,7 +428,7 @@ def _run(texto: str, rpr) -> list:
         else:
             t = etree.SubElement(r, W + "t")
             t.text = trecho
-            t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            t.set(XML_SPACE, "preserve")
         runs.append(r)
     return runs
 
@@ -425,25 +484,29 @@ def _op_texto(ed: _Editor, op, rel):
     texto = campo_texto(op)
     if "\n" in texto:
         raise OperacaoInvalida(
-            "operacao-invalida", "texto é um parágrafo: use \\v para quebra de linha", alvo=op["alvo"]
+            "operacao-invalida", "texto é um parágrafo: use \\v para quebra de linha", alvo=op.get("alvo")
         )
     p = ed.paragrafo(op.get("alvo"))
     atual = _texto(p)
     conferir(op, atual, op["alvo"])
     if OBJETO in _texto(p, com_objetos=True):
         raise OperacaoInvalida(
-            "operacao-invalida", f"{op['alvo']} tem imagem, campo ou nota: use substituir no trecho", alvo=op["alvo"]
+            "operacao-invalida",
+            f"{op['alvo']} tem imagem, campo, nota ou caixa de texto: use substituir no trecho",
+            alvo=op["alvo"],
+        )
+    if p.find("w:sdt", NS) is not None:
+        raise OperacaoInvalida(
+            "operacao-invalida", f"{op['alvo']} tem controle de conteúdo: use substituir no trecho", alvo=op["alvo"]
         )
     ed.tocar_texto(p, op["alvo"])
     ed.crescer(atual, texto)
     rev = ed.revisao(op)
     runs = list(_runs(p))
-    rpr = _rpr_limpo(runs[0]) if runs else _rpr_limpo(p.find("w:pPr", NS))
-    if rpr is not None and rpr.tag != W + "rPr":
-        rpr.tag = W + "rPr"
+    rpr = _rpr_limpo(runs[0]) if runs else None
     if rev is None:  # links e smartTags somem junto: o parágrafo vira um texto só, com a formatação do começo
         for el in list(p):
-            if etree.QName(el).localname in ("r", "hyperlink", "smartTag", "fldSimple", "proofErr", "customXml"):
+            if etree.QName(el).localname in ("r", "hyperlink", "smartTag", "proofErr", "customXml"):
                 p.remove(el)
         _incluir(ed, None, texto, rpr, None, pai=p)
     else:
@@ -463,53 +526,81 @@ def _op_substituir(ed: _Editor, op, rel):
     alvo = op.get("alvo")
     paragrafos = [ed.paragrafo(alvo)] if alvo is not None else list(_paragrafos(ed.corpo))
     rev = ed.revisao(op)
-    trocas, ignorados = 0, []
+    trocas, ignoradas = 0, 0
     for p in paragrafos:
         if busca not in _texto(p):
             continue
         if alvo is None and (_revisoes(p) or p in ed.tocados):
-            ignorados.append(p)
+            ignoradas += 1
             continue
         ed.tocar_texto(p, alvo or "documento")
-        _atomizar(p)
-        n = _trocar_no_paragrafo(ed, p, busca, troca, rev)
-        _juntar(p)
-        if n == 0:
-            ignorados.append(p)
-        trocas += n
-    if ignorados:
+        feitas, puladas = _trocar_no_paragrafo(ed, p, busca, troca, rev, TROCAS_MAX - trocas)
+        trocas += feitas
+        ignoradas += puladas
+    if ignoradas:
         ed.avisos.append(
-            f"{len(ignorados)} parágrafo(s) com '{busca[:40]}' não trocado(s): o trecho atravessa imagem, campo, link "
-            "ou revisão pendente"
+            f"{ignoradas} ocorrência(s) de '{busca[:40]}' não trocada(s): atravessa imagem, campo, link, controle de "
+            "conteúdo ou revisão pendente"
         )
     if trocas == 0:
         raise OperacaoInvalida("conflito", f"{busca[:60]!r} não aparece onde dá para trocar", alvo=alvo)
     rel.update(trocas=trocas, partes=["/" + ed.documento])
 
 
-def _trocar_no_paragrafo(ed: _Editor, p, busca: str, troca: str, rev) -> int:
-    """Troca cada ocorrência que fica dentro de um mesmo pai (parágrafo, link…) e não atravessa objeto."""
-    trocas, inicio = 0, 0
-    while True:
-        dono = [r for r in _runs(p) for _ in _texto_run(r)]  # o run de cada caractere visível
-        texto = "".join(_texto_run(r) for r in _runs(p))
-        k = texto.find(busca, inicio)
-        if k < 0:
-            return trocas
-        trecho = list(dict.fromkeys(dono[k : k + len(busca)]))
-        if len({r.getparent() for r in trecho}) != 1 or OBJETO in busca or OBJETO in texto[k : k + len(busca)]:
-            inicio = k + 1
-            continue
-        ed.crescer(texto, texto[:k] + troca + texto[k + len(busca) :])
-        rpr = _rpr_limpo(trecho[0])
+def _trocar_no_paragrafo(ed: _Editor, p, busca: str, troca: str, rev, restantes: int) -> tuple[int, int]:
+    """Troca as ocorrências que ficam dentro de um mesmo pai (parágrafo, link, controle…) sem atravessar objeto.
+    Uma passada: acha todas, corta só os runs das pontas e aplica do fim para o começo (as posições de trás não mudam).
+    Devolve (trocadas, puladas)."""
+    conteudo = _conteudo(p)
+    texto = "".join(t for _, t in conteudo)
+    if len(texto) > PARAGRAFO_MAX:
+        raise OperacaoInvalida("texto-grande", "parágrafo grande demais para substituir; use texto")
+    posicoes, k = [], texto.find(busca)
+    while k >= 0:
+        posicoes.append(k)
+        k = texto.find(busca, k + len(busca))
+    validas = []
+    spans, inicio = [], 0
+    for r, t in conteudo:
+        spans.append([inicio, inicio + len(t), r])
+        inicio += len(t)
+    comecos = [x[0] for x in spans]
+
+    def indice(pos):  # o span que contém o caractere `pos` (o último com começo <= pos; spans vazios ficam antes)
+        return bisect.bisect_right(comecos, pos) - 1
+
+    for k in posicoes:
+        fim = k + len(busca)
+        donos = [spans[x][2] for x in range(indice(k), indice(fim - 1) + 1) if spans[x][1] > spans[x][0]]
+        if OBJETO not in texto[k:fim] and len({r.getparent() for r in donos}) == 1:
+            validas.append(k)
+    if len(validas) > restantes:
+        raise OperacaoInvalida(
+            "operacao-invalida", f"mais de {TROCAS_MAX} ocorrências numa operação; seja mais específico"
+        )
+    ed.crescer(len(texto), len(texto) + len(validas) * (len(troca) - len(busca)))
+    for k in reversed(validas):
+        fim = k + len(busca)
+        i, j = indice(fim - 1), indice(k)
+        if fim < spans[i][1]:  # corta o resto do último run (fica fora da troca)
+            _dividir(spans[i][2], fim - spans[i][0])
+            spans[i][1] = fim
+        if k > spans[j][0]:  # corta o começo do primeiro run (fica fora da troca)
+            cauda = _dividir(spans[j][2], k - spans[j][0])
+            spans.insert(j + 1, [k, spans[j][1], cauda])
+            comecos.insert(j + 1, k)
+            spans[j][1] = k
+            i, j = i + 1, j + 1
+        trecho = [spans[x][2] for x in range(j, i + 1)]
+        modelo = next((r for r in trecho if _texto_run(r)), trecho[0])
+        rpr = _rpr_limpo(modelo)
         if rev is None:
             for novo in _run(troca, rpr):
                 trecho[0].addprevious(novo)
             _excluir(ed, trecho, None)
         else:
             _incluir(ed, _excluir(ed, trecho, rev), troca, rpr, rev)  # logo depois do w:del
-        trocas += 1
-        inicio = k + len(troca)
+    return len(validas), len(posicoes) - len(validas)
 
 
 def _op_estilo(ed: _Editor, op, rel):
@@ -580,7 +671,7 @@ def _op_inserir(ed: _Editor, op, rel):
         novo.append(ppr)
     _incluir(ed, None, texto, rpr, rev, pai=novo)
     if ed.usa_para_id:
-        novo.set(PARA_ID, f"{(int(ed.novo_id()) * 2654435761) % 0x7FFFFFFF:08X}")
+        novo.set(PARA_ID, ed.novo_para_id())
     p.addnext(novo)
     ed.tocados.add(novo)
     ed.pk.tocar(ed.documento)
@@ -592,8 +683,12 @@ def _op_inserir(ed: _Editor, op, rel):
 def _op_remover(ed: _Editor, op, rel):
     p = ed.paragrafo(op.get("alvo"))
     pai = p.getparent()
-    if len(pai.findall("w:p", NS)) == 1 and etree.QName(pai).localname in ("body", "tc"):
+    blocos = [e for e in pai if etree.QName(e).localname in ("p", "tbl", "sdt", "customXml")]
+    if etree.QName(pai).localname in ("body", "tc") and len(pai.findall("w:p", NS)) == 1:
         raise OperacaoInvalida("operacao-invalida", f"{op['alvo']} é o único parágrafo do bloco", alvo=op["alvo"])
+    if blocos[-1] is p and len(blocos) > 1 and etree.QName(blocos[-2]).localname == "tbl":
+        # célula e corpo precisam terminar em parágrafo: sem ele, o Word repara o arquivo
+        raise OperacaoInvalida("operacao-invalida", f"{op['alvo']} é o parágrafo que fecha uma tabela", alvo=op["alvo"])
     if p.find("w:pPr/w:sectPr", NS) is not None:
         raise OperacaoInvalida("operacao-invalida", f"{op['alvo']} fecha uma seção do documento", alvo=op["alvo"])
     if any(el.tag in (W + "commentRangeStart", W + "commentReference") for el in p.iter()):
@@ -605,7 +700,7 @@ def _op_remover(ed: _Editor, op, rel):
     if rev is None:
         pai.remove(p)
     else:
-        _excluir(ed, list(_runs(p)), rev)
+        _excluir(ed, list(_runs(p, campos=True)), rev)  # os runs de dentro de campo simples também
         ppr = p.find("w:pPr", NS)
         if ppr is None:
             ppr = etree.Element(W + "pPr")
@@ -687,7 +782,12 @@ OPERACOES = {
 
 def aplicar(dados: bytes, operacoes: list[dict]) -> tuple[bytes, list[dict], list[str]]:
     """Tudo ou nada: aplica as operações em ordem; a primeira que falha cancela todas."""
-    ed = _Editor(dados)
+    try:
+        ed = _Editor(dados)
+    except (KeyError, IndexError, ValueError, TypeError, AttributeError) as e:
+        if isinstance(e, (OperacaoInvalida, DocumentoRecusado)):
+            raise
+        raise OperacaoInvalida("operacao-invalida", f"DOCX fora do esperado ({type(e).__name__})") from None
     relatorio = []
     for k, op in enumerate(operacoes):
         if not isinstance(op, dict) or op.get("op") not in OPERACOES:

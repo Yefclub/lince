@@ -226,15 +226,182 @@ def test_substituir_contorna_imagem_e_link(contrato):
     def com_link(x):
         return x.replace(
             b"<w:t>Fim.</w:t></w:r>",
-            b'<w:t>Fim.</w:t></w:r><w:hyperlink w:anchor="x"><w:r><w:t xml:space="preserve"> Ver anexo</w:t></w:r>'
-            b"</w:hyperlink>",
+            b'<w:t>Fim.</w:t></w:r><w:r><w:drawing/></w:r><w:r><w:t xml:space="preserve"> anexo</w:t></w:r>'
+            b'<w:hyperlink w:anchor="x"><w:r><w:t xml:space="preserve"> Ver anexo</w:t></w:r></w:hyperlink>',
         )
 
     dados = _trocar_xml(contrato, com_link)
     novo, _ = codigo.editar(  # dentro do link: troca e o link continua
         dados, "c.docx", [{"op": "substituir", "buscar": "anexo", "trocar": "apêndice", "revisao": False}]
     )
-    assert '<w:hyperlink w:anchor="x">' in _xml(novo) and "apêndice" in _xml(novo)
+    xml = _xml(novo)
+    assert '<w:hyperlink w:anchor="x">' in xml and xml.count("apêndice") == 2 and "<w:drawing/>" in xml
+    with pytest.raises(OperacaoInvalida) as e:  # atravessa a imagem: não troca
+        codigo.editar(dados, "c.docx", [{"op": "substituir", "buscar": "Fim. anexo", "trocar": "x"}])
+    assert e.value.codigo == "conflito"
     with pytest.raises(OperacaoInvalida) as e:  # cruza a borda do link: não troca
         codigo.editar(dados, "c.docx", [{"op": "substituir", "buscar": "Fim. Ver", "trocar": "x"}])
     assert e.value.codigo == "conflito"
+
+
+def _com_paragrafos(dados, *paragrafos: bytes) -> bytes:
+    """Acrescenta parágrafos em XML cru antes do sectPr do corpo (o último elemento do documento)."""
+
+    def troca(x):
+        k = x.rindex(b"<w:sectPr")
+        return x[:k] + b"".join(paragrafos) + x[k:]
+
+    return _trocar_xml(dados, troca)
+
+
+CAMPO_SIMPLES = (
+    '<w:p><w:r><w:t xml:space="preserve">Página </w:t></w:r><w:fldSimple w:instr="PAGE"><w:r><w:t>3</w:t></w:r>'
+    "</w:fldSimple></w:p>"
+).encode()
+CAMPO_COMPLEXO = (
+    b'<w:p><w:r><w:t xml:space="preserve">Data: </w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+    b'<w:r><w:instrText xml:space="preserve"> DATE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+    b'<w:r><w:t>06/11/2026</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>'
+)
+CAIXA = (
+    b'<w:p><w:r><w:t xml:space="preserve">Veja </w:t></w:r><w:r><mc:AlternateContent><mc:Choice Requires="wps">'
+    b"<w:drawing/></mc:Choice><mc:Fallback><w:pict/></mc:Fallback></mc:AlternateContent></w:r></w:p>"
+)
+CONTROLE = (
+    b'<w:p><w:r><w:t xml:space="preserve">Nome: </w:t></w:r><w:sdt><w:sdtPr><w:tag w:val="nome"/></w:sdtPr>'
+    b"<w:sdtContent><w:r><w:t>Fulano</w:t></w:r></w:sdtContent></w:sdt></w:p>"
+)
+
+
+def test_campos_caixas_e_controles_nunca_sao_apagados(contrato):
+    dados = _com_paragrafos(contrato, CAMPO_SIMPLES, CAMPO_COMPLEXO, CAIXA, CONTROLE)
+    ps = _paragrafos(docx.extrair(dados))[-4:]
+    assert [p["texto"] for p in ps] == ["Página ", "Data: ", "Veja ", "Nome: Fulano"]
+    assert [bool(p.get("objetos")) for p in ps] == [True, True, True, False] and ps[3]["controles"]
+    for p in ps:
+        for revisao in (True, False):
+            with pytest.raises(OperacaoInvalida) as e:
+                codigo.editar(dados, "c.docx", [{"op": "texto", "alvo": p["id"], "texto": "x", "revisao": revisao}])
+            assert e.value.codigo == "operacao-invalida"
+    with pytest.raises(OperacaoInvalida):  # o resultado do campo é do Word: trocar ali não duraria
+        codigo.editar(dados, "c.docx", [{"op": "substituir", "alvo": ps[1]["id"], "buscar": "2026", "trocar": "x"}])
+    novo, rel = codigo.editar(
+        dados,
+        "c.docx",
+        [
+            {"op": "substituir", "alvo": ps[3]["id"], "buscar": "Fulano", "trocar": "Beltrano", "revisao": False},
+            {"op": "substituir", "alvo": ps[0]["id"], "buscar": "Página", "trocar": "Folha", "revisao": False},
+        ],
+    )
+    xml = _xml(novo)
+    assert '<w:sdtContent><w:r><w:t xml:space="preserve">Beltrano</w:t></w:r></w:sdtContent>' in xml
+    assert '<w:fldSimple w:instr="PAGE"><w:r><w:t>3</w:t></w:r></w:fldSimple>' in xml
+    assert "<mc:AlternateContent>" in xml and 'fldCharType="begin"' in xml
+
+
+def test_remover_com_revisao_mantem_o_campo_simples_marcado(contrato):
+    dados = _com_paragrafos(contrato, CAMPO_SIMPLES)
+    alvo = _paragrafos(docx.extrair(dados))[-1]["id"]
+    novo, _ = codigo.editar(dados, "c.docx", [{"op": "remover_paragrafo", "alvo": alvo}])
+    assert re.search(r'<w:fldSimple w:instr="PAGE"><w:del [^>]*><w:r><w:delText>3</w:delText>', _xml(novo))
+    assert docx.integridade(novo) == []
+
+
+def test_formatacao_pendente_tambem_e_revisao(contrato):
+    pendente = (
+        b'<w:p><w:r><w:rPr><w:b/><w:rPrChange w:id="900" w:author="Ana" w:date="2026-01-01T00:00:00Z"><w:rPr/>'
+        b"</w:rPrChange></w:rPr><w:t>Negrito proposto</w:t></w:r></w:p>"
+    )
+    dados = _com_paragrafos(contrato, pendente)
+    c = docx.extrair(dados)
+    p = _paragrafos(c)[-1]
+    assert p["revisoes"] and c["revisoes"] == 1
+    for op in (
+        {"op": "texto", "alvo": p["id"], "texto": "x", "revisao": False},
+        {"op": "substituir", "alvo": p["id"], "buscar": "Negrito", "trocar": "x"},
+    ):
+        with pytest.raises(OperacaoInvalida) as e:
+            codigo.editar(dados, "c.docx", [op])
+        assert e.value.codigo == "revisoes-pendentes"
+
+
+def test_corte_no_meio_de_run_com_varios_filhos_preserva_o_resto(contrato):
+    misto = (
+        b'<w:p><w:r><w:rPr><w:i/></w:rPr><w:t>Prazo</w:t><w:tab/><w:t xml:space="preserve">30 dias </w:t>'
+        b"<w:lastRenderedPageBreak/><w:t>fim</w:t></w:r></w:p>"
+    )
+    dados = _com_paragrafos(contrato, misto)
+    alvo = _paragrafos(docx.extrair(dados))[-1]["id"]
+    for revisao in (False, True):
+        novo, rel = codigo.editar(
+            dados, "c.docx", [{"op": "substituir", "alvo": alvo, "buscar": "30", "trocar": "45", "revisao": revisao}]
+        )
+        assert _texto(rel["codigo"], alvo) == "Prazo\t45 dias fim"
+        xml = _xml(novo)
+        assert "<w:tab/>" in xml and "<w:lastRenderedPageBreak/>" in xml
+        assert re.search(r"<w:r><w:rPr><w:i/></w:rPr><w:t[^>]*> dias </w:t>", xml)  # o resto continua itálico
+
+
+def test_substituir_muitas_vezes_e_linear_e_tem_teto(contrato):
+    import time
+
+    d = Document()
+    d.add_paragraph("a " * 9_000)
+    dados = _salvar(d)
+    alvo = _paragrafos(docx.extrair(dados))[0]["id"]
+    inicio = time.monotonic()
+    _, rel = codigo.editar(dados, "c.docx", [{"op": "substituir", "alvo": alvo, "buscar": "a", "trocar": "b"}])
+    assert rel["aplicadas"][0]["trocas"] == 9_000 and time.monotonic() - inicio < 10
+    d = Document()
+    d.add_paragraph("a " * 11_000)
+    with pytest.raises(OperacaoInvalida) as e:
+        codigo.editar(_salvar(d), "c.docx", [{"op": "substituir", "buscar": "a", "trocar": "b"}])
+    assert "ocorrências" in str(e.value)
+    with pytest.raises(OperacaoInvalida) as e:
+        codigo.editar(dados, "c.docx", [{"op": "texto", "alvo": alvo, "texto": "x" * 100_001}])
+    assert e.value.codigo == "texto-grande"
+
+
+def test_remover_recusa_o_que_quebraria_o_documento(contrato):
+    d = Document(io.BytesIO(contrato))
+    d.add_section()  # o parágrafo antes da quebra de seção carrega o sectPr
+    celula = d.tables[0].cell(0, 0)
+    celula.add_table(1, 1)
+    celula.paragraphs[-1].text = "Depois da tabela"  # o parágrafo que o python-docx põe depois da tabela
+    dados = _salvar(d)
+    c = docx.extrair(dados)
+    ids = [p["id"] for p in _paragrafos(c)]
+    comentado, _ = codigo.editar(dados, "c.docx", [{"op": "comentar", "alvo": ids[1], "texto": "ok"}])
+
+    def erro(op, base=dados):
+        with pytest.raises(OperacaoInvalida) as e:
+            codigo.editar(base, "c.docx", [op])
+        return str(e.value)
+
+    secao = c["blocos"][-1]["id"]  # o parágrafo vazio que o python-docx cria com o sectPr
+    assert "seção" in erro({"op": "remover_paragrafo", "alvo": secao, "revisao": False})
+    assert "comentário" in erro({"op": "remover_paragrafo", "alvo": ids[1]}, comentado)
+    fecha = next(p["id"] for p in _paragrafos(c) if p["texto"] == "Depois da tabela")
+    assert "fecha uma tabela" in erro({"op": "remover_paragrafo", "alvo": fecha, "revisao": False})
+
+
+def test_pacote_que_nao_e_docx_e_recusado_sem_erro_interno(contrato):
+    saida = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(contrato)) as o, zipfile.ZipFile(saida, "w") as z:
+        for i in o.infolist():
+            if i.filename != "_rels/.rels":
+                z.writestr(i, o.read(i))
+    with pytest.raises(OperacaoInvalida) as e:
+        codigo.editar(saida.getvalue(), "c.docx", [{"op": "texto", "alvo": "p:n0", "texto": "x"}])
+    assert e.value.codigo == "operacao-invalida"
+
+
+def test_paragrafo_dentro_de_customxml_aparece_na_leitura(contrato):
+    def envolver(x):
+        return x.replace(
+            b"<w:p><w:r><w:t>Fim.</w:t></w:r></w:p>",
+            b'<w:customXml w:element="x"><w:p><w:r><w:t>Fim.</w:t></w:r></w:p></w:customXml>',
+        )
+
+    c = docx.extrair(_trocar_xml(contrato, envolver))
+    assert c["blocos"][-1]["texto"] == "Fim."
