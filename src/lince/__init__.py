@@ -11,12 +11,13 @@ metadados corporativos e proteção contra texto oculto e prompt injection.
 
 from .cache import CacheDisco, CacheMemoria
 from .leitor import VERSAO as __version__
-from .leitor import Leitor, ler
+from .leitor import FormatoNaoSuportado, Leitor, ler
 from .provedores import FuncaoLeitor, LeitorVisual, OpenAICompativel
 from .tipos import Cobertura, RespostaIA, Resultado, Uso
 
 __all__ = [
     "Leitor",
+    "FormatoNaoSuportado",
     "ler",
     "OpenAICompativel",
     "FuncaoLeitor",

@@ -462,7 +462,7 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None) -> Starl
                     raise Problema(
                         400, "extensao-ausente", "Todo arquivo precisa de nome com extensão", a.filename or ""
                     )
-                if ext not in FORMATOS:  # recusa já, sem gastar upload, vaga nem fila com o que não seria lido
+                if ext not in FORMATOS:  # recusa antes da fila: nada é copiado, varrido nem lido, e as vagas voltam
                     raise Problema(
                         415,
                         "formato-nao-suportado",

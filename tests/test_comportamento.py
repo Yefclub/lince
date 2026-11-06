@@ -82,6 +82,21 @@ def test_texto_oculto_do_word_sai_do_corpo(tmp_path):
     assert r.alertas_injecao
 
 
+def test_formato_vem_do_conteudo_quando_a_extensao_nao_diz(tmp_path, pdf_tres_paginas):
+    d = Document()
+    d.add_paragraph("Contrato de fornecimento de soja.")
+    sem_extensao = tmp_path / "anexo"
+    d.save(sem_extensao)
+    assert "fornecimento de soja" in lince.ler(sem_extensao).markdown
+    pdf = tmp_path / "relatorio.bin"
+    pdf.write_bytes(open(pdf_tres_paginas, "rb").read())
+    assert lince.ler(pdf).cobertura.rotas == lince.ler(pdf_tres_paginas).cobertura.rotas != {}  # roteado como PDF
+    html = tmp_path / "pagina.html"
+    html.write_text("<p>oi</p>")
+    with pytest.raises(lince.FormatoNaoSuportado):
+        lince.ler(html)
+
+
 def test_documento_sem_injecao_nao_gera_alerta(tmp_path):
     p = tmp_path / "limpo.pdf"
     _pdf(p, ["Relatório mensal de produção.\nA unidade processou 1.200 t/dia."])

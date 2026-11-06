@@ -9,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
+import anydoc
+
 from ._trava import PDFIUM
 from .agrupamento import agrupar, distribuir_lotes
 from .cache import Cache, chave
@@ -30,10 +32,14 @@ OFFICE = {  # lidos pelo anydoc (com gráficos, fluxogramas e imagens à parte)
     ".pptx",
     ".pptm",
     ".ppsx",
+    ".ppsm",
     ".ppt",
+    ".pps",
+    ".pot",
     ".xlsx",
     ".xlsm",
     ".xls",
+    ".xlsb",
     ".odt",
     ".ods",
     ".odp",
@@ -45,8 +51,8 @@ OFFICE = {  # lidos pelo anydoc (com gráficos, fluxogramas e imagens à parte)
 FORMATOS = frozenset({".pdf"} | IMAGEM | TEXTO | OFFICE)  # o que o Lince lê; a API recusa o resto com 415
 
 
-class FormatoNaoSuportado(ValueError):
-    pass
+class FormatoNaoSuportado(anydoc.UnsupportedError):
+    """Formato que o Lince não lê. É um `anydoc.ConvertError`, como as demais falhas de conversão."""
 
 
 try:  # a versão vem do pacote instalado (pyproject), carimbada pelos workflows de versão
@@ -87,19 +93,17 @@ class Leitor:
 
     def _planejar(self, caminho, pasta):
         os.makedirs(f"{pasta}/ia", exist_ok=True)
-        ext = os.path.splitext(caminho)[1].lower()
+        ext = _extensao_lida(caminho)
         if ext == ".pdf":
             plano = planejar_pdf(caminho, pasta)
         elif ext in IMAGEM:
             plano = _plano_imagem(caminho, pasta)
         elif ext in TEXTO:
             plano = {"tipo": "texto", "md": _texto(caminho), "tarefas": []}
-        elif ext in OFFICE:
+        else:
             if zipfile.is_zipfile(caminho):  # Office, ODF, EPUB: conferido antes de qualquer descompactação
                 conferir_zip(caminho)
             plano = planejar_office(caminho, pasta)
-        else:
-            raise FormatoNaoSuportado(f"formato {ext or '(sem extensão)'} não suportado")
         plano["arquivo"] = os.path.basename(caminho)
         plano["meta_arquivo"] = metadados_arquivo(caminho)
         if plano.get("ilegiveis"):
@@ -256,6 +260,21 @@ def _recortes_ampliados(doc, t, io):
 
 def _precisa_rever(txt):
     return (not txt.strip()) or "[ilegível]" in txt or "[illegible]" in txt or txt.count("≈") >= 2
+
+
+def _extensao_lida(caminho: str) -> str:
+    """A extensão que decide a leitura. Fora da lista, o conteúdo decide (marcador do formato: PDF, RTF, OLE, pacote
+    Office ou ODF); sem marcador conhecido, o formato não é suportado."""
+    ext = os.path.splitext(caminho)[1].lower()
+    if ext in FORMATOS:
+        return ext
+    if zipfile.is_zipfile(caminho):  # a detecção abre o pacote: conferido antes de qualquer descompactação
+        conferir_zip(caminho)
+    with open(caminho, "rb") as f:
+        detectado = anydoc.format_from_bytes(f.read())
+    if detectado is None:
+        raise FormatoNaoSuportado(f"formato {ext or '(sem extensão)'} não suportado")
+    return f".{detectado}"
 
 
 def ler(caminho: str | Path, **opcoes) -> Resultado:
