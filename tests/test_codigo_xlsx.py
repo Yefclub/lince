@@ -71,8 +71,8 @@ def test_celulas_e_intervalo_mudam_so_a_aba_e_o_excel_recalcula(planilha):
         ],
     )
     assert rel["diff"]["partes_alteradas"] == ["/xl/workbook.xml", "/xl/worksheets/sheet1.xml"]
-    assert 'fullCalcOnLoad="1"' in _parte(novo, "xl/workbook.xml")
-    assert rel["avisos"]  # os valores calculados no código são os antigos até alguém abrir
+    assert any("recalcula" in a for a in rel["avisos"])  # os valores calculados no código são os antigos
+    assert any("abaixo da tabela TabFretes" in a for a in rel["avisos"])  # a linha 5 não entra na tabela sozinha
     wb = openpyxl.load_workbook(io.BytesIO(novo))
     assert [c.value for c in wb["Fretes"][5][:3]] == ["MS-PR", 80, 33.0]
     assert wb["Fretes"]["B3"].value == 250 and wb["Fretes"]["E2"].value == "=SUM(B2:B5)"
@@ -139,3 +139,195 @@ def test_recusas_explicam_o_motivo(planilha):
     assert erro({"op": "celula", "alvo": "Fretes!A11", "valor": float("nan")})[0] == "operacao-invalida"
     assert erro({"op": "renomear_aba", "aba": "Fretes", "nome": "resumo"})[0] == "conflito"
     assert erro({"op": "renomear_aba", "aba": "Fretes", "nome": "a/b"})[0] == "operacao-invalida"
+
+
+# ------------------------------------------------------------------ pacote escrito à mão, no formato do Excel
+LIVRO = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">{pr}<sheets>
+<sheet name="Dados" sheetId="1" r:id="rId1"/><sheet name="O'Neil" sheetId="2" r:id="rId2"/>
+<sheet name="Grafico" sheetId="3" r:id="rId3"/></sheets>
+<definedNames><definedName name="Total">Dados!$B$2:$B$3</definedName>
+<definedName name="Tres">'Dados:O''Neil'!$A$1</definedName></definedNames>{calc}</workbook>"""
+ABA_DADOS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+ xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"
+ xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><dimension ref="A1:D5"/>
+<cols><col min="4" max="4" width="12" style="1" customWidth="1"/></cols><sheetData>
+<row r="1" spans="1:4"><c r="A1" t="s"><v>0</v></c><c r="C1"><v>5</v></c></row>
+<row r="2" spans="1:4"><c r="B2"><v>10</v></c><c r="C2"><f t="shared" ref="C2:C3" si="0">B2*2</f><v>20</v></c></row>
+<row r="3" spans="1:4"><c r="B3"><v>4</v></c><c r="C3"><f t="shared" si="0"/><v>8</v></c></row>
+<row r="4"><c r="A4"><f t="array" ref="A4:B4">B2:B3*1</f><v>10</v></c><c r="C4" s="1"><v>46332</v></c>
+<c r="D4" vm="1"><v>#VALUE!</v></c></row>
+<row r="5"><c r="A5"><f>SUM(Dados!B2:B3)  +  'O''Neil'!A1</f><v>15</v></c><c r="B5" t="d"><v>2026-11-06</v></c></row>
+</sheetData><hyperlinks><hyperlink ref="A1" location="'O''Neil'!A1" display="ir"/></hyperlinks>
+<extLst><ext uri="{CCE6A557-97BC-4b89-ADB6-D9C93CAAB3DF}"><x14:dataValidations count="1">
+<x14:dataValidation type="list">
+<x14:formula1><xm:f>'O''Neil'!$A$1:$A$3</xm:f></x14:formula1><xm:sqref>E1</xm:sqref></x14:dataValidation>
+</x14:dataValidations></ext></extLst></worksheet>"""
+ABA_ONEIL = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+<row r="1"><c r="A1"><v>1</v></c></row></sheetData><sheetProtection sheet="1"/></worksheet>"""
+ESTILOS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="2">
+<xf numFmtId="0"/><xf numFmtId="14" applyNumberFormat="1"/></cellXfs></styleSheet>"""
+TEXTOS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1">
+<si><t>Rota</t></si></sst>"""
+CT = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml"
+ ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml"
+ ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+<Override PartName="/xl/worksheets/sheet2.xml"
+ ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+<Override PartName="/xl/chartsheets/sheet1.xml"
+ ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.chartsheet+xml"/>
+</Types>"""
+RAIZ = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1"
+ Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
+ Target="xl/workbook.xml"/>
+</Relationships>"""
+RELS_LIVRO = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+ Target="worksheets/sheet1.xml"/>
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+ Target="worksheets/sheet2.xml"/>
+<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet"
+ Target="chartsheets/sheet1.xml"/>
+<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"
+ Target="styles.xml"/>
+<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings"
+ Target="sharedStrings.xml"/>
+</Relationships>"""
+
+
+def _livro(pr="", calc="", protegido=False):
+    livro = LIVRO.format(pr=pr, calc=calc)
+    if protegido:
+        livro = livro.replace("<sheets>", '<workbookProtection lockStructure="1"/><sheets>')
+    saida = io.BytesIO()
+    with zipfile.ZipFile(saida, "w", zipfile.ZIP_DEFLATED) as z:
+        for nome, conteudo in [
+            ("[Content_Types].xml", CT),
+            ("_rels/.rels", RAIZ),
+            ("xl/workbook.xml", livro),
+            ("xl/_rels/workbook.xml.rels", RELS_LIVRO),
+            ("xl/worksheets/sheet1.xml", ABA_DADOS),
+            ("xl/worksheets/sheet2.xml", ABA_ONEIL),
+            (
+                "xl/chartsheets/sheet1.xml",
+                '<chartsheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>',
+            ),
+            ("xl/styles.xml", ESTILOS),
+            ("xl/sharedStrings.xml", TEXTOS),
+        ]:
+            z.writestr(nome, conteudo)
+    return saida.getvalue()
+
+
+def test_leitura_de_datas_no_formato_do_excel():
+    c = xlsx.extrair(_livro())
+    assert _celula(c, "Dados!C4")["data"] == "2026-11-06"
+    assert _celula(c, "Dados!B5")["data"] == "2026-11-06"  # t="d": data ISO no próprio arquivo
+    c1904 = xlsx.extrair(_livro(pr='<workbookPr date1904="1"/>'))
+    assert _celula(c1904, "Dados!C4")["data"] == "2030-11-07"
+    assert c["abas"][1]["protegida"]
+
+
+def test_renomear_troca_toda_referencia_e_preserva_o_resto():
+    novo, rel = codigo.editar(_livro(), "p.xlsx", [{"op": "renomear_aba", "aba": "O'Neil", "nome": "Vendas 2026"}])
+    aba = _parte(novo, "xl/worksheets/sheet1.xml")
+    assert "<f>SUM(Dados!B2:B3)  +  'Vendas 2026'!A1</f>" in aba  # espaços preservados
+    assert "<xm:f>'Vendas 2026'!$A$1:$A$3</xm:f>" in aba  # validação do Excel 2010+, em extLst
+    assert "location=\"'Vendas 2026'!A1\"" in aba
+    assert "<definedName name=\"Tres\">'Dados:Vendas 2026'!$A$1</definedName>" in _parte(novo, "xl/workbook.xml")
+    assert rel["aplicadas"][0]["referencias"] == 4
+    assert xlsx.integridade(novo) == []
+
+
+def test_renomear_recusa_nome_de_qualquer_aba_e_estrutura_protegida():
+    with pytest.raises(OperacaoInvalida) as e:
+        codigo.editar(_livro(), "p.xlsx", [{"op": "renomear_aba", "aba": "Dados", "nome": "grafico"}])
+    assert e.value.codigo == "conflito"  # aba de gráfico também conta
+    with pytest.raises(OperacaoInvalida) as e:
+        codigo.editar(_livro(protegido=True), "p.xlsx", [{"op": "renomear_aba", "aba": "Dados", "nome": "X"}])
+    assert "protegida" in str(e.value)
+
+
+def test_escrita_respeita_formulas_estilos_e_metadados():
+    novo, rel = codigo.editar(
+        _livro(),
+        "p.xlsx",
+        [
+            {"op": "celula", "alvo": "Dados!B1", "valor": 7},  # entra antes do C1 que já existe
+            {"op": "celula", "alvo": "Dados!D5", "valor": 46000},  # coluna D tem estilo de data
+            {"op": "celula", "alvo": "Dados!D4", "valor": 3},  # tinha vm (valor rico)
+            {"op": "celula", "alvo": "Dados!E2", "formula": "=xlookup(B2,B2:B3,C2:C3)"},
+        ],
+    )
+    aba = _parte(novo, "xl/worksheets/sheet1.xml")
+    assert '<c r="A1" t="s"><v>0</v></c><c r="B1"><v>7</v></c><c r="C1">' in aba
+    assert '<row r="1">' in aba and 'spans="1:4"' in aba  # a linha 1 perdeu o spans; as outras não
+    assert '<c r="D5" s="1"><v>46000</v></c>' in aba
+    assert '<c r="D4"><v>3</v></c>' in aba
+    assert "<f>_xlfn.XLOOKUP(B2,B2:B3,C2:C3)</f>" in aba
+    assert '<calcPr fullCalcOnLoad="1"/></workbook>' in _parte(novo, "xl/workbook.xml").replace("\n", "")
+    assert xlsx.integridade(novo) == []
+
+
+def test_calcpr_entra_na_posicao_do_esquema():
+    novo, _ = codigo.editar(_livro(), "p.xlsx", [{"op": "celula", "alvo": "Dados!B2", "valor": 1}])
+    livro = _parte(novo, "xl/workbook.xml").replace("\n", "")
+    assert livro.index("</definedNames>") < livro.index("<calcPr") < livro.index("</workbook>")
+    novo, _ = codigo.editar(
+        _livro(calc='<calcPr calcId="191029"/>'), "p.xlsx", [{"op": "celula", "alvo": "Dados!B2", "valor": 1}]
+    )
+    assert '<calcPr calcId="191029" fullCalcOnLoad="1"/>' in _parte(novo, "xl/workbook.xml")
+
+
+@pytest.mark.parametrize(
+    ("op", "trecho"),
+    [
+        ({"op": "celula", "alvo": "Dados!B4", "valor": 1}, "fórmula matricial A4:B4"),
+        ({"op": "celula", "alvo": "Dados!C2", "valor": 1}, "origem de uma fórmula compartilhada"),
+        ({"op": "celula", "alvo": "O'Neil!A2", "valor": 1}, "está protegida"),
+        ({"op": "celula", "alvo": "Dados!A9", "formula": "=SOMA(A1)"}, "função desconhecida: SOMA"),
+        ({"op": "celula", "alvo": "Dados!A9", "formula": "=SUM(A1;A2)"}, "vírgula"),
+        ({"op": "celula", "alvo": "Dados!A9", "formula": "=SUM(A1"}, "sem par"),
+        ({"op": "celula", "alvo": "Dados!A9", "formula": "=FILTER(A:A,B:B>1)"}, "matriz dinâmica"),
+        ({"op": "celula", "alvo": "Dados!A9", "valor": 10**400}, "grande demais"),
+        ({"op": "intervalo", "alvo": "Dados!A9", "valores": [["=" + "1+" * 5000 + "1"]]}, "8192"),
+    ],
+)
+def test_escritas_que_quebrariam_o_arquivo_sao_recusadas(op, trecho):
+    with pytest.raises(OperacaoInvalida) as e:
+        codigo.editar(_livro(), "p.xlsx", [op])
+    assert trecho in str(e.value)
+
+
+def test_pacote_fora_do_padrao_e_recusado_sem_erro_interno(planilha):
+    saida = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(planilha)) as o, zipfile.ZipFile(saida, "w") as z:
+        for i in o.infolist():
+            if i.filename != "_rels/.rels":
+                z.writestr(i, o.read(i))
+    with pytest.raises(OperacaoInvalida) as e:
+        codigo.editar(saida.getvalue(), "p.xlsx", [{"op": "celula", "alvo": "Fretes!A1", "valor": 1}])
+    assert e.value.codigo == "operacao-invalida"
+
+
+def test_intervalo_grande_e_linear():
+    import time
+
+    inicio = time.monotonic()
+    _, rel = codigo.editar(
+        _livro(), "p.xlsx", [{"op": "intervalo", "alvo": "Dados!F1", "valores": [[k] for k in range(20_000)]}]
+    )
+    assert rel["aplicadas"][0]["celulas"] == 20_000 and time.monotonic() - inicio < 10

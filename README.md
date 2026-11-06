@@ -149,8 +149,11 @@ Operações do XLSX, escritas direto no XML da aba (o openpyxl perderia imagens 
 | `renomear_aba` | Renomeia a aba e atualiza as referências a ela em fórmulas, nomes, validações e gráficos |
 
 Valor ou fórmula alterada faz o Excel recalcular tudo ao abrir, e por isso os resultados de fórmula no código novo
-ainda são os antigos. Célula dentro de mesclagem, de fórmula matricial, na origem de uma fórmula compartilhada ou no
-cabeçalho de uma tabela é recusada com o motivo.
+ainda são os antigos. A fórmula é conferida antes de entrar: sintaxe, funções conhecidas (em inglês) e o prefixo que
+o Excel exige nas funções novas (`XLOOKUP` vira `_xlfn.XLOOKUP` no arquivo); matriz dinâmica (`FILTER`, `UNIQUE`…)
+é recusada. Também são recusadas com o motivo: célula dentro de mesclagem, de fórmula matricial, na origem de uma
+fórmula compartilhada, no cabeçalho ou na linha de totais de uma tabela, e aba protegida. Renomear recusa nome já
+usado por qualquer aba (inclusive de gráfico) e pasta com a estrutura protegida.
 
 Operações do DOCX, que por padrão entram como **alterações controladas**: quem abre no Word vê o que a IA propôs e
 aceita ou rejeita cada uma. `"revisao": false` aplica direto, e `"revisao": {"autor": "Ana"}` troca o autor (o
