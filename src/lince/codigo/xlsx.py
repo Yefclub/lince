@@ -50,7 +50,9 @@ _XLFN = set(
     PERCENTILE.EXC PERCENTILE.INC PERCENTRANK.EXC PERCENTRANK.INC PERMUTATIONA PHI POISSON.DIST QUARTILE.EXC
     QUARTILE.INC RANK.AVG RANK.EQ RRI SEC SECH SHEET SHEETS SKEW.P STDEV.P STDEV.S SWITCH T.DIST T.DIST.2T T.DIST.RT
     T.INV T.INV.2T T.TEST TEXTJOIN UNICHAR UNICODE VAR.P VAR.S WEIBULL.DIST XLOOKUP XMATCH XOR NETWORKDAYS.INTL
-    WORKDAY.INTL ISO.CEILING""".split()
+    WORKDAY.INTL ISO.CEILING ACOT ACOTH ARABIC BASE Z.TEST IMCOSH IMCOT IMCSC IMCSCH IMSEC IMSECH IMSINH IMTAN MUNIT
+    ENCODEURL FILTERXML WEBSERVICE FORECAST.ETS FORECAST.ETS.CONFINT FORECAST.ETS.SEASONALITY
+    FORECAST.ETS.STAT""".split()
 )
 # Devolvem matriz que se espalha pelas células vizinhas: exigem metadados de matriz dinâmica que não escrevemos
 _MATRIZ_DINAMICA = set(
@@ -436,9 +438,6 @@ class _Editor:
                 "operacao-invalida", f"a edição passou de {EDICAO_PRAZO} s: divida em pedidos menores"
             )
 
-    def nomes_de_abas(self) -> set[str]:
-        return {s.get("name", "").casefold() for s in self.livro.todas()}
-
     def aba(self, nome) -> _Aba:
         for _, n, parte in self.livro.abas():
             if n == nome:
@@ -472,12 +471,85 @@ def _ampliar_dimensao(ws, col, lin):
     dim.set("ref", f"{_letras(c1)}{l1}" + ("" if (c1, l1) == (c2, l2) else f":{_letras(c2)}{l2}"))
 
 
-def _formula(texto: str, alvo: str, abas: set[str]) -> str:
-    """Fórmula pronta para o arquivo, ou recusa com o motivo. Confere a gramática (operando e operador alternados,
-    parênteses e chaves com par e não vazios, separadores no lugar, limites de aninhamento e de argumentos), as
-    funções (em inglês; as do Excel 2010+ ganham o prefixo _xlfn.) e as abas citadas, que precisam existir."""
+class _Contexto:
+    """O que uma fórmula pode citar: abas, nomes definidos e tabelas da pasta (em minúsculas)."""
+
+    def __init__(self, ed):
+        self.abas = {x.get("name", "").casefold() for x in ed.livro.todas()}
+        self.nomes = {
+            (d.get("name") or "").casefold() for d in ed.livro.raiz.findall("s:definedNames/s:definedName", NS)
+        }
+        self.tabelas = set()
+        for parte in ed.pk.partes:
+            if parte.startswith("xl/tables/") and parte.endswith(".xml") and parte not in ed.pk.removidas:
+                t = ed.pk.arvore(parte)
+                self.tabelas |= {(t.get(x) or "").casefold() for x in ("displayName", "name")}
+
+
+_PREFIXO = re.compile(r"(?:'((?:[^']|'')+)'|([^\s!:'\"\[\]()]+(?::[^\s!:'\"\[\]()]+)?))!")
+_CEL = r"\$?[A-Za-z]{1,3}\$?[0-9]{1,7}"
+_AREA = re.compile(rf"{_CEL}(?::{_CEL})?|\$?[A-Za-z]{{1,3}}:\$?[A-Za-z]{{1,3}}|\$?[0-9]{{1,7}}:\$?[0-9]{{1,7}}")
+_PONTA = re.compile(rf"{_CEL}|\$?[A-Za-z]{{1,3}}|\$?[0-9]{{1,7}}")
+_NOME_DEFINIDO = re.compile(r"[A-Za-z_\\][A-Za-z0-9_.\\?]*")
+_ESTRUTURADA = re.compile(r"([A-Za-z_\\][A-Za-z0-9_.\\]*)(\[.*\])")
+
+
+def _dentro_dos_limites(ref: str) -> bool:
+    for parte in ref.replace("$", "").split(":"):
+        m = re.fullmatch(r"([A-Za-z]{0,3})([0-9]{0,7})", parte)
+        if not m or (m.group(1) and _coluna(m.group(1).upper()) > 16_384):
+            return False
+        if m.group(2) and not 1 <= int(m.group(2)) <= 1_048_576:
+            return False
+    return True
+
+
+def _referencia(v: str, ctx: _Contexto, erro):
+    """Lista branca de operando de referência: [aba!]A1, A1:B2, A:A, 1:1, Aba!A1:Aba!B2, nome definido existente ou
+    referência estruturada de tabela existente. Qualquer outra coisa é recusada (o Excel repararia o arquivo)."""
+    m = _PREFIXO.match(v)
+    resto = v
+    if m:
+        nomes = (m.group(1).replace("''", "'") if m.group(1) else m.group(2)).split(":")
+        for nome in nomes:
+            if nome.casefold() not in ctx.abas:
+                raise erro(f"a aba {nome!r} não existe")
+        resto = v[m.end() :]
+    elif v.startswith("["):
+        raise erro("referência a outro arquivo não é escrita pela edição")
+    if _AREA.fullmatch(resto) and _dentro_dos_limites(resto):
+        return
+    if ":" in resto and "!" in resto:  # Aba!A1:Aba!B2
+        esquerda, direita = resto.split(":", 1)
+        if _PONTA.fullmatch(esquerda) and _dentro_dos_limites(esquerda):
+            m2 = _PREFIXO.match(direita)
+            if m2 and _PONTA.fullmatch(direita[m2.end() :]) and _dentro_dos_limites(direita[m2.end() :]):
+                return _referencia(direita, ctx, erro)
+    if not m and (e := _ESTRUTURADA.fullmatch(resto)):
+        conteudo, nivel = e.group(2), 0
+        for ch in conteudo:
+            nivel += {"[": 1, "]": -1}.get(ch, 0)
+            if nivel < 0:
+                break
+        if e.group(1).casefold() in ctx.tabelas and nivel == 0:
+            return
+        raise erro(f"tabela {e.group(1)!r} não existe ou referência estruturada inválida")
+    if _NOME_DEFINIDO.fullmatch(resto) and not _PONTA.fullmatch(resto):
+        if resto.casefold() in ctx.nomes:
+            return
+        raise erro(f"o nome {resto!r} não existe na pasta")
+    raise erro(f"referência inválida {v!r}")
+
+
+def _formula(texto: str, alvo: str, ctx: _Contexto) -> str:
+    """Fórmula pronta para o arquivo, ou recusa com o motivo. Lista branca: operando e operador alternados, parênteses
+    e chaves com par e não vazios, separadores no lugar, referências válidas e existentes, constantes de matriz só com
+    valores, texto até 255 caracteres, limites do Excel, e funções conhecidas (em inglês; as do Excel 2010+ ganham o
+    prefixo _xlfn.)."""
     if not texto.startswith("=") or len(texto) < 2:
         raise OperacaoInvalida("operacao-invalida", "fórmula começa com = (ex.: =SUM(A1:A3), em inglês)", alvo=alvo)
+    if _utf16(texto) > FORMULA_MAX:  # antes de tokenizar: o tokenizador não é linear em texto hostil
+        raise OperacaoInvalida("operacao-invalida", f"fórmula passa de {FORMULA_MAX} caracteres", alvo=alvo)
     try:
         tok = Tokenizer(texto)
     except Exception:  # noqa: BLE001 — o tokenizador do openpyxl recusa sintaxe quebrada com erros variados
@@ -488,62 +560,101 @@ def _formula(texto: str, alvo: str, abas: set[str]) -> str:
     def erro(motivo):
         return OperacaoInvalida("operacao-invalida", f"fórmula inválida ({motivo}): {texto[:80]!r}", alvo=alvo)
 
-    itens = [x for x in tok.items]
-    pilha, espera_valor = [], True  # pilha de [tipo, argumentos, vazio]
+    itens = list(tok.items)
+    pilha, espera_valor, prefixo = [], True, False  # pilha de [tipo, argumentos, vazio, colunas da 1ª linha]
     for k, item in enumerate(itens):
-        tipo, sub = item.type, item.subtype
+        tipo, sub, v = item.type, item.subtype, item.value
+        em_matriz = bool(pilha) and pilha[-1][0] == "ARRAY"
         if tipo == "WHITE-SPACE":
             prox = next((x for x in itens[k + 1 :] if x.type != "WHITE-SPACE"), None)
             if not espera_valor and prox is not None and (prox.type == "OPERAND" or prox.subtype == "OPEN"):
+                antes = next((x for x in reversed(itens[:k]) if x.type != "WHITE-SPACE"), None)
+                referencia_antes = antes is not None and (antes.subtype in ("RANGE", "CLOSE"))
+                referencia_depois = prox.subtype in ("RANGE", "OPEN")
+                if em_matriz or not (referencia_antes and referencia_depois):
+                    raise erro("espaço entre valores: a interseção só vale entre intervalos")
                 espera_valor = True  # espaço entre dois intervalos é o operador de interseção
             continue
         if pilha and sub != "CLOSE":
-            pilha[-1][2] = False  # o parêntese de cima já tem conteúdo
+            pilha[-1][2] = False
+        if tipo == "OPERAND" and sub == "RANGE" and v.startswith(":") and not espera_valor and not em_matriz:
+            _referencia(v[1:], ctx, erro)  # INDEX(...):A10
+            prefixo = False
+            continue
         if tipo == "OPERAND":
             if not espera_valor:
                 raise erro("falta operador entre dois valores")
-            if sub == "RANGE" and "!" in item.value:
-                _conferir_abas(item.value, abas, erro)
-            espera_valor = False
+            if em_matriz and sub not in ("NUMBER", "TEXT", "LOGICAL", "ERROR"):
+                raise erro("matriz constante só aceita números, textos, VERDADEIRO/FALSO e erros")
+            if sub == "TEXT" and _utf16(v[1:-1].replace('""', '"')) > 255:
+                raise erro("texto entre aspas passa de 255 caracteres")
+            if sub == "RANGE":
+                _referencia(v, ctx, erro)
+            espera_valor, prefixo = False, False
         elif sub == "OPEN":
             if not espera_valor:
                 raise erro("falta operador antes do parêntese")
+            if em_matriz:
+                raise erro("matriz constante só aceita valores")
             if tipo == "FUNC":
-                item.value = _nome_funcao(item.value[:-1], erro) + "("
+                nome = v[:-1]
+                if ":" in nome:  # A1:INDEX(...)
+                    ponta, nome = nome.rsplit(":", 1)
+                    _referencia(ponta, ctx, erro)
+                    item.value = ponta + ":" + _nome_funcao(nome, erro) + "("
+                else:
+                    item.value = _nome_funcao(nome, erro) + "("
                 if sum(1 for x in pilha if x[0] == "FUNC") >= FUNCOES_ANINHADAS_MAX:
                     raise erro(f"mais de {FUNCOES_ANINHADAS_MAX} funções aninhadas")
-            pilha.append([tipo, 0, True])
-            espera_valor = True
+            pilha.append([tipo, 0, True, None])
+            espera_valor, prefixo = True, False
         elif sub == "CLOSE":
+            if prefixo:
+                raise erro("operador sem valor depois")
             if not pilha or pilha[-1][0] != tipo:
                 raise erro("parêntese ou chave sem par")
             aberto = pilha.pop()
             if espera_valor and not (tipo == "FUNC" and (aberto[2] or aberto[1])):
                 raise erro("parêntese vazio ou valor faltando antes de fechar")
+            if tipo == "ARRAY" and aberto[3] is not None and aberto[3] != aberto[1]:
+                raise erro("linhas da matriz com tamanhos diferentes")
             espera_valor = False
         elif tipo == "SEP":
+            if prefixo:
+                raise erro("operador sem valor depois")
             if not pilha:
                 raise erro("separador fora de função")
             if sub == "ROW" and pilha[-1][0] != "ARRAY":
                 raise erro("separe os argumentos com vírgula, não ponto e vírgula")
             if espera_valor and pilha[-1][0] != "FUNC":  # argumento vazio só vale em função: IF(A1,,1)
                 raise erro("valor faltando antes do separador")
-            pilha[-1][1] += 1
-            if pilha[-1][1] >= ARGUMENTOS_MAX:
-                raise erro(f"mais de {ARGUMENTOS_MAX} argumentos")
+            if sub == "ROW":  # matriz: toda linha tem o mesmo número de colunas
+                topo = pilha[-1]
+                if topo[3] is None:
+                    topo[3] = topo[1]
+                elif topo[3] != topo[1]:
+                    raise erro("linhas da matriz com tamanhos diferentes")
+                topo[1] = 0
+            else:
+                pilha[-1][1] += 1
+                if pilha[-1][0] == "FUNC" and pilha[-1][1] >= ARGUMENTOS_MAX:
+                    raise erro(f"mais de {ARGUMENTOS_MAX} argumentos")
             espera_valor = True
         elif tipo == "OPERATOR-PREFIX":
             if not espera_valor:
                 raise erro("operador fora do lugar")
+            prefixo = True
         elif tipo == "OPERATOR-INFIX":
-            if espera_valor:
+            if espera_valor or em_matriz:
                 raise erro("operador sem valor antes")
+            if v == "," and not (pilha and pilha[-1][0] == "PAREN"):
+                raise erro("vírgula fora de função: use ponto como separador decimal (1.5)")
             espera_valor = True
         elif tipo == "OPERATOR-POSTFIX":
             if espera_valor:
                 raise erro("operador sem valor antes")
         else:
-            raise erro(f"elemento inesperado {item.value!r}")
+            raise erro(f"elemento inesperado {v!r}")
     if pilha:
         raise erro("parêntese ou chave sem par")
     if espera_valor:
@@ -568,18 +679,6 @@ def _nome_funcao(bruto: str, erro) -> str:
     if nome in FORMULAE:
         return nome
     raise erro(f"função desconhecida {nome}; use o nome em inglês, como SUM e IF")
-
-
-def _conferir_abas(operando: str, abas: set[str], erro):
-    """As abas citadas num operando (com aspas, 3D) precisam existir; vínculo com outro arquivo é recusado."""
-    prefixo = operando.rsplit("!", 1)[0]
-    if prefixo.startswith("["):
-        raise erro("referência a outro arquivo não é escrita pela edição")
-    if len(prefixo) > 1 and prefixo[0] == prefixo[-1] == "'":
-        prefixo = prefixo[1:-1].replace("''", "'")
-    for nome in prefixo.split(":"):
-        if nome.casefold() not in abas:
-            raise erro(f"a aba {nome!r} não existe")
 
 
 def _valor(valor, alvo: str):
@@ -654,7 +753,7 @@ def _avisar_tabela(ed: _Editor, aba: _Aba, col: int, lin: int, alvo: str):
 
 def _valor_da_op(ed: _Editor, op, alvo):
     if "formula" in op:
-        return None, _formula(campo_texto(op, "formula"), alvo, ed.nomes_de_abas())
+        return None, _formula(campo_texto(op, "formula"), alvo, _Contexto(ed))
     if "valor" not in op:
         raise OperacaoInvalida("operacao-invalida", "informe valor ou formula", alvo=alvo)
     return _valor(op["valor"], alvo), None
@@ -679,7 +778,7 @@ def _op_intervalo(ed: _Editor, op, rel):
     valores = op.get("valores")
     if not isinstance(valores, list) or not valores or not all(isinstance(x, list) and x for x in valores):
         raise OperacaoInvalida("operacao-invalida", "valores é uma matriz: lista de linhas não vazias", alvo=alvo)
-    abas = ed.nomes_de_abas()
+    ctx = _Contexto(ed)
     total = sum(len(x) for x in valores)
     if ed.escritas + total > ESCRITAS_MAX:
         raise OperacaoInvalida("operacao-invalida", f"no máximo {ESCRITAS_MAX} células por pedido", alvo=alvo)
@@ -690,7 +789,7 @@ def _op_intervalo(ed: _Editor, op, rel):
         for j, valor in enumerate(linha):
             ref = f"{aba.nome}!{_letras(col + j)}{lin + i}"
             if isinstance(valor, str) and valor.startswith("=") and len(valor) > 1:
-                _escrever(ed, aba, col + j, lin + i, ref, formula=_formula(valor, ref, abas))
+                _escrever(ed, aba, col + j, lin + i, ref, formula=_formula(valor, ref, ctx))
             else:
                 _escrever(ed, aba, col + j, lin + i, ref, valor=_valor(valor, ref))
     fim = f"{_letras(col + largura - 1)}{lin + len(valores) - 1}"
@@ -788,7 +887,9 @@ def _renomear_em(ed: _Editor, parte: str, antigo: str, novo: str) -> int:
     """Troca a aba em toda fórmula da parte (em qualquer namespace: x14:formula1/xm:f, c:f, cx:f, c15:f…) e no
     destino interno dos hiperlinks."""
     trocas = 0
-    for el in ed.pk.arvore(parte).iter():
+    for k, el in enumerate(ed.pk.arvore(parte).iter()):
+        if k % 8192 == 0:
+            ed.no_prazo()
         if not isinstance(el.tag, str):
             continue
         nome = etree.QName(el).localname
@@ -855,15 +956,20 @@ def _op_renomear_aba(ed: _Editor, op, rel):
         elif parte == "docProps/app.xml":  # lista de abas que o Explorer e o Finder mostram
             n = 0
             for el in ed.pk.arvore(parte).iter():
-                if isinstance(el.tag, str) and etree.QName(el).localname == "lpstr" and el.text == antigo:
-                    el.text, n = novo, n + 1
+                if isinstance(el.tag, str) and etree.QName(el).localname == "lpstr" and el.text:
+                    if el.text == antigo:  # nome da aba
+                        el.text, n = novo, n + 1
+                    elif "!" in el.text:  # Aba!Print_Area e outros nomes com escopo de aba
+                        texto, mudou = _trocar_aba(el.text, antigo, novo)
+                        if mudou:
+                            el.text, n = texto, n + 1
         else:
             continue
         if n:
             ed.pk.tocar(parte)
             mexidas.add(parte)
             trocas += n
-    restos = _restos(ed, antigo)
+    restos = [] if antigo.casefold() == novo.casefold() else _restos(ed, antigo)  # só a caixa: referência vale
     if restos:  # falha fechada: referência que não sabemos atualizar ficaria quebrada
         raise OperacaoInvalida(
             "operacao-invalida",
@@ -877,34 +983,53 @@ def _op_renomear_aba(ed: _Editor, op, rel):
 _PARSER_TOLERANTE = etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False, recover=True)
 
 
+_TEXTO_EXIBIDO = {"t", "v", "text"}  # texto de célula, valor em cache e texto de comentário: não são referência
+_ATRIBUTOS_EXIBIDOS = {"prompt", "error", "promptTitle", "errorTitle", "display", "tooltip"}
+
+
 def _restos(ed: _Editor, antigo: str) -> list[str]:
-    """Partes do pacote (XML, VML e relações) que ainda citam a aba `antigo` como referência, fora de texto de
-    célula e de texto exibido (w:t, a:t). Varre tudo, inclusive o que o renomear não conhece."""
+    """Partes do pacote (XML, VML e relações) que ainda citam a aba `antigo` como referência, fora de texto exibido.
+    Varre tudo, inclusive o que o renomear não conhece. Parte que não dá para ler entra como resto (falha fechada)."""
     alvo, achadas = antigo.casefold(), []
+    escapavel = bool(re.search(r"['&<>\"]", antigo)) or not antigo.isascii()
     for parte in ed.pk.partes:
         if parte in ed.pk.removidas or not parte.endswith((".xml", ".vml", ".rels")) or "sharedStrings" in parte:
             continue
+        ed.no_prazo()
         if parte in ed.pk.arvores:
             raiz = ed.pk.arvores[parte]
         else:
             bruto = ed.pk.partes[parte]
-            if not re.search(r"['&<>\"]", antigo) and alvo not in bruto.decode("utf-8", "ignore").casefold():
-                continue  # atalho: o nome nem aparece (só vale sem caractere que o XML ou a fórmula escapam)
+            texto = bruto.decode("utf-8", "ignore")
+            if (
+                not escapavel
+                and "&#" not in texto
+                and not bruto.startswith((b"\xff\xfe", b"\xfe\xff"))
+                and (alvo not in texto.casefold())
+            ):
+                continue  # atalho: o nome nem aparece (só vale sem escape possível)
             if b"<!DOCTYPE" in bruto or b"<!ENTITY" in bruto:
+                achadas.append(parte)
                 continue
-            raiz = etree.fromstring(bruto, _PARSER_TOLERANTE)
+            try:
+                raiz = etree.fromstring(bruto, _PARSER_TOLERANTE)
+            except etree.XMLSyntaxError:
+                raiz = None
             if raiz is None:
+                achadas.append(parte)
                 continue
-        for el in raiz.iter():
+        for k, el in enumerate(raiz.iter()):
+            if k % 8192 == 0:
+                ed.no_prazo()
             if not isinstance(el.tag, str):
                 continue
-            valores = [] if etree.QName(el).localname == "t" else [el.text or ""]
-            valores += list(el.attrib.values())
-            for v in valores:
-                if "!" in v and _trocar_aba(v.lstrip("#"), antigo, "\x00")[1]:
-                    achadas.append(parte)
-                    break
-            if achadas and achadas[-1] == parte:
+            valores = [] if etree.QName(el).localname in _TEXTO_EXIBIDO else [el.text or ""]
+            for chave, valor in el.attrib.items():
+                nome = etree.QName(chave).localname
+                if nome not in _ATRIBUTOS_EXIBIDOS:
+                    valores.append(valor[1:] if nome == "Target" and valor.startswith("#") else valor)
+            if any("!" in v and _trocar_aba(v, antigo, "\x00")[1] for v in valores):
+                achadas.append(parte)
                 break
     return achadas
 
@@ -963,6 +1088,7 @@ def aplicar(dados: bytes, operacoes: list[dict]) -> tuple[bytes, list[dict], lis
             )
         rel = {"op": op["op"], **({"alvo": op["alvo"]} if "alvo" in op else {})}
         try:
+            ed.no_prazo()
             OPERACOES[op["op"]](ed, op, rel)
         except OperacaoInvalida as e:
             e.indice = k

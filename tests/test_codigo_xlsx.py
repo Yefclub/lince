@@ -452,3 +452,91 @@ def _com_parte(dados, nome, conteudo):
             z.writestr(i, o.read(i))
         z.writestr(nome, conteudo)
     return saida.getvalue()
+
+
+@pytest.mark.parametrize(
+    "formula",
+    [
+        "=SUM(A1:)",
+        "=A1:B",
+        "=1A+1",
+        "=1.2.3",
+        "=Dados!",
+        '="a" "b"',
+        "=SUM({A1,B1})",
+        "={1,2;3}",
+        '="' + "x" * 300 + '"',
+        "=IF(A1,-)",
+        "=A1*1,5",
+        "=Nada*2",
+        "=XFE1",
+    ],
+)
+def test_lista_branca_recusa_o_que_o_excel_repararia(formula):
+    with pytest.raises(OperacaoInvalida):
+        codigo.editar(_livro(), "p.xlsx", [{"op": "celula", "alvo": "Dados!A9", "formula": formula}])
+
+
+@pytest.mark.parametrize(
+    "formula",
+    [
+        "=Dados!A1:Dados!B2",
+        "=A1:INDEX(B:B,5)",
+        "=INDEX(B:B,5):A10",
+        "=SUM(A1:B2 B1:C3)",
+        "=Total*2",
+        "={1,-2;3,4}",
+        "=SUM((A1,B1))",
+        "=-+A1",
+        "=TRUE",
+        '=ARABIC("X")',
+        "=1:1",
+        "=$A:$B",
+    ],
+)
+def test_lista_branca_aceita_formula_valida_comum(formula):
+    codigo.editar(_livro(), "p.xlsx", [{"op": "celula", "alvo": "Dados!A9", "formula": formula}])
+
+
+def test_formula_enorme_e_recusada_antes_de_tokenizar():
+    import time
+
+    inicio = time.monotonic()
+    with pytest.raises(OperacaoInvalida) as e:
+        codigo.editar(
+            _livro(), "p.xlsx", [{"op": "intervalo", "alvo": "Dados!A9", "valores": [["=" + "[a]" * 300_000]]}]
+        )
+    assert "8192" in str(e.value) and time.monotonic() - inicio < 2
+
+
+def test_prazo_vale_tambem_para_renomear(monkeypatch):
+    monkeypatch.setattr(xlsx, "EDICAO_PRAZO", -1)
+    with pytest.raises(OperacaoInvalida) as e:
+        codigo.editar(_livro(), "p.xlsx", [{"op": "renomear_aba", "aba": "Dados", "nome": "Base"}])
+    assert "divida" in str(e.value)
+
+
+def test_renomear_em_arquivo_comum_do_excel():
+    app = (
+        '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" '
+        'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><TitlesOfParts>'
+        '<vt:vector size="2" baseType="lpstr"><vt:lpstr>Dados</vt:lpstr><vt:lpstr>Dados!Print_Area</vt:lpstr>'
+        "</vt:vector></TitlesOfParts></Properties>"
+    )
+    comentario = (
+        '<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><commentList>'
+        '<comment ref="A1"><text><r><t>Conferir Dados!</t></r></text></comment></commentList></comments>'
+    )
+    dados = _com_parte(_com_parte(_livro(), "docProps/app.xml", app), "xl/comments1.xml", comentario)
+    novo, _ = codigo.editar(dados, "p.xlsx", [{"op": "renomear_aba", "aba": "Dados", "nome": "Base"}])
+    assert "<vt:lpstr>Base!Print_Area</vt:lpstr>" in _parte(novo, "docProps/app.xml")
+    codigo.editar(dados, "p.xlsx", [{"op": "renomear_aba", "aba": "Dados", "nome": "DADOS"}])  # só a caixa
+
+
+def test_aba_com_nome_de_erro_e_parte_ilegivel():
+    dados = _trocar(_livro(), "xl/workbook.xml", lambda x: x.replace('name="Grafico"', 'name="Ref"'))
+    dados = _trocar(dados, "xl/worksheets/sheet1.xml", lambda x: x.replace("<v>#VALUE!</v>", "<v>#REF!</v>"))
+    codigo.editar(dados, "p.xlsx", [{"op": "renomear_aba", "aba": "Ref", "nome": "Graf"}])  # #REF! não é a aba
+    ilegivel = _com_parte(_livro(), "xl/estranho.xml", "<!DOCTYPE x><x>O'Neil!A1</x>")
+    with pytest.raises(OperacaoInvalida):
+        codigo.editar(ilegivel, "p.xlsx", [{"op": "renomear_aba", "aba": "O'Neil", "nome": "Vendas"}])
