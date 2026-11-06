@@ -382,7 +382,9 @@ class _Editor:
         """Uma operação de texto por parágrafo por pedido, e nunca sobre revisões que já estavam no arquivo."""
         if sum(1 for _ in p.iter()) > ELEMENTOS_MAX or len(self.texto(p, objetos=True)) > PARAGRAFO_MAX:
             raise OperacaoInvalida(
-                "texto-grande", f"{alvo} é complexo demais para editar (XML muito grande)", alvo=alvo
+                "texto-grande",
+                f"{alvo} é grande demais para editar (mais de {PARAGRAFO_MAX} caracteres ou {ELEMENTOS_MAX} elementos)",
+                alvo=alvo,
             )
         if p in self.tocados:
             raise OperacaoInvalida("conflito", f"{alvo} já foi alterado neste pedido: junte as mudanças", alvo=alvo)
@@ -913,7 +915,7 @@ def aplicar(dados: bytes, operacoes: list[dict]) -> tuple[bytes, list[dict], lis
         raise OperacaoInvalida("operacao-invalida", f"DOCX fora do esperado ({type(e).__name__})") from None
     relatorio = []
     for k, op in enumerate(operacoes):
-        if not isinstance(op, dict) or op.get("op") not in OPERACOES:
+        if not isinstance(op, dict) or not isinstance(op.get("op"), str) or op["op"] not in OPERACOES:
             raise OperacaoInvalida(
                 "operacao-invalida",
                 f"op desconhecida: {op.get('op') if isinstance(op, dict) else op!r}; use uma de {', '.join(OPERACOES)}",

@@ -645,7 +645,7 @@ def aplicar(dados: bytes, operacoes: list[dict]) -> tuple[bytes, list[dict], lis
     ed = _Editor(dados)
     relatorio = []
     for k, op in enumerate(operacoes):
-        if not isinstance(op, dict) or op.get("op") not in OPERACOES:
+        if not isinstance(op, dict) or not isinstance(op.get("op"), str) or op["op"] not in OPERACOES:
             raise OperacaoInvalida(
                 "operacao-invalida",
                 f"op desconhecida: {op.get('op') if isinstance(op, dict) else op!r}; use uma de {', '.join(OPERACOES)}",

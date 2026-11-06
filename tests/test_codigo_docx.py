@@ -605,3 +605,23 @@ def test_paraid_repetido_e_ambiguo(contrato):
     with pytest.raises(OperacaoInvalida) as e:
         codigo.editar(dados, "c.docx", [{"op": "texto", "alvo": "p:0000ABCD", "texto": "x", "revisao": False}])
     assert e.value.codigo == "alvo-ambiguo"
+
+
+def test_paragrafo_com_texto_demais_e_recusado_e_op_malformada_nao_vira_erro_interno(contrato):
+    longo = b"<w:p><w:r><w:t>" + b"x" * 200_001 + b"</w:t></w:r></w:p>"  # poucos elementos, texto acima do teto
+    dados = _com_paragrafos(contrato, longo)
+    alvo = _paragrafos(docx.extrair(dados))[-1]["id"]
+    with pytest.raises(OperacaoInvalida) as e:
+        codigo.editar(dados, "c.docx", [{"op": "texto", "alvo": alvo, "texto": "x"}])
+    assert e.value.codigo == "texto-grande"
+    for nome in ("c.docx", "d.pptx"):
+        with pytest.raises(OperacaoInvalida):
+            codigo.editar(contrato if nome == "c.docx" else _deck(), nome, [{"op": []}])
+
+
+def _deck():
+    from pptx import Presentation
+
+    buf = io.BytesIO()
+    Presentation().save(buf)
+    return buf.getvalue()
