@@ -16,7 +16,36 @@ from ..limites import DocumentoRecusado, conferir_zip
 PARSER = etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False, remove_blank_text=False)
 R_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
 R_EMBED = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+R_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 NS_REL = {"rel": "http://schemas.openxmlformats.org/package/2006/relationships"}
+NS_CT = {"ct": "http://schemas.openxmlformats.org/package/2006/content-types"}
+QUEBRA = "\v"  # quebra de linha dentro do parágrafo (a:br, w:br), como no python-pptx; "\n" separa parágrafos
+TEXTO_MAX = 100_000  # caracteres num campo de texto de uma operação
+PARAGRAFO_MAX = 200_000  # caracteres num parágrafo depois de uma troca (substituir não amplifica sem limite)
+CRESCIMENTO_MAX = 5_000_000  # caracteres acrescentados somando todas as operações de um pedido
+
+
+class OperacaoInvalida(ValueError):
+    """Operação que não pode ser aplicada; `codigo` é estável para a IA tratar."""
+
+    def __init__(self, codigo: str, mensagem: str, indice: int | None = None, alvo: str | None = None):
+        super().__init__(mensagem)
+        self.codigo, self.indice, self.alvo = codigo, indice, alvo
+
+
+def campo_texto(op, nome="texto") -> str:
+    valor = op.get(nome)
+    if not isinstance(valor, str):
+        raise OperacaoInvalida("operacao-invalida", f"{nome} precisa ser texto", alvo=op.get("alvo"))
+    if len(valor) > TEXTO_MAX:
+        raise OperacaoInvalida("texto-grande", f"{nome} passa de {TEXTO_MAX} caracteres", alvo=op.get("alvo"))
+    return valor
+
+
+def conferir(op, atual: str, alvo: str):
+    """Concorrência otimista: se a operação diz o texto que espera encontrar, ele precisa estar lá."""
+    if "se_texto" in op and op["se_texto"] != atual:
+        raise OperacaoInvalida("conflito", f"o texto atual de {alvo} não é o esperado: {atual[:80]!r}", alvo=alvo)
 
 
 def sha(dados: bytes) -> str:
@@ -89,6 +118,32 @@ class Pacote:
     def tocar(self, nome: str):
         self.tocadas.add(nome)
 
+    def criar(self, nome: str, arvore, content_type: str | None = None):
+        """Parte nova no fim do pacote (com Override no [Content_Types].xml quando o tipo vem explícito)."""
+        if nome in self.partes:
+            raise ValueError(f"/{nome} já existe")
+        info = zipfile.ZipInfo(nome, date_time=self.infos[0].date_time)
+        info.compress_type = zipfile.ZIP_DEFLATED
+        self.infos.append(info)
+        self.partes[nome] = b""
+        self.arvores[nome] = arvore
+        self.tocar(nome)
+        if content_type:
+            ct = self.arvore("[Content_Types].xml")
+            etree.SubElement(ct, f"{{{NS_CT['ct']}}}Override", PartName="/" + nome, ContentType=content_type)
+            self.tocar("[Content_Types].xml")
+
+    def relacionar(self, dono: str, tipo_url: str, alvo_relativo: str) -> str:
+        """Acrescenta uma relação interna em `dono` e devolve o rId novo (o arquivo .rels já precisa existir)."""
+        rels = self.arvore(self.caminho_rels(dono))
+        usados = {r.get("Id") for r in rels}
+        n = len(usados) + 1
+        while f"rId{n}" in usados:
+            n += 1
+        etree.SubElement(rels, f"{{{NS_REL['rel']}}}Relationship", Id=f"rId{n}", Type=tipo_url, Target=alvo_relativo)
+        self.tocar(self.caminho_rels(dono))
+        return f"rId{n}"
+
     def salvar(self) -> bytes:
         out = io.BytesIO()
         with zipfile.ZipFile(out, "w") as z:
@@ -102,6 +157,35 @@ class Pacote:
                     )
                 z.writestr(i, dados)  # mesmo ZipInfo: nome, ordem, data e compressão
         return out.getvalue()
+
+
+def integridade(dados: bytes, prefixo: str) -> list[str]:
+    """Problemas estruturais do pacote: relação apontando para parte que não existe, parte sem content type, atributo
+    r:* (id, embed, link…) em parte XML de `prefixo` sem a relação correspondente (o Office "repara" o arquivo)."""
+    pk = Pacote(dados)
+    problemas = []
+    ct = pk.arvore("[Content_Types].xml")
+    padrao = {d.get("Extension").lower() for d in ct.findall("ct:Default", NS_CT)}
+    explicito = {o.get("PartName").lstrip("/") for o in ct.findall("ct:Override", NS_CT)}
+    for nome in pk.partes:
+        if nome.endswith("/") or nome == "[Content_Types].xml":
+            continue
+        extensao = nome.rsplit("/", 1)[-1].rsplit(".", 1)[-1].lower() if "." in nome.rsplit("/", 1)[-1] else ""
+        if nome not in explicito and extensao not in padrao:
+            problemas.append(f"/{nome} sem content type")
+        if nome.endswith(".rels"):
+            dono = nome.replace("_rels/", "").removesuffix(".rels")
+            for rid, (tipo, alvo) in pk.rels(dono).items():
+                if not tipo.startswith("externo") and alvo not in pk.partes:
+                    problemas.append(f"/{dono} {rid} aponta para /{alvo}, que não existe")
+        elif nome.endswith(".xml") and nome.startswith(prefixo):
+            ids = set(pk.rels(nome))
+            for el in pk.arvore(nome).iter():
+                for chave, valor in el.attrib.items():
+                    if chave.startswith(R_NS) and valor and valor not in ids:
+                        problemas.append(f"/{nome} cita {valor}, que não está nas relações")
+                        break
+    return problemas
 
 
 def comparar(antes: bytes, depois: bytes) -> dict:

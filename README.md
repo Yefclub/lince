@@ -108,8 +108,13 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
 ## Documento como código (edição por IA)
 
 Para uma IA editar um documento sem estragar layout, mestres, animações e gráficos, ela precisa da estrutura com
-endereços estáveis. Com `codigo=sim` no envio, cada PPTX traz `resultado.codigo`: slides, formas, parágrafos,
-células de tabela e séries de gráfico, cada um com um id tirado do próprio arquivo (`sld:258/sp:2/p:0`).
+endereços estáveis. Com `codigo=sim` no envio, cada PPTX e DOCX traz `resultado.codigo`, com um id tirado do
+próprio arquivo para cada peça:
+
+- **PPTX:** slides, formas, parágrafos, células de tabela e séries de gráfico (`sld:258/sp:2/p:0`).
+- **DOCX:** parágrafos e tabelas (cada célula traz os ids dos parágrafos dela), estilos e comentários. O id do
+  parágrafo é o `w14:paraId` que o Word grava (`p:1A2B3C4D`); em arquivo sem ele, a posição no documento (`p:n12`),
+  e aí vale mandar `se_texto`.
 
 `POST /v1/edicoes` recebe o arquivo e as operações, aplica tudo ou nada e devolve o relatório: o que mudou, o diff
 por parte, avisos (texto que pode transbordar) e o código novo. O arquivo editado sai em `GET /v1/edicoes/{id}/arquivo`.
@@ -123,6 +128,8 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" -F arquivo=@deck.pptx \
      http://localhost:8000/v1/edicoes
 ```
 
+Operações do PPTX:
+
 | Operação | O que faz |
 | --- | --- |
 | `texto` | Troca o texto de uma forma (uma linha por parágrafo) ou de um parágrafo, mantendo a formatação |
@@ -132,11 +139,28 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" -F arquivo=@deck.pptx \
 | `valor_grafico` | Muda um ponto da série no gráfico e na planilha embutida dele |
 | `ordem`, `remover_slide` | Reordena ou tira slides |
 
+Operações do DOCX, que por padrão entram como **alterações controladas**: quem abre no Word vê o que a IA propôs e
+aceita ou rejeita cada uma. `"revisao": false` aplica direto, e `"revisao": {"autor": "Ana"}` troca o autor (o
+padrão é `Lince`).
+
+| Operação | O que faz |
+| --- | --- |
+| `texto` | Troca o texto de um parágrafo, com a formatação do começo dele |
+| `substituir` | Busca e troca num parágrafo ou no documento todo (sem `alvo`); corta no caractere exato, então o resto do parágrafo mantém negrito, itálico e links |
+| `inserir_paragrafo_apos` | Parágrafo novo depois do alvo, com o formato dele ou com `estilo` |
+| `remover_paragrafo` | Tira o parágrafo |
+| `estilo_paragrafo` | Aplica um estilo do documento, pelo id ou pelo nome |
+| `comentar` | Comentário no parágrafo, com `autor` |
+
+No DOCX, um parágrafo recebe uma operação de texto por pedido, e o que já tem alteração controlada pendente no
+arquivo é recusado até alguém aceitar ou rejeitar no Word. Imagem, campo e nota no meio do parágrafo nunca são
+apagados: `texto` recusa, e `substituir` só troca o trecho que não passa por eles.
+
 - **Nada se perde:** só as partes tocadas são reescritas; o resto do arquivo (mídia, mestres, partes que o Lince
   não conhece) sai idêntico em bytes. No deck real de uma empresa, com 16 slides, gráficos com planilha embutida e
   tabela, 5 edições alteraram 6 das 97 partes, e a renderização antes e depois mostrou o layout intacto.
 - **Concorrência:** `se_texto` e `base_sha256` recusam a edição (409) se o documento mudou desde a leitura.
-- **Formatos:** PPTX hoje.
+- **Formatos:** PPTX e PPTM; DOCX e DOCM.
 
 ## Deploy
 

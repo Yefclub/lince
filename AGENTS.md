@@ -17,7 +17,7 @@ precisa. Biblioteca Python (`src/lince/`) e API HTTP (`lince.servidor`), empacot
 | Montagem do Markdown e metadados | `src/lince/montagem.py`, `src/lince/metadados.py` |
 | Texto oculto e prompt injection | `src/lince/seguranca.py` |
 | Prompt de leitura | `src/lince/prompts/leitura.md` (`VERSAO_PROMPT` em `instrucoes.py`) |
-| Documento como código e edição cirúrgica | `src/lince/codigo/` (`pacote.py`, `pptx.py`) |
+| Documento como código e edição cirúrgica | `src/lince/codigo/` (`pacote.py`, `pptx.py`, `docx.py`) |
 | Limites contra arquivo hostil | `src/lince/limites.py` |
 | Contrato da API (OpenAPI 3.1) | `src/lince/openapi.json` |
 | API HTTP, sessões e fila justa | `src/lince/servidor.py` |
@@ -70,11 +70,15 @@ estática do Python e dos workflows. Rode o equivalente local antes de commitar.
 - O arquivo original é a fonte; o código é uma visão. A edição nunca regenera o pacote: só as partes tocadas são
   reescritas (`Pacote.salvar`), o resto sai idêntico em bytes. `aplicar(arquivo, [])` tem de devolver todas as
   partes idênticas.
-- Ids vêm do próprio arquivo (`sld:<sldId>/sp:<cNvPr>`) e precisam sobreviver a reordenar e editar.
+- Ids vêm do próprio arquivo (`sld:<sldId>/sp:<cNvPr>`, `p:<w14:paraId>`) e precisam sobreviver a reordenar e
+  editar. Onde o arquivo não tem id (DOCX sem `paraId`), a posição vale para o arquivo enviado, resolvida antes de
+  aplicar a primeira operação.
+- No DOCX, edição de texto é alteração controlada por padrão (`w:ins`/`w:del`/`w:pPrChange`). Não troque esse padrão:
+  é o que deixa a pessoa aceitar ou rejeitar o que a IA fez.
 - Operação nova: tudo ou nada, erro com `OperacaoInvalida(codigo, …)` e teste de comportamento. Leitura e edição
   usam o mesmo extrator.
-- Teste com arquivos de produtores diferentes (PowerPoint, LibreOffice, python-pptx); arquivo real de empresa nunca
-  entra no repositório.
+- Teste com arquivos de produtores diferentes (PowerPoint, Word, LibreOffice, python-pptx, python-docx); arquivo real
+  de empresa nunca entra no repositório.
 
 ## Nada fica guardado
 

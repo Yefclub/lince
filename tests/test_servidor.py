@@ -567,3 +567,32 @@ def test_operacao_malformada_vira_422_e_nao_500(api, deck):
     pedido = {"operacoes": [{"op": "valor_grafico", "alvo": "sld:256/sp:2", "ponto": "a", "valor": "nan"}]}
     r = conforme(_editar(api, A, ("d.pptx", deck), pedido), "/v1/edicoes", "post")
     assert r.status_code == 422 and r.json()["operacao"] == 0
+
+
+def test_docx_lido_como_codigo_e_editado_com_alteracoes_controladas(api):
+    import io
+    import zipfile
+
+    from docx import Document
+
+    d = Document()
+    d.add_paragraph("Prazo de 30 dias.")
+    buf = io.BytesIO()
+    d.save(buf)
+    cod = enviar(api, ("c.docx", buf.getvalue()), {**A, **ESPERA}, codigo="sim").json()["itens"][0]["resultado"]
+    cod = cod["codigo"]
+    alvo = cod["blocos"][0]["id"]
+    pedido = {
+        "base_sha256": cod["sha256"],
+        "operacoes": [{"op": "substituir", "alvo": alvo, "buscar": "30", "trocar": "45"}],
+    }
+    r = conforme(_editar(api, A, ("c.docx", buf.getvalue()), pedido), "/v1/edicoes", "post")
+    assert r.status_code == 201 and r.json()["codigo"]["blocos"][0]["texto"] == "Prazo de 45 dias."
+    novo = api.get(r.headers["location"], headers=A).content
+    assert b"<w:ins " in zipfile.ZipFile(io.BytesIO(novo)).read("word/document.xml")
+    pendente = conforme(
+        _editar(api, A, ("c.docx", novo), {"operacoes": [{"op": "texto", "alvo": alvo, "texto": "x"}]}),
+        "/v1/edicoes",
+        "post",
+    )
+    assert pendente.status_code == 409 and pendente.json()["type"] == "urn:lince:erro:revisoes-pendentes"
