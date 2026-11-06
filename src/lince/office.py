@@ -176,11 +176,13 @@ def mermaid_do_fluxo(arestas):
     return "\n".join(linhas + ["```"])
 
 
-def planejar_office(path, pasta):
+def planejar_office(path, pasta, ext=None):
+    """`ext` é o formato já decidido pelo leitor (pela extensão ou pelo conteúdo)."""
     import anydoc
 
-    ext = os.path.splitext(path)[1].lower()
-    doc = anydoc.to_document(open(path, "rb").read())
+    ext = ext or os.path.splitext(path)[1].lower()
+    # CSV e TSV não têm assinatura: o formato vai explícito (o anydoc detecta separador e codificação)
+    doc = anydoc.to_document(open(path, "rb").read(), format="csv" if ext in (".csv", ".tsv") else None)
     tarefas = []
 
     def ler_imagem(data, mime, onde):

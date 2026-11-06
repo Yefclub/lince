@@ -9,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
+import anydoc
+
 from ._trava import PDFIUM
 from .agrupamento import agrupar, distribuir_lotes
 from .cache import Cache, chave
@@ -23,6 +25,36 @@ from .tipos import Cobertura, Resultado, Uso
 
 TEXTO = {".txt", ".md", ".json", ".yaml", ".yml", ".tex", ".xml"}
 IMAGEM = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+OFFICE = {  # lidos pelo anydoc (com gráficos, fluxogramas e imagens à parte)
+    ".docx",
+    ".docm",
+    ".doc",
+    ".pptx",
+    ".pptm",
+    ".ppsx",
+    ".ppsm",
+    ".ppt",
+    ".pps",
+    ".pot",
+    ".xlsx",
+    ".xlsm",
+    ".xls",
+    ".xlsb",
+    ".odt",
+    ".ods",
+    ".odp",
+    ".rtf",
+    ".epub",
+    ".csv",
+    ".tsv",
+}
+FORMATOS = frozenset({".pdf"} | IMAGEM | TEXTO | OFFICE)  # o que o Lince lê; a API recusa o resto com 415
+
+
+class FormatoNaoSuportado(anydoc.UnsupportedError):
+    """Formato que o Lince não lê. É um `anydoc.ConvertError`, como as demais falhas de conversão."""
+
+
 try:  # a versão vem do pacote instalado (pyproject), carimbada pelos workflows de versão
     VERSAO = version("lince")
 except PackageNotFoundError:  # rodando direto do código-fonte, sem instalar
@@ -61,7 +93,7 @@ class Leitor:
 
     def _planejar(self, caminho, pasta):
         os.makedirs(f"{pasta}/ia", exist_ok=True)
-        ext = os.path.splitext(caminho)[1].lower()
+        ext = _extensao_lida(caminho)
         if ext == ".pdf":
             plano = planejar_pdf(caminho, pasta)
         elif ext in IMAGEM:
@@ -71,9 +103,9 @@ class Leitor:
         else:
             if zipfile.is_zipfile(caminho):  # Office, ODF, EPUB: conferido antes de qualquer descompactação
                 conferir_zip(caminho)
-            plano = planejar_office(caminho, pasta)
+            plano = planejar_office(caminho, pasta, ext)
         plano["arquivo"] = os.path.basename(caminho)
-        plano["meta_arquivo"] = metadados_arquivo(caminho)
+        plano["meta_arquivo"] = metadados_arquivo(caminho, ext)
         if plano.get("ilegiveis"):
             plano["meta_arquivo"].setdefault("partes_ilegiveis", []).extend(plano["ilegiveis"])
         plano["tarefas_originais"] = list(plano.get("tarefas", []))
@@ -228,6 +260,21 @@ def _recortes_ampliados(doc, t, io):
 
 def _precisa_rever(txt):
     return (not txt.strip()) or "[ilegível]" in txt or "[illegible]" in txt or txt.count("≈") >= 2
+
+
+def _extensao_lida(caminho: str) -> str:
+    """A extensão que decide a leitura. Fora da lista, o conteúdo decide (marcador do formato: PDF, RTF, OLE, pacote
+    Office ou ODF); sem marcador conhecido, o formato não é suportado."""
+    ext = os.path.splitext(caminho)[1].lower()
+    if ext in FORMATOS:
+        return ext
+    if zipfile.is_zipfile(caminho):  # a detecção abre o pacote: conferido antes de qualquer descompactação
+        conferir_zip(caminho)
+    with open(caminho, "rb") as f:
+        detectado = anydoc.format_from_bytes(f.read())
+    if detectado is None:
+        raise FormatoNaoSuportado(f"formato {ext or '(sem extensão)'} não suportado")
+    return f".{detectado}"
 
 
 def ler(caminho: str | Path, **opcoes) -> Resultado:

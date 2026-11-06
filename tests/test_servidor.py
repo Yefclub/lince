@@ -244,6 +244,21 @@ def test_envios_paralelos_nao_furam_o_teto_de_pendentes():
     assert s.reservar("outro")  # o teto é por token
 
 
+def test_planilhas_em_texto_sao_lidas_com_separador_e_codificacao_detectados(api):
+    csv = 'nome;valor;obs\nJoão;1,5;"a;b"\n'.encode("latin-1")
+    s = enviar(api, [("dados.csv", csv), ("dados.tsv", b"a\tb\n1\t2\n")], {**A, **ESPERA}).json()
+    assert [i["estado"] for i in s["itens"]] == ["pronto", "pronto"]
+    assert "| João | 1,5 | a;b |" in s["itens"][0]["resultado"]["markdown"]
+    assert "| 1 | 2 |" in s["itens"][1]["resultado"]["markdown"]
+
+
+def test_formato_nao_suportado_recusa_o_lote_antes_de_entrar_na_fila(api, pdf):
+    r = conforme(enviar(api, [("bom.pdf", pdf), ("pagina.html", b"<p>oi</p>")], A), "/v1/sessoes", "post")
+    assert r.status_code == 415 and r.json()["type"] == "urn:lince:erro:formato-nao-suportado"
+    assert "pagina.html" in r.json()["detail"] and ".pdf" in r.json()["detail"]
+    assert api.app.state.servico.sessoes == {} and api.app.state.servico.vagas == {}
+
+
 def test_pedido_recusado_devolve_a_vaga(api, pdf):
     for _ in range(PENDENTES_POR_CLIENTE + 10):  # se a vaga vazasse, viria 429
         assert enviar(api, ("sem_extensao", pdf), A).status_code == 400

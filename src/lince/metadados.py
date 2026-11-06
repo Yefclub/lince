@@ -11,11 +11,11 @@ from xml.etree import ElementTree as ET  # noqa: F401
 from .limites import xml_ou_nada
 
 
-def metadados_arquivo(path):
+def metadados_arquivo(path, ext=None):
     """Metadados que a empresa precisa e que não estão no corpo: propriedades do arquivo,
-    comentários e alterações rastreadas (DOCX), abas ocultas (XLSX), info do PDF."""
+    comentários e alterações rastreadas (DOCX), abas ocultas (XLSX), info do PDF. `ext` é o formato já decidido."""
     meta = {}
-    ext = os.path.splitext(path)[1].lower()
+    ext = ext or os.path.splitext(path)[1].lower()
     if ext == ".pdf":
         import pypdfium2 as pdfium
 
