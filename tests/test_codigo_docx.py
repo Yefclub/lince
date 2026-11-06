@@ -582,3 +582,26 @@ def test_paragrafo_complexo_demais_e_recusado(contrato):
     with pytest.raises(OperacaoInvalida) as e:
         codigo.editar(dados, "c.docx", [{"op": "texto", "alvo": alvo, "texto": "x"}])
     assert e.value.codigo == "texto-grande"
+
+
+def test_texto_longo_de_mesma_formatacao_com_revisao_e_linear(contrato):
+    import time
+
+    longo = b"<w:p>" + (b"<w:r><w:t>" + b"x" * 40 + b"</w:t></w:r>") * 4_000 + b"</w:p>"  # 160 mil caracteres
+    dados = _com_paragrafos(contrato, longo)
+    alvo = _paragrafos(docx.extrair(dados))[-1]["id"]
+    for op in ({"op": "texto", "alvo": alvo, "texto": "Curto"}, {"op": "remover_paragrafo", "alvo": alvo}):
+        inicio = time.monotonic()
+        novo, _ = codigo.editar(dados, "c.docx", [op])
+        assert time.monotonic() - inicio < 5
+        assert "<w:delText>" + "x" * 160_000 + "</w:delText>" in _xml(novo)  # um delText só para o grupo
+
+
+def test_paraid_repetido_e_ambiguo(contrato):
+    def repetir(x):
+        return x.replace(b"<w:p>", b'<w:p w14:paraId="0000ABCD">', 2)
+
+    dados = _trocar_xml(contrato, repetir)
+    with pytest.raises(OperacaoInvalida) as e:
+        codigo.editar(dados, "c.docx", [{"op": "texto", "alvo": "p:0000ABCD", "texto": "x", "revisao": False}])
+    assert e.value.codigo == "alvo-ambiguo"

@@ -73,19 +73,6 @@ EDICAO_PRAZO = 60  # segundos por pedido de edição: passou, nada é aplicado (
 _LARGURA_ZERO = {"rPr", "lastRenderedPageBreak", "softHyphen"}  # filhos de run sem texto e sem conteúdo próprio
 AUTOR_PADRAO = "Lince"
 OBJETO = "￼"  # imagem, campo, nota: ocupa uma posição no texto para que nenhuma troca o atravesse
-CONTEUDO_OPACO = {
-    "drawing",
-    "pict",
-    "object",
-    "fldChar",
-    "instrText",
-    "footnoteReference",
-    "endnoteReference",
-    "commentReference",
-    "sym",
-    "ptab",
-    "AlternateContent",  # caixa de texto, forma e WordArt dentro do run
-}
 _ALVO_P = re.compile(r"p:(n\d{1,7}|[0-9A-Fa-f]{8})")
 _ALVO_T = re.compile(r"t:(\d{1,6})")
 
@@ -333,8 +320,8 @@ class _Editor:
         self.documento = _documento(self.pk)
         self.corpo = _corpo(self.pk, self.documento)
         self.ids = dict(_ids(self.corpo))  # resolvidos no arquivo original: inserir não muda o alvo das próximas
-        self.por_para_id: dict[str, list] = {}
-        for pid, p in self.ids.items():
+        self.por_para_id: dict[str, list] = {}  # da lista, não do dict: id repetido tem de dar alvo-ambiguo
+        for pid, p in _ids(self.corpo):
             if not pid.startswith("p:n"):
                 self.por_para_id.setdefault(pid, []).append(p)
         self.prazo_final = time.monotonic() + EDICAO_PRAZO
@@ -393,7 +380,7 @@ class _Editor:
 
     def tocar_texto(self, p, alvo):
         """Uma operação de texto por parágrafo por pedido, e nunca sobre revisões que já estavam no arquivo."""
-        if sum(1 for _ in p.iter()) > ELEMENTOS_MAX:
+        if sum(1 for _ in p.iter()) > ELEMENTOS_MAX or len(self.texto(p, objetos=True)) > PARAGRAFO_MAX:
             raise OperacaoInvalida(
                 "texto-grande", f"{alvo} é complexo demais para editar (XML muito grande)", alvo=alvo
             )
@@ -476,20 +463,26 @@ def _fatiar(r, pontos: list[int]) -> list:
 
 
 def _juntar_filhos(pai, tag):
-    """Junta runs vizinhos de `pai` que só têm um `tag` (w:delText) e o mesmo rPr."""
-    anterior = None
-    for r in list(pai):
-        if r.tag != W + "r" or len([x for x in r if x.tag != W + "rPr"]) != 1 or r.find(tag) is None:
-            anterior = None
+    """Junta runs vizinhos de `pai` que só têm um `tag` (w:delText) e o mesmo rPr. Linear: cada grupo é juntado com
+    um join só (concatenar run a run copiaria o texto acumulado a cada passo)."""
+    grupos, atual = [], []
+    for r in pai:
+        unico = r.tag == W + "r" and len([x for x in r if x.tag != W + "rPr"]) == 1 and r.find(tag) is not None
+        if unico and atual and _mesmo_rpr(atual[-1], r) and dict(atual[-1].attrib) == dict(r.attrib):
+            atual.append(r)
             continue
-        if anterior is not None and _mesmo_rpr(anterior, r) and dict(anterior.attrib) == dict(r.attrib):
-            ta, tb = anterior.find(tag), r.find(tag)
-            ta.text = (ta.text or "") + (tb.text or "")
-            if ta.text != ta.text.strip():
-                ta.set(XML_SPACE, "preserve")
+        if len(atual) > 1:
+            grupos.append(atual)
+        atual = [r] if unico else []
+    if len(atual) > 1:
+        grupos.append(atual)
+    for grupo in grupos:
+        alvo = grupo[0].find(tag)
+        alvo.text = "".join(r.find(tag).text or "" for r in grupo)
+        if alvo.text != alvo.text.strip():
+            alvo.set(XML_SPACE, "preserve")
+        for r in grupo[1:]:
             pai.remove(r)
-        else:
-            anterior = r
 
 
 def _mesmo_rpr(a, b) -> bool:
@@ -598,8 +591,11 @@ def _op_texto(ed: _Editor, op, rel):
         posicao = p.index(removiveis[0]) if removiveis else len(p)
         for el in removiveis:
             p.remove(el)
-        for k, novo in enumerate(_run(texto, rpr)):
-            p.insert(posicao + k, novo)
+        novos = _run(texto, rpr)
+        if novos:
+            p.insert(posicao, novos[0])
+            for anterior, novo in zip(novos, novos[1:], strict=False):  # addnext encadeado: linear
+                anterior.addnext(novo)
     else:
         ultima = _excluir(ed, runs, rev) if runs else None
         while ultima is not None and ultima.getparent() is not p:  # fora do link, como no modo direto
