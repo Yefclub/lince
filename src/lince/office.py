@@ -180,7 +180,8 @@ def planejar_office(path, pasta):
     import anydoc
 
     ext = os.path.splitext(path)[1].lower()
-    doc = anydoc.to_document(open(path, "rb").read())
+    # CSV e TSV não têm assinatura: o formato vai explícito (o anydoc detecta separador e codificação)
+    doc = anydoc.to_document(open(path, "rb").read(), format="csv" if ext in (".csv", ".tsv") else None)
     tarefas = []
 
     def ler_imagem(data, mime, onde):

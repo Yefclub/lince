@@ -23,6 +23,32 @@ from .tipos import Cobertura, Resultado, Uso
 
 TEXTO = {".txt", ".md", ".json", ".yaml", ".yml", ".tex", ".xml"}
 IMAGEM = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+OFFICE = {  # lidos pelo anydoc (com gráficos, fluxogramas e imagens à parte)
+    ".docx",
+    ".docm",
+    ".doc",
+    ".pptx",
+    ".pptm",
+    ".ppsx",
+    ".ppt",
+    ".xlsx",
+    ".xlsm",
+    ".xls",
+    ".odt",
+    ".ods",
+    ".odp",
+    ".rtf",
+    ".epub",
+    ".csv",
+    ".tsv",
+}
+FORMATOS = frozenset({".pdf"} | IMAGEM | TEXTO | OFFICE)  # o que o Lince lê; a API recusa o resto com 415
+
+
+class FormatoNaoSuportado(ValueError):
+    pass
+
+
 try:  # a versão vem do pacote instalado (pyproject), carimbada pelos workflows de versão
     VERSAO = version("lince")
 except PackageNotFoundError:  # rodando direto do código-fonte, sem instalar
@@ -68,10 +94,12 @@ class Leitor:
             plano = _plano_imagem(caminho, pasta)
         elif ext in TEXTO:
             plano = {"tipo": "texto", "md": _texto(caminho), "tarefas": []}
-        else:
+        elif ext in OFFICE:
             if zipfile.is_zipfile(caminho):  # Office, ODF, EPUB: conferido antes de qualquer descompactação
                 conferir_zip(caminho)
             plano = planejar_office(caminho, pasta)
+        else:
+            raise FormatoNaoSuportado(f"formato {ext or '(sem extensão)'} não suportado")
         plano["arquivo"] = os.path.basename(caminho)
         plano["meta_arquivo"] = metadados_arquivo(caminho)
         if plano.get("ilegiveis"):

@@ -185,8 +185,21 @@ No `clamd.conf`, `StreamMaxLength` precisa ser pelo menos `100M`, que é o teto 
 
 ## Formatos
 
-PDF (nativo, escaneado, misto), DOCX, DOC, PPTX, PPT, XLSX, XLS, ODT, ODS, ODP, RTF, EPUB, CSV, imagens
-(PNG, JPG, WEBP, TIFF, BMP, GIF) e texto (TXT, MD, JSON, YAML, XML, TeX).
+O formato vem da extensão do nome do arquivo. Qualquer outra extensão é recusada pela API com `415
+formato-nao-suportado`, antes do upload entrar na fila.
+
+| Tipo | Extensões | Leitura |
+| --- | --- | --- |
+| PDF | `.pdf` | Nativo, escaneado ou misto, roteado por página |
+| Word e texto rico | `.docx` `.docm` `.doc` `.odt` `.rtf` `.epub` | Texto, tabelas e imagens; texto oculto do `.docx` vai para os alertas |
+| Apresentação | `.pptx` `.pptm` `.ppsx` `.ppt` `.odp` | Slides, notas, tabelas e gráficos com os dados |
+| Planilha | `.xlsx` `.xlsm` `.xls` `.ods` `.csv` `.tsv` | Abas como tabelas; CSV e TSV com separador e codificação detectados |
+| Imagem | `.png` `.jpg` `.jpeg` `.webp` `.tif` `.tiff` `.bmp` `.gif` | Pelo modelo de visão |
+| Texto | `.txt` `.md` `.json` `.yaml` `.yml` `.xml` `.tex` | Como está |
+
+Documento como código e edição: `.pptx` e `.pptm` (`.ppsx` só na leitura do código).
+
+HTML, e-mail (`.eml`, `.msg`) e arquivos compactados (`.zip`) ainda não são aceitos.
 
 ## Instalação
 

@@ -34,7 +34,7 @@ from starlette.routing import Route
 
 from . import antivirus
 from . import codigo as codigo_doc
-from .leitor import VERSAO, Leitor
+from .leitor import FORMATOS, VERSAO, Leitor
 from .limites import DocumentoRecusado
 from .provedores import OpenAICompativel
 
@@ -457,9 +457,17 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None) -> Starl
             if pedir_codigo not in ("sim", "nao"):
                 raise Problema(400, "codigo-invalido", "codigo deve ser 'sim' ou 'nao'")
             for a in arquivos:
-                if not re.fullmatch(r"\.[a-z0-9]{1,8}", Path(a.filename or "").suffix.lower()):
+                ext = Path(a.filename or "").suffix.lower()
+                if not re.fullmatch(r"\.[a-z0-9]{1,8}", ext):
                     raise Problema(
                         400, "extensao-ausente", "Todo arquivo precisa de nome com extensão", a.filename or ""
+                    )
+                if ext not in FORMATOS:  # recusa já, sem gastar upload, vaga nem fila com o que não seria lido
+                    raise Problema(
+                        415,
+                        "formato-nao-suportado",
+                        "Formato não suportado",
+                        f"{a.filename!r}: aceitos {', '.join(sorted(FORMATOS))}",
                     )
             sessao = await _receber(
                 s, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=pedir_codigo == "sim"
