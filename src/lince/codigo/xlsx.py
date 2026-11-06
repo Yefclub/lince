@@ -208,13 +208,20 @@ _ESCAPE = re.compile(r"_x([0-9A-Fa-f]{4})_")
 
 
 def _decodificar(texto: str) -> str:
-    """O Excel guarda caractere especial como _xHHHH_ (ex.: _x000D_ é o retorno de carro): o código mostra o texto."""
-    return _ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), texto)
+    """O Excel guarda caractere especial como _xHHHH_ (ex.: _x000D_ é o retorno de carro): o código mostra o texto.
+    Emoji gravado em duas metades (_xD83D__xDE00_) vira um caractere só; metade solta vira U+FFFD."""
+    bruto = _ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), texto)
+    return bruto.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+
+
+_FORA_DO_XML = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 
 
 def _codificar(texto: str) -> str:
-    """O inverso: todo _ que começaria um _xHHHH_ vira _x005F_, então o Excel mostra exatamente o texto pedido."""
-    return re.sub(r"_(?=x[0-9A-Fa-f]{4}_)", "_x005F_", texto)
+    """O inverso: todo _ que começaria um _xHHHH_ vira _x005F_, e o caractere que o XML não aceita (controle) vira
+    _xHHHH_, então o Excel mostra exatamente o texto pedido e o que foi lido pode ser gravado de volta."""
+    texto = re.sub(r"_(?=x[0-9A-Fa-f]{4}_)", "_x005F_", texto)
+    return _FORA_DO_XML.sub(lambda m: f"_x{ord(m.group(0)):04X}_", texto)
 
 
 def _fora_de_fonetica(t) -> bool:

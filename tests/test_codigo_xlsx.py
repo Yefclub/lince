@@ -588,3 +588,14 @@ def test_retorno_de_carro_do_excel_e_lido_como_caractere():
 def test_matriz_nao_entra_em_uniao():
     with pytest.raises(OperacaoInvalida):
         codigo.editar(_livro(), "p.xlsx", [{"op": "celula", "alvo": "Dados!A9", "formula": "=SUM(({1,2},A1))"}])
+
+
+def test_controle_e_emoji_em_duas_metades_vindos_do_arquivo():
+    dados = _trocar(
+        _livro(), "xl/sharedStrings.xml", lambda x: x.replace("<t>Rota</t>", "<t>A_x0001_B_xD83D__xDE00_</t>")
+    )
+    lido = _celula(xlsx.extrair(dados), "Dados!A1")["valor"]
+    assert lido == "A\x01B\U0001f600"
+    novo, rel = codigo.editar(dados, "p.xlsx", [{"op": "celula", "alvo": "Dados!A2", "valor": lido}])
+    assert "_x0001_" in _parte(novo, "xl/worksheets/sheet1.xml")
+    assert _celula(rel["codigo"], "Dados!A2")["valor"] == lido
