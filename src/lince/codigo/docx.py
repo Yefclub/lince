@@ -119,22 +119,54 @@ def _ids(corpo) -> list[tuple[str, object]]:
     return out
 
 
+_ENVOLTORIOS = {"hyperlink", "smartTag", "ins", "moveTo", "customXml"}
+_MARCADORES = {  # filhos de parágrafo sem texto visível: ficam onde estão
+    "pPr",
+    "bookmarkStart",
+    "bookmarkEnd",
+    "commentRangeStart",
+    "commentRangeEnd",
+    "proofErr",
+    "permStart",
+    "permEnd",
+    "del",
+    "moveFrom",
+    "moveFromRangeStart",
+    "moveFromRangeEnd",
+    "moveToRangeStart",
+    "moveToRangeEnd",
+    "customXmlInsRangeStart",
+    "customXmlInsRangeEnd",
+    "customXmlDelRangeStart",
+    "customXmlDelRangeEnd",
+    "customXmlMoveFromRangeStart",
+    "customXmlMoveFromRangeEnd",
+    "customXmlMoveToRangeStart",
+    "customXmlMoveToRangeEnd",
+}
+
+
 def _runs(p, campos=False):
     """Runs visíveis do parágrafo, em ordem: os de dentro de hyperlink, smartTag e controles de conteúdo contam; os de
-    revisão excluída (w:del, moveFrom) não. O campo simples (w:fldSimple) vem inteiro, como um objeto, salvo com
-    `campos=True` (os runs de dentro dele). Não entra em parágrafos aninhados (caixas de texto)."""
+    revisão excluída (w:del, moveFrom) não. Todo o resto que não é run (campo simples, equação, texto bidirecional,
+    o que o Lince não conhece) vem inteiro, como objeto que nenhuma troca atravessa; com `campos=True`, desce no campo
+    simples e no texto bidirecional (para marcar os runs de dentro como excluídos). Não entra em caixas de texto."""
     for el in p:
+        if not isinstance(el.tag, str):
+            continue
         nome = etree.QName(el).localname
-        if nome == "r":
+        if el.tag == W + "r":
             yield el
-        elif nome == "fldSimple" and not campos:
-            yield el
-        elif nome in ("hyperlink", "smartTag", "fldSimple", "ins", "moveTo", "customXml"):
+        elif el.tag[: len(W)] == W and nome in _ENVOLTORIOS:
             yield from _runs(el, campos)
-        elif nome == "sdt":
+        elif el.tag == W + "sdt":
             conteudo = el.find("w:sdtContent", NS)
             if conteudo is not None:
                 yield from _runs(conteudo, campos)
+        elif campos and el.tag in (W + "fldSimple", W + "dir", W + "bdo"):
+            yield from _runs(el, campos)
+        elif not (el.tag[: len(W)] == W and nome in _MARCADORES):
+            yield el
 
 
 def _unidade(x) -> str:
@@ -144,8 +176,10 @@ def _unidade(x) -> str:
         return x.text or ""
     if nome == "tab":
         return "\t"
-    if nome in ("br", "cr"):
+    if nome == "cr" or (nome == "br" and x.get(W + "type") in (None, "textWrapping")):
         return QUEBRA
+    if nome == "br":
+        return OBJETO  # quebra de página e de coluna mudam o layout: trocar por \v estragaria
     if nome == "noBreakHyphen":
         return "-"
     return OBJETO if nome in CONTEUDO_OPACO else ""
@@ -155,12 +189,26 @@ def _texto_run(r) -> str:
     return "".join(_unidade(x) for x in r)
 
 
-def _conteudo(p) -> list[tuple[object, str]]:
+def _campos(corpo) -> dict:
+    """Profundidade de campo complexo no começo de cada parágrafo: sumário e índice são um campo só que atravessa
+    vários parágrafos (o dict usa o elemento como chave e o mantém vivo)."""
+    out, nivel = {}, 0
+    for p in _paragrafos(corpo):
+        out[p] = nivel
+        for r in _runs(p):
+            for f in r.iter(W + "fldChar") if r.tag == W + "r" else ():
+                tipo = f.get(W + "fldCharType")
+                nivel = nivel + 1 if tipo == "begin" else max(0, nivel - 1) if tipo == "end" else nivel
+    return out
+
+
+def _conteudo(p, campo: int = 0) -> list[tuple[object, str]]:
     """(run, texto) na ordem. Campo inteiro (simples ou complexo, inclusive o resultado mostrado) vira OBJETO: o
-    resultado é recalculado pelo Word, então trocar ali não teria efeito duradouro."""
-    out, campo = [], 0
+    resultado é recalculado pelo Word, então trocar ali não teria efeito duradouro. `campo` é a profundidade de campo
+    complexo em que o parágrafo começa."""
+    out = []
     for r in _runs(p):
-        if r.tag == W + "fldSimple":
+        if r.tag != W + "r":
             out.append((r, OBJETO))
             continue
         tipos = [f.get(W + "fldCharType") for f in r.findall("w:fldChar", NS)]
@@ -173,8 +221,8 @@ def _conteudo(p) -> list[tuple[object, str]]:
     return out
 
 
-def _texto(p, com_objetos=False) -> str:
-    t = "".join(texto for _, texto in _conteudo(p))
+def _texto(p, com_objetos=False, campo: int = 0) -> str:
+    t = "".join(texto for _, texto in _conteudo(p, campo))
     return t if com_objetos else t.replace(OBJETO, "")
 
 
@@ -195,18 +243,18 @@ def _estilos(pk: Pacote, documento: str) -> dict[str, str]:
     return out
 
 
-def _paragrafo(pid: str, p) -> dict:
+def _paragrafo(pid: str, p, campo: int = 0) -> dict:
     ppr = p.find("w:pPr", NS)
     estilo = ppr.find("w:pStyle", NS) if ppr is not None else None
     num = ppr.find("w:numPr", NS) if ppr is not None else None
-    out = {"id": pid, "estilo": estilo.get(W + "val") if estilo is not None else None, "texto": _texto(p)}
+    out = {"id": pid, "estilo": estilo.get(W + "val") if estilo is not None else None, "texto": _texto(p, campo=campo)}
     if num is not None:
         nivel, lista = num.find("w:ilvl", NS), num.find("w:numId", NS)
         out["lista"] = {
             "num": lista.get(W + "val") if lista is not None else None,
             "nivel": int(nivel.get(W + "val")) if nivel is not None else 0,
         }
-    if OBJETO in _texto(p, com_objetos=True):
+    if OBJETO in _texto(p, com_objetos=True, campo=campo):
         out["objetos"] = True  # imagem, campo, nota, caixa de texto: `texto` recusa, `substituir` trabalha em volta
     if p.find("w:sdt", NS) is not None:
         out["controles"] = True  # controle de conteúdo no parágrafo: `texto` recusa, `substituir` troca dentro dele
@@ -220,23 +268,30 @@ def extrair(dados: bytes) -> dict:
     documento = _documento(pk)
     corpo = _corpo(pk, documento)
     ids = {p: pid for pid, p in _ids(corpo)}  # chave é o elemento: o dict mantém o proxy do lxml vivo
+    campos = _campos(corpo)
+
+    def par(p):
+        return _paragrafo(ids[p], p, campos.get(p, 0))
+
+    def proprios(raiz, tag, dono):  # descendentes `tag` cujo `dono` mais próximo é `raiz` (sem descer em aninhados)
+        return [x for x in raiz.iter(W + tag) if next(x.iterancestors(W + dono), None) is raiz]
+
     blocos, tabelas = [], 0
     for el in corpo:
+        if not isinstance(el.tag, str):
+            continue
         nome = etree.QName(el).localname
         if nome == "p":
-            blocos.append({"tipo": "paragrafo", **_paragrafo(ids[el], el)})
-        elif nome == "tbl":
-            linhas = []
-            for tr in el.findall("w:tr", NS):
-                linhas.append(
-                    [[_paragrafo(ids[p], p) for p in tc.iter(W + "p") if p in ids] for tc in tr.findall("w:tc", NS)]
-                )
+            blocos.append({"tipo": "paragrafo", **par(el)})
+        elif nome == "tbl":  # linhas e células também dentro de controle de conteúdo (seção repetida)
+            linhas = [
+                [[par(p) for p in tc.iter(W + "p") if p in ids] for tc in proprios(tr, "tc", "tr")]
+                for tr in proprios(el, "tr", "tbl")
+            ]
             blocos.append({"tipo": "tabela", "id": f"t:{tabelas}", "linhas": linhas})
             tabelas += 1
         else:  # controle de conteúdo, customXml…: os parágrafos de dentro entram em ordem
-            for p in el.iter(W + "p"):
-                if p in ids:
-                    blocos.append({"tipo": "paragrafo", **_paragrafo(ids[p], p)})
+            blocos += [{"tipo": "paragrafo", **par(p)} for p in el.iter(W + "p") if p in ids]
     comentarios = []
     alvo = next((a for t, a in pk.rels(documento).values() if t == "comments"), None)
     if alvo in pk.partes:
@@ -274,6 +329,7 @@ class _Editor:
         self.documento = _documento(self.pk)
         self.corpo = _corpo(self.pk, self.documento)
         self.ids = dict(_ids(self.corpo))  # resolvidos no arquivo original: inserir não muda o alvo das próximas
+        self.campos = _campos(self.corpo)
         self.para_ids = {p.get(PARA_ID) for p in self.corpo.iter(W + "p") if p.get(PARA_ID)}
         self.usa_para_id = bool(self.para_ids)
         self.tocados: set = set()  # elementos (o set mantém os proxies vivos)
@@ -293,6 +349,9 @@ class _Editor:
     def _parte_comentarios(self):
         alvo = next((a for t, a in self.pk.rels(self.documento).values() if t == "comments"), None)
         return [alvo] if alvo in self.pk.partes else []
+
+    def texto(self, p, objetos=False) -> str:
+        return _texto(p, objetos, self.campos.get(p, 0))
 
     def novo_para_id(self) -> str:
         """paraId novo, único no documento e abaixo de 0x80000000, como o Word exige."""
@@ -357,37 +416,41 @@ class _Editor:
         return etree.Element(W + nome, {W + "id": self.novo_id(), W + "author": rev["autor"], W + "date": self.agora})
 
 
-def _dividir(r, o: int):
-    """Corta o run no deslocamento `o` (em unidades de _unidade) e devolve o run novo com o resto, logo depois dele.
-    O run novo leva cópia do rPr: a formatação dos dois lados não muda."""
+def _fatiar(r, pontos: list[int]) -> list:
+    """Corta o run em todos os `pontos` (deslocamentos em unidades de _unidade, crescentes, dentro do run) numa
+    passada só, e devolve os pedaços em ordem (o primeiro é o próprio `r`). Cada pedaço leva cópia do rPr: a
+    formatação não muda. Custo linear no tamanho do run, qualquer que seja o número de cortes."""
     rpr = r.find("w:rPr", NS)
     filhos = [x for x in r if x is not rpr]
-    acumulado, corte = 0, None
-    for k, x in enumerate(filhos):
+    atomos, posicao = [], 0  # (começo, elemento) com os w:t já cortados nos pontos que caem dentro deles
+    for x in filhos:
         tamanho = len(_unidade(x))
-        if acumulado + tamanho <= o:
-            acumulado += tamanho
-            continue
-        if acumulado < o:  # o corte cai dentro deste w:t
-            resto = etree.Element(W + "t")
-            resto.text = x.text[o - acumulado :]
-            x.text = x.text[: o - acumulado]
-            for t in (x, resto):
+        dentro = [q - posicao for q in pontos if posicao < q < posicao + tamanho] if x.tag == W + "t" else []
+        if not dentro:
+            atomos.append((posicao, x))
+        else:
+            texto, anterior = x.text, 0
+            for corte in [*dentro, tamanho]:
+                t = etree.Element(W + "t")
+                t.text = texto[anterior:corte]
                 if t.text != t.text.strip():
                     t.set(XML_SPACE, "preserve")
-            x.addnext(resto)
-            filhos.insert(k + 1, resto)
-            corte = k + 1
-        else:
-            corte = k
-        break
-    novo = etree.Element(W + "r", r.attrib)
-    if rpr is not None:
-        novo.append(copy.deepcopy(rpr))
-    for x in filhos[corte:] if corte is not None else []:
-        novo.append(x)
-    r.addnext(novo)
-    return novo
+                atomos.append((posicao + anterior, t))
+                anterior = corte
+        posicao += tamanho
+    for x in filhos:
+        r.remove(x)
+    pedacos, atual, k = [r], r, 0
+    for comeco, el in atomos:
+        while k < len(pontos) and comeco >= pontos[k]:  # passou de um ponto de corte: run novo
+            novo = etree.Element(W + "r", r.attrib)
+            if rpr is not None:
+                novo.append(copy.deepcopy(rpr))
+            atual.addnext(novo)
+            pedacos.append(novo)
+            atual, k = novo, k + 1
+        atual.append(el)
+    return pedacos  # um pedaço por trecho: todo corte é interno, então cada trecho começa com algum filho
 
 
 def _juntar_filhos(pai, tag):
@@ -487,12 +550,12 @@ def _op_texto(ed: _Editor, op, rel):
             "operacao-invalida", "texto é um parágrafo: use \\v para quebra de linha", alvo=op.get("alvo")
         )
     p = ed.paragrafo(op.get("alvo"))
-    atual = _texto(p)
+    atual = ed.texto(p)
     conferir(op, atual, op["alvo"])
-    if OBJETO in _texto(p, com_objetos=True):
+    if OBJETO in ed.texto(p, objetos=True):
         raise OperacaoInvalida(
             "operacao-invalida",
-            f"{op['alvo']} tem imagem, campo, nota ou caixa de texto: use substituir no trecho",
+            f"{op['alvo']} tem imagem, campo, nota, equação ou caixa de texto: use substituir no trecho",
             alvo=op["alvo"],
         )
     if p.find("w:sdt", NS) is not None:
@@ -504,14 +567,18 @@ def _op_texto(ed: _Editor, op, rel):
     rev = ed.revisao(op)
     runs = list(_runs(p))
     rpr = _rpr_limpo(runs[0]) if runs else None
-    if rev is None:  # links e smartTags somem junto: o parágrafo vira um texto só, com a formatação do começo
-        for el in list(p):
-            if etree.QName(el).localname in ("r", "hyperlink", "smartTag", "proofErr", "customXml"):
-                p.remove(el)
-        _incluir(ed, None, texto, rpr, None, pai=p)
+    if rev is None:  # links e smartTags somem junto; o texto novo fica onde estava o antigo (dentro dos bookmarks)
+        removiveis = [
+            e for e in p if etree.QName(e).localname in ("r", "hyperlink", "smartTag", "proofErr", "customXml")
+        ]
+        posicao = p.index(removiveis[0]) if removiveis else len(p)
+        for el in removiveis:
+            p.remove(el)
+        for k, novo in enumerate(_run(texto, rpr)):
+            p.insert(posicao + k, novo)
     else:
-        _excluir(ed, runs, rev)
-        _incluir(ed, None, texto, rpr, rev, pai=p)
+        ultima = _excluir(ed, runs, rev) if runs else None
+        _incluir(ed, ultima, texto, rpr, rev, pai=p)
     rel.update(antes=atual, depois=texto, partes=["/" + ed.documento])
 
 
@@ -528,13 +595,13 @@ def _op_substituir(ed: _Editor, op, rel):
     rev = ed.revisao(op)
     trocas, ignoradas = 0, 0
     for p in paragrafos:
-        if busca not in _texto(p):
+        visivel = ed.texto(p)
+        if busca not in visivel:
             continue
         if alvo is None and (_revisoes(p) or p in ed.tocados):
-            ignoradas += 1
+            ignoradas += visivel.count(busca)
             continue
-        ed.tocar_texto(p, alvo or "documento")
-        feitas, puladas = _trocar_no_paragrafo(ed, p, busca, troca, rev, TROCAS_MAX - trocas)
+        feitas, puladas = _trocar_no_paragrafo(ed, p, busca, troca, rev, TROCAS_MAX - trocas, alvo or "documento")
         trocas += feitas
         ignoradas += puladas
     if ignoradas:
@@ -547,51 +614,63 @@ def _op_substituir(ed: _Editor, op, rel):
     rel.update(trocas=trocas, partes=["/" + ed.documento])
 
 
-def _trocar_no_paragrafo(ed: _Editor, p, busca: str, troca: str, rev, restantes: int) -> tuple[int, int]:
+def _trocar_no_paragrafo(ed: _Editor, p, busca: str, troca: str, rev, restantes: int, rotulo: str) -> tuple[int, int]:
     """Troca as ocorrências que ficam dentro de um mesmo pai (parágrafo, link, controle…) sem atravessar objeto.
-    Uma passada: acha todas, corta só os runs das pontas e aplica do fim para o começo (as posições de trás não mudam).
-    Devolve (trocadas, puladas)."""
-    conteudo = _conteudo(p)
+    Linear: acha todas numa passada, corta cada run uma vez só em todos os pontos de troca e aplica do fim para o
+    começo (as posições de trás não mudam). Só marca o parágrafo como alterado se houver troca. (trocadas, puladas)"""
+    conteudo = _conteudo(p, ed.campos.get(p, 0))
     texto = "".join(t for _, t in conteudo)
     if len(texto) > PARAGRAFO_MAX:
         raise OperacaoInvalida("texto-grande", "parágrafo grande demais para substituir; use texto")
-    posicoes, k = [], texto.find(busca)
-    while k >= 0:
-        posicoes.append(k)
-        k = texto.find(busca, k + len(busca))
-    validas = []
     spans, inicio = [], 0
     for r, t in conteudo:
-        spans.append([inicio, inicio + len(t), r])
+        spans.append((inicio, inicio + len(t), r))
         inicio += len(t)
     comecos = [x[0] for x in spans]
 
-    def indice(pos):  # o span que contém o caractere `pos` (o último com começo <= pos; spans vazios ficam antes)
+    def indice(pos):  # o span que contém o caractere `pos` (spans vazios na mesma posição ficam antes)
         return bisect.bisect_right(comecos, pos) - 1
 
-    for k in posicoes:
+    validas, total, k = [], 0, texto.find(busca)
+    while k >= 0:
+        total += 1
         fim = k + len(busca)
         donos = [spans[x][2] for x in range(indice(k), indice(fim - 1) + 1) if spans[x][1] > spans[x][0]]
         if OBJETO not in texto[k:fim] and len({r.getparent() for r in donos}) == 1:
             validas.append(k)
+        k = texto.find(busca, fim)
+    if not validas:
+        return 0, total
     if len(validas) > restantes:
         raise OperacaoInvalida(
             "operacao-invalida", f"mais de {TROCAS_MAX} ocorrências numa operação; seja mais específico"
         )
+    ed.tocar_texto(p, rotulo)
     ed.crescer(len(texto), len(texto) + len(validas) * (len(troca) - len(busca)))
+    cortes: dict[int, set] = {}  # índice do span -> pontos de corte relativos a ele
+    for k in validas:
+        for pos in (k, k + len(busca)):
+            x = indice(pos) if pos < len(texto) else len(spans) - 1
+            if spans[x][0] < pos < spans[x][1]:
+                cortes.setdefault(x, set()).add(pos - spans[x][0])
+    pedacos = []  # (começo, fim, run) depois dos cortes: toda ocorrência começa e termina em borda de run
+    for x, (a, b, r) in enumerate(spans):
+        if x in cortes and r.tag == W + "r":
+            pontos = sorted(cortes[x])
+            for (de, ate), pedaco in zip(
+                zip([0, *pontos], [*pontos, b - a], strict=True), _fatiar(r, pontos), strict=True
+            ):
+                pedacos.append((a + de, a + ate, pedaco))
+        else:
+            pedacos.append((a, b, r))
+    comecos = [x[0] for x in pedacos]
     for k in reversed(validas):
         fim = k + len(busca)
-        i, j = indice(fim - 1), indice(k)
-        if fim < spans[i][1]:  # corta o resto do último run (fica fora da troca)
-            _dividir(spans[i][2], fim - spans[i][0])
-            spans[i][1] = fim
-        if k > spans[j][0]:  # corta o começo do primeiro run (fica fora da troca)
-            cauda = _dividir(spans[j][2], k - spans[j][0])
-            spans.insert(j + 1, [k, spans[j][1], cauda])
-            comecos.insert(j + 1, k)
-            spans[j][1] = k
-            i, j = i + 1, j + 1
-        trecho = [spans[x][2] for x in range(j, i + 1)]
+        j = bisect.bisect_left(comecos, k)
+        while j < len(pedacos) and pedacos[j][1] == pedacos[j][0] and pedacos[j][0] == k:
+            j += 1  # pula runs vazios que começam no mesmo ponto: ficam fora da troca
+        i = bisect.bisect_left(comecos, fim) - 1
+        trecho = [pedacos[x][2] for x in range(j, i + 1)]
         modelo = next((r for r in trecho if _texto_run(r)), trecho[0])
         rpr = _rpr_limpo(modelo)
         if rev is None:
@@ -600,7 +679,7 @@ def _trocar_no_paragrafo(ed: _Editor, p, busca: str, troca: str, rev, restantes:
             _excluir(ed, trecho, None)
         else:
             _incluir(ed, _excluir(ed, trecho, rev), troca, rpr, rev)  # logo depois do w:del
-    return len(validas), len(posicoes) - len(validas)
+    return len(validas), total - len(validas)
 
 
 def _op_estilo(ed: _Editor, op, rel):
@@ -693,14 +772,28 @@ def _op_remover(ed: _Editor, op, rel):
         raise OperacaoInvalida("operacao-invalida", f"{op['alvo']} fecha uma seção do documento", alvo=op["alvo"])
     if any(el.tag in (W + "commentRangeStart", W + "commentReference") for el in p.iter()):
         raise OperacaoInvalida("operacao-invalida", f"{op['alvo']} tem comentário: resolva antes", alvo=op["alvo"])
-    atual = _texto(p)
+    atual = ed.texto(p)
     conferir(op, atual, op["alvo"])
-    ed.tocar_texto(p, op["alvo"])
     rev = ed.revisao(op)
+    if rev is None and etree.QName(pai).localname not in ("body", "tc"):
+        # dentro de controle de conteúdo: tirar o parágrafo pode deixar a célula ou o controle vazio
+        raise OperacaoInvalida(
+            "operacao-invalida",
+            f"{op['alvo']} está dentro de um controle de conteúdo: remova com revisão",
+            alvo=op["alvo"],
+        )
+    conteudo = list(_runs(p, campos=True))  # os runs de dentro de campo simples e texto bidirecional também
+    if rev is not None and any(r.tag != W + "r" for r in conteudo):
+        raise OperacaoInvalida(
+            "operacao-invalida",
+            f"{op['alvo']} tem equação ou conteúdo que não dá para marcar como excluído",
+            alvo=op["alvo"],
+        )
+    ed.tocar_texto(p, op["alvo"])
     if rev is None:
         pai.remove(p)
     else:
-        _excluir(ed, list(_runs(p, campos=True)), rev)  # os runs de dentro de campo simples também
+        _excluir(ed, conteudo, rev)
         ppr = p.find("w:pPr", NS)
         if ppr is None:
             ppr = etree.Element(W + "pPr")

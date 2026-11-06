@@ -153,9 +153,10 @@ padrão é `Lince`).
 | `comentar` | Comentário no parágrafo, com `autor` |
 
 No DOCX, um parágrafo recebe uma operação de texto por pedido, e o que já tem alteração controlada pendente no
-arquivo (inclusive de formatação) é recusado até alguém aceitar ou rejeitar no Word. Imagem, campo, nota, caixa de
-texto e controle de conteúdo no meio do parágrafo nunca são apagados: `texto` recusa, e `substituir` só troca o
-trecho que não passa por eles (dentro de um controle de conteúdo, troca).
+arquivo (inclusive de formatação) é recusado até alguém aceitar ou rejeitar no Word. Imagem, campo (inclusive o
+sumário), nota, equação, quebra de página, caixa de texto e controle de conteúdo no meio do parágrafo nunca são
+apagados: `texto` recusa, e `substituir` só troca o trecho que não passa por eles (dentro de um controle de
+conteúdo, troca).
 
 - **Nada se perde:** só as partes tocadas são reescritas; o resto do arquivo (mídia, mestres, partes que o Lince
   não conhece) sai idêntico em bytes. No deck real de uma empresa, com 16 slides, gráficos com planilha embutida e

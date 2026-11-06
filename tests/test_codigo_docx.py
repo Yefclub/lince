@@ -405,3 +405,118 @@ def test_paragrafo_dentro_de_customxml_aparece_na_leitura(contrato):
 
     c = docx.extrair(_trocar_xml(contrato, envolver))
     assert c["blocos"][-1]["texto"] == "Fim."
+
+
+def test_troca_que_cruza_runs_corta_as_duas_pontas(contrato):
+    misto = (
+        b'<w:p><w:r><w:t>Pra</w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">zo de </w:t></w:r>'
+        b"<w:r><w:t>30</w:t></w:r></w:p>"
+    )
+    dados = _com_paragrafos(contrato, misto)
+    alvo = _paragrafos(docx.extrair(dados))[-1]["id"]
+    novo, rel = codigo.editar(
+        dados, "c.docx", [{"op": "substituir", "alvo": alvo, "buscar": "azo d", "trocar": "AZO D", "revisao": False}]
+    )
+    assert _texto(rel["codigo"], alvo) == "PrAZO De 30"
+    xml = _xml(novo)
+    assert re.search(r"<w:r><w:t>Pr</w:t></w:r><w:r><w:t[^>]*>AZO D</w:t></w:r>", xml)  # herda do 1º trocado
+    assert re.search(r"<w:r><w:rPr><w:b/></w:rPr><w:t[^>]*>e </w:t></w:r><w:r><w:t>30</w:t>", xml)
+
+
+def test_substituir_num_run_enorme_e_linear():
+    import time
+
+    d = Document()
+    d.add_paragraph(("a" + "x" * 19) * 10_000)  # 200 mil caracteres num run só, 10 mil ocorrências
+    dados = _salvar(d)
+    alvo = _paragrafos(docx.extrair(dados))[0]["id"]
+    inicio = time.monotonic()
+    _, rel = codigo.editar(
+        dados, "c.docx", [{"op": "substituir", "alvo": alvo, "buscar": "a", "trocar": "b", "revisao": False}]
+    )
+    assert time.monotonic() - inicio < 5
+    assert _texto(rel["codigo"], alvo) == ("b" + "x" * 19) * 10_000
+
+
+SUMARIO = (
+    b'<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> TOC \\o </w:instrText>'
+    b'</w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>Cap 1</w:t></w:r></w:p>'
+    b"<w:p><w:r><w:t>Cap 2</w:t></w:r></w:p>"
+    b'<w:p><w:r><w:t>Cap 3</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>'
+    b"<w:p><w:r><w:t>Depois do sumario</w:t></w:r></w:p>"
+)
+
+
+def test_sumario_de_varios_paragrafos_e_campo_inteiro(contrato):
+    dados = _com_paragrafos(contrato, SUMARIO)
+    ps = _paragrafos(docx.extrair(dados))[-4:]
+    assert [bool(p.get("objetos")) for p in ps] == [True, True, True, False]
+    with pytest.raises(OperacaoInvalida):
+        codigo.editar(dados, "c.docx", [{"op": "texto", "alvo": ps[1]["id"], "texto": "x"}])
+    with pytest.raises(OperacaoInvalida) as e:  # o Word refaz o sumário: trocar ali não duraria
+        codigo.editar(dados, "c.docx", [{"op": "substituir", "buscar": "Cap 2", "trocar": "x"}])
+    assert e.value.codigo == "conflito"
+
+
+@pytest.mark.parametrize(
+    "conteudo",
+    [
+        b'<w:r><w:t>Antes</w:t><w:br w:type="page"/><w:t>Depois</w:t></w:r>',
+        b'<w:r><w:t>Antes</w:t></w:r><m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">'
+        b"<m:r><m:t>x</m:t></m:r></m:oMath><w:r><w:t>Depois</w:t></w:r>",
+    ],
+    ids=["quebra-de-pagina", "equacao"],
+)
+def test_quebra_de_pagina_e_equacao_sao_objeto(contrato, conteudo):
+    dados = _com_paragrafos(contrato, b"<w:p>" + conteudo + b"</w:p>")
+    p = _paragrafos(docx.extrair(dados))[-1]
+    assert p["objetos"] and p["texto"] == "AntesDepois"
+    with pytest.raises(OperacaoInvalida):
+        codigo.editar(dados, "c.docx", [{"op": "texto", "alvo": p["id"], "texto": "x"}])
+    with pytest.raises(OperacaoInvalida):  # não atravessa
+        codigo.editar(dados, "c.docx", [{"op": "substituir", "alvo": p["id"], "buscar": "AntesDepois", "trocar": "x"}])
+
+
+def test_texto_novo_fica_dentro_do_bookmark(contrato):
+    titulo = (
+        b'<w:p><w:bookmarkStart w:id="7" w:name="_Toc1"/><w:r><w:t>Objeto</w:t></w:r><w:bookmarkEnd w:id="7"/></w:p>'
+    )
+    dados = _com_paragrafos(contrato, titulo)
+    alvo = _paragrafos(docx.extrair(dados))[-1]["id"]
+    for revisao in (False, True):
+        novo, _ = codigo.editar(dados, "c.docx", [{"op": "texto", "alvo": alvo, "texto": "Escopo", "revisao": revisao}])
+        assert re.search(r'w:name="_Toc1"/>.*Escopo.*<w:bookmarkEnd w:id="7"/>', _xml(novo))
+
+
+def test_linhas_dentro_de_controle_de_conteudo_aparecem_na_tabela(contrato):
+    def repetida(x):
+        k = x.index(b"<w:tr>", x.index(b"<w:tbl>"))
+        k = x.index(b"<w:tr>", k + 1)  # a segunda linha vira seção repetida
+        fim = x.index(b"</w:tr>", k) + len(b"</w:tr>")
+        return x[:k] + b"<w:sdt><w:sdtContent>" + x[k:fim] + b"</w:sdtContent></w:sdt>" + x[fim:]
+
+    dados = _trocar_xml(contrato, repetida)
+    tabela = next(b for b in docx.extrair(dados)["blocos"] if b["tipo"] == "tabela")
+    assert [[c[0]["texto"] for c in linha] for linha in tabela["linhas"]] == [["Item", "Valor"], ["Soja", "30 dias"]]
+
+
+def test_paragrafo_sem_troca_valida_nao_fica_marcado(contrato):
+    def com_link(x):  # "dias" aqui atravessa a borda do link: não dá para trocar
+        return x.replace(
+            b"<w:t>Fim.</w:t></w:r>",
+            b'<w:t xml:space="preserve">Fim. di</w:t></w:r><w:hyperlink w:anchor="x"><w:r><w:t>as</w:t></w:r>'
+            b"</w:hyperlink>",
+        )
+
+    dados = _trocar_xml(contrato, com_link)
+    ids = [p["id"] for p in _paragrafos(docx.extrair(dados))]
+    _, rel = codigo.editar(
+        dados,
+        "c.docx",
+        [
+            {"op": "substituir", "buscar": "dias", "trocar": "DIAS"},
+            {"op": "texto", "alvo": ids[-1], "texto": "Encerramento"},  # o parágrafo sem troca segue livre
+        ],
+    )
+    assert rel["aplicadas"][0]["trocas"] == 2 and _texto(rel["codigo"], ids[-1]) == "Encerramento"
+    assert any("1 ocorrência" in a for a in rel["avisos"])
