@@ -152,8 +152,10 @@ Valor ou fórmula alterada faz o Excel recalcular tudo ao abrir, e por isso os r
 ainda são os antigos. A fórmula é conferida antes de entrar: sintaxe, funções conhecidas (em inglês) e o prefixo que
 o Excel exige nas funções novas (`XLOOKUP` vira `_xlfn.XLOOKUP` no arquivo); matriz dinâmica (`FILTER`, `UNIQUE`…)
 é recusada. Também são recusadas com o motivo: célula dentro de mesclagem, de fórmula matricial, na origem de uma
-fórmula compartilhada, no cabeçalho ou na linha de totais de uma tabela, e aba protegida. Renomear recusa nome já
-usado por qualquer aba (inclusive de gráfico) e pasta com a estrutura protegida.
+fórmula compartilhada, no cabeçalho ou na linha de totais de uma tabela, em tabela dinâmica, e aba protegida.
+A fórmula também precisa citar abas que existem. Renomear recusa nome já usado por qualquer aba (inclusive de gráfico)
+e pasta com a estrutura protegida, e falha fechado: se a aba antiga continuar citada em algum lugar que a edição não
+atualiza (controle de formulário, VML), nada é aplicado e o erro diz onde. O pedido inteiro tem prazo de 60 s.
 
 Operações do DOCX, que por padrão entram como **alterações controladas**: quem abre no Word vê o que a IA propôs e
 aceita ou rejeita cada uma. `"revisao": false` aplica direto, e `"revisao": {"autor": "Ana"}` troca o autor (o

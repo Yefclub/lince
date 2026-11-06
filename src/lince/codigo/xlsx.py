@@ -8,6 +8,7 @@ cálculo antiga (`calcChain.xml`), que ficaria inconsistente, sai do pacote; o E
 import bisect
 import math
 import re
+import time
 from datetime import datetime, timedelta
 
 from lxml import etree
@@ -34,6 +35,10 @@ _REF = re.compile(r"\$?([A-Z]{1,3})\$?([1-9]\d{0,6})")
 _NOME_PROIBIDO = re.compile(r"[\[\]:*?/\\]")
 _FORMATOS_DATA = {14, 15, 16, 17, 22}  # 18–21 são hora e 45–47 são duração: não viram data
 _NOME_SIMPLES = re.compile(r"[A-Za-z_][A-Za-z_]*")
+EDICAO_PRAZO = 60  # segundos por pedido de edição: passou, nada é aplicado (o servidor não fica preso)
+FUNCOES_ANINHADAS_MAX = 64  # níveis de função (limite do Excel)
+ARGUMENTOS_MAX = 255  # argumentos por função (limite do Excel)
+BLOCO = 1024  # linhas por balde no índice das áreas proibidas
 # Funções do Excel 2010 em diante: no arquivo, levam o prefixo _xlfn. (sem ele, o Excel mostra #NAME?)
 _XLFN = set(
     """AGGREGATE BETA.DIST BETA.INV BINOM.DIST BINOM.DIST.RANGE BINOM.INV BITAND BITLSHIFT BITOR BITRSHIFT BITXOR
@@ -44,7 +49,8 @@ _XLFN = set(
     MAXIFS MINIFS MODE.MULT MODE.SNGL NEGBINOM.DIST NORM.DIST NORM.INV NORM.S.DIST NORM.S.INV NUMBERVALUE PDURATION
     PERCENTILE.EXC PERCENTILE.INC PERCENTRANK.EXC PERCENTRANK.INC PERMUTATIONA PHI POISSON.DIST QUARTILE.EXC
     QUARTILE.INC RANK.AVG RANK.EQ RRI SEC SECH SHEET SHEETS SKEW.P STDEV.P STDEV.S SWITCH T.DIST T.DIST.2T T.DIST.RT
-    T.INV T.INV.2T T.TEST TEXTJOIN UNICHAR UNICODE VAR.P VAR.S WEIBULL.DIST XLOOKUP XMATCH XOR""".split()
+    T.INV T.INV.2T T.TEST TEXTJOIN UNICHAR UNICODE VAR.P VAR.S WEIBULL.DIST XLOOKUP XMATCH XOR NETWORKDAYS.INTL
+    WORKDAY.INTL ISO.CEILING""".split()
 )
 # Devolvem matriz que se espalha pelas células vizinhas: exigem metadados de matriz dinâmica que não escrevemos
 _MATRIZ_DINAMICA = set(
@@ -77,6 +83,11 @@ def _ref(texto: str) -> tuple[int, int]:
     if col > 16_384 or lin > 1_048_576:
         raise ValueError(texto)
     return col, lin
+
+
+def _utf16(texto: str) -> int:
+    """Tamanho como o Excel conta (unidades UTF-16: emoji vale 2)."""
+    return len(texto.encode("utf-16-le")) // 2
 
 
 def _intervalo(texto: str) -> tuple[int, int, int, int]:
@@ -165,6 +176,8 @@ class _Livro:
             numero = float(v.text)
         except ValueError:
             return v.text
+        if not math.isfinite(numero):  # NaN e infinito não existem no Excel nem cabem em JSON
+            return v.text
         return int(numero) if numero.is_integer() and abs(numero) < 2**53 else numero
 
     def data(self, c, valor) -> str | None:
@@ -243,7 +256,7 @@ def extrair(dados: bytes) -> dict:
             {
                 "nome": d.get("name"),
                 "ref": d.text,
-                **({"aba": int(d.get("localSheetId"))} if d.get("localSheetId") else {}),
+                **({"aba": int(d.get("localSheetId"))} if (d.get("localSheetId") or "").isdigit() else {}),
             }
             for d in livro.raiz.findall("s:definedNames/s:definedName", NS)
         ],
@@ -263,8 +276,8 @@ def _tabelas(pk: Pacote, parte: str) -> list[dict]:
                     "nome": t.get("displayName") or t.get("name"),
                     "ref": t.get("ref"),
                     "parte": "/" + alvo,
-                    "cabecalho": int(t.get("headerRowCount", "1")),
-                    "totais": int(t.get("totalsRowCount", "0")),
+                    "cabecalho": int(t.get("headerRowCount", "1")) if t.get("headerRowCount", "1").isdigit() else 1,
+                    "totais": int(t.get("totalsRowCount", "0")) if t.get("totalsRowCount", "0").isdigit() else 0,
                 }
             )
     return out
@@ -304,7 +317,7 @@ class _Aba:
             self.colunas[lin] = sorted(cels)
         self.numeros = sorted(self.linhas)
         self.sem_r = sem_r  # linha ou célula sem referência: posição implícita, não dá para inserir com segurança
-        self.proibidas: list[tuple[tuple, str]] = []
+        self.proibidas: list[tuple[tuple, str]] = []  # vira índice no fim do __init__ (_indexar)
         for m in self.ws.findall("s:mergeCells/s:mergeCell", NS):
             area = _intervalo(m.get("ref"))
             self.proibidas.append(
@@ -332,20 +345,46 @@ class _Aba:
                 self.proibidas.append(
                     ((a[0], a[3] - t["totais"] + 1, a[2], a[3]), f"é a linha de totais da tabela {t['nome']}")
                 )
+        for tipo, alvo in ed.pk.rels(parte).values():  # tabela dinâmica: a próxima atualização apaga o que entrar ali
+            if tipo == "pivotTable" and alvo in ed.pk.partes:
+                local = ed.pk.arvore(alvo).find("s:location", NS)
+                if local is not None and local.get("ref"):
+                    self.proibidas.append(
+                        (_intervalo(local.get("ref")), f"fica dentro da tabela dinâmica {local.get('ref')}")
+                    )
+        self._indexar(ed)
         self.estilos_coluna = [
             (int(c.get("min")), int(c.get("max")), c.get("style"))
             for c in self.ws.findall("s:cols/s:col", NS)
             if c.get("style") and (c.get("min") or "").isdigit() and (c.get("max") or "").isdigit()
         ]
 
+    def _indexar(self, ed):
+        """Áreas proibidas por célula única (set) e por balde de BLOCO linhas: conferir uma escrita custa só as
+        áreas daquele balde, não todas as da aba."""
+        self.unicas: dict[tuple[int, int], str] = {}
+        self.baldes: dict[int, list] = {}
+        for k, (area, motivo) in enumerate(self.proibidas):
+            if k % 4096 == 0:
+                ed.no_prazo()
+            if area[0] > area[2] or area[1] > area[3]:
+                continue  # mesclagem de uma coluna ou de uma linha deixa uma das metades vazia
+            if area[0] == area[2] and area[1] == area[3]:
+                self.unicas.setdefault((area[0], area[1]), motivo)
+                continue
+            for b in range(area[1] // BLOCO, area[3] // BLOCO + 1):
+                self.baldes.setdefault(b, []).append((area, motivo))
+        del self.proibidas
+
     def conferir(self, col: int, lin: int, alvo: str):
         if self.protegida:
             raise OperacaoInvalida("operacao-invalida", f"a aba {self.nome!r} está protegida", alvo=alvo)
         if self.sem_r:
             raise OperacaoInvalida("operacao-invalida", f"a aba {self.nome!r} tem linhas sem referência", alvo=alvo)
-        for area, motivo in self.proibidas:
-            if _dentro(col, lin, area):
-                raise OperacaoInvalida("operacao-invalida", f"{alvo} {motivo}", alvo=alvo)
+        motivo = self.unicas.get((col, lin))
+        motivo = motivo or next((m for area, m in self.baldes.get(lin // BLOCO, ()) if _dentro(col, lin, area)), None)
+        if motivo:
+            raise OperacaoInvalida("operacao-invalida", f"{alvo} {motivo}", alvo=alvo)
 
     def celula(self, col: int, lin: int, criar: bool):
         c = self.celulas.get(lin, {}).get(col)
@@ -389,6 +428,16 @@ class _Editor:
         self.crescimento = 0
         self.recalcular = False
         self.avisos: list[str] = []
+        self.prazo_final = time.monotonic() + EDICAO_PRAZO
+
+    def no_prazo(self):
+        if time.monotonic() > self.prazo_final:
+            raise OperacaoInvalida(
+                "operacao-invalida", f"a edição passou de {EDICAO_PRAZO} s: divida em pedidos menores"
+            )
+
+    def nomes_de_abas(self) -> set[str]:
+        return {s.get("name", "").casefold() for s in self.livro.todas()}
 
     def aba(self, nome) -> _Aba:
         for _, n, parte in self.livro.abas():
@@ -423,46 +472,114 @@ def _ampliar_dimensao(ws, col, lin):
     dim.set("ref", f"{_letras(c1)}{l1}" + ("" if (c1, l1) == (c2, l2) else f":{_letras(c2)}{l2}"))
 
 
-def _formula(texto: str, alvo: str) -> str:
-    """Fórmula pronta para o arquivo: sintaxe conferida, funções conhecidas, prefixo _xlfn. onde o Excel exige."""
+def _formula(texto: str, alvo: str, abas: set[str]) -> str:
+    """Fórmula pronta para o arquivo, ou recusa com o motivo. Confere a gramática (operando e operador alternados,
+    parênteses e chaves com par e não vazios, separadores no lugar, limites de aninhamento e de argumentos), as
+    funções (em inglês; as do Excel 2010+ ganham o prefixo _xlfn.) e as abas citadas, que precisam existir."""
     if not texto.startswith("=") or len(texto) < 2:
         raise OperacaoInvalida("operacao-invalida", "fórmula começa com = (ex.: =SUM(A1:A3), em inglês)", alvo=alvo)
-    if len(texto) > FORMULA_MAX:
-        raise OperacaoInvalida("operacao-invalida", f"fórmula passa de {FORMULA_MAX} caracteres", alvo=alvo)
     try:
         tok = Tokenizer(texto)
     except Exception:  # noqa: BLE001 — o tokenizador do openpyxl recusa sintaxe quebrada com erros variados
         raise OperacaoInvalida(
             "operacao-invalida", f"fórmula com sintaxe inválida: {texto[:80]!r}", alvo=alvo
         ) from None
-    nivel, matriz = 0, 0
-    for item in tok.items:
-        if item.type in ("FUNC", "PAREN"):
-            nivel += 1 if item.subtype == "OPEN" else -1
-        elif item.type == "ARRAY":
-            matriz += 1 if item.subtype == "OPEN" else -1
-        elif item.type == "SEP" and item.subtype == "ROW" and not matriz:
-            raise OperacaoInvalida(
-                "operacao-invalida", "separe os argumentos com vírgula, não ponto e vírgula", alvo=alvo
-            )
-        if item.type == "FUNC" and item.subtype == "OPEN":
-            nome = item.value[:-1].upper()
-            if nome.startswith(("_XLFN.", "_XLWS.", "_XLUDF.")) or nome in FORMULAE:
-                item.value = item.value[:-1].upper() + "("  # o arquivo guarda o nome em maiúsculas
-                continue
-            if nome in _MATRIZ_DINAMICA:
-                raise OperacaoInvalida(
-                    "operacao-invalida", f"{nome} devolve matriz dinâmica, que a edição não escreve", alvo=alvo
-                )
-            if nome in _XLFN:
-                item.value = "_xlfn." + nome + "("
-                continue
-            raise OperacaoInvalida(
-                "operacao-invalida", f"função desconhecida: {nome} (use o nome em inglês, como SUM e IF)", alvo=alvo
-            )
-    if nivel != 0 or matriz != 0:
-        raise OperacaoInvalida("operacao-invalida", "fórmula com parênteses ou chaves sem par", alvo=alvo)
-    return tok.render()
+
+    def erro(motivo):
+        return OperacaoInvalida("operacao-invalida", f"fórmula inválida ({motivo}): {texto[:80]!r}", alvo=alvo)
+
+    itens = [x for x in tok.items]
+    pilha, espera_valor = [], True  # pilha de [tipo, argumentos, vazio]
+    for k, item in enumerate(itens):
+        tipo, sub = item.type, item.subtype
+        if tipo == "WHITE-SPACE":
+            prox = next((x for x in itens[k + 1 :] if x.type != "WHITE-SPACE"), None)
+            if not espera_valor and prox is not None and (prox.type == "OPERAND" or prox.subtype == "OPEN"):
+                espera_valor = True  # espaço entre dois intervalos é o operador de interseção
+            continue
+        if pilha and sub != "CLOSE":
+            pilha[-1][2] = False  # o parêntese de cima já tem conteúdo
+        if tipo == "OPERAND":
+            if not espera_valor:
+                raise erro("falta operador entre dois valores")
+            if sub == "RANGE" and "!" in item.value:
+                _conferir_abas(item.value, abas, erro)
+            espera_valor = False
+        elif sub == "OPEN":
+            if not espera_valor:
+                raise erro("falta operador antes do parêntese")
+            if tipo == "FUNC":
+                item.value = _nome_funcao(item.value[:-1], erro) + "("
+                if sum(1 for x in pilha if x[0] == "FUNC") >= FUNCOES_ANINHADAS_MAX:
+                    raise erro(f"mais de {FUNCOES_ANINHADAS_MAX} funções aninhadas")
+            pilha.append([tipo, 0, True])
+            espera_valor = True
+        elif sub == "CLOSE":
+            if not pilha or pilha[-1][0] != tipo:
+                raise erro("parêntese ou chave sem par")
+            aberto = pilha.pop()
+            if espera_valor and not (tipo == "FUNC" and (aberto[2] or aberto[1])):
+                raise erro("parêntese vazio ou valor faltando antes de fechar")
+            espera_valor = False
+        elif tipo == "SEP":
+            if not pilha:
+                raise erro("separador fora de função")
+            if sub == "ROW" and pilha[-1][0] != "ARRAY":
+                raise erro("separe os argumentos com vírgula, não ponto e vírgula")
+            if espera_valor and pilha[-1][0] != "FUNC":  # argumento vazio só vale em função: IF(A1,,1)
+                raise erro("valor faltando antes do separador")
+            pilha[-1][1] += 1
+            if pilha[-1][1] >= ARGUMENTOS_MAX:
+                raise erro(f"mais de {ARGUMENTOS_MAX} argumentos")
+            espera_valor = True
+        elif tipo == "OPERATOR-PREFIX":
+            if not espera_valor:
+                raise erro("operador fora do lugar")
+        elif tipo == "OPERATOR-INFIX":
+            if espera_valor:
+                raise erro("operador sem valor antes")
+            espera_valor = True
+        elif tipo == "OPERATOR-POSTFIX":
+            if espera_valor:
+                raise erro("operador sem valor antes")
+        else:
+            raise erro(f"elemento inesperado {item.value!r}")
+    if pilha:
+        raise erro("parêntese ou chave sem par")
+    if espera_valor:
+        raise erro("termina sem valor")
+    final = tok.render()
+    if _utf16(final) > FORMULA_MAX:
+        raise OperacaoInvalida("operacao-invalida", f"fórmula passa de {FORMULA_MAX} caracteres", alvo=alvo)
+    return final
+
+
+def _nome_funcao(bruto: str, erro) -> str:
+    """Nome da função como o arquivo guarda: maiúsculas, prefixo _xlfn. só onde o Excel exige."""
+    nome = bruto.upper()
+    while nome.startswith(("_XLFN.", "_XLWS.")):  # quem já mandou com prefixo passa pela mesma conferência
+        nome = nome.split(".", 1)[1]
+    if nome.startswith("_XLUDF."):
+        raise erro("função de suplemento ou macro não é escrita pela edição")
+    if nome in _MATRIZ_DINAMICA:
+        raise erro(f"{nome} devolve matriz dinâmica, que a edição não escreve")
+    if nome in _XLFN:
+        return "_xlfn." + nome
+    if nome in FORMULAE:
+        return nome
+    raise erro(f"função desconhecida {nome}; use o nome em inglês, como SUM e IF")
+
+
+def _conferir_abas(operando: str, abas: set[str], erro):
+    """As abas citadas num operando (com aspas, 3D) precisam existir; vínculo com outro arquivo é recusado."""
+    prefixo = operando.rsplit("!", 1)[0]
+    if prefixo.startswith("["):
+        raise erro("referência a outro arquivo não é escrita pela edição")
+    if len(prefixo) > 1 and prefixo[0] == prefixo[-1] == "'":
+        prefixo = prefixo[1:-1].replace("''", "'")
+    for nome in prefixo.split(":"):
+        if nome.casefold() not in abas:
+            raise erro(f"a aba {nome!r} não existe")
 
 
 def _valor(valor, alvo: str):
@@ -480,7 +597,7 @@ def _valor(valor, alvo: str):
             raise OperacaoInvalida("operacao-invalida", "número precisa ser finito", alvo=alvo)
         return valor
     if isinstance(valor, str):
-        if len(valor) > TEXTO_CELULA_MAX:
+        if _utf16(valor) > TEXTO_CELULA_MAX:
             raise OperacaoInvalida("operacao-invalida", f"texto passa de {TEXTO_CELULA_MAX} caracteres", alvo=alvo)
         return valor
     raise OperacaoInvalida("operacao-invalida", "valor é número, texto, booleano ou null", alvo=alvo)
@@ -518,6 +635,8 @@ def _escrever(ed: _Editor, aba: _Aba, col: int, lin: int, alvo: str, valor=None,
     if ed.crescimento > CRESCIMENTO_MAX:
         raise OperacaoInvalida("texto-grande", "o texto resultante passa do limite de tamanho do documento")
     ed.escritas += 1
+    if ed.escritas % 1024 == 0:
+        ed.no_prazo()
     if ed.escritas > ESCRITAS_MAX:
         raise OperacaoInvalida("operacao-invalida", f"no máximo {ESCRITAS_MAX} células por pedido")
     ed.pk.tocar(aba.parte)
@@ -533,9 +652,9 @@ def _avisar_tabela(ed: _Editor, aba: _Aba, col: int, lin: int, alvo: str):
                 ed.avisos.append(aviso)
 
 
-def _valor_da_op(op, alvo):
+def _valor_da_op(ed: _Editor, op, alvo):
     if "formula" in op:
-        return None, _formula(campo_texto(op, "formula"), alvo)
+        return None, _formula(campo_texto(op, "formula"), alvo, ed.nomes_de_abas())
     if "valor" not in op:
         raise OperacaoInvalida("operacao-invalida", "informe valor ou formula", alvo=alvo)
     return _valor(op["valor"], alvo), None
@@ -544,7 +663,7 @@ def _valor_da_op(op, alvo):
 def _op_celula(ed: _Editor, op, rel):
     alvo = op.get("alvo")
     aba, col, lin = ed.celula_alvo(alvo)
-    valor, formula = _valor_da_op(op, alvo)
+    valor, formula = _valor_da_op(ed, op, alvo)
     if "se_valor" in op:
         c = aba.celula(col, lin, criar=False)
         atual = ed.livro.valor(c) if c is not None else None
@@ -558,8 +677,9 @@ def _op_intervalo(ed: _Editor, op, rel):
     alvo = op.get("alvo")
     aba, col, lin = ed.celula_alvo(alvo)
     valores = op.get("valores")
-    if not isinstance(valores, list) or not valores or not all(isinstance(x, list) for x in valores):
-        raise OperacaoInvalida("operacao-invalida", "valores é uma matriz: lista de linhas", alvo=alvo)
+    if not isinstance(valores, list) or not valores or not all(isinstance(x, list) and x for x in valores):
+        raise OperacaoInvalida("operacao-invalida", "valores é uma matriz: lista de linhas não vazias", alvo=alvo)
+    abas = ed.nomes_de_abas()
     total = sum(len(x) for x in valores)
     if ed.escritas + total > ESCRITAS_MAX:
         raise OperacaoInvalida("operacao-invalida", f"no máximo {ESCRITAS_MAX} células por pedido", alvo=alvo)
@@ -570,7 +690,7 @@ def _op_intervalo(ed: _Editor, op, rel):
         for j, valor in enumerate(linha):
             ref = f"{aba.nome}!{_letras(col + j)}{lin + i}"
             if isinstance(valor, str) and valor.startswith("=") and len(valor) > 1:
-                _escrever(ed, aba, col + j, lin + i, ref, formula=_formula(valor, ref))
+                _escrever(ed, aba, col + j, lin + i, ref, formula=_formula(valor, ref, abas))
             else:
                 _escrever(ed, aba, col + j, lin + i, ref, valor=_valor(valor, ref))
     fim = f"{_letras(col + largura - 1)}{lin + len(valores) - 1}"
@@ -624,6 +744,14 @@ def _trocar_aba(texto: str, antigo: str, novo: str) -> tuple[str, bool]:
             externo = False
             i = j + 1
             continue
+        if ch == "#":  # código de erro (#REF!, #DIV/0!, #N/A): não é nome de aba
+            j = i + 1
+            while j < n and (texto[j].isalnum() or texto[j] in "/_"):
+                j += 1
+            j += 1 if j < n and texto[j] in "!?" else 0
+            out.append(texto[i:j])
+            externo, i = False, j
+            continue
         if (ch.isalnum() or ch in "_.") and (i == 0 or not (texto[i - 1].isalnum() or texto[i - 1] in "_.$")):
             j = i
             while j < n and (texto[j].isalnum() or texto[j] in "_.:"):
@@ -631,7 +759,8 @@ def _trocar_aba(texto: str, antigo: str, novo: str) -> tuple[str, bool]:
             palavra = texto[i:j]
             if j < n and texto[j] == "!" and not externo:
                 inicio_ref, nomes = "", palavra.split(":")
-                if len(nomes) > 1 and _PARTE_REF.fullmatch(nomes[0]):  # A1:Aba!B2 — o A1 é célula, não aba
+                if len(nomes) > 1 and i > 0 and texto[i - 1] == "!" and _PARTE_REF.fullmatch(nomes[0]):
+                    # Aba!A1:Aba!B2: o A1 depois do ! é célula; sem ! antes, Jan:Dez! é intervalo 3D de abas
                     inicio_ref, nomes = nomes[0] + ":", nomes[1:]
                 if any(x.casefold() == antigo.casefold() for x in nomes):
                     palavra = inicio_ref + _citar(":".join(_trocar(nomes, antigo, novo)))
@@ -691,7 +820,7 @@ def _op_renomear_aba(ed: _Editor, op, rel):
         raise OperacaoInvalida("alvo-inexistente", f"aba {antigo!r} não existe", alvo=str(antigo))
     if (
         not isinstance(novo, str)
-        or not 0 < len(novo) <= 31
+        or not 0 < _utf16(novo) <= 31
         or _NOME_PROIBIDO.search(novo)
         or novo.startswith("'")
         or novo.endswith("'")
@@ -704,26 +833,80 @@ def _op_renomear_aba(ed: _Editor, op, rel):
         )
     if any(s.get("name").lower() == novo.lower() for s in ed.livro.todas() if s is not sh):
         raise OperacaoInvalida("conflito", f"já existe uma aba chamada {novo!r}", alvo=antigo)
-    antes = set(ed.pk.tocadas)
     sh.set("name", novo)
     ed.pk.tocar(ed.livro.parte)
-    trocas = 0
+    mexidas, trocas = {ed.livro.parte}, 0
     for d in ed.livro.raiz.findall("s:definedNames/s:definedName", NS):
         if d.text:
             texto, mudou = _trocar_aba(d.text, antigo, novo)
             if mudou:
                 d.text, trocas = texto, trocas + 1
+    for parte in list(ed.pk.partes):
+        if parte in ed.pk.removidas or not parte.endswith(".xml") or "/_rels/" in parte or parte == ed.livro.parte:
+            continue
+        if parte.startswith(("xl/worksheets/", "xl/tables/", "xl/charts/", "xl/chartsheets/")):
+            n = _renomear_em(ed, parte, antigo, novo)
+        elif parte.startswith("xl/pivotCache/"):
+            n = 0
+            for src in ed.pk.arvore(parte).iter(S + "worksheetSource"):
+                if src.get("sheet") == antigo:
+                    src.set("sheet", novo)
+                    n += 1
+        elif parte == "docProps/app.xml":  # lista de abas que o Explorer e o Finder mostram
+            n = 0
+            for el in ed.pk.arvore(parte).iter():
+                if isinstance(el.tag, str) and etree.QName(el).localname == "lpstr" and el.text == antigo:
+                    el.text, n = novo, n + 1
+        else:
+            continue
+        if n:
+            ed.pk.tocar(parte)
+            mexidas.add(parte)
+            trocas += n
+    restos = _restos(ed, antigo)
+    if restos:  # falha fechada: referência que não sabemos atualizar ficaria quebrada
+        raise OperacaoInvalida(
+            "operacao-invalida",
+            f"a aba {antigo!r} é citada em {', '.join('/' + p for p in restos[:3])}, onde a edição não atualiza "
+            "referências: renomeie no Excel",
+            alvo=antigo,
+        )
+    rel.update(antes=antigo, depois=novo, referencias=trocas, partes=sorted("/" + p for p in mexidas))
+
+
+_PARSER_TOLERANTE = etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False, recover=True)
+
+
+def _restos(ed: _Editor, antigo: str) -> list[str]:
+    """Partes do pacote (XML, VML e relações) que ainda citam a aba `antigo` como referência, fora de texto de
+    célula e de texto exibido (w:t, a:t). Varre tudo, inclusive o que o renomear não conhece."""
+    alvo, achadas = antigo.casefold(), []
     for parte in ed.pk.partes:
-        if parte.startswith("xl/") and parte.endswith(".xml") and "/_rels/" not in parte and parte != ed.livro.parte:
-            if parte.startswith(("xl/worksheets/", "xl/tables/", "xl/charts/", "xl/chartsheets/")):
-                trocas += _renomear_em(ed, parte, antigo, novo)
-            elif parte.startswith("xl/pivotCache/"):
-                for src in ed.pk.arvore(parte).iter(S + "worksheetSource"):
-                    if src.get("sheet") == antigo:
-                        src.set("sheet", novo)
-                        ed.pk.tocar(parte)
-                        trocas += 1
-    rel.update(antes=antigo, depois=novo, referencias=trocas, partes=sorted("/" + p for p in ed.pk.tocadas - antes))
+        if parte in ed.pk.removidas or not parte.endswith((".xml", ".vml", ".rels")) or "sharedStrings" in parte:
+            continue
+        if parte in ed.pk.arvores:
+            raiz = ed.pk.arvores[parte]
+        else:
+            bruto = ed.pk.partes[parte]
+            if not re.search(r"['&<>\"]", antigo) and alvo not in bruto.decode("utf-8", "ignore").casefold():
+                continue  # atalho: o nome nem aparece (só vale sem caractere que o XML ou a fórmula escapam)
+            if b"<!DOCTYPE" in bruto or b"<!ENTITY" in bruto:
+                continue
+            raiz = etree.fromstring(bruto, _PARSER_TOLERANTE)
+            if raiz is None:
+                continue
+        for el in raiz.iter():
+            if not isinstance(el.tag, str):
+                continue
+            valores = [] if etree.QName(el).localname == "t" else [el.text or ""]
+            valores += list(el.attrib.values())
+            for v in valores:
+                if "!" in v and _trocar_aba(v.lstrip("#"), antigo, "\x00")[1]:
+                    achadas.append(parte)
+                    break
+            if achadas and achadas[-1] == parte:
+                break
+    return achadas
 
 
 def _recalcular_ao_abrir(ed: _Editor):
@@ -772,7 +955,7 @@ def aplicar(dados: bytes, operacoes: list[dict]) -> tuple[bytes, list[dict], lis
         raise OperacaoInvalida("operacao-invalida", f"XLSX fora do esperado ({type(e).__name__})") from None
     relatorio = []
     for k, op in enumerate(operacoes):
-        if not isinstance(op, dict) or op.get("op") not in OPERACOES:
+        if not isinstance(op, dict) or not isinstance(op.get("op"), str) or op["op"] not in OPERACOES:
             raise OperacaoInvalida(
                 "operacao-invalida",
                 f"op desconhecida: {op.get('op') if isinstance(op, dict) else op!r}; use uma de {', '.join(OPERACOES)}",

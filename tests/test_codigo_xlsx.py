@@ -298,11 +298,20 @@ def test_calcpr_entra_na_posicao_do_esquema():
         ({"op": "celula", "alvo": "Dados!B4", "valor": 1}, "fórmula matricial A4:B4"),
         ({"op": "celula", "alvo": "Dados!C2", "valor": 1}, "origem de uma fórmula compartilhada"),
         ({"op": "celula", "alvo": "O'Neil!A2", "valor": 1}, "está protegida"),
-        ({"op": "celula", "alvo": "Dados!A9", "formula": "=SOMA(A1)"}, "função desconhecida: SOMA"),
+        ({"op": "celula", "alvo": "Dados!A9", "formula": "=SOMA(A1)"}, "função desconhecida SOMA"),
         ({"op": "celula", "alvo": "Dados!A9", "formula": "=SUM(A1;A2)"}, "vírgula"),
         ({"op": "celula", "alvo": "Dados!A9", "formula": "=SUM(A1"}, "sem par"),
         ({"op": "celula", "alvo": "Dados!A9", "formula": "=FILTER(A:A,B:B>1)"}, "matriz dinâmica"),
         ({"op": "celula", "alvo": "Dados!A9", "valor": 10**400}, "grande demais"),
+        ({"op": "celula", "alvo": "Dados!A9", "formula": "=A1*"}, "termina sem valor"),
+        ({"op": "celula", "alvo": "Dados!A9", "formula": "=()"}, "parêntese vazio"),
+        ({"op": "celula", "alvo": "Dados!A9", "formula": "=SUM(A1)(B1)"}, "falta operador"),
+        ({"op": "celula", "alvo": "Dados!A9", "formula": "=Dadoss!A1"}, "não existe"),
+        ({"op": "celula", "alvo": "Dados!A9", "formula": "=[1]Dados!A1"}, "outro arquivo"),
+        ({"op": "celula", "alvo": "Dados!A9", "formula": "=_xlfn._xlws.FILTER(A:A,B:B)"}, "matriz dinâmica"),
+        ({"op": "celula", "alvo": "Dados!A9", "formula": "=_xlfn.QUALQUER(A1)"}, "desconhecida"),
+        ({"op": "intervalo", "alvo": "Dados!A9", "valores": [[]]}, "não vazias"),
+        ({"op": "renomear_aba", "aba": "Dados", "nome": "🙂" * 16}, "31 caracteres"),
         ({"op": "intervalo", "alvo": "Dados!A9", "valores": [["=" + "1+" * 5000 + "1"]]}, "8192"),
     ],
 )
@@ -331,3 +340,115 @@ def test_intervalo_grande_e_linear():
         _livro(), "p.xlsx", [{"op": "intervalo", "alvo": "Dados!F1", "valores": [[k] for k in range(20_000)]}]
     )
     assert rel["aplicadas"][0]["celulas"] == 20_000 and time.monotonic() - inicio < 10
+
+
+def test_formula_valida_sai_no_formato_do_arquivo():
+    novo, _ = codigo.editar(
+        _livro(),
+        "p.xlsx",
+        [
+            {"op": "celula", "alvo": "Dados!A9", "formula": "=networkdays.intl(B2,B3)+IF(B2,,1)"},
+            {"op": "celula", "alvo": "Dados!A10", "formula": "=SUM('Dados:O''Neil'!A1)+TODAY()"},
+        ],
+    )
+    aba = _parte(novo, "xl/worksheets/sheet1.xml")
+    assert "<f>_xlfn.NETWORKDAYS.INTL(B2,B3)+IF(B2,,1)</f>" in aba
+    assert "<f>SUM('Dados:O''Neil'!A1)+TODAY()</f>" in aba
+
+
+def test_renomear_intervalo_3d_sem_aspas_e_codigo_de_erro():
+    def ajustar(livro):
+        return (
+            livro.replace('name="Dados"', 'name="Jan"')
+            .replace("Dados!$B$2:$B$3", "SUM(Jan:Ref!$B$2)+#REF!")
+            .replace("'Dados:O''Neil'!$A$1", "#DIV/0!")
+            .replace('name="Grafico"', 'name="Ref"')
+        )
+
+    dados = _trocar(_livro(), "xl/workbook.xml", ajustar)
+    for antigo, novo, esperado in [
+        ("Jan", "Janeiro", "SUM('Janeiro:Ref'!$B$2)+#REF!"),
+        ("Ref", "Dez 2026", "SUM('Jan:Dez 2026'!$B$2)+#REF!"),
+    ]:
+        resultado, _ = codigo.editar(dados, "p.xlsx", [{"op": "renomear_aba", "aba": antigo, "nome": novo}])
+        livro = _parte(resultado, "xl/workbook.xml")
+        assert f">{esperado}</definedName>" in livro and ">#DIV/0!</definedName>" in livro
+
+
+def test_renomear_recusa_referencia_em_lugar_que_nao_atualiza():
+    def com_controle(aba):
+        return aba.replace(
+            "<sheetData>", "<sheetData><!-- --><x:ctrl xmlns:x=\"urn:teste\" linkedCell=\"'O''Neil'!A1\"/>", 1
+        )
+
+    dados = _trocar(_livro(), "xl/worksheets/sheet1.xml", com_controle)
+    with pytest.raises(OperacaoInvalida) as e:
+        codigo.editar(dados, "p.xlsx", [{"op": "renomear_aba", "aba": "O'Neil", "nome": "Vendas"}])
+    assert "/xl/worksheets/sheet1.xml" in str(e.value) and "renomeie no Excel" in str(e.value)
+
+
+def test_partes_de_cada_renomear_e_titulos_do_arquivo():
+    app = (
+        '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" '
+        'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><TitlesOfParts>'
+        '<vt:vector size="1" baseType="lpstr"><vt:lpstr>Dados</vt:lpstr></vt:vector></TitlesOfParts></Properties>'
+    )
+    dados = _com_parte(_livro(), "docProps/app.xml", app)
+    _, rel = codigo.editar(
+        dados,
+        "p.xlsx",
+        [
+            {"op": "renomear_aba", "aba": "Dados", "nome": "Base"},
+            {"op": "renomear_aba", "aba": "Base", "nome": "Base 2"},
+        ],
+    )
+    # o workbook.xml já tinha sido tocado pela 1ª operação e continua na lista da 2ª
+    assert rel["aplicadas"][1]["partes"] == ["/docProps/app.xml", "/xl/workbook.xml", "/xl/worksheets/sheet1.xml"]
+    novo, _ = codigo.editar(dados, "p.xlsx", [{"op": "renomear_aba", "aba": "Dados", "nome": "Base"}])
+    assert "<vt:lpstr>Base</vt:lpstr>" in _parte(novo, "docProps/app.xml")
+
+
+def test_numero_nao_finito_no_arquivo_vira_texto_na_leitura():
+    dados = _trocar(_livro(), "xl/worksheets/sheet1.xml", lambda x: x.replace("<v>5</v>", "<v>NaN</v>"))
+    assert _celula(xlsx.extrair(dados), "Dados!C1")["valor"] == "NaN"
+
+
+def test_muitas_mesclagens_nao_deixam_a_escrita_quadratica():
+    import time
+
+    mescladas = "".join(f'<mergeCell ref="A{k}:B{k}"/>' for k in range(100, 20_100))
+    dados = _trocar(
+        _livro(),
+        "xl/worksheets/sheet1.xml",
+        lambda x: x.replace("</sheetData>", f'</sheetData><mergeCells count="20000">{mescladas}</mergeCells>'),
+    )
+    inicio = time.monotonic()
+    _, rel = codigo.editar(
+        dados, "p.xlsx", [{"op": "intervalo", "alvo": "Dados!F1", "valores": [[k] for k in range(20_000)]}]
+    )
+    assert rel["aplicadas"][0]["celulas"] == 20_000 and time.monotonic() - inicio < 10
+    with pytest.raises(OperacaoInvalida):
+        codigo.editar(dados, "p.xlsx", [{"op": "celula", "alvo": "Dados!B500", "valor": 1}])
+
+
+def test_pedido_malformado_nao_vira_erro_interno():
+    with pytest.raises(OperacaoInvalida):
+        codigo.editar(_livro(), "p.xlsx", [{"op": []}])
+
+
+def _trocar(dados, parte, troca):
+    saida = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(dados)) as o, zipfile.ZipFile(saida, "w") as z:
+        for i in o.infolist():
+            conteudo = o.read(i)
+            z.writestr(i, troca(conteudo.decode()).encode() if i.filename == parte else conteudo)
+    return saida.getvalue()
+
+
+def _com_parte(dados, nome, conteudo):
+    saida = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(dados)) as o, zipfile.ZipFile(saida, "w") as z:
+        for i in o.infolist():
+            z.writestr(i, o.read(i))
+        z.writestr(nome, conteudo)
+    return saida.getvalue()
