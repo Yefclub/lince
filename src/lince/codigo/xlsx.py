@@ -52,7 +52,8 @@ _XLFN = set(
     T.INV T.INV.2T T.TEST TEXTJOIN UNICHAR UNICODE VAR.P VAR.S WEIBULL.DIST XLOOKUP XMATCH XOR NETWORKDAYS.INTL
     WORKDAY.INTL ISO.CEILING ACOT ACOTH ARABIC BASE Z.TEST IMCOSH IMCOT IMCSC IMCSCH IMSEC IMSECH IMSINH IMTAN MUNIT
     ENCODEURL FILTERXML WEBSERVICE FORECAST.ETS FORECAST.ETS.CONFINT FORECAST.ETS.SEASONALITY
-    FORECAST.ETS.STAT""".split()
+    FORECAST.ETS.STAT TEXTBEFORE TEXTAFTER VALUETOTEXT ARRAYTOTEXT REGEXTEST REGEXEXTRACT REGEXREPLACE IMAGE
+    ECMA.CEILING""".split()
 )
 # Devolvem matriz que se espalha pelas células vizinhas: exigem metadados de matriz dinâmica que não escrevemos
 _MATRIZ_DINAMICA = set(
@@ -472,26 +473,22 @@ def _ampliar_dimensao(ws, col, lin):
 
 
 class _Contexto:
-    """O que uma fórmula pode citar: abas, nomes definidos e tabelas da pasta (em minúsculas)."""
+    """O que uma fórmula pode citar: abas e nomes definidos da pasta (em minúsculas)."""
 
     def __init__(self, ed):
         self.abas = {x.get("name", "").casefold() for x in ed.livro.todas()}
         self.nomes = {
             (d.get("name") or "").casefold() for d in ed.livro.raiz.findall("s:definedNames/s:definedName", NS)
         }
-        self.tabelas = set()
-        for parte in ed.pk.partes:
-            if parte.startswith("xl/tables/") and parte.endswith(".xml") and parte not in ed.pk.removidas:
-                t = ed.pk.arvore(parte)
-                self.tabelas |= {(t.get(x) or "").casefold() for x in ("displayName", "name")}
 
 
 _PREFIXO = re.compile(r"(?:'((?:[^']|'')+)'|([^\s!:'\"\[\]()]+(?::[^\s!:'\"\[\]()]+)?))!")
 _CEL = r"\$?[A-Za-z]{1,3}\$?[0-9]{1,7}"
 _AREA = re.compile(rf"{_CEL}(?::{_CEL})?|\$?[A-Za-z]{{1,3}}:\$?[A-Za-z]{{1,3}}|\$?[0-9]{{1,7}}:\$?[0-9]{{1,7}}")
 _PONTA = re.compile(rf"{_CEL}|\$?[A-Za-z]{{1,3}}|\$?[0-9]{{1,7}}")
-_NOME_DEFINIDO = re.compile(r"[A-Za-z_\\][A-Za-z0-9_.\\?]*")
-_ESTRUTURADA = re.compile(r"([A-Za-z_\\][A-Za-z0-9_.\\]*)(\[.*\])")
+_NOME_DEFINIDO = re.compile(r"[^\W\d][\w.\\?]*|\\[\w.\\?]*")  # letras com acento valem (Preço, Março)
+_CELULA = re.compile(_CEL)
+_NUMERO = re.compile(r"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")  # só o que o Excel lê como número
 
 
 def _dentro_dos_limites(ref: str) -> bool:
@@ -525,16 +522,11 @@ def _referencia(v: str, ctx: _Contexto, erro):
             m2 = _PREFIXO.match(direita)
             if m2 and _PONTA.fullmatch(direita[m2.end() :]) and _dentro_dos_limites(direita[m2.end() :]):
                 return _referencia(direita, ctx, erro)
-    if not m and (e := _ESTRUTURADA.fullmatch(resto)):
-        conteudo, nivel = e.group(2), 0
-        for ch in conteudo:
-            nivel += {"[": 1, "]": -1}.get(ch, 0)
-            if nivel < 0:
-                break
-        if e.group(1).casefold() in ctx.tabelas and nivel == 0:
-            return
-        raise erro(f"tabela {e.group(1)!r} não existe ou referência estruturada inválida")
-    if _NOME_DEFINIDO.fullmatch(resto) and not _PONTA.fullmatch(resto):
+    if "[" in resto:
+        # Tabela[Col], Tabela[@Col]: a forma gravada no arquivo e as colunas da tabela precisariam de conferência
+        # própria; sem ela o Excel repara. A edição não escreve: use o intervalo de células (B2:B10).
+        raise erro("referência estruturada de tabela não é escrita pela edição; use o intervalo de células")
+    if _NOME_DEFINIDO.fullmatch(resto) and not _CELULA.fullmatch(resto):
         if resto.casefold() in ctx.nomes:
             return
         raise erro(f"o nome {resto!r} não existe na pasta")
@@ -561,7 +553,7 @@ def _formula(texto: str, alvo: str, ctx: _Contexto) -> str:
         return OperacaoInvalida("operacao-invalida", f"fórmula inválida ({motivo}): {texto[:80]!r}", alvo=alvo)
 
     itens = list(tok.items)
-    pilha, espera_valor, prefixo = [], True, False  # pilha de [tipo, argumentos, vazio, colunas da 1ª linha]
+    pilha, espera_valor, prefixo, uniao = [], True, False, False  # pilha: [tipo, argumentos, vazio, colunas]
     for k, item in enumerate(itens):
         tipo, sub, v = item.type, item.subtype, item.value
         em_matriz = bool(pilha) and pilha[-1][0] == "ARRAY"
@@ -577,7 +569,10 @@ def _formula(texto: str, alvo: str, ctx: _Contexto) -> str:
             continue
         if pilha and sub != "CLOSE":
             pilha[-1][2] = False
+        anterior = next((x for x in reversed(itens[:k]) if x.type != "WHITE-SPACE"), None)
         if tipo == "OPERAND" and sub == "RANGE" and v.startswith(":") and not espera_valor and not em_matriz:
+            if anterior is None or anterior.subtype != "CLOSE" or anterior.type not in ("FUNC", "PAREN"):
+                raise erro("intervalo com : só depois de referência")
             _referencia(v[1:], ctx, erro)  # INDEX(...):A10
             prefixo = False
             continue
@@ -586,11 +581,15 @@ def _formula(texto: str, alvo: str, ctx: _Contexto) -> str:
                 raise erro("falta operador entre dois valores")
             if em_matriz and sub not in ("NUMBER", "TEXT", "LOGICAL", "ERROR"):
                 raise erro("matriz constante só aceita números, textos, VERDADEIRO/FALSO e erros")
+            if sub == "NUMBER" and not _NUMERO.fullmatch(v):
+                raise erro(f"número {v!r} fora do formato do Excel")
+            if uniao and sub != "RANGE":
+                raise erro("vírgula entre valores: use ponto como separador decimal (1.5)")
             if sub == "TEXT" and _utf16(v[1:-1].replace('""', '"')) > 255:
                 raise erro("texto entre aspas passa de 255 caracteres")
             if sub == "RANGE":
                 _referencia(v, ctx, erro)
-            espera_valor, prefixo = False, False
+            espera_valor, prefixo, uniao = False, False, False
         elif sub == "OPEN":
             if not espera_valor:
                 raise erro("falta operador antes do parêntese")
@@ -647,8 +646,11 @@ def _formula(texto: str, alvo: str, ctx: _Contexto) -> str:
         elif tipo == "OPERATOR-INFIX":
             if espera_valor or em_matriz:
                 raise erro("operador sem valor antes")
-            if v == "," and not (pilha and pilha[-1][0] == "PAREN"):
+            if v == "," and not (
+                pilha and pilha[-1][0] == "PAREN" and anterior is not None and anterior.subtype in ("RANGE", "CLOSE")
+            ):
                 raise erro("vírgula fora de função: use ponto como separador decimal (1.5)")
+            uniao = v == ","  # união (A1,B1): o operando seguinte também precisa ser referência
             espera_valor = True
         elif tipo == "OPERATOR-POSTFIX":
             if espera_valor:
@@ -726,7 +728,7 @@ def _escrever(ed: _Editor, aba: _Aba, col: int, lin: int, alvo: str, valor=None,
     elif isinstance(valor, str):
         c.set("t", "inlineStr")  # não mexe na tabela de textos compartilhados, que outras células usam
         t = etree.SubElement(etree.SubElement(c, S + "is"), S + "t")
-        t.text = valor
+        t.text = re.sub(r"_(x[0-9A-Fa-f]{4}_)", r"_x005F_\1", valor)  # _xHHHH_ é escape no Excel: mantém o literal
         if valor != valor.strip():
             t.set(XML_SPACE, "preserve")
         ed.crescimento += len(valor)

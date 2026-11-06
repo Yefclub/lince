@@ -540,3 +540,33 @@ def test_aba_com_nome_de_erro_e_parte_ilegivel():
     ilegivel = _com_parte(_livro(), "xl/estranho.xml", "<!DOCTYPE x><x>O'Neil!A1</x>")
     with pytest.raises(OperacaoInvalida):
         codigo.editar(ilegivel, "p.xlsx", [{"op": "renomear_aba", "aba": "O'Neil", "nome": "Vendas"}])
+
+
+@pytest.mark.parametrize(
+    "formula",
+    ["=Tabela1[@Valor]*2", "=TabFretes[Toneladas]", "=1_000*A1", "=nan", "=(B2*1,5)+C2", '="a":A1', "=A1%:B1"],
+)
+def test_rodada_final_recusa_estruturada_numero_estranho_e_virgula(formula):
+    with pytest.raises(OperacaoInvalida):
+        codigo.editar(_livro(), "p.xlsx", [{"op": "celula", "alvo": "Dados!A9", "formula": formula}])
+
+
+def test_nomes_curtos_e_com_acento_funcoes_novas_e_texto_com_escape():
+    def nomes(x):
+        return x.replace(
+            "</definedNames>",
+            '<definedName name="ISS">0.05</definedName><definedName name="Preço">10</definedName></definedNames>',
+        )
+
+    dados = _trocar(_livro(), "xl/workbook.xml", nomes)
+    novo, _ = codigo.editar(
+        dados,
+        "p.xlsx",
+        [
+            {"op": "celula", "alvo": "Dados!A9", "formula": "=B2*ISS+Preço"},
+            {"op": "celula", "alvo": "Dados!A10", "formula": '=TEXTBEFORE("a-b","-")'},
+            {"op": "celula", "alvo": "Dados!A11", "valor": "_x0041_"},
+        ],
+    )
+    aba = _parte(novo, "xl/worksheets/sheet1.xml")
+    assert "<f>B2*ISS+Preço</f>" in aba and "_xlfn.TEXTBEFORE" in aba and "<t>_x005F_x0041_</t>" in aba
