@@ -596,3 +596,22 @@ def test_docx_lido_como_codigo_e_editado_com_alteracoes_controladas(api):
         "post",
     )
     assert pendente.status_code == 409 and pendente.json()["type"] == "urn:lince:erro:revisoes-pendentes"
+
+
+def test_xlsx_lido_como_codigo_e_editado(api):
+    import io
+
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    wb.active.title = "Fretes"
+    wb.active["A1"], wb.active["A2"] = 10, "=A1*2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    cod = enviar(api, ("p.xlsx", buf.getvalue()), {**A, **ESPERA}, codigo="sim").json()["itens"][0]["resultado"]
+    assert [c["id"] for c in cod["codigo"]["abas"][0]["celulas"]] == ["Fretes!A1", "Fretes!A2"]
+    pedido = {"base_sha256": cod["codigo"]["sha256"], "operacoes": [{"op": "celula", "alvo": "Fretes!A1", "valor": 15}]}
+    r = conforme(_editar(api, A, ("p.xlsx", buf.getvalue()), pedido), "/v1/edicoes", "post")
+    assert r.status_code == 201 and r.json()["codigo"]["abas"][0]["celulas"][0]["valor"] == 15
+    novo = openpyxl.load_workbook(io.BytesIO(api.get(r.headers["location"], headers=A).content))
+    assert novo["Fretes"]["A1"].value == 15 and novo["Fretes"]["A2"].value == "=A1*2"

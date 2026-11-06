@@ -115,6 +115,7 @@ próprio arquivo para cada peça:
 - **DOCX:** parágrafos e tabelas (cada célula traz os ids dos parágrafos dela), estilos e comentários. O id do
   parágrafo é o `w14:paraId` que o Word grava (`p:1A2B3C4D`); em arquivo sem ele, a posição no documento (`p:n12`),
   e aí vale mandar `se_texto`.
+- **XLSX:** abas, células com valor, fórmula e data (`Fretes!B3`), mesclagens, tabelas e nomes definidos.
 
 `POST /v1/edicoes` recebe o arquivo e as operações, aplica tudo ou nada e devolve o relatório: o que mudou, o diff
 por parte, avisos (texto que pode transbordar) e o código novo. O arquivo editado sai em `GET /v1/edicoes/{id}/arquivo`.
@@ -138,6 +139,18 @@ Operações do PPTX:
 | `celula_tabela` | Troca o texto de uma célula |
 | `valor_grafico` | Muda um ponto da série no gráfico e na planilha embutida dele |
 | `ordem`, `remover_slide` | Reordena ou tira slides |
+
+Operações do XLSX, escritas direto no XML da aba (o openpyxl perderia imagens e gráficos ao salvar):
+
+| Operação | O que faz |
+| --- | --- |
+| `celula` | Grava um valor (número, texto, booleano ou vazio) ou uma fórmula (`=SUM(B2:B5)`, em inglês) numa célula, mantendo o estilo |
+| `intervalo` | Grava uma matriz de valores a partir de uma célula; texto que começa com `=` é fórmula |
+| `renomear_aba` | Renomeia a aba e atualiza as referências a ela em fórmulas, nomes, validações e gráficos |
+
+Valor ou fórmula alterada faz o Excel recalcular tudo ao abrir, e por isso os resultados de fórmula no código novo
+ainda são os antigos. Célula dentro de mesclagem, de fórmula matricial, na origem de uma fórmula compartilhada ou no
+cabeçalho de uma tabela é recusada com o motivo.
 
 Operações do DOCX, que por padrão entram como **alterações controladas**: quem abre no Word vê o que a IA propôs e
 aceita ou rejeita cada uma. `"revisao": false` aplica direto, e `"revisao": {"autor": "Ana"}` troca o autor (o
@@ -163,7 +176,7 @@ elementos XML é recusado, e o pedido inteiro que passa de 60 s não aplica nada
   não conhece) sai idêntico em bytes. No deck real de uma empresa, com 16 slides, gráficos com planilha embutida e
   tabela, 5 edições alteraram 6 das 97 partes, e a renderização antes e depois mostrou o layout intacto.
 - **Concorrência:** `se_texto` e `base_sha256` recusam a edição (409) se o documento mudou desde a leitura.
-- **Formatos:** PPTX e PPTM; DOCX e DOCM.
+- **Formatos:** PPTX e PPTM; DOCX e DOCM; XLSX e XLSM.
 
 ## Deploy
 

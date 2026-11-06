@@ -8,11 +8,20 @@ Leitura e edição usam o mesmo extrator, então os ids que a IA lê são os que
 
 import os
 
-from . import docx, pptx
+from . import docx, pptx, xlsx
 from .pacote import OperacaoInvalida, comparar, sha
 
-EXTRATORES = {".pptx": pptx, ".pptm": pptx, ".ppsx": pptx, ".docx": docx, ".docm": docx}
-EDITAVEIS = {".pptx": pptx, ".pptm": pptx, ".docx": docx, ".docm": docx}
+EXTRATORES = {
+    ".pptx": pptx,
+    ".pptm": pptx,
+    ".ppsx": pptx,
+    ".docx": docx,
+    ".docm": docx,
+    ".xlsx": xlsx,
+    ".xlsm": xlsx,
+}
+EDITAVEIS = EXTRATORES.copy()
+del EDITAVEIS[".ppsx"]  # apresentação de exibição: só leitura
 OPERACOES_MAX = 500  # por pedido de edição
 CRESCIMENTO_AVISO = 1.3  # texto 30% maior que o original pode transbordar a caixa (autoajuste não é recalculado)
 
