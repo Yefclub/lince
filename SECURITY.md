@@ -12,8 +12,7 @@ servidor faz requisições. Por isso:
 
 - Só `http`/`https`, sem query nem fragmento; redirect do provedor não é seguido (a chave não vai para outro host).
 - O documento não é guardado: é apagado assim que lido, e o resultado sai da memória na entrega (ou em 15 min, se
-  ninguém buscar). A chave do provedor sai da memória quando a sessão termina (com `prazo`, a leitura que já estava
-  em curso no fim do prazo ainda a usa até responder ou atingir o timeout do provedor). Só com `LINCE_REDIS` ligado, a
+  ninguém buscar). A chave do provedor sai da memória quando a sessão termina. Só com `LINCE_REDIS` ligado, a
   transcrição que a IA fez de cada recorte ou página fica no Redis por `LINCE_CACHE_DIAS`, separada por token (um
   cliente não vê nem envenena o cache de outro).
 - Cada cliente tem até 64 leituras pendentes; upload exige `Content-Length` e tem teto de 100 MB.

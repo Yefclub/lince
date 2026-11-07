@@ -114,7 +114,7 @@
                     "default": "nao"
                   },
                   "prazo": {
-                    "description": "Segundos para cada documento ficar pronto, contados do início da leitura dele (a espera na fila não conta). A leitura pela IA que não couber vira a pendência `prazo esgotado` em `cobertura.pendentes`, e o texto nativo sai completo. Sem prazo, o documento é lido até o fim.",
+                    "description": "Segundos para as leituras pela IA de cada documento, contados do início da leitura dele (a espera na fila não conta, e a extração nativa não é interrompida). Nenhuma leitura pela IA começa depois do prazo, e a que está em curso é cortada quando ele vence; o que não coube vira a pendência `prazo esgotado` em `cobertura.pendentes`, e o texto nativo sai completo. Sem prazo, o documento é lido até o fim.",
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 3600

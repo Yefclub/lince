@@ -54,9 +54,11 @@ leitor = lince.Leitor(
 ```
 
 - Sem `ia`, o Lince devolve o texto nativo completo e marca o que ficou pendente.
-- `leitor.ler(arquivo, prazo=20)`: entrega em até 20 s (o chat lê com prazo; a base, sem). O que a IA não leu a
-  tempo vira a pendência `prazo esgotado` e o texto nativo sai completo. A leitura que já estava em curso termina em
-  segundo plano: vai para o cache e o custo chega em `ao_usar`, que pode ser chamado de outra thread.
+- `leitor.ler(arquivo, prazo=20)`: as leituras pela IA têm 20 s (o chat lê com prazo; a base, sem). Nenhuma
+  começa depois disso, e a que está em curso no `OpenAICompativel` é cortada quando o prazo vence, sem novas
+  tentativas: o que não coube vira a pendência `prazo esgotado`, e o texto nativo sai completo. Nada fica rodando
+  depois da entrega, e todo custo chega em `ao_usar` e em `Resultado.uso`. A extração nativa não é interrompida.
+  Provedor próprio lê o tempo que sobra em `lince.prazo_restante()` e pode levantar `lince.PrazoEsgotado`.
 - 429 e 5xx do provedor são repetidos com espera exponencial e `Retry-After`.
 - Falha da IA nunca derruba o documento: a leitura nativa fica e a pendência é registrada.
 
@@ -100,8 +102,9 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   (`urn:lince:erro:<codigo>`) e `instance` igual ao `X-Request-Id`. O `X-Request-Id` enviado volta em toda
   resposta, o que facilita o rastreio entre os dois sistemas.
 - **Sem `X-IA-URL`**: só a extração nativa; o que precisava de IA aparece em `cobertura.pendentes`.
-- **Prazo**: com `prazo=20`, cada documento fica pronto em até 20 s depois de sair da fila; o que a IA não leu a
-  tempo aparece em `cobertura.pendentes` como `prazo esgotado`, e a leitura em curso ainda alimenta o cache.
+- **Prazo**: com `prazo=20`, as leituras pela IA de cada documento têm 20 s a partir do início da leitura dele (a
+  fila e a extração nativa não entram na conta); o que não coube aparece em `cobertura.pendentes` como
+  `prazo esgotado`.
 - **Fila justa**: os documentos são atendidos em rodízio entre tokens, então quem manda 500 não trava quem
   mandou 1. Até 16 documentos em leitura ao mesmo tempo por instância.
 - **Isolamento**: um token nunca vê sessão nem referência de outro. `LINCE_TOKENS` aceita vários tokens

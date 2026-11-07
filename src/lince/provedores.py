@@ -13,7 +13,8 @@ import urllib.request
 from collections.abc import Callable
 from typing import Protocol
 
-from .tipos import RespostaIA, Uso
+from ._prazo import prazo_restante
+from .tipos import PrazoEsgotado, RespostaIA, Uso
 
 
 class LeitorVisual(Protocol):
@@ -92,8 +93,13 @@ class OpenAICompativel:
         if self.chave:
             cab["Authorization"] = f"Bearer {self.chave}"
         for k in range(self.tentativas):
+            restante = prazo_restante()
+            if restante is not None and restante <= 0:
+                raise PrazoEsgotado
+            # com prazo, a chamada em curso é cortada quando ele vence: nada fica rodando depois da entrega
+            timeout = self.timeout if restante is None else min(self.timeout, restante)
             try:
-                with _ABRIDOR.open(urllib.request.Request(self.url, corpo, cab), timeout=self.timeout) as r:
+                with _ABRIDOR.open(urllib.request.Request(self.url, corpo, cab), timeout=timeout) as r:
                     d = json.load(r)
                 u = d.get("usage") or {}
                 return RespostaIA(
@@ -103,13 +109,22 @@ class OpenAICompativel:
             except urllib.error.HTTPError as e:
                 if e.code != 429 and e.code < 500 or k == self.tentativas - 1:
                     raise
-                espera = _retry_after(e.headers.get("Retry-After")) or min(30, 0.5 * 2**k)
-                time.sleep(espera + random.random() * 0.3)
-            except (urllib.error.URLError, TimeoutError):
+                _esperar(_retry_after(e.headers.get("Retry-After")) or min(30, 0.5 * 2**k), e)
+            except (urllib.error.URLError, TimeoutError) as e:
+                if (restante := prazo_restante()) is not None and restante <= 0:
+                    raise PrazoEsgotado from e  # o timeout foi o do prazo, não falha do provedor
                 if k == self.tentativas - 1:
                     raise
-                time.sleep(min(30, 0.5 * 2**k))
+                _esperar(min(30, 0.5 * 2**k), e)
         raise RuntimeError("inalcançável")
+
+
+def _esperar(segundos, erro):
+    """Espera antes de repetir, a menos que a espera passe do prazo: aí a nova tentativa não acontece."""
+    segundos += random.random() * 0.3
+    if (restante := prazo_restante()) is not None and restante <= segundos:
+        raise PrazoEsgotado from erro
+    time.sleep(segundos)
 
 
 class FuncaoLeitor:

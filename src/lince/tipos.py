@@ -15,6 +15,11 @@ class Uso:
     tarefa: str = ""
 
 
+class PrazoEsgotado(Exception):
+    """A leitura pela IA não coube no prazo do documento. Provedor próprio pode levantar quando
+    `lince.prazo_restante()` acabar; o Lince registra a pendência `prazo esgotado`."""
+
+
 @dataclass
 class RespostaIA:
     texto: str

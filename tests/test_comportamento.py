@@ -299,41 +299,86 @@ def test_esforco_maximo_mantem_as_leituras_da_folha_agrupada(tmp_path):
     assert r.cobertura.pendentes == []
 
 
-def test_prazo_esgotado_vira_pendencia_e_o_custo_e_registrado_mesmo_depois(tmp_path):
-    import threading
-    import time
-
+def _pdf_com_figura(tmp_path, texto="Texto nativo do relatório."):
     from PIL import Image
 
     Image.new("RGB", (800, 400), "navy").save(tmp_path / "f.png")
     pdf = tmp_path / "f.pdf"
     c = canvas.Canvas(str(pdf), pagesize=A4)
-    c.drawString(60, 780, "Texto nativo do relatório.")
+    c.drawString(60, 780, texto)
     c.drawImage(str(tmp_path / "f.png"), 60, 400, width=400, height=200)
     c.save()
-    custos, chegou = [], threading.Event()
+    return pdf
+
+
+def test_prazo_corta_a_chamada_em_curso_e_nada_fica_rodando_depois(tmp_path):
+    import time
+
+    class Lento(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            threading.Event().wait(4)  # o provedor demora mais que o prazo
+            self.send_response(200)
+            self.end_headers()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Lento)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    custos = []
+    ia = lince.OpenAICompativel(f"http://127.0.0.1:{srv.server_port}/v1", "m")
+    leitor = lince.Leitor(ia=ia, ao_usar=custos.append, agrupar=False)
+    vivas = threading.active_count()
+    inicio = time.monotonic()
+    r = leitor.ler(_pdf_com_figura(tmp_path), prazo=1)
+    gasto = time.monotonic() - inicio
+    srv.shutdown()
+    assert gasto < 2.5  # cortou no prazo, sem as 6 tentativas de 120 s
+    assert "Texto nativo do relatório." in r.markdown
+    assert any(p.endswith("prazo esgotado") for p in r.cobertura.pendentes) and not r.uso and not custos
+    assert threading.active_count() <= vivas + 1  # nenhuma leitura ficou em segundo plano (+1: o servidor falso)
+
+
+def test_provedor_proprio_ve_o_tempo_que_sobra(tmp_path):
+    vistos = []
 
     def ia(imagem, instrucao):
-        time.sleep(1.5)
-        return "lido devagar"
+        vistos.append(lince.prazo_restante())
+        return "lido"
 
-    def registrar(uso):
-        custos.append(uso)
-        chegou.set()
+    pdf = _pdf_com_figura(tmp_path)
+    lince.Leitor(ia=lince.FuncaoLeitor(ia, "m"), agrupar=False).ler(pdf, prazo=30)
+    lince.Leitor(ia=lince.FuncaoLeitor(ia, "m"), agrupar=False).ler(pdf)
+    assert 0 < vistos[0] <= 30 and vistos[1] is None and lince.prazo_restante() is None
 
-    cache = lince.CacheMemoria()
-    leitor = lince.Leitor(ia=lince.FuncaoLeitor(ia, "m"), cache=cache, ao_usar=registrar, agrupar=False)
-    inicio = time.monotonic()
-    r = leitor.ler(pdf, prazo=0.3)
-    assert time.monotonic() - inicio < 1.2  # entregou no prazo, sem esperar a IA
-    assert "Texto nativo do relatório." in r.markdown
-    assert any(p.endswith("prazo esgotado") for p in r.cobertura.pendentes) and not r.uso
-    assert chegou.wait(5) and len(custos) == 1  # a leitura em curso terminou depois e o custo foi registrado
-    chamadas = []
-    leitor2 = lince.Leitor(
-        ia=lince.FuncaoLeitor(lambda i, s: chamadas.append(1) or "x", "m"), cache=cache, agrupar=False
-    )
-    assert "lido devagar" in leitor2.ler(pdf).markdown and not chamadas  # e ficou no cache para a próxima
+
+def test_lote_cortado_pelo_prazo_nao_vira_resposta_vazia_nos_itens(tmp_path):
+    from PIL import Image
+
+    pdf = tmp_path / "titulos.pdf"
+    c = canvas.Canvas(str(pdf), pagesize=A4)
+    c.drawString(60, 800, "Relatório com títulos em imagem.")
+    for n in range(4):  # títulos pequenos em imagem: viram um lote numa chamada só
+        Image.new("RGB", (600, 80), (20 * n, 60, 160)).save(tmp_path / f"t{n}.png")
+        c.drawImage(str(tmp_path / f"t{n}.png"), 60, 700 - 120 * n, width=300, height=40)
+    c.save()
+
+    def ia(imagem, instrucao):
+        raise lince.PrazoEsgotado
+
+    r = lince.Leitor(ia=lince.FuncaoLeitor(ia, "m")).ler(pdf)
+    assert any(p.startswith("lote") and p.endswith("prazo esgotado") for p in r.cobertura.pendentes)
+    assert not any("resposta vazia" in p for p in r.cobertura.pendentes)
+
+
+def test_falha_do_ledger_continua_derrubando_a_leitura(tmp_path):
+    def ledger(uso):
+        raise RuntimeError("orçamento estourado")
+
+    leitor = lince.Leitor(ia=lince.FuncaoLeitor(lambda i, s: "lido", "m"), ao_usar=ledger, agrupar=False)
+    with pytest.raises(RuntimeError, match="orçamento estourado"):  # quem paga decide; o Lince não engole
+        leitor.ler(_pdf_com_figura(tmp_path), prazo=30)
 
 
 @pytest.mark.parametrize("prazo", [0, -1, float("inf"), float("nan")])
