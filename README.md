@@ -65,7 +65,8 @@ Serviço para qualquer plataforma chamar, com contrato **OpenAPI 3.1** versionad
 Cada envio, de um documento ou de um lote, cria uma **sessão**. Quem chama marca a sessão com uma `referencia`
 própria, por exemplo `usuario:42`. Assim, um sistema com N usuários sabe de quem é cada resultado.
 
-**Nada fica guardado.** O arquivo é apagado assim que lido. O resultado fica em memória só
+**O documento não fica guardado.** O arquivo é apagado assim que lido (a exceção é o cache opcional de transcrições,
+abaixo). O resultado fica em memória só
 até ser entregue: a primeira resposta com a sessão `concluida` (o próprio envio com `Prefer: wait`, ou um `GET`) é a
 entrega. Depois dela, a sessão fica 60 s para repetir o pedido caso a resposta tenha se perdido, e some; um
 `DELETE` confirma o recebimento e apaga na hora. Resultado que ninguém busca em 15 min é descartado.
@@ -231,14 +232,24 @@ No `clamd.conf`, `StreamMaxLength` precisa ser pelo menos `100M`, que é o teto 
 
 ### Cache das leituras da IA (opcional)
 
-Com `LINCE_REDIS=redis://host:6379/0`, o que a IA leu de cada recorte ou página fica no Redis por
-`LINCE_CACHE_DIAS` dias (padrão 30), e a mesma imagem, com a mesma instrução e o mesmo modelo, não é paga de novo,
-nem em outro envio nem em outra versão do Lince. Fica só o texto lido, sob o hash da imagem; o documento nunca. Sem a
-variável, não há cache. Com o Redis fora do ar, o Lince lê normalmente, pela IA. Pode ser o Redis que a sua
-plataforma já usa: as chaves levam o prefixo `lince:leitura:`.
+Com `LINCE_REDIS=redis://host:6379/0`, a transcrição que a IA fez de cada recorte ou página fica no Redis por
+`LINCE_CACHE_DIAS` dias (padrão 30). A mesma imagem, com a mesma instrução e o mesmo modelo, não é paga de novo, nem
+em outro envio nem em outra versão do Lince. Fica a transcrição em texto puro, sob o hash da imagem; numa página
+escaneada, ela é o texto da página. O arquivo nunca é guardado. Resposta vazia ou lote que a IA devolveu quebrado não
+entram no cache: a próxima tentativa lê de novo.
 
-Na biblioteca, passe o cliente que a plataforma já tem: `lince.Leitor(ia=..., cache=lince.CacheRedis(cliente))`
-(instale com `pip install "lince[redis]"`), ou qualquer objeto com `obter(chave)` e `guardar(chave, texto)`.
+O cache é **separado por token**: um cliente não descobre o que outro leu nem recebe resposta gravada por outro.
+Sem a variável, não há cache. Com o Redis fora do ar, o Lince lê normalmente pela IA e só volta a tentar o Redis 30 s
+depois de uma falha.
+
+**Redis:** use uma instância (ou um banco) com teto de memória e descarte das chaves antigas, por exemplo
+`maxmemory 2gb` e `maxmemory-policy allkeys-lru`. Não divida a memória com um Redis de filas que exige `noeviction`
+(BullMQ, Sidekiq e afins): as transcrições acumulam, e quando a memória acaba quem cai são as filas. As chaves levam o
+prefixo `lince:leitura:`.
+
+Na biblioteca, passe o cliente síncrono que a plataforma já tem, com `socket_timeout` definido (sem ele, um Redis
+travado prende a leitura): `lince.Leitor(ia=..., cache=lince.CacheRedis(cliente))` (instale com
+`pip install "lince[redis]"`), ou qualquer objeto com `obter(chave)` e `guardar(chave, texto)`.
 
 ## Formatos
 

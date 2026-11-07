@@ -1,5 +1,6 @@
 """API HTTP: cada resposta é conferida contra o contrato OpenAPI; os testes provam sessão, lote, referência,
-entrega única (nada fica guardado), idempotência, isolamento entre tokens, limites e a proteção do provedor."""
+entrega única (o documento não fica guardado), idempotência, isolamento entre tokens, limites e proteção do
+provedor."""
 
 import json
 import threading
@@ -354,6 +355,20 @@ def test_cache_do_servidor_vale_entre_envios(pdf_com_figura):
     assert contador.chamadas == 1  # o segundo envio não paga a mesma imagem
     assert not primeiro["uso"][0]["cache"] and segundo["uso"][0]["cache"]
     assert "Lapa 3500" in segundo["markdown"]
+
+
+def test_cache_do_servidor_e_separado_por_token(pdf_com_figura):
+    from lince import CacheMemoria
+
+    srv, contador, url = _provedor("Gráfico de barras: Lapa 3500.")
+    api = TestClient(criar_app(["token-a", "token-b"], cache=CacheMemoria()))
+    ia = {**ESPERA, "X-IA-URL": url, "X-IA-Modelo": "m"}
+    enviar(api, ("g.pdf", pdf_com_figura), {**A, **ia})
+    outro = enviar(api, ("g.pdf", pdf_com_figura), {**B, **ia}).json()["itens"][0]["resultado"]
+    de_novo = enviar(api, ("g.pdf", pdf_com_figura), {**A, **ia}).json()["itens"][0]["resultado"]
+    srv.shutdown()
+    # o token B não aproveita (nem descobre) a leitura do A; o A aproveita a própria
+    assert contador.chamadas == 2 and not outro["uso"][0]["cache"] and de_novo["uso"][0]["cache"]
 
 
 def test_retry_after_do_provedor_tem_teto():

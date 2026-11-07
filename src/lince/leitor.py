@@ -13,7 +13,7 @@ from pathlib import Path
 import anydoc
 
 from ._trava import PDFIUM
-from .agrupamento import agrupar, distribuir_lotes
+from .agrupamento import agrupar, distribuir_lotes, resposta_aproveitavel
 from .cache import Cache, chave
 from .instrucoes import PROMPT_PADRAO, VERSAO_PROMPT, instrucao
 from .limites import LADO_MAX_PX, conferir_zip
@@ -168,7 +168,8 @@ class Leitor:
             if (txt := self._cache_obter(k)) is not None:
                 return t["id"], txt, Uso(self.ia.modelo, cache=True, tarefa=t["id"])
             r = self.ia.ler(img, instr)
-            self._cache_guardar(k, r.texto)
+            if resposta_aproveitavel(plano, t["id"], r.texto):
+                self._cache_guardar(k, r.texto)
             r.uso.tarefa = t["id"]
             return t["id"], r.texto, r.uso
 

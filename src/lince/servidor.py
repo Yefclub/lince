@@ -1,9 +1,10 @@
 """API HTTP do Lince. O contrato é `openapi.json` (servido em /v1/openapi.json); este módulo o implementa.
 
 Cada envio (um documento ou um lote) cria uma sessão, marcada pela `referencia` de quem chama, para o sistema de
-origem saber de quem é cada resultado. Nada é guardado: o arquivo é apagado assim que lido, e o resultado fica em
-memória só até ser entregue (a primeira resposta com a sessão concluída, mais REENTREGA para repetir se a resposta
-se perder) ou até ENTREGA_PRAZO. O modelo de visão vem
+origem saber de quem é cada resultado. O documento não é guardado: o arquivo é apagado assim que lido, e o resultado
+fica em memória só até ser entregue (a primeira resposta com a sessão concluída, mais REENTREGA para repetir se a
+resposta se perder) ou até ENTREGA_PRAZO. Só com LINCE_REDIS, a transcrição que a IA fez de cada recorte ou página
+fica no Redis por LINCE_CACHE_DIAS, separada por token. O modelo de visão vem
 em cada envio (X-IA-URL, X-IA-Modelo, X-IA-Chave): o servidor não guarda chave de provedor. Fila justa entre tokens.
 """
 
@@ -34,7 +35,7 @@ from starlette.routing import Route
 
 from . import antivirus
 from . import codigo as codigo_doc
-from .cache import CacheRedis
+from .cache import CacheComEscopo, CacheRedis
 from .leitor import FORMATOS, VERSAO, Leitor
 from .limites import DocumentoRecusado
 from .provedores import OpenAICompativel
@@ -153,7 +154,7 @@ class Servico:
         self.sessoes: dict[str, dict] = {}
         self.idempotencia: dict[tuple[str, str], str] = {}
         self.clamav: tuple[str, int] | None = None  # LINCE_CLAMAV: todo arquivo recebido passa pelo antivírus
-        self.cache = None  # LINCE_REDIS: leituras da IA compartilhadas entre envios (só o texto lido, por hash)
+        self.cache = None  # LINCE_REDIS: transcrições da IA reaproveitadas entre envios do mesmo token
         self.edicoes: dict[str, dict] = {}  # arquivo editado esperando download (entrega única, como as sessões)
         self.vagas: dict[str, int] = {}  # documentos pendentes por cliente, reservados antes do upload
         self.retidos: dict[str, int] = {}  # bytes de resultado em memória por cliente (sessões em curso e concluídas)
@@ -195,7 +196,8 @@ class Servico:
                 estado = "cancelado"
                 return
             doc["estado"], doc["inicio"] = "lendo", time.time()
-            r = Leitor(ia=sessao["ia"], esforco=sessao["esforco"], cache=self.cache).ler(doc["arquivo"])
+            cache = CacheComEscopo(self.cache, sessao["cliente"]) if self.cache else None
+            r = Leitor(ia=sessao["ia"], esforco=sessao["esforco"], cache=cache).ler(doc["arquivo"])
             doc["resultado"] = {
                 "markdown": r.markdown,
                 "metadados": r.metadados,

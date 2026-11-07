@@ -77,8 +77,9 @@ def test_cache_do_servidor_vem_do_ambiente():
     for env in ({"LINCE_REDIS": "http://redis"}, {"LINCE_REDIS": "redis://r", "LINCE_CACHE_DIAS": "abc"}):
         with pytest.raises(ValueError):
             cache_do_ambiente(env)
-    with pytest.raises(ValueError):
-        cache_do_ambiente({"LINCE_REDIS": "redis://r", "LINCE_CACHE_DIAS": "0"})
+    for dias in ("0", "inf", "nan", "0.000001"):  # menos de um segundo não dá para expirar no Redis
+        with pytest.raises(ValueError):
+            cache_do_ambiente({"LINCE_REDIS": "redis://r", "LINCE_CACHE_DIAS": dias})
 
 
 def test_redis_lento_nao_cobra_o_timeout_em_cada_leitura(tmp_path):
@@ -110,3 +111,52 @@ def test_redis_lento_nao_cobra_o_timeout_em_cada_leitura(tmp_path):
     )
     leitor.ler(pdf)
     assert len(chamadas) == 4 and RedisLento.tentativas == 1  # depois da 1ª falha, o cache fica em pausa
+
+
+def test_resposta_vazia_nao_fica_no_cache(pdf_com_figura):
+    respostas, chamadas = iter(["", "lido"]), []
+    cache = lince.CacheMemoria()
+
+    def ia(i, s):
+        chamadas.append(1)
+        return next(respostas)
+
+    leitor = lince.Leitor(ia=lince.FuncaoLeitor(ia, "m"), cache=cache, agrupar=False)
+    assert leitor.ler(pdf_com_figura).cobertura.pendentes  # falha passageira: pendência nesta leitura
+    r = leitor.ler(pdf_com_figura)
+    assert len(chamadas) == 2 and "lido" in r.markdown  # a nova tentativa lê de novo, não repete a falha
+
+
+def test_lote_quebrado_nao_vai_para_o_cache():
+    from lince.agrupamento import resposta_aproveitavel
+
+    plano = {"lotes": {"lote1": [(1, "a"), (2, "b")]}}
+    assert not resposta_aproveitavel(plano, "lote1", "Desculpe, não consegui.")
+    assert not resposta_aproveitavel(plano, "lote1", '{"1": "", "2": ""}')
+    assert resposta_aproveitavel(plano, "lote1", 'Aqui: {"1": "Receita", "2": ""}')
+    assert not resposta_aproveitavel(plano, "t1", "  ") and resposta_aproveitavel(plano, "t1", "texto")
+
+
+def test_cache_volta_depois_da_pausa_e_ignora_tipo_inesperado(monkeypatch):
+    class Instavel(RedisFalso):
+        falhar = True
+
+        def get(self, k):
+            if self.falhar:
+                self.falhar = False
+                raise ConnectionError("caiu")
+            return super().get(k)
+
+    redis = Instavel()
+    cache = lince.CacheRedis(redis)
+    monkeypatch.setattr(lince.CacheRedis, "PAUSA", 0)
+    with pytest.raises(ConnectionError):
+        cache.obter("k")
+    cache.guardar("k", "texto")
+    assert cache.obter("k") == "texto"  # passada a pausa, o Redis é usado de novo
+
+    class Assincrono(RedisFalso):
+        def get(self, k):
+            return object()  # o que um cliente redis.asyncio devolveria (uma corrotina), nunca texto
+
+    assert lince.CacheRedis(Assincrono()).obter("k") is None

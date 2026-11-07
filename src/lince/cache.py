@@ -6,6 +6,7 @@ Redis que já tem (`CacheRedis(cliente)`) ou qualquer objeto com `obter` e `guar
 
 import hashlib
 import json
+import math
 import os
 import tempfile
 import time
@@ -34,12 +35,14 @@ class CacheRedis:
     PAUSA = 30  # segundos sem tentar o Redis depois de uma falha: Redis lento não soma 2 s em cada leitura
 
     def __init__(self, redis, dias: float = 30):
+        """`redis`: URL (o Lince cria o cliente com timeout de 2 s) ou o cliente síncrono da plataforma, que precisa
+        ter `socket_timeout`: sem ele, um Redis travado prende a leitura."""
+        if not (math.isfinite(dias) and dias * 86400 >= 1):
+            raise ValueError("dias precisa ser um número finito de pelo menos um segundo")
         if isinstance(redis, str):
             import redis as redis_py
 
             redis = redis_py.Redis.from_url(redis, socket_timeout=2, socket_connect_timeout=2)
-        if dias <= 0:
-            raise ValueError("dias precisa ser maior que zero")
         self.redis, self.segundos, self._fora_ate = redis, int(dias * 86400), 0.0
 
     def _chamar(self, funcao, *args, **kw):
@@ -53,10 +56,29 @@ class CacheRedis:
 
     def obter(self, k):
         v = self._chamar(self.redis.get, self.PREFIXO + k)
-        return v.decode("utf-8") if isinstance(v, bytes) else v
+        if isinstance(v, bytes):
+            return v.decode("utf-8")
+        return v if isinstance(v, str) else None  # tipo inesperado (cliente assíncrono, por exemplo) não é acerto
 
     def guardar(self, k, texto):
         self._chamar(self.redis.set, self.PREFIXO + k, texto.encode("utf-8"), ex=self.segundos)
+
+
+class CacheComEscopo:
+    """O mesmo cache separado por dono (o token, na API): um cliente não descobre o que outro leu nem grava resposta
+    que outro vai receber, mas continua aproveitando as próprias leituras entre envios e versões."""
+
+    def __init__(self, cache, escopo: str):
+        self.cache, self._escopo = cache, hashlib.sha256(escopo.encode()).hexdigest()[:32]
+
+    def _k(self, k):
+        return hashlib.sha256(f"{self._escopo}:{k}".encode()).hexdigest()
+
+    def obter(self, k):
+        return self.cache.obter(self._k(k))
+
+    def guardar(self, k, texto):
+        self.cache.guardar(self._k(k), texto)
 
 
 class CacheMemoria:
