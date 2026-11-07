@@ -27,9 +27,12 @@ ESPERADO = {
     "poi_SimpleMacro.docm": "This is a macro word processing document",
     "testWORD.doc": "Sample Word Document Title",
     "poi_SimpleMacro.doc": "This is a macro word processing document",
+    "poi_DiffFirstPageHeadFoot.doc": "HEADING TEXT",
+    "poi_HeaderFooterUnicode.doc": "Molière",
     "testOpenOffice2.odt": "sample Open Office document",
     "testFooter.odt": "Here is some text on page 2",
     "testRTF.rtf": "Test d’indexation Word",
+    "testRTFVarious.rtf": "Here is a text box",
     "testEPUB.epub": "This is the text for chapter One",
     "testPPT.pptx": "Attachment Test",
     "poi_SampleShow.pptx": "Title of the first slide",
@@ -39,6 +42,8 @@ ESPERADO = {
     "testPPT.ppsm": "Attachment Test",
     "testPPT.ppt": "Sample Powerpoint Slide",
     "poi_SampleShow.ppt": "Title of the first slide",
+    "poi_SimpleMacro.ppt": "This is a macro slideshow",
+    "poi_headers_footers.ppt": None,  # só tem cabeçalho e rodapé: vão para os metadados
     "testPPT.pps": "Sample Powerpoint Slide",
     "testPPT.pot": "Sample Powerpoint Slide",
     "testMasterFooter.odp": None,  # só tem texto no rodapé da página mestra: vai para os metadados
@@ -50,6 +55,10 @@ ESPERADO = {
     "poi_testVarious.xlsb": "This is a string",
     "testEXCEL.xls": "Sample Excel Worksheet",
     "poi_SimpleMacro.xls": "This is a macro workbook",
+    "poi_EmbeddedChartHeaderTest.xls": "| Data 1 | Data 2 | Data 3 |",
+    "poi_47251_1.xls": "AAAAAAAAAA AAAAAAA AAAAA AAAAAAAA",  # o POI já publica o conteúdo trocado por "A"
+    "poi_TwoSheetsOneHidden.xls": "Sheet2A1",
+    "poi_60405.xls": "NullPointerException during build",
     "testFooter.ods": "| Data 3 | Data 4 |",
     "testCSV.csv": "Numbers and their Squares",
     "texto.tsv": "| soja | 3500 |",
@@ -116,6 +125,27 @@ def test_cabecalho_e_rodape_do_word_e_do_excel_vao_para_os_metadados(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("nome", "texto"),
+    [
+        ("testWORD.doc", "This is the header for our document"),
+        ("poi_DiffFirstPageHeadFoot.doc", "I am the header on the first page, and I’m nice and simple"),
+        ("poi_HeaderFooterUnicode.doc", "This is a simple header, with a € euro symbol in it."),
+        ("poi_EmbeddedChartHeaderTest.xls", "Top Left Top Center Top Right"),
+        ("poi_47251_1.xls", "[página] of [páginas]"),
+        ("poi_headers_footers.ppt", "Global Slide Footer"),
+        ("testRTFVarious.rtf", "This is the header text."),
+    ],
+)
+def test_cabecalho_e_rodape_dos_binarios_e_do_rtf_vao_para_os_metadados(nome, texto):
+    r = lince.ler(REAIS / nome)
+    assert texto in r.metadados["cabeçalho/rodapé"] and texto not in r.markdown
+
+
+def test_aba_oculta_do_xls_e_sinalizada():
+    assert lince.ler(REAIS / "poi_TwoSheetsOneHidden.xls").metadados["abas_ocultas"] == ["Sheet1"]
+
+
+@pytest.mark.parametrize(
     "nome",
     [
         "testWORD_macros.docm",
@@ -123,15 +153,57 @@ def test_cabecalho_e_rodape_do_word_e_do_excel_vao_para_os_metadados(tmp_path):
         "poi_SimpleMacro.pptm",
         "poi_SimpleMacro.doc",
         "poi_SimpleMacro.xls",
+        "poi_SimpleMacro.ppt",  # VBA dentro de um objeto comprimido: só o VBAInfoAtom denuncia
+        "poi_60405.xls",  # folha de macro do Excel 4.0, sem VBA nenhum
     ],
 )
 def test_macro_e_sinalizada_na_leitura(nome):
     assert lince.ler(REAIS / nome).metadados["macros"] is True
 
 
-@pytest.mark.parametrize("nome", ["testWORD.docx", "testWORD.doc", "testEXCEL.xls", "testOpenOffice2.odt"])
+@pytest.mark.parametrize(
+    "nome",
+    # o testPPT.ppt tem o registro de VBA com "sem macros": a presença do registro não basta
+    ["testWORD.docx", "testWORD.doc", "testEXCEL.xls", "testOpenOffice2.odt", "testPPT.ppt", "poi_SampleShow.ppt"],
+)
 def test_arquivo_sem_macro_nao_e_sinalizado(nome):
     assert "macros" not in lince.ler(REAIS / nome).metadados
+
+
+def test_folha_de_macro_do_excel_4_nao_depende_de_vba():
+    assert "_VBA_PROJECT".encode("utf-16-le") not in (REAIS / "poi_60405.xls").read_bytes()
+
+
+def test_campo_do_word_vira_o_resultado_e_pagina_vira_nome():
+    from lince.legados import _sem_campos
+
+    assert _sem_campos("Página \x13 PAGE \x14 3\x15 de \x13 NUMPAGES \x145\x15") == "Página [página] de [páginas]"
+    assert _sem_campos('\x13 HYPERLINK "https://exemplo.com" \x14exemplo.com\x15') == "exemplo.com"
+    aninhado = '\x13 IF \x13 PAGE \x141\x15 = 1 "a" \x14primeira\x15 fim'
+    assert _sem_campos(aninhado) == "primeira fim"
+
+
+def test_rtf_usa_a_pagina_de_codigo_da_fonte_e_ignora_grupo_sem_fim(tmp_path):
+    # fonte 1 em Shift-JIS (\fcharset128): \'82\'a0 é "あ"; o cabeçalho é lido como o corpo, pela fonte
+    rtf = (
+        rb"{\rtf1\ansi\deff0{\fonttbl{\f0\fcharset0 Arial;}{\f1\fcharset128 MS Gothic;}}"
+        rb"{\header\pard\f1 \'82\'a0\par}{\footerr\pard Rodap\'e9\par}\pard Corpo\par}"
+    )
+    (tmp_path / "jp.rtf").write_bytes(rtf)
+    r = lince.ler(tmp_path / "jp.rtf")
+    assert r.metadados["cabeçalho/rodapé"] == ["Rodapé", "あ"] and "Corpo" in r.markdown
+    from lince.metadados import metadados_arquivo
+
+    (tmp_path / "aberto.rtf").write_bytes(rb"{\rtf1{\header abc")  # grupo que nunca fecha
+    assert metadados_arquivo(tmp_path / "aberto.rtf") == {}
+
+
+def test_ole_malformado_nao_derruba_os_metadados(tmp_path):
+    from lince.metadados import metadados_arquivo
+
+    cortado = tmp_path / "cortado.doc"
+    cortado.write_bytes((REAIS / "testWORD.doc").read_bytes()[:4096])  # cabeçalho OLE válido, setores faltando
+    assert metadados_arquivo(cortado).get("partes_ilegiveis") == ["cabeçalho, rodapé e macros"]
 
 
 def test_macro_do_odf_e_do_excel_4_sao_sinalizadas(tmp_path):

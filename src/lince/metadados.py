@@ -12,6 +12,7 @@ import zipfile  # noqa: F401
 import zlib
 from xml.etree import ElementTree as ET  # noqa: F401
 
+from . import legados
 from .limites import xml_ou_nada
 
 
@@ -31,13 +32,21 @@ def metadados_arquivo(path, ext=None):
         return meta
     if ext in ODF:
         return _metadados_odf(path, meta, ext)
+    if ext == ".rtf":
+        try:
+            bordas = legados.rtf(open(path, "rb").read(), _linhas_rtf)
+        except Exception:  # noqa: BLE001 — RTF fora do padrão: o corpo continua lido, sem cabeçalho e rodapé
+            meta["partes_ilegiveis"] = ["cabeçalho e rodapé"]
+        else:
+            _guardar_bordas(meta, bordas)
+        return meta
     if ext in BINARIOS_OLE:
         # Word e Excel binários guardam o VBA no armazenamento _VBA_PROJECT (o PowerPoint, dentro de um objeto)
         if os.path.getsize(path):
             with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
                 if m.find("_VBA_PROJECT".encode("utf-16-le")) >= 0:
                     meta["macros"] = True
-        return meta
+        return _metadados_ole(path, meta, ext)
     if ext not in OOXML:
         return meta
     W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -118,6 +127,53 @@ def metadados_arquivo(path, ext=None):
         if ilegiveis:
             meta["partes_ilegiveis"] = ilegiveis  # malformadas ou hostis: ficaram de fora dos metadados
     return meta
+
+
+def _metadados_ole(path, meta, ext):
+    """DOC, XLS e PPT: cabeçalho e rodapé, abas ocultas e macro que o _VBA_PROJECT não denuncia (VBA do PowerPoint
+    e folha de macro do Excel 4.0). Excel 2.x a 4.x não são OLE: ficam sem esses metadados."""
+    import olefile
+
+    if not olefile.isOleFile(path):
+        return meta
+    try:
+        with olefile.OleFileIO(path) as o:
+            if ext == ".doc":
+                achado = {"bordas": legados.doc(o)}
+            elif ext == ".xls":
+                achado = legados.xls(o)
+            else:
+                achado = legados.ppt(o)
+    except Exception:  # noqa: BLE001 — OLE malformado ou hostil: o corpo continua lido, sem estes metadados
+        meta["partes_ilegiveis"] = ["cabeçalho, rodapé e macros"]
+        return meta
+    bordas = achado.get("bordas", [])
+    _guardar_bordas(meta, [_sem_codigos_excel(t) for t in bordas] if ext == ".xls" else bordas)
+    if achado.get("ocultas"):
+        meta["abas_ocultas"] = achado["ocultas"]
+    if achado.get("macro"):
+        meta["macros"] = True
+    return meta
+
+
+def _linhas_rtf(dados: bytes) -> list[str]:
+    """Linhas de texto de um RTF pelo mesmo leitor do corpo; tabela vira as células separadas por espaço."""
+    import anydoc
+
+    from .office import serializar
+
+    try:
+        md, _ = serializar(anydoc.to_document(dados, format="rtf"), lambda *_: "")
+    except anydoc.ConvertError:
+        return []
+    linhas = []
+    for linha in md.splitlines():
+        if re.fullmatch(r"\|(?: --- \|)+", linha):
+            continue
+        if linha.startswith("|"):
+            linha = " ".join(c.strip() for c in linha.strip("|").split(" | ") if c.strip())
+        linhas.append(linha.removeprefix("\\"))
+    return linhas
 
 
 _CABECALHO_XLSX = re.compile(  # (?<!/) : <oddHeader/> vazio não engole o elemento seguinte

@@ -10,9 +10,9 @@ e `NOTICE-Apache-Tika.txt`). Arquivos tirados dos conjuntos de teste públicos d
 
 | Arquivo aqui | Origem |
 | --- | --- |
-| `poi_SampleDoc.docx`, `poi_SimpleMacro.docm`, `poi_SimpleMacro.doc` | apache/poi `test-data/document/` (`SampleDoc.docx`, `SimpleMacro.docm`, `SimpleMacro.doc`) |
-| `poi_SampleSS.xlsx`, `poi_SimpleMacro.xlsm`, `poi_SimpleMacro.xls`, `poi_sample.xlsb`, `poi_testVarious.xlsb` | apache/poi `test-data/spreadsheet/` (`SampleSS.xlsx`, `SimpleMacro.xlsm`, `SimpleMacro.xls`, `sample.xlsb`, `testVarious.xlsb`) |
-| `poi_SampleShow.pptx`, `poi_SampleShow.ppt`, `poi_SimpleMacro.pptm` | apache/poi `test-data/slideshow/` |
+| `poi_SampleDoc.docx`, `poi_SimpleMacro.docm`, `poi_SimpleMacro.doc`, `poi_DiffFirstPageHeadFoot.doc`, `poi_HeaderFooterUnicode.doc` | apache/poi `test-data/document/` (mesmo nome, sem o prefixo `poi_`) |
+| `poi_SampleSS.xlsx`, `poi_SimpleMacro.xlsm`, `poi_SimpleMacro.xls`, `poi_sample.xlsb`, `poi_testVarious.xlsb`, `poi_EmbeddedChartHeaderTest.xls`, `poi_47251_1.xls`, `poi_TwoSheetsOneHidden.xls`, `poi_60405.xls` | apache/poi `test-data/spreadsheet/` (mesmo nome, sem o prefixo `poi_`) |
+| `poi_SampleShow.pptx`, `poi_SampleShow.ppt`, `poi_SimpleMacro.pptm`, `poi_SimpleMacro.ppt`, `poi_headers_footers.ppt` | apache/poi `test-data/slideshow/` (mesmo nome, sem o prefixo `poi_`) |
 | `test*.*` (PDF, Word, Excel, PowerPoint, ODF, RTF, EPUB, CSV, imagens) | apache/tika, pastas `test-documents/` dos módulos de parser, mesmo nome |
 
 **Modificados pelo Lince:** nomes de pessoas e de empresas foram trocados por "Autor de teste" (ou texto neutro do
@@ -21,9 +21,12 @@ foram reescritas só as partes que continham nomes (as XML como texto; as binár
 mesmo tamanho); nos binários (DOC, XLS, PPT, PDF) a troca tem o mesmo número
 de bytes, para não deslocar nenhum ponteiro interno, e o RTF foi editado como texto. Fora esses nomes (inclusive um
 que aparecia no texto de um slide do `testPPT`), o conteúdo, a estrutura e o programa que gravou cada arquivo
-continuam os originais; os arquivos sem nome nenhum não foram tocados.
+continuam os originais; os arquivos sem nome nenhum não foram tocados. Nos OLE, o nome curto de empresa (três a seis
+letras) foi trocado só no stream de propriedades (`DocumentSummaryInformation`), para a troca não acertar outro texto.
 
-`testEXCEL.xlsb` fica como caso de falha conhecida: o leitor atual recusa o arquivo com erro claro do documento.
+`testEXCEL.xlsb` fica como caso de falha conhecida: o leitor recusa o arquivo com erro claro do documento. Ele foi
+gravado fora da especificação (o registro BrtBundleSh traz quatro bytes a mais antes do `rId` da aba), e o calamine,
+o outro leitor livre de `.xlsb` testado, também não o abre.
 
 ## Derivados (mesmo conteúdo, outra extensão)
 
