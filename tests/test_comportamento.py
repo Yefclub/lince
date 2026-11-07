@@ -470,3 +470,37 @@ def test_releitura_ampliada_respeita_o_prazo_e_mantem_a_primeira_leitura(tmp_pat
 
     r = lince.Leitor(ia=lince.FuncaoLeitor(lenta, "m"), esforco="max", agrupar=False).ler(pdf, prazo=3)
     assert "Diesel S10: R$ [ilegível]" in r.markdown and "segunda_passada" not in r.cobertura.rotas
+
+
+@pytest.mark.parametrize("chunked", [False, True], ids=["content-length", "chunked"])
+def test_leitura_que_da_certo_com_prazo_continua_dando_certo(tmp_path, chunked):
+    class Normal(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            out = json.dumps({"choices": [{"message": {"content": "Gráfico lido."}}], "usage": {"prompt_tokens": 9}})
+            out = out.encode()
+            self.send_response(200)
+            if chunked:
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                for parte in (out[:10], out[10:]):
+                    self.wfile.write(f"{len(parte):x}\r\n".encode() + parte + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+            else:
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Normal)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    custos = []
+    ia = lince.OpenAICompativel(f"http://127.0.0.1:{srv.server_port}/v1", "m")
+    r = lince.Leitor(ia=ia, ao_usar=custos.append, agrupar=False).ler(_pdf_com_figura(tmp_path), prazo=30)
+    srv.shutdown()
+    assert "Gráfico lido." in r.markdown and r.cobertura.leituras_ia == 1 and not r.cobertura.pendentes
+    assert [u.tokens_entrada for u in custos] == [9]

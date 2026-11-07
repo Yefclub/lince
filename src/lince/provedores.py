@@ -128,8 +128,11 @@ def _ler_corpo(r, timeout) -> bytes:
         if (restante := prazo_restante()) is not None:
             if restante <= 0:
                 raise PrazoEsgotado
-            if sock is not None:
-                sock.settimeout(min(timeout, restante))
+            if sock is not None and not r.isclosed():  # resposta já lida até o fim: o socket pode estar fechado
+                try:
+                    sock.settimeout(min(timeout, restante))
+                except OSError:
+                    sock = None  # o ajuste é só refinamento: sem ele, vale o timeout inicial, nunca uma falha
         if not (bloco := r.read1(64 * 1024)):
             return b"".join(partes)
         partes.append(bloco)
