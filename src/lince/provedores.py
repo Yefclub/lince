@@ -100,7 +100,7 @@ class OpenAICompativel:
             timeout = self.timeout if restante is None else min(self.timeout, restante)
             try:
                 with _ABRIDOR.open(urllib.request.Request(self.url, corpo, cab), timeout=timeout) as r:
-                    d = json.loads(_ler_corpo(r))
+                    d = json.loads(_ler_corpo(r, timeout))
                 u = d.get("usage") or {}
                 return RespostaIA(
                     d["choices"][0]["message"]["content"] or "",
@@ -119,15 +119,20 @@ class OpenAICompativel:
         raise RuntimeError("inalcançável")
 
 
-def _ler_corpo(r) -> bytes:
-    """Corpo da resposta em blocos, conferindo o prazo a cada um: provedor que manda a resposta aos poucos não segura
-    a leitura além do prazo (o timeout do socket vale por operação, não para o corpo inteiro)."""
+def _ler_corpo(r, timeout) -> bytes:
+    """Corpo da resposta em blocos. Com prazo, antes de cada bloco o socket espera só o que sobra dele: o provedor que
+    manda aos poucos ou para no meio não segura a leitura (o timeout do socket vale por operação, não para o corpo)."""
+    sock = getattr(getattr(getattr(r, "fp", None), "raw", None), "_sock", None)  # sem ele, fica o timeout inicial
     partes = []
-    while bloco := r.read1(64 * 1024):
+    while True:
+        if (restante := prazo_restante()) is not None:
+            if restante <= 0:
+                raise PrazoEsgotado
+            if sock is not None:
+                sock.settimeout(min(timeout, restante))
+        if not (bloco := r.read1(64 * 1024)):
+            return b"".join(partes)
         partes.append(bloco)
-        if (restante := prazo_restante()) is not None and restante <= 0:
-            raise PrazoEsgotado
-    return b"".join(partes)
 
 
 def _esperar(segundos, erro, sorteio=True):

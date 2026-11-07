@@ -59,8 +59,8 @@ leitor = lince.Leitor(
   que está em curso no `OpenAICompativel` é cortada, sem novas tentativas: o que não coube vira a pendência
   `prazo esgotado`, e o texto nativo sai completo. Nada fica rodando depois da entrega. Toda leitura concluída chega em
   `ao_usar` e em `Resultado.uso`; a chamada cortada pode ser cobrada pelo provedor sem aparecer ali (ela já tinha sido
-  enviada). O corte acompanha a rede: conexão, envio de imagem grande ou DNS lento podem passar alguns segundos do
-  prazo. Provedor próprio lê o tempo que sobra em `lince.prazo_restante()` e pode levantar `lince.PrazoEsgotado`.
+  enviada). O corte vale também quando o provedor manda a resposta aos poucos ou para no meio dela; só a conexão, o
+  envio de uma imagem grande ou um DNS lento podem passar alguns segundos do prazo. Provedor próprio lê o tempo que sobra em `lince.prazo_restante()` e pode levantar `lince.PrazoEsgotado`.
 - 429 e 5xx do provedor são repetidos com espera exponencial e `Retry-After`.
 - Falha da IA nunca derruba o documento: a leitura nativa fica e a pendência é registrada.
 

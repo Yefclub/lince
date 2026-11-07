@@ -388,34 +388,57 @@ def test_prazo_invalido_e_recusado(prazo, tmp_path):
         lince.Leitor().ler(tmp_path / "a.txt", prazo=prazo)
 
 
-def test_provedor_que_manda_a_resposta_aos_poucos_nao_segura_o_prazo(tmp_path):
+def _provedor_que_trava(passos):
+    """Provedor que manda os cabeçalhos e depois `passos` (bytes a enviar ou segundos a esperar)."""
     import time
 
-    class AosPoucos(BaseHTTPRequestHandler):
+    class Provedor(BaseHTTPRequestHandler):
+        chegou = threading.Event()
+
         def log_message(self, *a):
             pass
 
         def do_POST(self):
             self.rfile.read(int(self.headers["Content-Length"]))
+            type(self).chegou.set()
             self.send_response(200)
             self.send_header("Content-Length", "100000")
             self.end_headers()
             try:
-                for _ in range(200):  # um byte a cada 0,2 s: cada recv chega antes do timeout do socket
-                    self.wfile.write(b" ")
-                    self.wfile.flush()
-                    time.sleep(0.2)
+                for p in passos:
+                    if isinstance(p, bytes):
+                        self.wfile.write(p)
+                        self.wfile.flush()
+                    else:
+                        time.sleep(p)
             except OSError:
                 pass
 
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), AosPoucos)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Provedor)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    ia = lince.OpenAICompativel(f"http://127.0.0.1:{srv.server_port}/v1", "m")
+    return srv, Provedor.chegou, lince.OpenAICompativel(f"http://127.0.0.1:{srv.server_port}/v1", "m")
+
+
+@pytest.mark.parametrize(
+    "passos",
+    [
+        [b" ", 0.2] * 200,  # aos poucos: cada byte chega antes do timeout do socket
+        [b" ", 1.4, b" ", 5],  # para no meio: um byte quase no fim do prazo e depois trava
+    ],
+    ids=["aos-poucos", "para-no-meio"],
+)
+def test_provedor_lento_no_corpo_nao_segura_o_prazo(tmp_path, passos):
+    import time
+
+    pdf = _pdf_com_figura(tmp_path)
+    srv, chegou, ia = _provedor_que_trava(passos)
+    leitor = lince.Leitor(ia=ia, agrupar=False)
     inicio = time.monotonic()
-    r = lince.Leitor(ia=ia, agrupar=False).ler(_pdf_com_figura(tmp_path), prazo=1)
+    r = leitor.ler(pdf, prazo=2)
     gasto = time.monotonic() - inicio
     srv.shutdown()
-    assert gasto < 2.5 and any(p.endswith("prazo esgotado") for p in r.cobertura.pendentes)
+    assert chegou.is_set()  # a leitura chegou ao provedor: o corte foi no corpo, não antes da chamada
+    assert gasto < 2.8 and any(p.endswith("prazo esgotado") for p in r.cobertura.pendentes)  # prazo de 2 s
 
 
 def test_releitura_ampliada_respeita_o_prazo_e_mantem_a_primeira_leitura(tmp_path):
@@ -441,8 +464,9 @@ def test_releitura_ampliada_respeita_o_prazo_e_mantem_a_primeira_leitura(tmp_pat
 
     def lenta(imagem, instrucao):
         assert "SEGUNDA LEITURA" not in instrucao  # com o prazo vencido, nem renderiza nem relê
-        threading.Event().wait(0.6)
+        while lince.prazo_restante() > 0:  # a 1ª leitura termina só depois do prazo, seja qual for a máquina
+            threading.Event().wait(0.05)
         return "Diesel S10: R$ [ilegível]"
 
-    r = lince.Leitor(ia=lince.FuncaoLeitor(lenta, "m"), esforco="max", agrupar=False).ler(pdf, prazo=0.5)
+    r = lince.Leitor(ia=lince.FuncaoLeitor(lenta, "m"), esforco="max", agrupar=False).ler(pdf, prazo=3)
     assert "Diesel S10: R$ [ilegível]" in r.markdown and "segunda_passada" not in r.cobertura.rotas
