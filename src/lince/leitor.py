@@ -122,10 +122,10 @@ class Leitor:
 
     # ------------------------------------------------------------------ leitura
     def ler(self, caminho: str | Path, prazo: float | None = None) -> Resultado:
-        """`prazo`: segundos, a partir de agora, para as leituras pela IA (o chat lê com prazo; a base, sem). Nenhuma
-        leitura começa depois dele, e a que está em curso no `OpenAICompativel` é cortada quando ele vence, sem novas
-        tentativas: o que não coube vira a pendência "prazo esgotado" e o texto nativo sai completo. A extração
-        nativa não é interrompida. Provedor próprio lê o tempo que sobra em `lince.prazo_restante()`."""
+        """`prazo`: segundos, a partir de agora, para o documento (o chat lê com prazo; a base, sem). A extração
+        nativa conta, mas não é interrompida. Nenhuma leitura pela IA começa depois do prazo, e a que está em curso
+        no `OpenAICompativel` é cortada (com a folga da rede), sem novas tentativas: o que não coube vira a pendência
+        "prazo esgotado" e o texto nativo sai completo. Provedor próprio lê o que sobra em `lince.prazo_restante()`."""
         if prazo is not None and not (math.isfinite(prazo) and prazo > 0):
             raise ValueError("prazo precisa ser um número de segundos maior que zero")
         token = LIMITE.set(time.monotonic() + prazo if prazo is not None else None)

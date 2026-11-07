@@ -54,11 +54,13 @@ leitor = lince.Leitor(
 ```
 
 - Sem `ia`, o Lince devolve o texto nativo completo e marca o que ficou pendente.
-- `leitor.ler(arquivo, prazo=20)`: as leituras pela IA têm 20 s (o chat lê com prazo; a base, sem). Nenhuma
-  começa depois disso, e a que está em curso no `OpenAICompativel` é cortada quando o prazo vence, sem novas
-  tentativas: o que não coube vira a pendência `prazo esgotado`, e o texto nativo sai completo. Nada fica rodando
-  depois da entrega, e todo custo chega em `ao_usar` e em `Resultado.uso`. A extração nativa não é interrompida.
-  Provedor próprio lê o tempo que sobra em `lince.prazo_restante()` e pode levantar `lince.PrazoEsgotado`.
+- `leitor.ler(arquivo, prazo=20)`: 20 s, a partir da chamada, para o documento (o chat lê com prazo; a base,
+  sem). A extração nativa conta no prazo, mas nunca é interrompida. Nenhuma leitura pela IA começa depois dele, e a
+  que está em curso no `OpenAICompativel` é cortada, sem novas tentativas: o que não coube vira a pendência
+  `prazo esgotado`, e o texto nativo sai completo. Nada fica rodando depois da entrega. Toda leitura concluída chega em
+  `ao_usar` e em `Resultado.uso`; a chamada cortada pode ser cobrada pelo provedor sem aparecer ali (ela já tinha sido
+  enviada). O corte acompanha a rede: conexão, envio de imagem grande ou DNS lento podem passar alguns segundos do
+  prazo. Provedor próprio lê o tempo que sobra em `lince.prazo_restante()` e pode levantar `lince.PrazoEsgotado`.
 - 429 e 5xx do provedor são repetidos com espera exponencial e `Retry-After`.
 - Falha da IA nunca derruba o documento: a leitura nativa fica e a pendência é registrada.
 
@@ -102,9 +104,9 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   (`urn:lince:erro:<codigo>`) e `instance` igual ao `X-Request-Id`. O `X-Request-Id` enviado volta em toda
   resposta, o que facilita o rastreio entre os dois sistemas.
 - **Sem `X-IA-URL`**: só a extração nativa; o que precisava de IA aparece em `cobertura.pendentes`.
-- **Prazo**: com `prazo=20`, as leituras pela IA de cada documento têm 20 s a partir do início da leitura dele (a
-  fila e a extração nativa não entram na conta); o que não coube aparece em `cobertura.pendentes` como
-  `prazo esgotado`.
+- **Prazo**: com `prazo=20`, cada documento tem 20 s a partir do início da leitura dele (a espera na fila não
+  conta; a extração nativa conta, mas não é interrompida); o que a IA não leu a tempo aparece em
+  `cobertura.pendentes` como `prazo esgotado`.
 - **Fila justa**: os documentos são atendidos em rodízio entre tokens, então quem manda 500 não trava quem
   mandou 1. Até 16 documentos em leitura ao mesmo tempo por instância.
 - **Isolamento**: um token nunca vê sessão nem referência de outro. `LINCE_TOKENS` aceita vários tokens

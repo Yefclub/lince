@@ -100,7 +100,7 @@ class OpenAICompativel:
             timeout = self.timeout if restante is None else min(self.timeout, restante)
             try:
                 with _ABRIDOR.open(urllib.request.Request(self.url, corpo, cab), timeout=timeout) as r:
-                    d = json.load(r)
+                    d = json.loads(_ler_corpo(r))
                 u = d.get("usage") or {}
                 return RespostaIA(
                     d["choices"][0]["message"]["content"] or "",
@@ -115,13 +115,25 @@ class OpenAICompativel:
                     raise PrazoEsgotado from e  # o timeout foi o do prazo, não falha do provedor
                 if k == self.tentativas - 1:
                     raise
-                _esperar(min(30, 0.5 * 2**k), e)
+                _esperar(min(30, 0.5 * 2**k), e, sorteio=False)
         raise RuntimeError("inalcançável")
 
 
-def _esperar(segundos, erro):
+def _ler_corpo(r) -> bytes:
+    """Corpo da resposta em blocos, conferindo o prazo a cada um: provedor que manda a resposta aos poucos não segura
+    a leitura além do prazo (o timeout do socket vale por operação, não para o corpo inteiro)."""
+    partes = []
+    while bloco := r.read1(64 * 1024):
+        partes.append(bloco)
+        if (restante := prazo_restante()) is not None and restante <= 0:
+            raise PrazoEsgotado
+    return b"".join(partes)
+
+
+def _esperar(segundos, erro, sorteio=True):
     """Espera antes de repetir, a menos que a espera passe do prazo: aí a nova tentativa não acontece."""
-    segundos += random.random() * 0.3
+    if sorteio:  # só no 429/5xx, como antes: espalha as novas tentativas de quem levou limite ao mesmo tempo
+        segundos += random.random() * 0.3
     if (restante := prazo_restante()) is not None and restante <= segundos:
         raise PrazoEsgotado from erro
     time.sleep(segundos)

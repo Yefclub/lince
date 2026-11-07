@@ -14,6 +14,8 @@ base de conhecimento, o documento é lido até o fim, como antes.
 #### O prazo vale de verdade
 
 Nenhuma leitura pela IA começa depois do prazo, e a que está em andamento é interrompida quando ele vence, sem novas
-tentativas. Nada fica rodando depois da entrega, então o servidor não acumula chamadas penduradas e todo custo
-aparece no relatório de uso da própria resposta. Quem usa um provedor próprio vê o tempo que sobra em
-`lince.prazo_restante()`.
+tentativas, inclusive quando o provedor manda a resposta aos poucos. Nada fica rodando depois da entrega, então o
+servidor não acumula chamadas penduradas, e toda leitura concluída aparece no relatório de uso da própria resposta.
+A chamada interrompida já tinha sido enviada e pode ser cobrada pelo provedor sem aparecer nesse relatório. O corte
+acompanha a rede: uma conexão lenta pode passar alguns segundos do prazo. Quem usa um provedor próprio vê o tempo que
+sobra em `lince.prazo_restante()`.

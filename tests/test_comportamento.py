@@ -386,3 +386,63 @@ def test_prazo_invalido_e_recusado(prazo, tmp_path):
     (tmp_path / "a.txt").write_text("oi")
     with pytest.raises(ValueError):
         lince.Leitor().ler(tmp_path / "a.txt", prazo=prazo)
+
+
+def test_provedor_que_manda_a_resposta_aos_poucos_nao_segura_o_prazo(tmp_path):
+    import time
+
+    class AosPoucos(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.send_header("Content-Length", "100000")
+            self.end_headers()
+            try:
+                for _ in range(200):  # um byte a cada 0,2 s: cada recv chega antes do timeout do socket
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                    time.sleep(0.2)
+            except OSError:
+                pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), AosPoucos)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    ia = lince.OpenAICompativel(f"http://127.0.0.1:{srv.server_port}/v1", "m")
+    inicio = time.monotonic()
+    r = lince.Leitor(ia=ia, agrupar=False).ler(_pdf_com_figura(tmp_path), prazo=1)
+    gasto = time.monotonic() - inicio
+    srv.shutdown()
+    assert gasto < 2.5 and any(p.endswith("prazo esgotado") for p in r.cobertura.pendentes)
+
+
+def test_releitura_ampliada_respeita_o_prazo_e_mantem_a_primeira_leitura(tmp_path):
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (900, 500), "white")
+    ImageDraw.Draw(img).text((40, 40), "Tabela de preços", fill="black")
+    img.save(tmp_path / "t.png")
+    pdf = tmp_path / "t.pdf"
+    c = canvas.Canvas(str(pdf), pagesize=A4)
+    c.drawString(60, 780, "Anexo com a tabela de preços em imagem.")
+    c.drawImage(str(tmp_path / "t.png"), 60, 400, width=450, height=250)
+    c.save()
+
+    def ia(imagem, instrucao):
+        if "SEGUNDA LEITURA" in instrucao:
+            raise lince.PrazoEsgotado  # o prazo venceu durante a releitura
+        return "Diesel S10: R$ [ilegível]"
+
+    r = lince.Leitor(ia=lince.FuncaoLeitor(ia, "m"), esforco="max", agrupar=False).ler(pdf, prazo=30)
+    assert "Diesel S10: R$ [ilegível]" in r.markdown  # a 1ª leitura fica valendo
+    assert r.cobertura.rotas["segunda_passada"] == 0 and not r.cobertura.pendentes
+
+    def lenta(imagem, instrucao):
+        assert "SEGUNDA LEITURA" not in instrucao  # com o prazo vencido, nem renderiza nem relê
+        threading.Event().wait(0.6)
+        return "Diesel S10: R$ [ilegível]"
+
+    r = lince.Leitor(ia=lince.FuncaoLeitor(lenta, "m"), esforco="max", agrupar=False).ler(pdf, prazo=0.5)
+    assert "Diesel S10: R$ [ilegível]" in r.markdown and "segunda_passada" not in r.cobertura.rotas
