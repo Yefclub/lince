@@ -331,11 +331,14 @@ def rtf(dados: bytes, ler_rtf) -> tuple[list[str], bool]:
     prologo = cab.group(0) if cab else b"{\\rtf1"
     if (m := re.search(rb"\{\\fonttbl", dados)) and (fim := _fim_do_grupo(dados, m.end())) > 0:
         prologo += dados[m.start() : fim]
-    vistos, saida, lidos = set(), [], 0
+    vistos, saida, lidos, percorridos = set(), [], 0, 0
     for m in _GRUPO_BORDA.finditer(dados):
         fim = _fim_do_grupo(dados, m.end())
         if fim < 0:
             return saida, False  # grupo sem fim: o resto do arquivo não é cabeçalho
+        percorridos += fim - m.end()  # antes do teste de repetição: grupo repetido também custa a busca do fim
+        if percorridos > _RELEITURA_MAX * len(dados):
+            return saida, False
         corpo = dados[m.end() : fim - 1]
         if corpo in vistos:
             continue  # mala direta repete o mesmo cabeçalho em cada seção: não conta para os tetos

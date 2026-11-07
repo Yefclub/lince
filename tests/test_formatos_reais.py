@@ -559,3 +559,13 @@ def test_stream_ole_que_declara_mais_bytes_que_o_arquivo_e_recusado(tmp_path):
     struct.pack_into("<I", dados, entrada + 0x78, 0x7FFFFFFF)  # tamanho do stream na entrada do diretório
     (tmp_path / "gigante.doc").write_bytes(bytes(dados))
     assert metadados_arquivo(tmp_path / "gigante.doc").get("partes_ilegiveis") == ["cabeçalho, rodapé e macros"]
+
+
+def test_rtf_com_torre_de_grupos_repetida_para_rapido_e_fica_parcial(tmp_path):
+    from lince.metadados import metadados_arquivo
+
+    torre = rb"{\header " * 64 + b"x" * 20_000 + b"}" * 64  # 64 grupos aninhados; as cópias seguintes repetem
+    (tmp_path / "torre.rtf").write_bytes(rb"{\rtf1\ansi " + torre * 40 + rb"\pard Corpo\par}")
+    inicio = time.monotonic()
+    meta = metadados_arquivo(tmp_path / "torre.rtf")
+    assert time.monotonic() - inicio < 5 and meta["partes_ilegiveis"] == ["cabeçalho e rodapé (parcial)"]
