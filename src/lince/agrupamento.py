@@ -98,7 +98,15 @@ def resposta_aproveitavel(plano, tid, texto: str) -> bool:
     if itens is None:
         return bool(texto.strip())
     dados = _json_do_lote(texto)
-    return any(str(dados.get(str(n), dados.get(n, ""))).strip() for n, _ in itens)
+    return any(_valor_do_item(dados, n).strip() for n, _ in itens)
+
+
+def _valor_do_item(dados: dict, n) -> str:
+    """Texto do item n do lote, pelo mesmo critério na distribuição e no cache: null, false e 0 são vazio."""
+    v = dados.get(str(n), dados.get(n, ""))
+    if isinstance(v, (dict, list)):
+        v = json.dumps(v, ensure_ascii=False)
+    return str(v or "")
 
 
 def distribuir_lotes(plano, respostas):
@@ -109,8 +117,5 @@ def distribuir_lotes(plano, respostas):
             continue
         dados = _json_do_lote(R.pop(lid))
         for n, tid in itens:
-            v = dados.get(str(n), dados.get(n, ""))
-            if isinstance(v, (dict, list)):
-                v = json.dumps(v, ensure_ascii=False)
-            R[tid] = v or ""
+            R[tid] = _valor_do_item(dados, n)
     return R

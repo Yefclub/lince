@@ -77,7 +77,7 @@ def test_cache_do_servidor_vem_do_ambiente():
     for env in ({"LINCE_REDIS": "http://redis"}, {"LINCE_REDIS": "redis://r", "LINCE_CACHE_DIAS": "abc"}):
         with pytest.raises(ValueError):
             cache_do_ambiente(env)
-    for dias in ("0", "inf", "nan", "0.000001"):  # menos de um segundo não dá para expirar no Redis
+    for dias in ("0", "inf", "nan", "0.000001", "1e12"):  # fora de 1 s a 10 anos o Redis não expira a chave
         with pytest.raises(ValueError):
             cache_do_ambiente({"LINCE_REDIS": "redis://r", "LINCE_CACHE_DIAS": dias})
 
@@ -133,6 +133,7 @@ def test_lote_quebrado_nao_vai_para_o_cache():
     plano = {"lotes": {"lote1": [(1, "a"), (2, "b")]}}
     assert not resposta_aproveitavel(plano, "lote1", "Desculpe, não consegui.")
     assert not resposta_aproveitavel(plano, "lote1", '{"1": "", "2": ""}')
+    assert not resposta_aproveitavel(plano, "lote1", '{"1": null, "2": false}')  # modo JSON dizendo "nada"
     assert resposta_aproveitavel(plano, "lote1", 'Aqui: {"1": "Receita", "2": ""}')
     assert not resposta_aproveitavel(plano, "t1", "  ") and resposta_aproveitavel(plano, "t1", "texto")
 

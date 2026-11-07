@@ -27,6 +27,9 @@ class Cache(Protocol):
     def guardar(self, k: str, texto: str) -> None: ...
 
 
+DIAS_MAX = 3650  # dez anos: acima disso o EX do Redis estoura e o cache ficaria desligado em silêncio
+
+
 class CacheRedis:
     """Cache no Redis da plataforma (passe o cliente que ela já usa) ou num próprio (passe a URL). Cada leitura vence
     em `dias`; a chave leva o prefixo `lince:leitura:` para não colidir com o resto do Redis."""
@@ -37,8 +40,8 @@ class CacheRedis:
     def __init__(self, redis, dias: float = 30):
         """`redis`: URL (o Lince cria o cliente com timeout de 2 s) ou o cliente síncrono da plataforma, que precisa
         ter `socket_timeout`: sem ele, um Redis travado prende a leitura."""
-        if not (math.isfinite(dias) and dias * 86400 >= 1):
-            raise ValueError("dias precisa ser um número finito de pelo menos um segundo")
+        if not (math.isfinite(dias) and 1 <= dias * 86400 <= DIAS_MAX * 86400):
+            raise ValueError(f"dias precisa estar entre um segundo e {DIAS_MAX} dias")
         if isinstance(redis, str):
             import redis as redis_py
 
