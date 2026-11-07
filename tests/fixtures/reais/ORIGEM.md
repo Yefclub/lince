@@ -17,7 +17,8 @@ e `NOTICE-Apache-Tika.txt`). Arquivos tirados dos conjuntos de teste públicos d
 
 **Modificados pelo Lince:** nomes de pessoas e de empresas foram trocados por "Autor de teste" (ou texto neutro do
 mesmo tamanho), para que nenhum fixture traga dado real de pessoa ou empresa. Nos pacotes zip (OOXML, ODF, EPUB)
-foram reescritas só as partes XML que continham nomes; nos binários (DOC, XLS, PPT, PDF) a troca tem o mesmo número
+foram reescritas só as partes que continham nomes (as XML como texto; as binárias, como a do `.xlsb`, com troca do
+mesmo tamanho); nos binários (DOC, XLS, PPT, PDF) a troca tem o mesmo número
 de bytes, para não deslocar nenhum ponteiro interno, e o RTF foi editado como texto. Fora esses nomes (inclusive um
 que aparecia no texto de um slide do `testPPT`), o conteúdo, a estrutura e o programa que gravou cada arquivo
 continuam os originais; os arquivos sem nome nenhum não foram tocados.
