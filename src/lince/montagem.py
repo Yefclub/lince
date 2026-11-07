@@ -23,7 +23,8 @@ def _metadados(pasta, plano, corpo, moveis):
         por_tipo.setdefault(tipo, set()).add(txt.strip())
     if moveis:
         por_tipo.setdefault("cabeçalho/rodapé", set()).update(moveis)
-    meta.update({k: sorted(v) for k, v in por_tipo.items()})
+    for k, v in por_tipo.items():  # junta com o que o arquivo já declara (cabeçalho/rodapé nativo)
+        meta[k] = sorted(set(meta.get(k, [])) | v)
     if plano.get("texto_oculto"):
         meta["texto_oculto_removido"] = plano["texto_oculto"]
     alertas = alertas_injecao(corpo) + [a for o in plano.get("texto_oculto", []) for a in alertas_injecao(o["texto"])]
@@ -44,7 +45,8 @@ def montar(pasta, respostas):
 
     def acabamento(txt):
         txt = re.sub(r"(?<=\w)--(?=\w)", "—", txt)  # travessão datilografado
-        return txt
+        txt = re.sub(r"(?m)^[ \t]*\\[ \t]*$", "", txt)  # parágrafo vazio vira "\" no Markdown: some
+        return re.sub(r"\n{3,}", "\n\n", txt)
 
     partes = []
     if plano["tipo"] == "office":

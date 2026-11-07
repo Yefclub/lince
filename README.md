@@ -247,6 +247,13 @@ leitura falha com `lince.FormatoNaoSuportado`.
 
 Documento como código e edição: `.pptx` e `.pptm` (`.ppsx` só na leitura do código).
 
+Cabeçalho e rodapé (Word, Excel, OpenDocument) saem do corpo e ficam nos metadados, em `cabeçalho/rodapé`; arquivo
+com macro ganha `macros: true` (a macro nunca é executada).
+
+Cada extensão da tabela é testada no CI com um arquivo gravado por programa de verdade (Word, Excel, PowerPoint,
+LibreOffice), vindo dos conjuntos de teste públicos do Apache POI e do Apache Tika (`tests/fixtures/reais/`). Limite
+conhecido: alguns `.xlsb` falham na leitura com erro claro do documento (dois de sete arquivos reais testados).
+
 HTML, e-mail (`.eml`, `.msg`) e arquivos compactados (`.zip`) ainda não são aceitos.
 
 ## Instalação

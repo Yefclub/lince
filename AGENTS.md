@@ -81,6 +81,9 @@ estática do Python e dos workflows. Rode o equivalente local antes de commitar.
   serve só para conferir o resultado nos testes.
 - Teste com arquivos de produtores diferentes (PowerPoint, Word, Excel, LibreOffice, python-pptx, python-docx, openpyxl); arquivo real
   de empresa nunca entra no repositório.
+- Todo formato aceito tem arquivo real em `tests/fixtures/reais/`, com origem e licença em `ORIGEM.md` (só fonte de
+  licença permissiva, como os conjuntos de teste do Apache POI e do Tika). Formato novo sem arquivo lá reprova
+  `test_todo_formato_aceito_tem_arquivo_real`.
 
 ## Nada fica guardado
 
