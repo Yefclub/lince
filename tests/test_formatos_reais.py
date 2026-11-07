@@ -256,8 +256,7 @@ def _com_parte(origem: Path, destino: Path, parte: str, conteudo: bytes, trocar:
 
 
 def test_cabecalho_vazio_do_excel_nao_engole_o_rodape(tmp_path):
-    aba = (REAIS / "testEXCEL.xlsx").open("rb")
-    with zipfile.ZipFile(aba) as z:
+    with zipfile.ZipFile(REAIS / "testEXCEL.xlsx") as z:
         xml = z.read("xl/worksheets/sheet1.xml")
     xml = xml.replace(
         b"</worksheet>",
@@ -278,7 +277,13 @@ def test_caixa_de_texto_no_cabecalho_do_word_sai_uma_vez(tmp_path):
     ).encode()
     arquivo = _com_parte(REAIS / "testWORD.docx", tmp_path / "c.docx", "word/header9.xml", caixa)
     bordas = lince.ler(arquivo).metadados["cabeçalho/rodapé"]
-    assert bordas.count("Confidencial") == 1 and "Topo" in bordas  # nem colado ("TopoConfidencial") nem repetido
+    assert "Confidencial" in bordas and "Topo" in bordas  # nem colado ("TopoConfidencial")
+    from xml.etree import ElementTree as ET
+
+    from lince.metadados import _paragrafos_word
+
+    # antes da limpeza por conjunto: o mc:Fallback (cópia do mc:Choice) não entra
+    assert _paragrafos_word(ET.fromstring(caixa), f"{{{w}}}") == ["Topo", "Confidencial"]
 
 
 def test_xml_hostil_profundo_no_odf_nao_derruba_a_leitura(tmp_path):
