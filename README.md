@@ -249,8 +249,8 @@ Documento como código e edição: `.pptx` e `.pptm` (`.ppsx` só na leitura do 
 
 Cabeçalho e rodapé de `.docx`, `.docm`, `.xlsx`, `.xlsm`, `.odt`, `.ods` e `.odp` saem do corpo e ficam nos
 metadados, em `cabeçalho/rodapé` (nos formatos binários antigos e no RTF, ainda não). Arquivo com macro ganha
-`macros: true`: VBA nos formatos OOXML, `.doc` e `.xls`, macro do Excel 4.0 e macro do LibreOffice (no `.ppt`, ainda
-não). A macro nunca é executada.
+`macros: true`: VBA nos formatos OOXML (inclusive `.xlsb`), `.doc` e `.xls`, macro do Excel 4.0 em `.xlsx`, `.xlsm` e
+`.xlsb`, e macro do LibreOffice (ainda não: VBA no `.ppt` e macro do Excel 4.0 no `.xls`). A macro nunca é executada.
 
 Cada extensão da tabela é testada no CI com um arquivo real em `tests/fixtures/reais/`: os de Word, Excel,
 PowerPoint, OpenDocument, RTF, EPUB, PDF, CSV e imagem vêm dos conjuntos de teste públicos do Apache POI e do Apache

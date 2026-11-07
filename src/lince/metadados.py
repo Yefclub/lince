@@ -4,10 +4,12 @@ import hashlib  # noqa: F401
 import html
 import io  # noqa: F401
 import json  # noqa: F401
+import lzma
 import mmap
 import os  # noqa: F401
 import re  # noqa: F401
 import zipfile  # noqa: F401
+import zlib
 from xml.etree import ElementTree as ET  # noqa: F401
 
 from .limites import xml_ou_nada
@@ -105,7 +107,7 @@ def metadados_arquivo(path, ext=None):
         bordas = []
         for parte in sorted(nomes):
             if re.fullmatch(r"word/(header|footer)\d*\.xml", parte) and (raiz := arvore(parte)) is not None:
-                bordas += [_texto_word(par, W) for par in raiz.iter(f"{W}p")]
+                bordas += _paragrafos_word(raiz, W)
             elif re.fullmatch(r"xl/worksheets/sheet\d+\.xml", parte) and (dados := ler(parte)) is not None:
                 # a aba pode ser enorme: só o trecho <headerFooter> (fica no fim) é lido, sem montar a árvore
                 for _, texto in _CABECALHO_XLSX.findall(dados):
@@ -118,8 +120,8 @@ def metadados_arquivo(path, ext=None):
     return meta
 
 
-_CABECALHO_XLSX = re.compile(
-    rb"<(?:\w+:)?(oddHeader|oddFooter|evenHeader|evenFooter|firstHeader|firstFooter)\b[^>]*>(.*?)</", re.S
+_CABECALHO_XLSX = re.compile(  # (?<!/) : <oddHeader/> vazio não engole o elemento seguinte
+    rb"<(?:\w+:)?(oddHeader|oddFooter|evenHeader|evenFooter|firstHeader|firstFooter)\b[^>]*(?<!/)>(.*?)</", re.S
 )
 BINARIOS_OLE = {".doc", ".xls", ".ppt", ".pps", ".pot"}
 
@@ -128,33 +130,54 @@ def _ler_parte(z, parte, ilegiveis):
     """Bytes da parte, ou None (registrada) se ela não puder ser lida: CRC errado, cifrada, compressão estranha."""
     try:
         return z.read(parte)
-    except (zipfile.BadZipFile, RuntimeError, NotImplementedError, EOFError, OSError, KeyError, ValueError):
+    except (
+        zipfile.BadZipFile,
+        RuntimeError,
+        NotImplementedError,
+        EOFError,
+        OSError,
+        KeyError,
+        ValueError,
+        zlib.error,
+        lzma.LZMAError,
+    ):
         ilegiveis.append(parte)
         return None
 
 
-def _texto_word(par, W) -> str:
-    """Texto do parágrafo do Word com tab e quebra viradas espaço (o cabeçalho costuma separar com tab)."""
-    partes = []
-    for el in par.iter():
-        if el.tag == f"{W}t":
-            partes.append(el.text or "")
-        elif el.tag in (f"{W}tab", f"{W}br", f"{W}cr"):
-            partes.append(" ")
-    return "".join(partes)
+_MC_FALLBACK = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
 
 
-OOXML = {".docx", ".docm", ".xlsx", ".xlsm", ".pptx", ".pptm", ".ppsx", ".ppsm"}
+def _paragrafos_word(raiz, W) -> list[str]:
+    """Texto de cada parágrafo, sem recursão (XML hostil profundo não estoura a pilha). Caixa de texto
+    (w:txbxContent) vira entrada própria em vez de colar no parágrafo de fora; mc:Fallback, que repete o
+    mc:Choice, é ignorado. Tab e quebra viram espaço (o cabeçalho costuma separar com tab)."""
+    saida, pilha = [], [(raiz, None)]  # (elemento, partes do parágrafo aberto em que ele está)
+    while pilha:
+        el, partes = pilha.pop()
+        if el.tag == _MC_FALLBACK:
+            continue
+        if el.tag == f"{W}txbxContent":
+            partes = None  # o que tem dentro não é do parágrafo de fora
+        if el.tag == f"{W}p":
+            partes = []
+            saida.append(partes)
+        elif partes is not None:
+            if el.tag == f"{W}t":
+                partes.append(el.text or "")
+            elif el.tag in (f"{W}tab", f"{W}br", f"{W}cr"):
+                partes.append(" ")
+        pilha.extend((filho, partes) for filho in reversed(list(el)))
+    return ["".join(p) for p in saida]
+
+
+OOXML = {".docx", ".docm", ".xlsx", ".xlsm", ".xlsb", ".pptx", ".pptm", ".ppsx", ".ppsm"}
 ODF = {".odt", ".ods", ".odp"}
-CABECALHOS_XLSX = {"oddHeader", "oddFooter", "evenHeader", "evenFooter", "firstHeader", "firstFooter"}
 ODF_NS = {
-    "office": "urn:oasis:names:tc:opendocument:xmlns:office:1.0",
     "style": "urn:oasis:names:tc:opendocument:xmlns:style:1.0",
     "text": "urn:oasis:names:tc:opendocument:xmlns:text:1.0",
     "draw": "urn:oasis:names:tc:opendocument:xmlns:drawing:1.0",
     "presentation": "urn:oasis:names:tc:opendocument:xmlns:presentation:1.0",
-    "dc": "http://purl.org/dc/elements/1.1/",
-    "meta": "urn:oasis:names:tc:opendocument:xmlns:meta:1.0",
 }
 
 
@@ -179,12 +202,28 @@ def _guardar_bordas(meta: dict, textos):
 
 
 def _texto_odf(el) -> str:
-    """Texto ODF com tab, quebra de linha e espaços (text:s) virados espaço."""
-    partes = [el.text or ""]
-    for filho in el:
-        nome = filho.tag.split("}")[-1]
-        partes.append(" " if nome in ("tab", "line-break", "s") else _texto_odf(filho))
-        partes.append(filho.tail or "")
+    """Texto ODF sem recursão (XML hostil profundo não estoura a pilha): tab, quebra e text:s viram espaço; quadro
+    (draw:frame, caixa de texto) não entra, porque os parágrafos dele são lidos como entradas próprias."""
+    partes, pilha = [], [("el", el)]
+    while pilha:
+        tipo, x = pilha.pop()
+        if tipo == "texto":
+            partes.append(x)
+            continue
+        if x is not el:
+            nome = x.tag.split("}")[-1] if isinstance(x.tag, str) else ""
+            if nome in ("tab", "line-break", "s"):
+                partes.append(" ")
+                pilha.append(("texto", x.tail or ""))
+                continue
+            if nome == "frame":
+                pilha.append(("texto", x.tail or ""))
+                continue
+            pilha.append(("texto", x.tail or ""))  # o tail vem depois dos filhos (pilha: empilhado antes)
+        filhos = list(x)
+        for f in reversed(filhos):
+            pilha.append(("el", f))
+        partes.append(x.text or "")
     return "".join(partes)
 
 

@@ -244,3 +244,63 @@ def test_edicao_no_powerpoint_real_preserva_macro_e_reabre():
         assert [p["texto"] for p in depois["paragrafos"]] == ["Título novo"]
         assert _vba(novo) == _vba(dados)
         assert codigo.pptx.integridade(novo) == []
+
+
+def _com_parte(origem: Path, destino: Path, parte: str, conteudo: bytes, trocar: bool = False):
+    with zipfile.ZipFile(origem) as o, zipfile.ZipFile(destino, "w", zipfile.ZIP_DEFLATED) as z:
+        for i in o.infolist():
+            if not (trocar and i.filename == parte):
+                z.writestr(i, o.read(i))
+        z.writestr(parte, conteudo)
+    return destino
+
+
+def test_cabecalho_vazio_do_excel_nao_engole_o_rodape(tmp_path):
+    aba = (REAIS / "testEXCEL.xlsx").open("rb")
+    with zipfile.ZipFile(aba) as z:
+        xml = z.read("xl/worksheets/sheet1.xml")
+    xml = xml.replace(
+        b"</worksheet>",
+        b"<headerFooter><oddHeader/><oddFooter>&amp;CP&#225;gina &amp;P</oddFooter></headerFooter></worksheet>",
+    )
+    arquivo = _com_parte(REAIS / "testEXCEL.xlsx", tmp_path / "p.xlsx", "xl/worksheets/sheet1.xml", xml, True)
+    assert lince.ler(arquivo).metadados["cabeçalho/rodapé"] == ["Página [página]"]
+
+
+def test_caixa_de_texto_no_cabecalho_do_word_sai_uma_vez(tmp_path):
+    w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    mc = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+    caixa = (
+        f'<w:hdr xmlns:w="{w}" xmlns:mc="{mc}"><w:p><w:r><w:t>Topo</w:t></w:r><w:r><mc:AlternateContent>'
+        "<mc:Choice><w:txbxContent><w:p><w:r><w:t>Confidencial</w:t></w:r></w:p></w:txbxContent></mc:Choice>"
+        "<mc:Fallback><w:txbxContent><w:p><w:r><w:t>Confidencial</w:t></w:r></w:p></w:txbxContent></mc:Fallback>"
+        "</mc:AlternateContent></w:r></w:p></w:hdr>"
+    ).encode()
+    arquivo = _com_parte(REAIS / "testWORD.docx", tmp_path / "c.docx", "word/header9.xml", caixa)
+    bordas = lince.ler(arquivo).metadados["cabeçalho/rodapé"]
+    assert bordas.count("Confidencial") == 1 and "Topo" in bordas  # nem colado ("TopoConfidencial") nem repetido
+
+
+def test_xml_hostil_profundo_no_odf_nao_derruba_a_leitura(tmp_path):
+    with zipfile.ZipFile(REAIS / "testFooter.odt") as z:
+        estilos = z.read("styles.xml")
+    fundo = b"<text:span>" * 5000 + b"fundo" + b"</text:span>" * 5000
+    estilos = estilos.replace(b"Here is footer text", b"Here is footer text" + fundo, 1)
+    arquivo = _com_parte(REAIS / "testFooter.odt", tmp_path / "f.odt", "styles.xml", estilos, True)
+    from lince.metadados import metadados_arquivo  # o leitor do corpo já recusa; os metadados rodam à parte
+
+    assert any("fundo" in t for t in metadados_arquivo(str(arquivo))["cabeçalho/rodapé"])
+
+
+def test_macro_no_xlsb_e_parte_corrompida(tmp_path):
+    xlsb = _com_parte(REAIS / "poi_sample.xlsb", tmp_path / "m.xlsb", "xl/vbaProject.bin", b"\x00" * 64)
+    assert lince.ler(xlsb).metadados["macros"] is True
+    corrompido = tmp_path / "c.docx"
+    corrompido.write_bytes((REAIS / "testWORD.docx").read_bytes())
+    with zipfile.ZipFile(corrompido) as z:
+        info = z.getinfo("docProps/core.xml")
+    dados = bytearray(corrompido.read_bytes())
+    inicio = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
+    dados[inicio : inicio + 8] = b"\xff" * 8  # stream deflate inválido: zlib.error ao ler
+    corrompido.write_bytes(bytes(dados))
+    assert "docProps/core.xml" in lince.ler(corrompido).metadados["partes_ilegiveis"]

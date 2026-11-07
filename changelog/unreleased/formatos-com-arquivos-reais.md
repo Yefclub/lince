@@ -13,7 +13,8 @@ de página e data aparecem legíveis, como `Página [página] de [páginas]`.
 #### Arquivos com macro sinalizados
 
 Documentos, planilhas e apresentações com macro trazem `macros: true` nos metadados: VBA do Office (inclusive
-`.doc` e `.xls` antigos), macro do Excel 4.0 e macro do LibreOffice. A macro nunca é executada.
+`.doc` e `.xls` antigos), macro do Excel 4.0 nas planilhas modernas e macro do LibreOffice. A macro nunca é
+executada.
 
 #### Texto mais limpo
 
