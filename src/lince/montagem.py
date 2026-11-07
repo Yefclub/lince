@@ -23,7 +23,8 @@ def _metadados(pasta, plano, corpo, moveis):
         por_tipo.setdefault(tipo, set()).add(txt.strip())
     if moveis:
         por_tipo.setdefault("cabeçalho/rodapé", set()).update(moveis)
-    meta.update({k: sorted(v) for k, v in por_tipo.items()})
+    for k, v in por_tipo.items():  # junta com o que o arquivo já declara (cabeçalho/rodapé nativo)
+        meta[k] = sorted(set(meta.get(k, [])) | v)
     if plano.get("texto_oculto"):
         meta["texto_oculto_removido"] = plano["texto_oculto"]
     alertas = alertas_injecao(corpo) + [a for o in plano.get("texto_oculto", []) for a in alertas_injecao(o["texto"])]
@@ -34,6 +35,17 @@ def _metadados(pasta, plano, corpo, moveis):
     return corpo.strip() + "\n"
 
 
+def acabamento(txt: str) -> str:
+    """Limpeza final do corpo: travessão, parágrafo vazio solto e linhas em branco demais; blocos de código
+    (``` ou ~~~) ficam como estão."""
+    pedacos = re.split(r"(?ms)(^(?:```|~~~).*?^(?:```|~~~)[ \t]*$)", txt)
+    for k in range(0, len(pedacos), 2):
+        t = re.sub(r"(?<=\w)--(?=\w)", "—", pedacos[k])  # travessão datilografado
+        t = re.sub(r"(?m)^[ \t]*\\[ \t]*$", "", t)  # parágrafo vazio vira "\" no Markdown: some
+        pedacos[k] = re.sub(r"\n{3,}", "\n\n", t)
+    return "".join(pedacos)
+
+
 def montar(pasta, respostas):
     plano = json.load(open(f"{pasta}/plano.json", encoding="utf-8"))
     R = {k: sem_repeticao(v) for k, v in distribuir_lotes(plano, respostas).items()}
@@ -41,10 +53,6 @@ def montar(pasta, respostas):
     def bloco_ia(tid, rotulo):
         txt = R.get(tid, "").strip()
         return f"<!-- lido pela IA: {tid} -->\n{txt}" if txt else f"> [{rotulo}: pendente]"
-
-    def acabamento(txt):
-        txt = re.sub(r"(?<=\w)--(?=\w)", "—", txt)  # travessão datilografado
-        return txt
 
     partes = []
     if plano["tipo"] == "office":
