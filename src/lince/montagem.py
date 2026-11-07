@@ -35,6 +35,17 @@ def _metadados(pasta, plano, corpo, moveis):
     return corpo.strip() + "\n"
 
 
+def acabamento(txt: str) -> str:
+    """Limpeza final do corpo: travessão, parágrafo vazio solto e linhas em branco demais; blocos de código
+    (``` ou ~~~) ficam como estão."""
+    pedacos = re.split(r"(?ms)(^(?:```|~~~).*?^(?:```|~~~)[ \t]*$)", txt)
+    for k in range(0, len(pedacos), 2):
+        t = re.sub(r"(?<=\w)--(?=\w)", "—", pedacos[k])  # travessão datilografado
+        t = re.sub(r"(?m)^[ \t]*\\[ \t]*$", "", t)  # parágrafo vazio vira "\" no Markdown: some
+        pedacos[k] = re.sub(r"\n{3,}", "\n\n", t)
+    return "".join(pedacos)
+
+
 def montar(pasta, respostas):
     plano = json.load(open(f"{pasta}/plano.json", encoding="utf-8"))
     R = {k: sem_repeticao(v) for k, v in distribuir_lotes(plano, respostas).items()}
@@ -42,11 +53,6 @@ def montar(pasta, respostas):
     def bloco_ia(tid, rotulo):
         txt = R.get(tid, "").strip()
         return f"<!-- lido pela IA: {tid} -->\n{txt}" if txt else f"> [{rotulo}: pendente]"
-
-    def acabamento(txt):
-        txt = re.sub(r"(?<=\w)--(?=\w)", "—", txt)  # travessão datilografado
-        txt = re.sub(r"(?m)^[ \t]*\\[ \t]*$", "", txt)  # parágrafo vazio vira "\" no Markdown: some
-        return re.sub(r"\n{3,}", "\n\n", txt)
 
     partes = []
     if plano["tipo"] == "office":

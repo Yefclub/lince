@@ -1,8 +1,10 @@
 """Metadados que a empresa precisa: propriedades do arquivo, comentários, alterações rastreadas, abas ocultas."""
 
 import hashlib  # noqa: F401
+import html
 import io  # noqa: F401
 import json  # noqa: F401
+import mmap
 import os  # noqa: F401
 import re  # noqa: F401
 import zipfile  # noqa: F401
@@ -26,7 +28,14 @@ def metadados_arquivo(path, ext=None):
             pass
         return meta
     if ext in ODF:
-        return _metadados_odf(path, meta)
+        return _metadados_odf(path, meta, ext)
+    if ext in BINARIOS_OLE:
+        # Word e Excel binários guardam o VBA no armazenamento _VBA_PROJECT (o PowerPoint, dentro de um objeto)
+        if os.path.getsize(path):
+            with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+                if m.find("_VBA_PROJECT".encode("utf-16-le")) >= 0:
+                    meta["macros"] = True
+        return meta
     if ext not in OOXML:
         return meta
     W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -34,9 +43,13 @@ def metadados_arquivo(path, ext=None):
         nomes = set(z.namelist())
         ilegiveis = []
 
+        def ler(parte):
+            return _ler_parte(z, parte, ilegiveis)
+
         def arvore(parte):
-            raiz = xml_ou_nada(z.read(parte))
-            if raiz is None:
+            dados = ler(parte)
+            raiz = xml_ou_nada(dados) if dados is not None else None
+            if raiz is None and parte not in ilegiveis:
                 ilegiveis.append(parte)
             return raiz
 
@@ -92,17 +105,43 @@ def metadados_arquivo(path, ext=None):
         bordas = []
         for parte in sorted(nomes):
             if re.fullmatch(r"word/(header|footer)\d*\.xml", parte) and (raiz := arvore(parte)) is not None:
-                bordas += ["".join(t.text or "" for t in par.iter(f"{W}t")) for par in raiz.iter(f"{W}p")]
-            elif re.fullmatch(r"xl/worksheets/sheet\d+\.xml", parte) and (raiz := arvore(parte)) is not None:
-                for el in raiz.iter():
-                    if el.tag.split("}")[-1] in CABECALHOS_XLSX and el.text:
-                        bordas.append(_sem_codigos_excel(el.text))
+                bordas += [_texto_word(par, W) for par in raiz.iter(f"{W}p")]
+            elif re.fullmatch(r"xl/worksheets/sheet\d+\.xml", parte) and (dados := ler(parte)) is not None:
+                # a aba pode ser enorme: só o trecho <headerFooter> (fica no fim) é lido, sem montar a árvore
+                for _, texto in _CABECALHO_XLSX.findall(dados):
+                    bordas.append(_sem_codigos_excel(html.unescape(texto.decode("utf-8", "replace"))))
         _guardar_bordas(meta, bordas)
-        if any(n.lower().endswith("vbaproject.bin") for n in nomes):
-            meta["macros"] = True  # nunca executadas; ficam no arquivo e o aviso vai junto
+        if any(n.lower().endswith("vbaproject.bin") or n.startswith("xl/macrosheets/") for n in nomes):
+            meta["macros"] = True  # VBA ou macro do Excel 4.0: nunca executadas; ficam no arquivo e o aviso vai junto
         if ilegiveis:
             meta["partes_ilegiveis"] = ilegiveis  # malformadas ou hostis: ficaram de fora dos metadados
     return meta
+
+
+_CABECALHO_XLSX = re.compile(
+    rb"<(?:\w+:)?(oddHeader|oddFooter|evenHeader|evenFooter|firstHeader|firstFooter)\b[^>]*>(.*?)</", re.S
+)
+BINARIOS_OLE = {".doc", ".xls", ".ppt", ".pps", ".pot"}
+
+
+def _ler_parte(z, parte, ilegiveis):
+    """Bytes da parte, ou None (registrada) se ela não puder ser lida: CRC errado, cifrada, compressão estranha."""
+    try:
+        return z.read(parte)
+    except (zipfile.BadZipFile, RuntimeError, NotImplementedError, EOFError, OSError, KeyError, ValueError):
+        ilegiveis.append(parte)
+        return None
+
+
+def _texto_word(par, W) -> str:
+    """Texto do parágrafo do Word com tab e quebra viradas espaço (o cabeçalho costuma separar com tab)."""
+    partes = []
+    for el in par.iter():
+        if el.tag == f"{W}t":
+            partes.append(el.text or "")
+        elif el.tag in (f"{W}tab", f"{W}br", f"{W}cr"):
+            partes.append(" ")
+    return "".join(partes)
 
 
 OOXML = {".docx", ".docm", ".xlsx", ".xlsm", ".pptx", ".pptm", ".ppsx", ".ppsm"}
@@ -123,10 +162,11 @@ def _sem_codigos_excel(texto: str) -> str:
     """Cabeçalho do Excel sem os códigos de formatação: &L/&C/&R viram separador, &P/&N/&D/&T/&F/&A viram nome."""
     nomes = {"P": "[página]", "N": "[páginas]", "D": "[data]", "T": "[hora]", "F": "[arquivo]", "A": "[aba]"}
     texto = re.sub(r'&"[^"]*"', "", texto)  # fonte
+    texto = re.sub(r"&K(?:[0-9A-Fa-f]{6}|\d{2}[+-]\d{3})", "", texto)  # cor (RGB ou tema)
     texto = re.sub(r"&\d+", "", texto)  # tamanho
     texto = re.sub(r"&([LCR])", " | ", texto)
     texto = re.sub(r"&([PNDTFA])", lambda m: nomes[m.group(1)], texto)
-    texto = re.sub(r"&[BIUSEXYKGZ]", "", texto).replace("&&", "&")
+    texto = re.sub(r"&[BIUSEXYKGZOH]", "", texto).replace("&&", "&")
     return " ".join(p.strip() for p in texto.split("|") if p.strip())
 
 
@@ -139,10 +179,16 @@ def _guardar_bordas(meta: dict, textos):
 
 
 def _texto_odf(el) -> str:
-    return "".join(el.itertext())
+    """Texto ODF com tab, quebra de linha e espaços (text:s) virados espaço."""
+    partes = [el.text or ""]
+    for filho in el:
+        nome = filho.tag.split("}")[-1]
+        partes.append(" " if nome in ("tab", "line-break", "s") else _texto_odf(filho))
+        partes.append(filho.tail or "")
+    return "".join(partes)
 
 
-def _metadados_odf(path, meta):
+def _metadados_odf(path, meta, ext):
     """ODT, ODS e ODP: propriedades (meta.xml) e cabeçalho/rodapé das páginas mestras (styles.xml), que o leitor
     do corpo não vê; no ODP, também as declarações de rodapé e cabeçalho dos slides (content.xml)."""
     ns = {k: "{" + v + "}" for k, v in ODF_NS.items()}
@@ -153,8 +199,9 @@ def _metadados_odf(path, meta):
         def arvore(parte):
             if parte not in nomes:
                 return None
-            raiz = xml_ou_nada(z.read(parte))
-            if raiz is None:
+            dados = _ler_parte(z, parte, ilegiveis)
+            raiz = xml_ou_nada(dados) if dados is not None else None
+            if raiz is None and parte not in ilegiveis:
                 ilegiveis.append(parte)
             return raiz
 
@@ -170,10 +217,15 @@ def _metadados_odf(path, meta):
                 "description": "description",
             }
             props = {}
+            chaves = []
             for el in raiz.iter():
                 nome = el.tag.split("}")[-1]
-                if nome in campos and el.text and el.text.strip():
+                if nome == "keyword" and el.text and el.text.strip():
+                    chaves.append(el.text.strip())  # cada palavra-chave vem num elemento próprio
+                elif nome in campos and el.text and el.text.strip():
                     props.setdefault(campos[nome], el.text.strip())
+            if chaves:
+                props["keywords"] = ", ".join(chaves)
             if props:
                 meta["propriedades"] = props
         bordas = []
@@ -186,7 +238,7 @@ def _metadados_odf(path, meta):
                 for quadro in mestra.iter(ns["draw"] + "frame"):
                     if quadro.get(ns["presentation"] + "class") in ("footer", "header"):
                         bordas += [_texto_odf(p) for p in quadro.iter(ns["text"] + "p")]
-        if (raiz := arvore("content.xml")) is not None:
+        if ext == ".odp" and (raiz := arvore("content.xml")) is not None:  # declarações só no ODP
             for el in raiz.iter():
                 if el.tag in (ns["presentation"] + "footer-decl", ns["presentation"] + "header-decl"):
                     bordas.append(_texto_odf(el))

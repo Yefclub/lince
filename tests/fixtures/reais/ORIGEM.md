@@ -5,17 +5,24 @@ programas de verdade (Microsoft Word, Excel e PowerPoint, LibreOffice, NeoOffice
 
 ## Apache POI e Apache Tika
 
-Licença: **Apache License 2.0**. Arquivos copiados sem alteração dos conjuntos de teste públicos dos projetos.
+Licença: **Apache License 2.0** (texto em `LICENSE-Apache-2.0.txt`; avisos dos projetos em `NOTICE-Apache-POI.txt`
+e `NOTICE-Apache-Tika.txt`). Arquivos tirados dos conjuntos de teste públicos dos projetos.
 
 | Arquivo aqui | Origem |
 | --- | --- |
-| `poi_SampleDoc.docx`, `poi_SimpleMacro.docm` | apache/poi `test-data/document/` (`SampleDoc.docx`, `SimpleMacro.docm`) |
-| `poi_SampleSS.xlsx`, `poi_SimpleMacro.xlsm`, `poi_sample.xlsb`, `poi_testVarious.xlsb` | apache/poi `test-data/spreadsheet/` (`SampleSS.xlsx`, `SimpleMacro.xlsm`, `sample.xlsb`, `testVarious.xlsb`) |
+| `poi_SampleDoc.docx`, `poi_SimpleMacro.docm`, `poi_SimpleMacro.doc` | apache/poi `test-data/document/` (`SampleDoc.docx`, `SimpleMacro.docm`, `SimpleMacro.doc`) |
+| `poi_SampleSS.xlsx`, `poi_SimpleMacro.xlsm`, `poi_SimpleMacro.xls`, `poi_sample.xlsb`, `poi_testVarious.xlsb` | apache/poi `test-data/spreadsheet/` (`SampleSS.xlsx`, `SimpleMacro.xlsm`, `SimpleMacro.xls`, `sample.xlsb`, `testVarious.xlsb`) |
 | `poi_SampleShow.pptx`, `poi_SampleShow.ppt`, `poi_SimpleMacro.pptm` | apache/poi `test-data/slideshow/` |
 | `test*.*` (PDF, Word, Excel, PowerPoint, ODF, RTF, EPUB, CSV, imagens) | apache/tika, pastas `test-documents/` dos módulos de parser, mesmo nome |
 
-Os metadados de autoria dentro de alguns arquivos (por exemplo, `dc:creator`) trazem os nomes dos contribuidores
-que os criaram, como publicados pelos projetos.
+**Modificados pelo Lince:** nomes de pessoas e de empresas foram trocados por "Autor de teste" (ou texto neutro do
+mesmo tamanho), para que nenhum fixture traga dado real de pessoa ou empresa. Nos pacotes zip (OOXML, ODF, EPUB)
+foram reescritas só as partes XML que continham nomes; nos binários (DOC, XLS, PPT, PDF) a troca tem o mesmo número
+de bytes, para não deslocar nenhum ponteiro interno, e o RTF foi editado como texto. Fora esses nomes (inclusive um
+que aparecia no texto de um slide do `testPPT`), o conteúdo, a estrutura e o programa que gravou cada arquivo
+continuam os originais; os arquivos sem nome nenhum não foram tocados.
+
+`testEXCEL.xlsb` fica como caso de falha conhecida: o leitor atual recusa o arquivo com erro claro do documento.
 
 ## Derivados (mesmo conteúdo, outra extensão)
 

@@ -26,6 +26,7 @@ ESPERADO = {
     "testWORD_macros.docm": "The quick brown fox",
     "poi_SimpleMacro.docm": "This is a macro word processing document",
     "testWORD.doc": "Sample Word Document Title",
+    "poi_SimpleMacro.doc": "This is a macro word processing document",
     "testOpenOffice2.odt": "sample Open Office document",
     "testFooter.odt": "Here is some text on page 2",
     "testRTF.rtf": "Test d’indexation Word",
@@ -48,6 +49,7 @@ ESPERADO = {
     "poi_sample.xlsb": "| Lorem | 111 |",
     "poi_testVarious.xlsb": "This is a string",
     "testEXCEL.xls": "Sample Excel Worksheet",
+    "poi_SimpleMacro.xls": "This is a macro workbook",
     "testFooter.ods": "| Data 3 | Data 4 |",
     "testCSV.csv": "Numbers and their Squares",
     "texto.tsv": "| soja | 3500 |",
@@ -113,9 +115,67 @@ def test_cabecalho_e_rodape_do_word_e_do_excel_vao_para_os_metadados(tmp_path):
     assert lince.ler(tmp_path / "p.xlsx").metadados["cabeçalho/rodapé"] == ["Página [página] de [páginas]"]
 
 
-@pytest.mark.parametrize("nome", ["testWORD_macros.docm", "poi_SimpleMacro.xlsm", "poi_SimpleMacro.pptm"])
+@pytest.mark.parametrize(
+    "nome",
+    [
+        "testWORD_macros.docm",
+        "poi_SimpleMacro.xlsm",
+        "poi_SimpleMacro.pptm",
+        "poi_SimpleMacro.doc",
+        "poi_SimpleMacro.xls",
+    ],
+)
 def test_macro_e_sinalizada_na_leitura(nome):
     assert lince.ler(REAIS / nome).metadados["macros"] is True
+
+
+@pytest.mark.parametrize("nome", ["testWORD.docx", "testWORD.doc", "testEXCEL.xls", "testOpenOffice2.odt"])
+def test_arquivo_sem_macro_nao_e_sinalizado(nome):
+    assert "macros" not in lince.ler(REAIS / nome).metadados
+
+
+def test_macro_do_odf_e_do_excel_4_sao_sinalizadas(tmp_path):
+    for origem, parte in (
+        ("testOpenOffice2.odt", "Basic/Standard/Module1.xml"),
+        ("testEXCEL.xlsx", "xl/macrosheets/sheet1.xml"),
+    ):
+        destino = tmp_path / origem
+        with zipfile.ZipFile(REAIS / origem) as o, zipfile.ZipFile(destino, "w") as z:
+            for i in o.infolist():
+                z.writestr(i, o.read(i))
+            z.writestr(parte, "<x/>")
+        assert lince.ler(destino).metadados["macros"] is True
+
+
+def test_cabecalho_do_excel_sem_codigos_e_word_com_tab(tmp_path):
+    from lince.metadados import _sem_codigos_excel
+
+    assert _sem_codigos_excel('&L&"Arial,Bold"&KFF0000Confidencial&C&K01+000&OPágina &P&R&H&D') == (
+        "Confidencial Página [página] [data]"
+    )
+    d = Document()
+    d.sections[0].header.paragraphs[0].add_run("Confidencial")
+    d.sections[0].header.paragraphs[0].add_run().add_tab()
+    d.sections[0].header.paragraphs[0].add_run("Versão 3")
+    d.add_paragraph("Corpo")
+    d.save(tmp_path / "t.docx")
+    assert lince.ler(tmp_path / "t.docx").metadados["cabeçalho/rodapé"] == ["Confidencial Versão 3"]
+
+
+def test_xlsb_que_o_leitor_nao_entende_falha_com_erro_claro():
+    import anydoc
+
+    with pytest.raises(anydoc.ConvertError):  # erro do documento, nunca resultado vazio ou parcial calado
+        lince.ler(REAIS / "testEXCEL.xlsb")
+
+
+def test_acabamento_limpa_o_texto_e_preserva_bloco_de_codigo():
+    from lince.montagem import acabamento
+
+    codigo_py = "```python\ndef a():\n    pass\n\n\n\\\ndef b():\n    pass\n```"
+    saida = acabamento("Texto--solto\n\n\\\n\n\n\nFim\n\n" + codigo_py + "\n")
+    assert saida.startswith("Texto—solto\n\nFim\n\n")  # fora do bloco: limpo
+    assert codigo_py in saida  # dentro: intacto (duas linhas em branco e a barra continuam)
 
 
 EDITAVEIS = [n for n in ESPERADO if Path(n).suffix.lower() in codigo.EDITAVEIS]
@@ -180,5 +240,7 @@ def test_edicao_no_powerpoint_real_preserva_macro_e_reabre():
         forma = next(f for s in c["slides"] for f in s["formas"] if f.get("paragrafos"))
         novo, rel = codigo.editar(dados, nome, [{"op": "texto", "alvo": forma["id"], "texto": "Título novo"}])
         Presentation(io.BytesIO(novo))
+        depois = next(f for s in rel["codigo"]["slides"] for f in s["formas"] if f["id"] == forma["id"])
+        assert [p["texto"] for p in depois["paragrafos"]] == ["Título novo"]
         assert _vba(novo) == _vba(dados)
         assert codigo.pptx.integridade(novo) == []

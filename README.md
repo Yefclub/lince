@@ -247,12 +247,16 @@ leitura falha com `lince.FormatoNaoSuportado`.
 
 Documento como código e edição: `.pptx` e `.pptm` (`.ppsx` só na leitura do código).
 
-Cabeçalho e rodapé (Word, Excel, OpenDocument) saem do corpo e ficam nos metadados, em `cabeçalho/rodapé`; arquivo
-com macro ganha `macros: true` (a macro nunca é executada).
+Cabeçalho e rodapé de `.docx`, `.docm`, `.xlsx`, `.xlsm`, `.odt`, `.ods` e `.odp` saem do corpo e ficam nos
+metadados, em `cabeçalho/rodapé` (nos formatos binários antigos e no RTF, ainda não). Arquivo com macro ganha
+`macros: true`: VBA nos formatos OOXML, `.doc` e `.xls`, macro do Excel 4.0 e macro do LibreOffice (no `.ppt`, ainda
+não). A macro nunca é executada.
 
-Cada extensão da tabela é testada no CI com um arquivo gravado por programa de verdade (Word, Excel, PowerPoint,
-LibreOffice), vindo dos conjuntos de teste públicos do Apache POI e do Apache Tika (`tests/fixtures/reais/`). Limite
-conhecido: alguns `.xlsb` falham na leitura com erro claro do documento (dois de sete arquivos reais testados).
+Cada extensão da tabela é testada no CI com um arquivo real em `tests/fixtures/reais/`: os de Word, Excel,
+PowerPoint, OpenDocument, RTF, EPUB, PDF, CSV e imagem vêm dos conjuntos de teste públicos do Apache POI e do Apache
+Tika, gravados pelos próprios programas; `.pps`, `.pot`, `.jpeg` e `.tiff` são cópias com outra extensão, e os de
+texto foram escritos à mão. Limite conhecido: alguns `.xlsb` falham na leitura com erro claro do documento (dois de
+sete arquivos reais testados).
 
 HTML, e-mail (`.eml`, `.msg`) e arquivos compactados (`.zip`) ainda não são aceitos.
 
