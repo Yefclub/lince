@@ -247,10 +247,10 @@ leitura falha com `lince.FormatoNaoSuportado`.
 
 Documento como código e edição: `.pptx` e `.pptm` (`.ppsx` só na leitura do código).
 
-Cabeçalho e rodapé de `.docx`, `.docm`, `.doc`, `.rtf`, `.xlsx`, `.xlsm`, `.xls`, `.ppt`, `.odt`, `.ods` e `.odp`
+Cabeçalho e rodapé de `.docx`, `.docm`, `.doc`, `.rtf`, `.xlsx`, `.xlsm`, `.xls`, `.ppt`, `.pps`, `.pot`, `.odt`, `.ods` e `.odp`
 saem do corpo e ficam nos metadados, em `cabeçalho/rodapé`, com número de página e data legíveis
 (`Página [página] de [páginas]`). Abas ocultas do `.xlsx` e do `.xls` ficam em `abas_ocultas`. Arquivo com macro
-ganha `macros: true`: VBA no Office (OOXML, inclusive `.xlsb`, e `.doc`, `.xls` e `.ppt`), macro do Excel 4.0
+ganha `macros: true`: VBA no Office (OOXML, inclusive `.xlsb`, e `.doc`, `.xls`, `.ppt`, `.pps` e `.pot`), macro do Excel 4.0
 (`.xlsx`, `.xlsm`, `.xlsb` e `.xls`) e macro do LibreOffice. A macro nunca é executada.
 
 Cada extensão da tabela é testada no CI com um arquivo real em `tests/fixtures/reais/`: os de Word, Excel,

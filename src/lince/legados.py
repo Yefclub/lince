@@ -2,7 +2,9 @@
 RTF), abas ocultas (XLS) e macros (VBA no PPT, folha de macro do Excel 4.0 no XLS).
 
 Leitura defensiva: arquivo hostil ou fora do padrão nunca derruba a leitura do documento; quem chama trata a exceção
-e segue sem esses metadados. Os laços andam sobre os bytes, sem recursão, e nunca passam do fim do stream."""
+e segue sem esses metadados. Os laços andam sobre os bytes, sem recursão, e nunca passam do fim do stream; todo o
+trabalho (bytes percorridos, copiados e decodificados, textos guardados) sai de um `Orcamento` proporcional ao
+stream, então nenhuma estrutura sobreposta ou repetida multiplica o custo."""
 
 import codecs
 import itertools
@@ -14,6 +16,30 @@ _HEADER, _FOOTER, _CODEPAGE, _HEADER_FOOTER = 0x0014, 0x0015, 0x0042, 0x089C
 FOLHA_DE_MACRO, MODULO_VBA = 1, 6  # BOUNDSHEET.dt: folha de macro do Excel 4.0 e módulo do Excel 5
 _REGISTROS_POR_ABA = 4096  # o cabeçalho fica no bloco de configuração da página, antes das células
 _CODEPAGES = {367: "ascii", 1200: "utf-16-le", 10000: "mac_roman", 32768: "mac_roman", 32769: "cp1252"}
+_FATOR = 2  # arquivo legítimo percorre cada região uma vez; o dobro sobra para diretórios e cabeçalhos de registro
+_FOLGA = 64 * 1024
+_TEXTO_MAX = 1024  # caracteres por cabeçalho ou rodapé (o Excel limita a 255; o PowerPoint, na prática, a poucos)
+_TEXTOS_MAX = 1024  # cabeçalhos e rodapés distintos por arquivo
+
+
+class Orcamento:
+    """Teto de trabalho de um arquivo. Estourar é estrutura hostil (regiões sobrepostas, cadeias repetidas): levanta
+    ValueError, e quem chama registra os metadados como ilegíveis em vez de gastar memória e CPU sem limite."""
+
+    def __init__(self, tamanho):
+        self.bytes, self.textos = _FATOR * tamanho + _FOLGA, _TEXTOS_MAX
+
+    def gastar(self, n):
+        self.bytes -= n
+        if self.bytes < 0:
+            raise ValueError("estrutura sobreposta ou repetida: orçamento de leitura esgotado")
+
+    def guardar(self, bordas: dict, texto: str):
+        if texto not in bordas:
+            self.textos -= 1
+            if self.textos < 0:
+                raise ValueError("cabeçalhos e rodapés distintos demais")
+            bordas[texto] = None
 
 
 def ler_stream(o, nome, teto):
@@ -28,11 +54,10 @@ def ler_stream(o, nome, teto):
 
 
 def _registros(b, i, orcamento):
-    """(tipo, dados) de cada registro a partir de `i`, enquanto houver orçamento (lista de um inteiro, compartilhada
-    entre as abas: cada registro tem ao menos 4 bytes, então um arquivo legítimo nunca passa de len(b) // 4)."""
-    while i + 4 <= len(b) and orcamento[0] > 0:
-        orcamento[0] -= 1
+    """(tipo, dados) de cada registro a partir de `i`; cada registro (cabeçalho e cópia dos dados) sai do orçamento."""
+    while i + 4 <= len(b):
         tipo, tam = struct.unpack_from("<HH", b, i)
+        orcamento.gastar(4 + tam)
         yield tipo, b[i + 4 : i + 4 + tam]
         i += 4 + tam
 
@@ -44,13 +69,14 @@ def _texto_xls(d, i, codificacao, cch_bytes):
         return "", len(d)
     cch = d[i] if cch_bytes == 1 else struct.unpack_from("<H", d, i)[0]
     i += cch_bytes
+    n = min(cch, _TEXTO_MAX)
     if codificacao is None:
         alto = i < len(d) and d[i] & 1
         i += 1
         if alto:
-            return d[i : i + 2 * cch].decode("utf-16-le", "replace"), i + 2 * cch
-        return d[i : i + cch].decode("latin-1"), i + cch
-    return d[i : i + cch].decode(codificacao, "replace"), i + cch
+            return d[i : i + 2 * n].decode("utf-16-le", "replace"), i + 2 * cch
+        return d[i : i + n].decode("latin-1"), i + cch
+    return d[i : i + n].decode(codificacao, "replace"), i + cch
 
 
 def _codificacao_biff5(cp):
@@ -80,7 +106,7 @@ def xls(o, teto) -> dict:
     if len(b) < 8 or struct.unpack_from("<H", b, 0)[0] != _BOF:
         return {}
     codificacao = None if struct.unpack_from("<H", b, 4)[0] == 0x0600 else "cp1252"  # BOF.vers: BIFF8 ou não
-    orcamento = [len(b) // 4 + 1]
+    orcamento = Orcamento(len(b))
     abas, bordas, saida = set(), {}, {"ocultas": [], "macro": False}
     for tipo, d in _registros(b, 0, orcamento):
         if tipo == _FILEPASS:
@@ -102,10 +128,10 @@ def xls(o, teto) -> dict:
             if tipo in (_DIMENSIONS, _EOF) or lidos > _REGISTROS_POR_ABA:
                 break
             if tipo in (_HEADER, _FOOTER) and d:
-                bordas.setdefault(_texto_xls(d, 0, codificacao, 1 if codificacao else 2)[0])
+                orcamento.guardar(bordas, _texto_xls(d, 0, codificacao, 1 if codificacao else 2)[0])
             elif tipo == _HEADER_FOOTER:
                 for texto in _header_footer_2007(d):
-                    bordas.setdefault(texto)
+                    orcamento.guardar(bordas, texto)
     saida["bordas"] = list(bordas)
     return saida
 
@@ -116,7 +142,7 @@ _CONTEINER, _VBA_INFO, _VBA_INFO_ATOM, _CABECALHOS_RODAPES, _CSTRING = 0xF, 0x03
 _USER_EDIT, _PERSIST_DIRECTORY, _EDICOES_MAX = 0x0FF5, 0x1772, 4096
 
 
-def _objetos_vivos(b, usuario):
+def _objetos_vivos(b, usuario, orcamento):
     """Posições dos objetos da versão atual: Current User → último UserEditAtom → diretórios de persistência, do mais
     novo ao mais antigo (MS-PPT 2.3). Assim o salvamento rápido, que deixa versões antigas no stream, não traz macro
     ou rodapé que já foram apagados. None se a cadeia não fecha: quem chama varre o stream inteiro."""
@@ -125,12 +151,14 @@ def _objetos_vivos(b, usuario):
     edicao, vistos, posicoes = struct.unpack_from("<I", usuario, 16)[0], set(), {}
     while edicao and edicao not in vistos and len(vistos) < _EDICOES_MAX:
         vistos.add(edicao)
+        orcamento.gastar(36)
         if edicao + 36 > len(b) or struct.unpack_from("<H", b, edicao + 2)[0] != _USER_EDIT:
             return None
         anterior, diretorio = struct.unpack_from("<II", b, edicao + 16)
         if diretorio + 8 > len(b) or struct.unpack_from("<H", b, diretorio + 2)[0] != _PERSIST_DIRECTORY:
             return None
         fim = min(diretorio + 8 + struct.unpack_from("<I", b, diretorio + 4)[0], len(b))
+        orcamento.gastar(fim - diretorio)  # edições diferentes apontando o mesmo diretório pagam cada leitura
         i = diretorio + 8
         while i + 4 <= fim:
             v = struct.unpack_from("<I", b, i)[0]
@@ -139,23 +167,24 @@ def _objetos_vivos(b, usuario):
                 posicoes.setdefault(ident + k, struct.unpack_from("<I", b, i + 4 + 4 * k)[0])
             i += 4 + 4 * quantos
         edicao = anterior
-    return sorted({p for p in posicoes.values() if p + 8 <= len(b)}) if posicoes else None
+    validas = sorted({p for p in posicoes.values() if p + 8 <= len(b)})
+    return validas or None
 
 
 def ppt(o, teto) -> dict:
     """Macro (VBAInfoAtom com fHasMacros) e textos de cabeçalho, rodapé e data dos slides e das anotações."""
     b = ler_stream(o, "PowerPoint Document", teto)
-    vivos = _objetos_vivos(b, ler_stream(o, "Current User", teto)) if o.exists("Current User") else None
+    orcamento = Orcamento(len(b))
+    vivos = _objetos_vivos(b, ler_stream(o, "Current User", teto), orcamento) if o.exists("Current User") else None
     if vivos is None:
         pilha = [(0, len(b), None)]
     else:  # cada objeto vivo é um registro: o tamanho dele delimita a varredura
         pilha = [(p, min(p + 8 + struct.unpack_from("<I", b, p + 4)[0], len(b)), None) for p in vivos]
     saida, bordas = {"macro": False}, {}
-    orcamento = len(b) // 8 + 1  # todo registro tem cabeçalho de 8 bytes: objetos sobrepostos não multiplicam o custo
-    while pilha and orcamento > 0:
+    while pilha:
         i, fim, pai = pilha.pop()
-        while i + 8 <= fim and orcamento > 0:
-            orcamento -= 1
+        while i + 8 <= fim:
+            orcamento.gastar(8)  # objetos vivos sobrepostos pagam de novo cada registro que repetem
             ver, tipo, tam = struct.unpack_from("<HHI", b, i)
             corpo = i + 8
             if ver & 0xF == _CONTEINER:
@@ -163,7 +192,9 @@ def ppt(o, teto) -> dict:
             elif pai == _VBA_INFO and tipo == _VBA_INFO_ATOM and tam >= 8 and corpo + 8 <= len(b):
                 saida["macro"] |= struct.unpack_from("<I", b, corpo + 4)[0] == 1
             elif pai == _CABECALHOS_RODAPES and tipo == _CSTRING:
-                bordas.setdefault(b[corpo : min(corpo + tam, fim)].decode("utf-16-le", "replace"))
+                texto = b[corpo : min(corpo + tam, fim, corpo + 2 * _TEXTO_MAX)]
+                orcamento.gastar(len(texto))
+                orcamento.guardar(bordas, texto.decode("utf-16-le", "replace"))
             i = corpo + tam
     saida["bordas"] = list(bordas)
     return saida
@@ -275,7 +306,7 @@ def doc(o, teto) -> list[str]:
 
 _GRUPO_BORDA = re.compile(rb"\{\\(?:header|footer)[lrf]?(?![a-z])")
 _RELEITURA_MAX = 4  # bytes relidos por byte do arquivo; arquivo real relê bem menos (cabeçalhos curtos e repetidos)
-_GRUPOS_MAX = 64  # Word grava até seis por seção (comum, esquerda, direita, primeira; cabeçalho e rodapé)
+_GRUPOS_MAX = 64  # distintos; o Word grava até seis por seção, quase sempre repetidos de uma seção para outra
 
 
 def _fim_do_grupo(s: bytes, i: int) -> int:
@@ -292,27 +323,25 @@ def _fim_do_grupo(s: bytes, i: int) -> int:
     return -1 if prof else i
 
 
-def rtf(dados: bytes, ler_rtf) -> list[str]:
+def rtf(dados: bytes, ler_rtf) -> tuple[list[str], bool]:
     """Texto dos grupos \\header e \\footer (e variantes l, r, f). Cada grupo vira um RTF mínimo com o prólogo e a
     tabela de fontes do original e é lido pelo mesmo leitor do corpo (`ler_rtf`), que já resolve página de código
-    por fonte, \\u e campos."""
+    por fonte, \\u e campos. Devolve também se todos os grupos foram lidos (False: algum teto cortou a leitura)."""
     cab = re.match(rb"\{\\rtf1(?:\\[a-z]+-?\d* ?)*", dados)
     prologo = cab.group(0) if cab else b"{\\rtf1"
     if (m := re.search(rb"\{\\fonttbl", dados)) and (fim := _fim_do_grupo(dados, m.end())) > 0:
         prologo += dados[m.start() : fim]
     vistos, saida, lidos = set(), [], 0
-    for n, m in enumerate(_GRUPO_BORDA.finditer(dados)):
-        if n >= _GRUPOS_MAX:
-            break
+    for m in _GRUPO_BORDA.finditer(dados):
         fim = _fim_do_grupo(dados, m.end())
         if fim < 0:
-            break  # grupo sem fim: o resto do arquivo não é cabeçalho
+            return saida, False  # grupo sem fim: o resto do arquivo não é cabeçalho
         corpo = dados[m.end() : fim - 1]
         if corpo in vistos:
-            continue
+            continue  # mala direta repete o mesmo cabeçalho em cada seção: não conta para os tetos
         vistos.add(corpo)
         lidos += len(prologo) + len(corpo)  # o prólogo (tabela de fontes) é relido a cada grupo distinto
-        if lidos > _RELEITURA_MAX * len(dados):
-            break  # grupos aninhados ou prólogo enorme de propósito: o custo fica proporcional ao arquivo
+        if len(vistos) > _GRUPOS_MAX or lidos > _RELEITURA_MAX * len(dados):
+            return saida, False  # grupos aninhados ou prólogo enorme de propósito: custo proporcional ao arquivo
         saida += ler_rtf(prologo + corpo + b"}")
-    return saida
+    return saida, True

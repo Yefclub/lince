@@ -202,7 +202,7 @@ def test_rtf_usa_a_pagina_de_codigo_da_fonte_e_ignora_grupo_sem_fim(tmp_path):
     from lince.metadados import metadados_arquivo
 
     (tmp_path / "aberto.rtf").write_bytes(rb"{\rtf1{\header abc")  # grupo que nunca fecha
-    assert metadados_arquivo(tmp_path / "aberto.rtf") == {}
+    assert metadados_arquivo(tmp_path / "aberto.rtf") == {"partes_ilegiveis": ["cabeçalho e rodapé (parcial)"]}
 
 
 def test_ole_malformado_nao_derruba_os_metadados(tmp_path):
@@ -426,15 +426,74 @@ def test_xls_biff5_usa_o_codepage_e_le_aba_oculta():
     assert r["ocultas"] == ["Лист"] and r["bordas"] == ["&CСекрет"]
 
 
-def test_xls_le_o_cabecalho_da_primeira_pagina_do_excel_2007_e_resiste_a_aba_repetida():
+def test_xls_le_o_cabecalho_da_primeira_pagina_do_excel_2007():
     texto = "Confidencial"
     hf = bytes(30) + struct.pack("<4H", 0, 0, len(texto), 0) + struct.pack("<HB", len(texto), 0) + texto.encode()
-    aba = _bof(0x0600) + _reg(0x089C, hf) + _reg(0x14, struct.pack("<HB", 2, 0) + b"oi")
-    pos = len(_bof(0x0600)) + 5000 * len(_reg(0x85, bytes(8))) + len(_reg(0x0A))
-    globais = _bof(0x0600) + _reg(0x85, struct.pack("<IBBBB", pos, 0, 0, 0, 0)) * 5000 + _reg(0x0A)
+    aba = _bof(0x0600) + _reg(0x089C, hf) + _reg(0x14, struct.pack("<HB", 2, 0) + b"oi") + _reg(0x0200, bytes(14))
+    pos = len(_bof(0x0600)) + len(_reg(0x85, bytes(8))) + len(_reg(0x0A))
+    globais = _bof(0x0600) + _reg(0x85, struct.pack("<IBBBB", pos, 0, 0, 0, 0)) + _reg(0x0A)
+    assert legados.xls(_OleFalso(Workbook=globais + aba), 10**6)["bordas"] == ["Confidencial", "oi"]
+
+
+def _rapido(funcao, *args):
+    """Levanta ValueError (orçamento) em menos de 2 s: estrutura hostil nunca vira minutos de CPU nem gigabytes."""
     inicio = time.monotonic()
-    r = legados.xls(_OleFalso(Workbook=globais + aba + _reg(0x0200, bytes(14))), 10**8)
-    assert r["bordas"] == ["Confidencial", "oi"] and time.monotonic() - inicio < 2  # 5000 abas no mesmo lugar: uma
+    with pytest.raises(ValueError):
+        funcao(*args)
+    assert time.monotonic() - inicio < 2
+
+
+def test_xls_com_abas_sobrepostas_esgota_o_orcamento():
+    # milhares de abas em posições distintas de uma região onde cada posição começa um HEADER de 64 KB diferente
+    # (unidades de 8 bytes: cabeçalho do registro + 4 bytes que variam, então cada texto lido é distinto)
+    regiao = b"".join(struct.pack("<HHI", 0x14, 0xFFFF, k * 2654435761 % 2**32) for k in range(20_000))
+    inicio = len(_bof(0x0600)) + 3000 * len(_reg(0x85, bytes(8))) + len(_reg(0x0A))
+    globais = _bof(0x0600) + b"".join(
+        _reg(0x85, struct.pack("<IBBBB", inicio + 8 * k, 0, 0, 0, 0)) for k in range(3000)
+    )
+    _rapido(legados.xls, _OleFalso(Workbook=globais + _reg(0x0A) + regiao), 10**8)
+
+
+def _ppt_hostil(objetos, posicoes, edicoes=1):
+    """Stream com `objetos`, um diretório que aponta o id 1 em diante para `posicoes` e `edicoes` UserEditAtom
+    encadeados, todos usando o mesmo diretório."""
+    diretorio_em = len(objetos)
+    entradas = b"".join(struct.pack("<I", p) for p in posicoes)
+    diretorio = _rec(0x0, 0x1772, struct.pack("<I", 1 | (len(posicoes) << 20)) + entradas)
+    stream, anterior = objetos + diretorio, 0
+    for _ in range(edicoes):
+        atual = len(stream)
+        stream += _rec(0x0, 0x0FF5, struct.pack("<IHBBIII", 0, 0, 0, 3, anterior, diretorio_em, 1) + bytes(8))
+        anterior = atual
+    usuario = _rec(0x0, 0x0FF6, struct.pack("<III", 20, 0xE391C05F, anterior) + bytes(8))
+    return _OleFalso(PowerPoint_Document=stream, Current_User=usuario)
+
+
+def test_ppt_com_objetos_vivos_sobrepostos_esgota_o_orcamento():
+    # cada unidade de 16 bytes: contêiner de rodapé gigante seguido de CString gigante; todos os offsets vivos
+    unidade = struct.pack("<HHI", 0xF, 0x0FD9, 0xFFFFFF) + struct.pack("<HHI", 0x0, 0x0FBA, 0xFFFFFF)
+    _rapido(legados.ppt, _ppt_hostil(unidade * 4000, [16 * k for k in range(4000)]), 10**8)
+
+
+def test_ppt_com_edicoes_repetidas_no_mesmo_diretorio_esgota_o_orcamento():
+    _rapido(legados.ppt, _ppt_hostil(_documento_ppt(0), [0] * 4095, edicoes=4000), 10**8)
+
+
+def test_ppt_com_cadeia_quebrada_cai_na_varredura_do_stream():
+    ole = _OleFalso(PowerPoint_Document=_documento_ppt(1), Current_User=bytes(16) + struct.pack("<I", 999_999))
+    assert legados.ppt(ole, 10**6)["macro"] is True
+
+
+def test_rtf_com_muitas_secoes_repetidas_nao_perde_o_cabecalho_distinto(tmp_path):
+    from lince.metadados import metadados_arquivo
+
+    repetidos = rb"{\header\pard Igual\par}" * 200  # mala direta: o mesmo cabeçalho em cada seção
+    (tmp_path / "mala.rtf").write_bytes(rb"{\rtf1\ansi " + repetidos + rb"{\footer\pard Distinto\par}\pard Corpo\par}")
+    assert metadados_arquivo(tmp_path / "mala.rtf") == {"cabeçalho/rodapé": ["Distinto", "Igual"]}
+    distintos = b"".join(b"{\\header\\pard C%d\\par}" % k for k in range(70))
+    (tmp_path / "muitos.rtf").write_bytes(rb"{\rtf1\ansi " + distintos + rb"\pard Corpo\par}")
+    meta = metadados_arquivo(tmp_path / "muitos.rtf")
+    assert len(meta["cabeçalho/rodapé"]) == 64 and meta["partes_ilegiveis"] == ["cabeçalho e rodapé (parcial)"]
 
 
 def _rec(ver, tipo, corpo):
@@ -473,11 +532,23 @@ def test_piece_table_hostil_nao_multiplica_o_texto():
 
 
 def test_campos_do_word_tem_custo_linear_e_aninhamento_com_teto():
-    inicio = time.monotonic()
-    assert legados._sem_campos("\x13 X \x14r\x15" * 100_000 + "a" * 100_000).count("r") == 100_000
-    assert time.monotonic() - inicio < 2
+    inicio = time.monotonic()  # 63 campos abertos em fase de resultado: o custo não multiplica pela profundidade
+    aninhado = "\x13X\x14" * 63 + "a" * 300_000 + "\x15" * 63
+    assert legados._sem_campos(aninhado) == "a" * 300_000 and time.monotonic() - inicio < 2
     with pytest.raises(ValueError):  # vira partes_ilegiveis em metadados_arquivo
         legados._sem_campos("\x13\x14" * 50_000 + "a" * 50_000)
+
+
+def test_stream_que_declara_mais_bytes_que_o_arquivo_nem_e_lido():
+    class Gigante(_OleFalso):
+        def get_size(self, nome):
+            return 10**9
+
+        def openstream(self, nome):
+            raise AssertionError("leu o stream antes de conferir o tamanho")
+
+    with pytest.raises(ValueError):
+        legados.ler_stream(Gigante(WordDocument=b""), "WordDocument", 10**6)
 
 
 def test_stream_ole_que_declara_mais_bytes_que_o_arquivo_e_recusado(tmp_path):

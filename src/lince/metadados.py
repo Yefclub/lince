@@ -35,13 +35,15 @@ def metadados_arquivo(path, ext=None):
         return _metadados_odf(path, meta, ext)
     if ext == ".rtf":
         try:
-            bordas = legados.rtf(Path(path).read_bytes(), _linhas_rtf)
+            bordas, completo = legados.rtf(Path(path).read_bytes(), _linhas_rtf)
         except MemoryError:
             raise  # falta de memória não é parte ruim: derruba o documento, como no resto da leitura
         except Exception:  # noqa: BLE001 — RTF fora do padrão: o corpo continua lido, sem cabeçalho e rodapé
             meta["partes_ilegiveis"] = ["cabeçalho e rodapé"]
         else:
             _guardar_bordas(meta, bordas)
+            if not completo:
+                meta["partes_ilegiveis"] = ["cabeçalho e rodapé (parcial)"]
         return meta
     if ext in BINARIOS_OLE:
         # Word e Excel binários guardam o VBA no armazenamento _VBA_PROJECT (o PowerPoint, dentro de um objeto)
