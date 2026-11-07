@@ -1,6 +1,7 @@
 """Orquestrador: arquivo → extração nativa e roteamento → leituras pela IA (com cache) → markdown + metadados."""
 
 import json
+import logging
 import os
 import tempfile
 import zipfile
@@ -161,12 +162,13 @@ class Leitor:
         def um(t):
             img = Path(f"{pasta}/ia/{t['id']}.png").read_bytes()
             instr = instrucao(t, self.prompt, faixas)
-            k = chave(img, instr, getattr(self.ia, "identidade", self.ia.modelo), f"{VERSAO}/{VERSAO_PROMPT}")
-            if self.cache and (txt := self.cache.obter(k)) is not None:
+            # a chave é o que muda a resposta: imagem, instrução, modelo e versão do prompt (não a versão do pacote,
+            # senão cada release leria e pagaria tudo de novo)
+            k = chave(img, instr, getattr(self.ia, "identidade", self.ia.modelo), VERSAO_PROMPT)
+            if (txt := self._cache_obter(k)) is not None:
                 return t["id"], txt, Uso(self.ia.modelo, cache=True, tarefa=t["id"])
             r = self.ia.ler(img, instr)
-            if self.cache:
-                self.cache.guardar(k, r.texto)
+            self._cache_guardar(k, r.texto)
             r.uso.tarefa = t["id"]
             return t["id"], r.texto, r.uso
 
@@ -187,6 +189,24 @@ class Leitor:
                 if self.ao_usar:
                     self.ao_usar(uso)
         return respostas, usos
+
+    def _cache_obter(self, k):
+        """Cache fora do ar (Redis caído, rede) não derruba a leitura: segue lendo pela IA, como sem cache."""
+        if not self.cache:
+            return None
+        try:
+            return self.cache.obter(k)
+        except Exception as e:  # noqa: BLE001
+            _avisar_cache(e)
+            return None
+
+    def _cache_guardar(self, k, texto):
+        if not self.cache:
+            return
+        try:
+            self.cache.guardar(k, texto)
+        except Exception as e:  # noqa: BLE001
+            _avisar_cache(e)
 
     # ------------------------------------------------------------------ esforço máximo
     def _segunda_passada(self, caminho, plano, R, cobertura):
@@ -275,6 +295,10 @@ def _extensao_lida(caminho: str) -> str:
     if detectado is None:
         raise FormatoNaoSuportado(f"formato {ext or '(sem extensão)'} não suportado")
     return f".{detectado}"
+
+
+def _avisar_cache(e):
+    logging.getLogger("lince").warning("cache indisponível, lendo sem ele: %s: %s", type(e).__name__, str(e)[:200])
 
 
 def ler(caminho: str | Path, **opcoes) -> Resultado:

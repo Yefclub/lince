@@ -1,12 +1,14 @@
 """Cache de leituras: a mesma imagem com a mesma instrução e o mesmo modelo não é paga duas vezes.
 
-A plataforma pode trocar por Redis/Postgres implementando `obter` e `guardar`.
+Guarda só o texto que a IA leu de cada recorte ou página, pela chave (hash); nunca o documento. A plataforma usa o
+Redis que já tem (`CacheRedis(cliente)`) ou qualquer objeto com `obter` e `guardar`.
 """
 
 import hashlib
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Protocol
 
@@ -22,6 +24,39 @@ class Cache(Protocol):
     def obter(self, k: str) -> str | None: ...
 
     def guardar(self, k: str, texto: str) -> None: ...
+
+
+class CacheRedis:
+    """Cache no Redis da plataforma (passe o cliente que ela já usa) ou num próprio (passe a URL). Cada leitura vence
+    em `dias`; a chave leva o prefixo `lince:leitura:` para não colidir com o resto do Redis."""
+
+    PREFIXO = "lince:leitura:"
+    PAUSA = 30  # segundos sem tentar o Redis depois de uma falha: Redis lento não soma 2 s em cada leitura
+
+    def __init__(self, redis, dias: float = 30):
+        if isinstance(redis, str):
+            import redis as redis_py
+
+            redis = redis_py.Redis.from_url(redis, socket_timeout=2, socket_connect_timeout=2)
+        if dias <= 0:
+            raise ValueError("dias precisa ser maior que zero")
+        self.redis, self.segundos, self._fora_ate = redis, int(dias * 86400), 0.0
+
+    def _chamar(self, funcao, *args, **kw):
+        if time.monotonic() < self._fora_ate:
+            return None  # em pausa: segue sem cache, sem esperar o timeout de novo
+        try:
+            return funcao(*args, **kw)
+        except Exception:
+            self._fora_ate = time.monotonic() + self.PAUSA
+            raise
+
+    def obter(self, k):
+        v = self._chamar(self.redis.get, self.PREFIXO + k)
+        return v.decode("utf-8") if isinstance(v, bytes) else v
+
+    def guardar(self, k, texto):
+        self._chamar(self.redis.set, self.PREFIXO + k, texto.encode("utf-8"), ex=self.segundos)
 
 
 class CacheMemoria:

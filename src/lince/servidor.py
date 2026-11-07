@@ -34,6 +34,7 @@ from starlette.routing import Route
 
 from . import antivirus
 from . import codigo as codigo_doc
+from .cache import CacheRedis
 from .leitor import FORMATOS, VERSAO, Leitor
 from .limites import DocumentoRecusado
 from .provedores import OpenAICompativel
@@ -152,6 +153,7 @@ class Servico:
         self.sessoes: dict[str, dict] = {}
         self.idempotencia: dict[tuple[str, str], str] = {}
         self.clamav: tuple[str, int] | None = None  # LINCE_CLAMAV: todo arquivo recebido passa pelo antivírus
+        self.cache = None  # LINCE_REDIS: leituras da IA compartilhadas entre envios (só o texto lido, por hash)
         self.edicoes: dict[str, dict] = {}  # arquivo editado esperando download (entrega única, como as sessões)
         self.vagas: dict[str, int] = {}  # documentos pendentes por cliente, reservados antes do upload
         self.retidos: dict[str, int] = {}  # bytes de resultado em memória por cliente (sessões em curso e concluídas)
@@ -193,7 +195,7 @@ class Servico:
                 estado = "cancelado"
                 return
             doc["estado"], doc["inicio"] = "lendo", time.time()
-            r = Leitor(ia=sessao["ia"], esforco=sessao["esforco"]).ler(doc["arquivo"])
+            r = Leitor(ia=sessao["ia"], esforco=sessao["esforco"], cache=self.cache).ler(doc["arquivo"])
             doc["resultado"] = {
                 "markdown": r.markdown,
                 "metadados": r.metadados,
@@ -398,9 +400,9 @@ class _Envelope:
 
 
 # -------------------------------------------------------------------- rotas
-def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None) -> Starlette:
+def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=None) -> Starlette:
     s = Servico(tokens)
-    s.clamav = clamav
+    s.clamav, s.cache = clamav, cache
 
     async def saude(request):
         return JSONResponse({"status": "ok", "versao": VERSAO, "contrato": CONTRATO["info"]["version"]})
@@ -785,9 +787,27 @@ def main():
         raise SystemExit(str(e)) from None
     if not tokens and not a.sem_autenticacao:
         raise SystemExit("Defina LINCE_TOKENS (tokens aceitos, separados por vírgula) ou use --sem-autenticacao.")
+    try:
+        cache = cache_do_ambiente(os.environ)
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
     import uvicorn
 
-    uvicorn.run(criar_app(tokens, clamav), host=a.host, port=a.porta, proxy_headers=True, log_level="info")
+    uvicorn.run(criar_app(tokens, clamav, cache), host=a.host, port=a.porta, proxy_headers=True, log_level="info")
+
+
+def cache_do_ambiente(env) -> CacheRedis | None:
+    """LINCE_REDIS liga o cache; LINCE_CACHE_DIAS diz por quanto tempo cada leitura fica (padrão 30)."""
+    url = (env.get("LINCE_REDIS") or "").strip()
+    if not url:
+        return None
+    try:
+        dias = float(env.get("LINCE_CACHE_DIAS") or 30)
+    except ValueError:
+        raise ValueError("LINCE_CACHE_DIAS precisa ser um número de dias") from None
+    if not url.startswith(("redis://", "rediss://", "unix://")):
+        raise ValueError("LINCE_REDIS precisa ser uma URL redis://, rediss:// ou unix://")
+    return CacheRedis(url, dias)
 
 
 if __name__ == "__main__":

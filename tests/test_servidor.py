@@ -342,6 +342,20 @@ def test_redirect_do_provedor_nao_e_seguido(pdf_com_figura):
     assert r.json()["itens"][0]["resultado"]["cobertura"]["pendentes"]
 
 
+def test_cache_do_servidor_vale_entre_envios(pdf_com_figura):
+    from lince import CacheMemoria
+
+    srv, contador, url = _provedor("Gráfico de barras: Lapa 3500.")
+    api = TestClient(criar_app(["token-a"], cache=CacheMemoria()))
+    cab = {**A, **ESPERA, "X-IA-URL": url, "X-IA-Modelo": "m"}
+    primeiro = enviar(api, ("g.pdf", pdf_com_figura), cab).json()["itens"][0]["resultado"]
+    segundo = enviar(api, ("g.pdf", pdf_com_figura), cab).json()["itens"][0]["resultado"]
+    srv.shutdown()
+    assert contador.chamadas == 1  # o segundo envio não paga a mesma imagem
+    assert not primeiro["uso"][0]["cache"] and segundo["uso"][0]["cache"]
+    assert "Lapa 3500" in segundo["markdown"]
+
+
 def test_retry_after_do_provedor_tem_teto():
     from lince.provedores import ESPERA_MAX_PROVEDOR, _retry_after
 

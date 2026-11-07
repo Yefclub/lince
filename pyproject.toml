@@ -18,7 +18,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-servidor = ["starlette>=1.10", "uvicorn>=0.54", "python-multipart>=0.0.32"]  # BSD-3 / BSD-3 / Apache-2.0
+servidor = ["starlette>=1.10", "uvicorn>=0.54", "python-multipart>=0.0.32", "redis>=8.1,<9"]  # BSD-3 / BSD-3 / Apache-2.0 / MIT
+redis = ["redis>=8.1,<9"]  # MIT — CacheRedis para quem usa o Lince como lib
 
 [dependency-groups]
 # só desenvolvimento e CI (não vão para a imagem); versões travadas no uv.lock e atualizadas pelo Dependabot
