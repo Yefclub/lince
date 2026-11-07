@@ -10,6 +10,7 @@ import os  # noqa: F401
 import re  # noqa: F401
 import zipfile  # noqa: F401
 import zlib
+from pathlib import Path
 from xml.etree import ElementTree as ET  # noqa: F401
 
 from . import legados
@@ -34,7 +35,9 @@ def metadados_arquivo(path, ext=None):
         return _metadados_odf(path, meta, ext)
     if ext == ".rtf":
         try:
-            bordas = legados.rtf(open(path, "rb").read(), _linhas_rtf)
+            bordas = legados.rtf(Path(path).read_bytes(), _linhas_rtf)
+        except MemoryError:
+            raise  # falta de memória não é parte ruim: derruba o documento, como no resto da leitura
         except Exception:  # noqa: BLE001 — RTF fora do padrão: o corpo continua lido, sem cabeçalho e rodapé
             meta["partes_ilegiveis"] = ["cabeçalho e rodapé"]
         else:
@@ -136,14 +139,17 @@ def _metadados_ole(path, meta, ext):
 
     if not olefile.isOleFile(path):
         return meta
+    teto = os.path.getsize(path)
     try:
         with olefile.OleFileIO(path) as o:
             if ext == ".doc":
-                achado = {"bordas": legados.doc(o)}
+                achado = {"bordas": legados.doc(o, teto)}
             elif ext == ".xls":
-                achado = legados.xls(o)
+                achado = legados.xls(o, teto)
             else:
-                achado = legados.ppt(o)
+                achado = legados.ppt(o, teto)
+    except MemoryError:
+        raise
     except Exception:  # noqa: BLE001 — OLE malformado ou hostil: o corpo continua lido, sem estes metadados
         meta["partes_ilegiveis"] = ["cabeçalho, rodapé e macros"]
         return meta
@@ -157,7 +163,8 @@ def _metadados_ole(path, meta, ext):
 
 
 def _linhas_rtf(dados: bytes) -> list[str]:
-    """Linhas de texto de um RTF pelo mesmo leitor do corpo; tabela vira as células separadas por espaço."""
+    """Linhas de texto de um RTF pelo mesmo leitor do corpo, sem a marcação do Markdown: tabela vira as células
+    separadas por espaço; título e item de lista perdem a marca."""
     import anydoc
 
     from .office import serializar
@@ -172,7 +179,8 @@ def _linhas_rtf(dados: bytes) -> list[str]:
             continue
         if linha.startswith("|"):
             linha = " ".join(c.strip() for c in linha.strip("|").split(" | ") if c.strip())
-        linhas.append(linha.removeprefix("\\"))
+        linha = re.sub(r"^\s*(?:#{1,6}|[-*+]|\d+[.)])\s+", "", linha)
+        linhas.append(linha.removeprefix("\\").replace("\\|", "|"))
     return linhas
 
 

@@ -4,6 +4,8 @@ Origem e licença de cada arquivo em tests/fixtures/reais/ORIGEM.md.
 """
 
 import io
+import struct
+import time
 import zipfile
 from pathlib import Path
 
@@ -13,7 +15,7 @@ from docx import Document
 from pptx import Presentation
 
 import lince
-from lince import codigo
+from lince import codigo, legados
 from lince.leitor import FORMATOS
 
 REAIS = Path(__file__).parent / "fixtures" / "reais"
@@ -58,6 +60,7 @@ ESPERADO = {
     "poi_EmbeddedChartHeaderTest.xls": "| Data 1 | Data 2 | Data 3 |",
     "poi_47251_1.xls": "AAAAAAAAAA AAAAAAA AAAAA AAAAAAAA",  # o POI já publica o conteúdo trocado por "A"
     "poi_TwoSheetsOneHidden.xls": "Sheet2A1",
+    "poi_45761.xls": "| Visible |",
     "poi_60405.xls": "NullPointerException during build",
     "testFooter.ods": "| Data 3 | Data 4 |",
     "testCSV.csv": "Numbers and their Squares",
@@ -141,8 +144,10 @@ def test_cabecalho_e_rodape_dos_binarios_e_do_rtf_vao_para_os_metadados(nome, te
     assert texto in r.metadados["cabeçalho/rodapé"] and texto not in r.markdown
 
 
-def test_aba_oculta_do_xls_e_sinalizada():
+def test_aba_oculta_e_muito_oculta_do_xls_sao_sinalizadas():
     assert lince.ler(REAIS / "poi_TwoSheetsOneHidden.xls").metadados["abas_ocultas"] == ["Sheet1"]
+    # "muito oculta" (hsState 2): a interface do Excel não reexibe, só macro
+    assert lince.ler(REAIS / "poi_45761.xls").metadados["abas_ocultas"] == ["HiddenSheet", "VeryHiddenSheet"]
 
 
 @pytest.mark.parametrize(
@@ -170,8 +175,10 @@ def test_arquivo_sem_macro_nao_e_sinalizado(nome):
     assert "macros" not in lince.ler(REAIS / nome).metadados
 
 
-def test_folha_de_macro_do_excel_4_nao_depende_de_vba():
-    assert "_VBA_PROJECT".encode("utf-16-le") not in (REAIS / "poi_60405.xls").read_bytes()
+@pytest.mark.parametrize("nome", ["poi_60405.xls", "poi_SimpleMacro.ppt"])
+def test_macro_sem_vba_project_visivel_vem_do_caminho_novo(nome):
+    # nem folha de macro do Excel 4.0 nem o VBA comprimido do PowerPoint deixam _VBA_PROJECT à vista
+    assert "_VBA_PROJECT".encode("utf-16-le") not in (REAIS / nome).read_bytes()
 
 
 def test_campo_do_word_vira_o_resultado_e_pagina_vira_nome():
@@ -381,3 +388,103 @@ def test_macro_no_xlsb_e_parte_corrompida(tmp_path):
     dados[inicio : inicio + 8] = b"\xff" * 8  # stream deflate inválido: zlib.error ao ler
     corrompido.write_bytes(bytes(dados))
     assert "docProps/core.xml" in lince.ler(corrompido).metadados["partes_ilegiveis"]
+
+
+class _OleFalso:
+    """Só o que os leitores de legados usam do olefile: streams sintéticos para estrutura hostil ou rara."""
+
+    def __init__(self, **streams):
+        self.streams = {k.replace("_", " "): v for k, v in streams.items()}
+
+    def exists(self, nome):
+        return nome in self.streams
+
+    def get_size(self, nome):
+        return len(self.streams[nome])
+
+    def openstream(self, nome):
+        return io.BytesIO(self.streams[nome])
+
+
+def _reg(tipo, dados=b""):
+    return struct.pack("<HH", tipo, len(dados)) + dados
+
+
+def _bof(vers):
+    return _reg(0x0809, struct.pack("<HH", vers, 0x10) + bytes(12))
+
+
+def test_xls_biff5_usa_o_codepage_e_le_aba_oculta():
+    cabecalho = "&CСекрет".encode("cp1251")  # BIFF5: cch de 1 byte e bytes na página de código do CODEPAGE
+    aba = _bof(0x0500) + _reg(0x14, bytes([len(cabecalho)]) + cabecalho) + _reg(0x0200, bytes(10))
+    nome = "Лист".encode("cp1251")
+    globais_sem_aba = _bof(0x0500) + _reg(0x42, struct.pack("<H", 1251))
+    tam_aba = len(_reg(0x85, bytes(6) + bytes([len(nome)]) + nome))
+    pos = len(globais_sem_aba) + tam_aba + len(_reg(0x0A))
+    globais = globais_sem_aba + _reg(0x85, struct.pack("<IBB", pos, 1, 0) + bytes([len(nome)]) + nome) + _reg(0x0A)
+    r = legados.xls(_OleFalso(Book=globais + aba), 10**6)
+    assert r["ocultas"] == ["Лист"] and r["bordas"] == ["&CСекрет"]
+
+
+def test_xls_le_o_cabecalho_da_primeira_pagina_do_excel_2007_e_resiste_a_aba_repetida():
+    texto = "Confidencial"
+    hf = bytes(30) + struct.pack("<4H", 0, 0, len(texto), 0) + struct.pack("<HB", len(texto), 0) + texto.encode()
+    aba = _bof(0x0600) + _reg(0x089C, hf) + _reg(0x14, struct.pack("<HB", 2, 0) + b"oi")
+    pos = len(_bof(0x0600)) + 5000 * len(_reg(0x85, bytes(8))) + len(_reg(0x0A))
+    globais = _bof(0x0600) + _reg(0x85, struct.pack("<IBBBB", pos, 0, 0, 0, 0)) * 5000 + _reg(0x0A)
+    inicio = time.monotonic()
+    r = legados.xls(_OleFalso(Workbook=globais + aba + _reg(0x0200, bytes(14))), 10**8)
+    assert r["bordas"] == ["Confidencial", "oi"] and time.monotonic() - inicio < 2  # 5000 abas no mesmo lugar: uma
+
+
+def _rec(ver, tipo, corpo):
+    return struct.pack("<HHI", ver, tipo, len(corpo)) + corpo
+
+
+def _documento_ppt(tem_macro):
+    atomo = _rec(0x2, 0x0400, struct.pack("<III", 3, tem_macro, 2))
+    return _rec(0xF, 0x03E8, _rec(0xF, 0x03FF, atomo))
+
+
+def test_ppt_ignora_a_versao_antiga_deixada_pelo_salvamento_rapido():
+    antigo, atual = _documento_ppt(1), _documento_ppt(0)  # a macro foi apagada no último salvamento
+    diretorio_em = len(antigo) + len(atual)
+    diretorio = _rec(0x0, 0x1772, struct.pack("<II", 1 | (1 << 20), len(antigo)))
+    edicao_em = diretorio_em + len(diretorio)
+    edicao = _rec(0x0, 0x0FF5, struct.pack("<IHBBIII", 0, 0, 0, 3, 0, diretorio_em, 1) + bytes(8))
+    stream = antigo + atual + diretorio + edicao
+    usuario = _rec(0x0, 0x0FF6, struct.pack("<III", 20, 0xE391C05F, edicao_em) + bytes(8))
+    assert legados.ppt(_OleFalso(PowerPoint_Document=stream, Current_User=usuario), 10**6)["macro"] is False
+    # sem a cadeia de edições, a varredura do stream inteiro acharia a macro antiga: o teste prova a diferença
+    assert legados.ppt(_OleFalso(PowerPoint_Document=stream), 10**6)["macro"] is True
+
+
+def test_piece_table_hostil_nao_multiplica_o_texto():
+    def documento(cps, fc):
+        plc = struct.pack(f"<{len(cps)}I", *cps) + b"".join(struct.pack("<HIH", 0, fc, 0) for _ in cps[1:])
+        clx = b"\x02" + struct.pack("<I", len(plc)) + plc
+        wd = bytearray(struct.pack("<II", 0, len(clx)).rjust(33 * 8 + 8, b"\0") + b"a" * 10_000)
+        return bytes(wd), clx
+
+    wd, clx = documento([0, 2**31, 0, 2**31], 0x40000000)  # posições fora de ordem: recusa
+    assert legados._texto_por_cp(wd, clx, 0, 0, 2**31) == ""
+    wd, clx = documento([0, 2**31 - 1], 0x40000000)  # uma peça que diz ter 2 bilhões de caracteres
+    assert len(legados._texto_por_cp(wd, clx, 0, 0, 2**31 - 1)) <= len(wd)
+
+
+def test_campos_do_word_tem_custo_linear_e_aninhamento_com_teto():
+    inicio = time.monotonic()
+    assert legados._sem_campos("\x13 X \x14r\x15" * 100_000 + "a" * 100_000).count("r") == 100_000
+    assert time.monotonic() - inicio < 2
+    with pytest.raises(ValueError):  # vira partes_ilegiveis em metadados_arquivo
+        legados._sem_campos("\x13\x14" * 50_000 + "a" * 50_000)
+
+
+def test_stream_ole_que_declara_mais_bytes_que_o_arquivo_e_recusado(tmp_path):
+    from lince.metadados import metadados_arquivo
+
+    dados = bytearray((REAIS / "testWORD.doc").read_bytes())
+    entrada = dados.index("WordDocument".encode("utf-16-le"))
+    struct.pack_into("<I", dados, entrada + 0x78, 0x7FFFFFFF)  # tamanho do stream na entrada do diretório
+    (tmp_path / "gigante.doc").write_bytes(bytes(dados))
+    assert metadados_arquivo(tmp_path / "gigante.doc").get("partes_ilegiveis") == ["cabeçalho, rodapé e macros"]
