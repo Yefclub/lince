@@ -297,3 +297,47 @@ def test_esforco_maximo_mantem_as_leituras_da_folha_agrupada(tmp_path):
     r = lince.Leitor(ia=lince.FuncaoLeitor(ia, "m"), esforco="max").ler(pdf)
     assert "Título lido 1" in r.markdown and "pendente" not in r.markdown
     assert r.cobertura.pendentes == []
+
+
+def test_prazo_esgotado_vira_pendencia_e_o_custo_e_registrado_mesmo_depois(tmp_path):
+    import threading
+    import time
+
+    from PIL import Image
+
+    Image.new("RGB", (800, 400), "navy").save(tmp_path / "f.png")
+    pdf = tmp_path / "f.pdf"
+    c = canvas.Canvas(str(pdf), pagesize=A4)
+    c.drawString(60, 780, "Texto nativo do relatório.")
+    c.drawImage(str(tmp_path / "f.png"), 60, 400, width=400, height=200)
+    c.save()
+    custos, chegou = [], threading.Event()
+
+    def ia(imagem, instrucao):
+        time.sleep(1.5)
+        return "lido devagar"
+
+    def registrar(uso):
+        custos.append(uso)
+        chegou.set()
+
+    cache = lince.CacheMemoria()
+    leitor = lince.Leitor(ia=lince.FuncaoLeitor(ia, "m"), cache=cache, ao_usar=registrar, agrupar=False)
+    inicio = time.monotonic()
+    r = leitor.ler(pdf, prazo=0.3)
+    assert time.monotonic() - inicio < 1.2  # entregou no prazo, sem esperar a IA
+    assert "Texto nativo do relatório." in r.markdown
+    assert any(p.endswith("prazo esgotado") for p in r.cobertura.pendentes) and not r.uso
+    assert chegou.wait(5) and len(custos) == 1  # a leitura em curso terminou depois e o custo foi registrado
+    chamadas = []
+    leitor2 = lince.Leitor(
+        ia=lince.FuncaoLeitor(lambda i, s: chamadas.append(1) or "x", "m"), cache=cache, agrupar=False
+    )
+    assert "lido devagar" in leitor2.ler(pdf).markdown and not chamadas  # e ficou no cache para a próxima
+
+
+@pytest.mark.parametrize("prazo", [0, -1, float("inf"), float("nan")])
+def test_prazo_invalido_e_recusado(prazo, tmp_path):
+    (tmp_path / "a.txt").write_text("oi")
+    with pytest.raises(ValueError):
+        lince.Leitor().ler(tmp_path / "a.txt", prazo=prazo)

@@ -211,6 +211,9 @@ def test_token_nao_ve_sessao_nem_referencia_de_outro(api, pdf):
     [
         ([("documento", b"x")], {}, {}, "extensao-ausente"),
         ([("a.pdf", b"x")], {"esforco": "turbo"}, {}, "esforco-invalido"),
+        ([("a.pdf", b"x")], {"prazo": "0"}, {}, "prazo-invalido"),
+        ([("a.pdf", b"x")], {"prazo": "3601"}, {}, "prazo-invalido"),
+        ([("a.pdf", b"x")], {"prazo": "1.5"}, {}, "prazo-invalido"),
         ([("a.pdf", b"x")], {"referencia": "nome com espaço"}, {}, "referencia-invalida"),
         ([("a.pdf", b"x")], {}, {"X-IA-URL": "http://x/v1"}, "provedor-incompleto"),
         ([("a.pdf", b"x")], {}, {"X-IA-URL": "file:///etc/passwd", "X-IA-Modelo": "m"}, "provedor-invalido"),
@@ -288,7 +291,7 @@ def test_fila_justa_nao_deixa_um_cliente_travar_o_outro():
 
 
 # ------------------------------------------------------------------ provedor de IA
-def _provedor(texto, status=200, local=None):
+def _provedor(texto, status=200, local=None, demora=0):
     """Provedor OpenAI-compatível falso que responde sempre o mesmo texto (ou um redirect)."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -301,6 +304,7 @@ def _provedor(texto, status=200, local=None):
         def do_POST(self):
             self.rfile.read(int(self.headers["Content-Length"]))
             type(self).chamadas += 1
+            threading.Event().wait(demora)
             if status != 200:
                 self.send_response(status)
                 self.send_header("Location", local or "/")
@@ -341,6 +345,21 @@ def test_redirect_do_provedor_nao_e_seguido(pdf_com_figura):
     destino.shutdown()
     assert chamado.chamadas == 0
     assert r.json()["itens"][0]["resultado"]["cobertura"]["pendentes"]
+
+
+def test_prazo_entrega_o_nativo_na_hora_e_marca_a_leitura_que_nao_coube(pdf_com_figura):
+    import time
+
+    srv, contador, url = _provedor("Gráfico: Lapa 3500.", demora=3)
+    api = TestClient(criar_app(["token-a"]))
+    inicio = time.monotonic()
+    r = enviar(api, ("g.pdf", pdf_com_figura), {**A, **ESPERA, "X-IA-URL": url, "X-IA-Modelo": "m"}, prazo="1")
+    gasto = time.monotonic() - inicio
+    srv.shutdown()
+    resultado = conforme(r, "/v1/sessoes", "post").json()["itens"][0]["resultado"]
+    assert gasto < 2.5  # não esperou os 3 s da IA
+    assert "Produção anual por unidade." in resultado["markdown"]  # o texto nativo saiu completo
+    assert any("prazo esgotado" in p for p in resultado["cobertura"]["pendentes"])
 
 
 def test_cache_do_servidor_vale_entre_envios(pdf_com_figura):

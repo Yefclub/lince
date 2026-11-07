@@ -59,6 +59,7 @@ CABECALHOS_MAX = {"x-ia-url": 2048, "x-ia-modelo": 200, "x-ia-chave": 4096}
 ERROS_HTTP = {400: "requisicao-invalida", 404: "rota-inexistente", 405: "metodo-nao-permitido"}
 LISTA_MAX = 200
 ESFORCOS = {"padrao", "max"}
+PRAZO_MIN, PRAZO_MAX = 1, 3600  # segundos por documento; o chat usa poucos, a base não manda prazo
 MIDIA = {
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ".pptm": "application/vnd.ms-powerpoint.presentation.macroEnabled.12",
@@ -197,7 +198,8 @@ class Servico:
                 return
             doc["estado"], doc["inicio"] = "lendo", time.time()
             cache = CacheComEscopo(self.cache, sessao["cliente"]) if self.cache else None
-            r = Leitor(ia=sessao["ia"], esforco=sessao["esforco"], cache=cache).ler(doc["arquivo"])
+            leitor = Leitor(ia=sessao["ia"], esforco=sessao["esforco"], cache=cache)
+            r = leitor.ler(doc["arquivo"], prazo=sessao.get("prazo"))
             doc["resultado"] = {
                 "markdown": r.markdown,
                 "metadados": r.metadados,
@@ -457,6 +459,15 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=No
             esforco = str(form.get("esforco") or "padrao")
             if esforco not in ESFORCOS:
                 raise Problema(400, "esforco-invalido", "esforco deve ser 'padrao' ou 'max'")
+            prazo = form.get("prazo")
+            if prazo is not None and prazo != "":
+                if not re.fullmatch(r"\d{1,4}", str(prazo)) or not PRAZO_MIN <= int(prazo) <= PRAZO_MAX:
+                    raise Problema(
+                        400, "prazo-invalido", f"prazo deve ser um inteiro de {PRAZO_MIN} a {PRAZO_MAX} segundos"
+                    )
+                prazo = int(prazo)
+            else:
+                prazo = None
             pedir_codigo = str(form.get("codigo") or "nao")
             if pedir_codigo not in ("sim", "nao"):
                 raise Problema(400, "codigo-invalido", "codigo deve ser 'sim' ou 'nao'")
@@ -474,7 +485,7 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=No
                         f"{a.filename!r}: aceitos {', '.join(sorted(FORMATOS))}",
                     )
             sessao = await _receber(
-                s, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=pedir_codigo == "sim"
+                s, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=pedir_codigo == "sim", prazo=prazo
             )
         finally:
             if form is not None:
@@ -691,7 +702,7 @@ async def _varrer(s: Servico, nome, arquivo):
         ) from None
 
 
-async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=False):
+async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=False, prazo=None):
     """Grava o lote, calcula hash e tamanho, aplica a idempotência e põe os documentos na fila."""
     pasta = tempfile.mkdtemp(prefix="lince-api-")
     try:
@@ -720,7 +731,7 @@ async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave
         if sum(d["bytes"] for d in itens) > TAMANHO_MAX:
             raise Problema(413, "envio-grande", "Envio grande demais", f"Teto de {TAMANHO_MAX // 2**20} MB por envio.")
         provedor = getattr(ia, "identidade", None)
-        conteudo = [referencia, esforco, provedor, codigo, [(d["nome"], d["sha256"]) for d in itens]]
+        conteudo = [referencia, esforco, provedor, codigo, [(d["nome"], d["sha256"]) for d in itens], prazo]
         impressao = hashlib.sha256(json.dumps(conteudo).encode()).hexdigest()
         s.limpar()
         if chave_idem:  # repetição ou chave reusada: responde antes de varrer (o envio aceito já foi varrido)
@@ -751,6 +762,7 @@ async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave
                 "cliente": cliente,
                 "referencia": referencia,
                 "esforco": esforco,
+                "prazo": prazo,
                 "codigo": codigo,
                 "ia": ia,
                 "criada_em": time.time(),

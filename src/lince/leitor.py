@@ -2,11 +2,14 @@
 
 import json
 import logging
+import math
 import os
 import tempfile
+import threading
+import time
 import zipfile
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -86,6 +89,7 @@ class Leitor:
         self.ia, self.cache, self.ao_usar, self.prompt = ia, cache, ao_usar, prompt
         self.concorrencia, self.agrupar, self.max_leituras = concorrencia, agrupar, max_leituras
         self.esforco = esforco  # "padrao" | "max": 2ª passada ampliada no que saiu ilegível/estimado
+        self._trava_uso = threading.Lock()
 
     # ------------------------------------------------------------------ planejamento
     def planejar(self, caminho: str | Path, pasta: str | Path) -> dict:
@@ -117,7 +121,13 @@ class Leitor:
         return plano
 
     # ------------------------------------------------------------------ leitura
-    def ler(self, caminho: str | Path) -> Resultado:
+    def ler(self, caminho: str | Path, prazo: float | None = None) -> Resultado:
+        """`prazo`: segundos para entregar, contados do início (o chat lê com prazo; a base, sem). A leitura pela IA
+        que não couber vira a pendência "prazo esgotado" e o texto nativo sai completo. A que já estava em curso
+        termina em segundo plano: vai para o cache e o custo sai em `ao_usar` (não em `Resultado.uso`)."""
+        if prazo is not None and not (math.isfinite(prazo) and prazo > 0):
+            raise ValueError("prazo precisa ser um número de segundos maior que zero")
+        limite = time.monotonic() + prazo if prazo is not None else None
         with tempfile.TemporaryDirectory(prefix="lince-") as pasta:
             plano = self.planejar(caminho, pasta)
             cobertura = Cobertura(
@@ -130,13 +140,15 @@ class Leitor:
             if self.max_leituras is not None and len(tarefas) > self.max_leituras:
                 cobertura.pendentes += [f"{t['id']}: teto de leituras" for t in tarefas[self.max_leituras :]]
                 tarefas = tarefas[: self.max_leituras]
-            respostas, usos = self._ler_tarefas(plano, tarefas, pasta, cobertura)
-            if self.esforco == "max" and self.ia is not None and plano["tipo"] == "pdf":
+            respostas, usos = self._ler_tarefas(plano, tarefas, pasta, cobertura, limite)
+            if self.esforco == "max" and self.ia is not None and plano["tipo"] == "pdf" and not _vencido(limite):
                 respostas = distribuir_lotes(plano, respostas)
-                usos += self._segunda_passada(str(caminho), plano, respostas, cobertura)
+                usos += self._segunda_passada(str(caminho), plano, respostas, cobertura, limite)
             if self.ia is not None:  # resposta vazia não pode virar lacuna silenciosa no documento
                 lidos = distribuir_lotes(plano, respostas)
                 ja = {p.split(":", 1)[0] for p in cobertura.pendentes}
+                # item de um lote que já tem pendência (erro, prazo) não é "resposta vazia"
+                ja |= {tid for lid, itens in (plano.get("lotes") or {}).items() if lid in ja for _, tid in itens}
                 cobertura.pendentes += [
                     f"{t['id']}: resposta vazia da IA"
                     for t in plano.get("tarefas_originais", [])
@@ -150,7 +162,7 @@ class Leitor:
                 meta = json.loads(Path(f"{pasta}/metadados.json").read_text(encoding="utf-8"))
             return Resultado(md, meta, cobertura, usos)
 
-    def _ler_tarefas(self, plano, tarefas, pasta, cobertura):
+    def _ler_tarefas(self, plano, tarefas, pasta, cobertura, limite=None):
         respostas, usos = {}, []
         if not tarefas:
             return respostas, usos
@@ -160,36 +172,62 @@ class Leitor:
         faixas = len(plano["tarefas"]) if plano["tipo"] == "imagem" else None
 
         def um(t):
+            if _vencido(limite):
+                raise _PrazoEsgotado
             img = Path(f"{pasta}/ia/{t['id']}.png").read_bytes()
             instr = instrucao(t, self.prompt, faixas)
             # a chave é o que muda a resposta: imagem, instrução, modelo e versão do prompt (não a versão do pacote,
             # senão cada release leria e pagaria tudo de novo)
             k = chave(img, instr, getattr(self.ia, "identidade", self.ia.modelo), VERSAO_PROMPT)
             if (txt := self._cache_obter(k)) is not None:
-                return t["id"], txt, Uso(self.ia.modelo, cache=True, tarefa=t["id"])
+                return t["id"], txt, self._registrar(Uso(self.ia.modelo, cache=True, tarefa=t["id"]))
             r = self.ia.ler(img, instr)
             if resposta_aproveitavel(plano, t["id"], r.texto):
                 self._cache_guardar(k, r.texto)
             r.uso.tarefa = t["id"]
-            return t["id"], r.texto, r.uso
+            return t["id"], r.texto, self._registrar(r.uso)
 
-        with ThreadPoolExecutor(self.concorrencia) as ex:
-            futuros = {ex.submit(um, t): t for t in tarefas}
-            for f, t in futuros.items():
-                try:
-                    tid, txt, uso = f.result()
-                except Exception as e:  # noqa: BLE001 — leitura falhou: o nativo segue, a pendência fica registrada
-                    cobertura.pendentes.append(f"{t['id']}: {type(e).__name__}: {str(e)[:120]}")
-                    continue
-                respostas[tid] = txt
-                usos.append(uso)
-                if uso.cache:
-                    cobertura.leituras_cache += 1
-                else:
-                    cobertura.leituras_ia += 1
-                if self.ao_usar:
-                    self.ao_usar(uso)
+        def pendencia(t, e):
+            if isinstance(e, _PrazoEsgotado):
+                return f"{t['id']}: prazo esgotado"
+            return f"{t['id']}: {type(e).__name__}: {str(e)[:120]}"  # o nativo segue, a pendência fica registrada
+
+        for tid, txt, uso in self._executar(tarefas, um, limite, cobertura, pendencia):
+            respostas[tid] = txt
+            usos.append(uso)
+            if uso.cache:
+                cobertura.leituras_cache += 1
+            else:
+                cobertura.leituras_ia += 1
         return respostas, usos
+
+    def _registrar(self, uso: Uso) -> Uso:
+        """Custo para o ledger assim que a IA responde, na thread da leitura: a que termina depois do prazo também
+        é registrada. As chamadas a `ao_usar` são uma de cada vez."""
+        if self.ao_usar:
+            with self._trava_uso:
+                self.ao_usar(uso)
+        return uso
+
+    def _executar(self, itens, funcao, limite, cobertura, pendencia):
+        """`funcao` em paralelo para cada item, na ordem. Falha e prazo viram pendência (`pendencia(item, erro)`, ou
+        nada se ela devolver None). No prazo, a fila é cancelada e quem está em curso termina sem ser esperado."""
+        ex = ThreadPoolExecutor(self.concorrencia)
+        futuros = [(ex.submit(funcao, it), it) for it in itens]
+        try:
+            wait([f for f, _ in futuros], timeout=None if limite is None else max(0.0, limite - time.monotonic()))
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+        saida = []
+        for f, it in futuros:
+            if f.cancelled() or not f.done():
+                erro = _PrazoEsgotado()
+            elif (erro := f.exception()) is None:
+                saida.append(f.result())
+                continue
+            if (msg := pendencia(it, erro)) is not None:
+                cobertura.pendentes.append(msg)
+        return saida
 
     def _cache_obter(self, k):
         """Cache fora do ar (Redis caído, rede) não derruba a leitura: segue lendo pela IA, como sem cache."""
@@ -210,7 +248,7 @@ class Leitor:
             _avisar_cache(e)
 
     # ------------------------------------------------------------------ esforço máximo
-    def _segunda_passada(self, caminho, plano, R, cobertura):
+    def _segunda_passada(self, caminho, plano, R, cobertura, limite=None):
         """Releitura ampliada (2–3x) do que saiu ilegível, estimado ou vazio, com a 1ª leitura como contexto."""
         import io
 
@@ -226,6 +264,8 @@ class Leitor:
             doc.close()
 
         def um(item):
+            if _vencido(limite):
+                raise _PrazoEsgotado
             t, partes = item
             instr = instrucao(t, self.prompt) + (
                 f"\n\nSEGUNDA LEITURA, com resolução maior, em {len(partes)} parte(s) na ordem de leitura."
@@ -235,21 +275,17 @@ class Leitor:
             )
             resp = self.ia.ler(partes[0], instr, extras=partes[1:])
             resp.uso.tarefa = t["id"] + ":zoom"
+            self._registrar(resp.uso)
             return t["id"], resp
 
-        with ThreadPoolExecutor(self.concorrencia) as ex:
-            for f in [ex.submit(um, item) for item in preparados]:
-                try:
-                    tid, resp = f.result()
-                except Exception as e:  # noqa: BLE001 — a 1ª leitura fica valendo
-                    cobertura.pendentes.append(f"zoom: {type(e).__name__}: {str(e)[:100]}")
-                    continue
-                if resp.texto.strip():
-                    R[tid] = resp.texto
-                usos.append(resp.uso)
-                cobertura.leituras_ia += 1
-                if self.ao_usar:
-                    self.ao_usar(resp.uso)
+        def pendencia(item, e):  # a 1ª leitura fica valendo; prazo na releitura não é pendência
+            return None if isinstance(e, _PrazoEsgotado) else f"zoom: {type(e).__name__}: {str(e)[:100]}"
+
+        for tid, resp in self._executar(preparados, um, limite, cobertura, pendencia):
+            if resp.texto.strip():
+                R[tid] = resp.texto
+            usos.append(resp.uso)
+            cobertura.leituras_ia += 1
         cobertura.rotas["segunda_passada"] = len(alvos)
         return usos
 
@@ -298,13 +334,21 @@ def _extensao_lida(caminho: str) -> str:
     return f".{detectado}"
 
 
+class _PrazoEsgotado(Exception):
+    """A leitura pela IA não começou (ou não terminou) dentro do prazo do documento."""
+
+
+def _vencido(limite) -> bool:
+    return limite is not None and time.monotonic() >= limite
+
+
 def _avisar_cache(e):
     logging.getLogger("lince").warning("cache indisponível, lendo sem ele: %s: %s", type(e).__name__, str(e)[:200])
 
 
-def ler(caminho: str | Path, **opcoes) -> Resultado:
+def ler(caminho: str | Path, prazo: float | None = None, **opcoes) -> Resultado:
     """Atalho: `lince.ler("arquivo.pdf", ia=OpenAICompativel(...))`."""
-    return Leitor(**opcoes).ler(caminho)
+    return Leitor(**opcoes).ler(caminho, prazo=prazo)
 
 
 def _texto(caminho):
