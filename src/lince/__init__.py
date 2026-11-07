@@ -9,7 +9,7 @@ metadados corporativos e proteção contra texto oculto e prompt injection.
     r.markdown, r.metadados, r.cobertura, r.alertas_injecao
 """
 
-from .cache import CacheDisco, CacheMemoria
+from .cache import CacheDisco, CacheMemoria, CacheRedis
 from .leitor import VERSAO as __version__
 from .leitor import FormatoNaoSuportado, Leitor, ler
 from .provedores import FuncaoLeitor, LeitorVisual, OpenAICompativel
@@ -24,6 +24,7 @@ __all__ = [
     "LeitorVisual",
     "CacheMemoria",
     "CacheDisco",
+    "CacheRedis",
     "Resultado",
     "Cobertura",
     "Uso",

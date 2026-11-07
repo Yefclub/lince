@@ -51,7 +51,8 @@ estática do Python e dos workflows. Rode o equivalente local antes de commitar.
   metadados. Corte de repetição só nas bordas da página.
 - Mudou prompt, recorte ou montagem: rode a bateria de qualidade que você tiver e compare antes/depois
   documento a documento. Mudança que só reformata não pode alterar nenhuma saída.
-- Mudou o prompt: suba `VERSAO_PROMPT` (invalida o cache de leituras).
+- Mudou o prompt, o pedido ao provedor (parâmetros, estrutura das mensagens) ou o tratamento da resposta antes de
+  ela ir para o cache: suba `VERSAO_PROMPT`. É ela, e não a versão do pacote, que invalida o cache de leituras.
 
 ## Contrato da API
 
@@ -87,9 +88,11 @@ estática do Python e dos workflows. Rode o equivalente local antes de commitar.
 
 ## Nada fica guardado
 
-- O servidor não persiste nada: documento apagado assim que lido, sem cache em disco, resultado em memória só até a
-  entrega (`Servico.entregar`) ou `ENTREGA_PRAZO`. Não adicione banco, volume ou cache no servidor sem decisão do
-  mantenedor. O `CacheDisco` existe só para quem usa a biblioteca diretamente.
+- O servidor não persiste o documento: apagado assim que lido, resultado em memória só até a entrega
+  (`Servico.entregar`) ou `ENTREGA_PRAZO`. A única exceção, decidida pelo mantenedor, é o cache opcional de
+  transcrições da IA no Redis (`LINCE_REDIS`), separado por token (`CacheComEscopo`) e com validade
+  (`LINCE_CACHE_DIAS`). Não adicione banco, volume ou outro cache no servidor sem nova decisão do mantenedor. O
+  `CacheDisco` existe só para quem usa a biblioteca diretamente.
 
 ## Atualizações
 
