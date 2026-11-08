@@ -12,14 +12,17 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from lxml import etree
 
 from ._prazo import prazo_restante
+from ._trava import sem_pdfium
 
 LADO_PX = 1600  # o lado maior do desenho: legível para a IA sem gerar imagem enorme
 LADO_MIN_PX = 800  # desenho pequeno é ampliado até aqui (4x o tamanho declarado, no máximo LADO_PX)
+FILHO = Path(__file__).with_name("_desenhar.py")
 SEGUNDOS_MAX = 30  # teto do lote de desenhos de um documento: filtro hostil prende o resvg por minutos
 SVG_NS, XLINK_NS = "http://www.w3.org/2000/svg", "http://www.w3.org/1999/xlink"
 _MEDIDA = re.compile(r"^\s*([0-9]*\.?[0-9]+(?:e[+-]?\d+)?)\s*([a-z]*)\s*$", re.I)
@@ -131,18 +134,36 @@ def desenhar_lote(itens) -> list[str]:
             indices.append(i)
     if not trabalho:
         return resultados
-    for i in indices:
-        resultados[i] = "tempo"
+    inicio = time.monotonic()
     teto = SEGUNDOS_MAX if (resta := prazo_restante()) is None else max(0.1, min(SEGUNDOS_MAX, resta))
-    filho = [sys.executable, "-I", str(Path(__file__).with_name("_desenhar.py"))]
-    try:
-        saida = subprocess.run(  # noqa: S603 — o próprio Python e um script do pacote; o SVG vai pela entrada
-            filho, input=json.dumps(trabalho), capture_output=True, text=True, timeout=teto
-        ).stdout
-    except subprocess.TimeoutExpired as e:  # o run mata o filho; o que ele já concluiu vale
-        saida = e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout or ""
-    for linha in saida.splitlines():
-        k, _, resultado = linha.partition(" ")
-        if k.isdigit() and int(k) < len(indices) and resultado in ("lido", "branco", "ilegivel"):
-            resultados[indices[int(k)]] = resultado
+    feitos = {}  # posição no trabalho -> resultado
+    k = 0
+    while k < len(trabalho):  # o filho que morre (memória, abort) perde só o desenho em que estava
+        if (sobra := teto - (time.monotonic() - inicio)) <= 0:
+            break
+        try:
+            with sem_pdfium():  # o desenho não usa a PDFium: os outros documentos seguem enquanto ele roda
+                fim = subprocess.run(  # noqa: S603 — o próprio Python e um script do pacote; o SVG vai pela entrada
+                    [sys.executable, "-I", str(FILHO)],
+                    input=json.dumps(trabalho[k:]),
+                    capture_output=True,
+                    text=True,
+                    timeout=sobra,
+                )
+            saida, morreu, cortado = fim.stdout, fim.returncode != 0, False
+        except subprocess.TimeoutExpired as e:  # o run mata o filho; o que ele já concluiu vale
+            saida = e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout or ""
+            morreu, cortado = False, True
+        ultimo = k - 1  # o último desenho que o filho concluiu nesta rodada
+        for linha in saida.splitlines():
+            n, _, resultado = linha.partition(" ")
+            if n.isdigit() and resultado in ("lido", "branco", "ilegivel") and k + int(n) < len(trabalho):
+                feitos[k + int(n)] = resultado
+                ultimo = max(ultimo, k + int(n))
+        if cortado or not morreu:
+            break  # sem tempo para o resto, ou o filho terminou o lote
+        feitos[ultimo + 1] = "ilegivel"  # o desenho seguinte ao último concluído derrubou o filho
+        k = ultimo + 2
+    for posicao, i in enumerate(indices):
+        resultados[i] = feitos.get(posicao, "tempo")
     return resultados
