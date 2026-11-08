@@ -1,7 +1,9 @@
 """Âncoras de posição: o número do slide no texto, a nota do gráfico no lugar dele, onde está cada imagem e quem a
 leu, e a mesma imagem lida uma vez só (issue #33, itens 6 e 9)."""
 
+import hashlib
 import io
+import re
 
 from PIL import Image, ImageDraw
 from pptx import Presentation
@@ -51,14 +53,21 @@ def test_slide_numerado_e_nota_do_grafico_no_lugar(tmp_path):
 
 def test_imagem_repetida_lida_uma_vez_e_posicao_de_cada_uma(tmp_path):
     vistas = []
-    leitor = lince.Leitor(ia=lince.FuncaoLeitor(lambda img, i: vistas.append(img) or f"Leitura {len(vistas)}", "m"))
-    r = leitor.ler(_apresentacao(tmp_path))
+
+    def ia(img, instrucao):  # o texto depende só da imagem: as leituras correm em paralelo, a ordem não importa
+        vistas.append(img)
+        return f"Leitura {hashlib.sha256(img).hexdigest()[:12]}"
+
+    r = lince.Leitor(ia=lince.FuncaoLeitor(ia, "m")).ler(_apresentacao(tmp_path))
     assert len(vistas) == 2  # o logo repetido e a figura do slide 2
     imagens = r.estrutura["imagens"]
     assert [(i["slide"], i["lida"]) for i in imagens] == [(1, True), (2, True), (2, True)]
-    logo1, logo2, _ = imagens
+    logo1, logo2, figura = imagens
     assert logo2["lida_por"] == logo1["tarefa"] and logo1["lida_por"] == logo1["tarefa"]
-    assert r.markdown.count("Leitura 1") == 2  # a mesma leitura do logo nos dois lugares
+    blocos = dict(re.findall(r"<!-- lido pela IA: (\w+) -->\n(.+)", r.markdown))
+    assert (
+        blocos[logo1["tarefa"]] == blocos[logo2["tarefa"]] != blocos[figura["tarefa"]]
+    )  # a leitura do logo, não outra
 
 
 def test_posicao_das_imagens_no_pdf(tmp_path):
@@ -101,5 +110,6 @@ def test_faixas_iguais_de_uma_imagem_alta_sao_lidas_cada_uma(tmp_path):
     p = tmp_path / "alta.png"
     Image.new("RGB", (800, 6000), "white").save(p)  # alta: vira faixas, todas iguais
     lidas = []
-    r = lince.Leitor(ia=lince.FuncaoLeitor(lambda img, i: lidas.append(1) or f"Faixa {len(lidas)}.", "m")).ler(p)
-    assert len(lidas) > 1 and all(f"Faixa {k}." in r.markdown for k in range(1, len(lidas) + 1))
+    r = lince.Leitor(ia=lince.FuncaoLeitor(lambda img, i: lidas.append(1) or "Faixa lida.", "m")).ler(p)
+    # 6000 px de altura em faixas de 600 (3/4 da largura): dez faixas, cada uma lida e no texto, sem depender da ordem
+    assert len(lidas) == 10 and r.markdown.count("Faixa lida.") == 10
