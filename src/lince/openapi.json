@@ -971,7 +971,7 @@
             "description": "Por que `codigo` é nulo."
           },
           "estrutura": {
-            "description": "Para navegar e indexar. `paginas` (PDF), `slides` (apresentações) e `abas` (planilhas, na ordem, com as ocultas marcadas) vêm do próprio arquivo, não do Markdown. `secoes` são os títulos do Markdown (fora de bloco de código) com o nível e a posição; `inicio_das_paginas` (só PDF) diz onde cada página começa no Markdown. Posições (`inicio`) são em pontos de código Unicode, não em unidades UTF-16: em JavaScript, conte por `Array.from(markdown)`. Acima de 2000 títulos, a lista para e `secoes_cortadas` vem `true`. `nomes_definidos` (planilhas OOXML) são os intervalos com nome do arquivo, até 32. `perfil_tabular` (planilhas e CSV) traz, por tabela, o que a IA precisa para decidir como consultar os dados sem ler tudo: o cabeçalho, cada coluna com o tipo dominante (`numero`, `data`, `booleano`, `texto` ou `vazio`), até 5 linhas de amostra e `linhas_extraidas` (linhas com dado que estão no Markdown). Montado das mesmas linhas da tabela do texto: nunca diz mais do que ele tem. `extracao_cortada` marca a aba que um teto cortou no texto; `colunas_cortadas`, a que tem mais de 64 colunas. Os tipos saem das primeiras 5.000 linhas com dado (`linhas_observadas`); o valor do cabeçalho e da amostra vai até 120 caracteres.",
+            "description": "Para navegar e indexar. `paginas` (PDF), `slides` (apresentações) e `abas` (planilhas, na ordem, com as ocultas marcadas) vêm do próprio arquivo, não do Markdown. `secoes` são os títulos do Markdown (fora de bloco de código) com o nível e a posição; `inicio_das_paginas` (só PDF) diz onde cada página começa no Markdown. Posições (`inicio`) são em pontos de código Unicode, não em unidades UTF-16: em JavaScript, conte por `Array.from(markdown)`. Acima de 2000 títulos, a lista para e `secoes_cortadas` vem `true`. `nomes_definidos` (`.xlsx` e `.xlsm`) são os intervalos com nome do usuário, sem os reservados do Excel nem os ocultos; acima de 32, a lista para e `nomes_definidos_cortados` vem `true`. `perfil_tabular` (planilhas e CSV) traz, por tabela, o que a IA precisa para decidir como consultar os dados sem ler tudo: o cabeçalho, cada coluna com o tipo dominante (`numero`, `data`, `booleano`, `texto` ou `vazio`), até 5 linhas de amostra e `linhas_extraidas` (linhas com dado que estão no Markdown). Montado das mesmas linhas da tabela do texto: nunca diz mais do que ele tem. `extracao_cortada` marca a aba que um teto cortou no texto; `colunas_cortadas`, a que tem mais de 64 colunas. Os tipos saem das primeiras 5.000 linhas com dado (`linhas_observadas`); o valor do cabeçalho e da amostra vai até 120 caracteres.",
             "type": "object",
             "required": [
               "secoes"
@@ -1074,7 +1074,7 @@
                         "string",
                         "null"
                       ],
-                      "description": "Nome da aba; `null` no CSV."
+                      "description": "Nome da aba, como em `abas`; `null` quando o arquivo não dá o nome (CSV, ou planilha sem a lista de abas)."
                     },
                     "linhas_extraidas": {
                       "type": "integer",
@@ -1136,6 +1136,9 @@
                     }
                   }
                 }
+              },
+              "nomes_definidos_cortados": {
+                "type": "boolean"
               }
             }
           }

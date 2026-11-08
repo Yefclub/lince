@@ -91,10 +91,22 @@ def _abas_xlsx(dados) -> dict:
         for s in raiz.iter()
         if s.tag.endswith("}sheet")
     ]
-    nomes = [n.get("name", "")[:120] for n in raiz.iter() if n.tag.endswith("}definedName")]
+    # intervalos com nome do usuário, por onde a IA consulta a planilha: os reservados do Excel (_xlnm.Print_Area,
+    # _FilterDatabase) e os ocultos ficam de fora, e o nome com escopo de aba entra uma vez
+    nomes = list(
+        dict.fromkeys(
+            n.get("name", "")[:120]
+            for n in raiz.iter()
+            if n.tag.endswith("}definedName")
+            and not n.get("name", "").startswith("_xlnm.")
+            and n.get("hidden") not in ("1", "true")
+        )
+    )
     saida = {"abas": abas} if abas else {}
-    if nomes:  # intervalos com nome: por onde a IA consulta a planilha
+    if nomes:
         saida["nomes_definidos"] = nomes[:NOMES_DEFINIDOS_MAX]
+        if len(nomes) > NOMES_DEFINIDOS_MAX:
+            saida["nomes_definidos_cortados"] = True
     return saida
 
 

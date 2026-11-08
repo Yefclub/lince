@@ -672,8 +672,8 @@ def _celulas_declaradas(path) -> int:
 
 
 def _celula(v) -> str:
-    """O valor como o leitor do corpo escreve: data ISO, número inteiro sem .0, booleano TRUE/FALSE, texto aparado,
-    | escapado, no máximo CARACTERES_POR_CELULA_MAX caracteres."""
+    """O valor como o leitor do corpo escreve: data ISO, número inteiro sem .0, booleano TRUE/FALSE, texto aparado
+    (os espaços de dentro ficam), | escapado, no máximo CARACTERES_POR_CELULA_MAX caracteres."""
     import datetime
 
     if v is None:
@@ -684,7 +684,7 @@ def _celula(v) -> str:
         v = int(v)
     if isinstance(v, datetime.datetime) and v.time() == datetime.time(0):
         v = v.date()
-    texto = " ".join(str(v).split())
+    texto = re.sub(r"\r\n|[\r\n]", " ", str(v)).strip()  # como o leitor do corpo: cada quebra vira um espaço
     if len(texto) > CARACTERES_POR_CELULA_MAX:
         texto = f"{texto[:CARACTERES_POR_CELULA_MAX]}…[+{len(texto) - CARACTERES_POR_CELULA_MAX} caracteres]"
     return texto.replace("|", "\\|")
@@ -750,7 +750,8 @@ def _xlsx_em_fluxo(path, ilegiveis) -> tuple[str, list[dict]]:
             perfis.append(aba.montar(cortada))
             texto = titulo + "\n".join(tabela)
             if cortada:
-                aviso = f"aba {ws.title} entregue com {len(linhas) - 1} linhas de dados por limite de extração"
+                com_dado = sum(1 for linha in linhas[1:] if any(linha))  # o mesmo número do perfil
+                aviso = f"aba {ws.title} entregue com {com_dado} linhas de dados por limite de extração"
                 texto += (
                     f"\n\n[TRUNCADO: {aviso}. O restante NÃO está nesta leitura; não afirme nada sobre ele. Para a"
                     " análise completa, use o arquivo original.]"
@@ -763,22 +764,21 @@ def _xlsx_em_fluxo(path, ilegiveis) -> tuple[str, list[dict]]:
 
 
 def _texto_simples(blocos) -> str:
-    """Texto de uma célula do documento do anydoc, sem marcação: o mesmo que a tabela do Markdown mostra."""
-    partes = []
+    """Texto de uma célula do documento do anydoc, sem marcação: o mesmo que a tabela do Markdown mostra (os
+    parágrafos juntos por espaço, as pontas aparadas, os espaços de dentro mantidos)."""
 
     def inl(xs):
+        out = []
         for x in xs or []:
             if x.kind == "text":
-                partes.append(x.text or "")
+                out.append(x.text or "")
             elif x.kind == "link":
-                inl(x.content)
+                out.append(inl(x.content))
             elif x.kind == "line_break":
-                partes.append(" ")
+                out.append(" ")
+        return "".join(out)
 
-    for b in blocos or []:
-        inl(b.content)
-        partes.append(" ")
-    return " ".join("".join(partes).split())
+    return "\n\n".join(t for t in (inl(b.content) for b in blocos or []) if t.strip()).replace("\n", " ").strip()
 
 
 def _perfis(doc) -> list[dict]:

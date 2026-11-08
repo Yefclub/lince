@@ -90,6 +90,7 @@ def test_em_fluxo_igual_ao_leitor_do_corpo_em_forma_irregular(tmp_path, monkeypa
     ws.append([None, 1, 2])
     ws.append([])  # linha vazia no meio
     ws.append([None, 3, 4, 5, 6])  # linha mais larga que o cabeçalho
+    ws.append([None, "dois  espaços", " a\tb\r\nc\n\nd "])  # espaços de dentro e quebras, como no corpo
     ws["H20"].number_format = "0.00"  # dimensão maior que os dados
     p = tmp_path / "irregular.xlsx"
     wb.save(p)

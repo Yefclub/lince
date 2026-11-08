@@ -20,5 +20,6 @@ O perfil é montado das mesmas linhas que viram a tabela do Markdown, então nun
 aba cortada por um limite de leitura vem marcada com `extracao_cortada`, e a planilha com mais de 64 colunas vem
 com `colunas_cortadas`. O resultado é o mesmo nos dois caminhos de leitura, o normal e o de planilha grande.
 
-Nas planilhas do Excel, `estrutura.nomes_definidos` lista os intervalos com nome do arquivo (até 32). O contrato da
+Nos arquivos `.xlsx` e `.xlsm`, `estrutura.nomes_definidos` lista os intervalos com nome criados pelo usuário (até 32,
+sem os nomes internos do Excel, como a área de impressão). O contrato da
 API passa para a versão 1.8.0, só com campos novos.

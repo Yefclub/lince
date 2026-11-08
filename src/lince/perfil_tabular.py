@@ -12,7 +12,10 @@ COLUNAS_MAX = 64  # planilha larga: o perfil lista as primeiras e declara o cort
 LINHAS_OBSERVADAS_MAX = 5_000  # janela de inferência de tipo por aba
 CARACTERES_MAX = 120  # por valor no cabeçalho e na amostra
 
-_NUMERO = re.compile(r"[+-]?(?:\d+(?:[.,]\d+)*|[.,]\d+)(?:[eE][+-]?\d+)?%?")
+# milhar em grupos de 3 com um separador só e decimal com o outro (1.234.567,89 ou 1,234.5); IP e versão são texto
+_NUMERO = re.compile(
+    r"[+-]?(?:\d{1,3}([.,])\d{3}(?:\1\d{3})*(?:(?!\1)[.,]\d+)?|\d+(?:[.,]\d+)?|[.,]\d+)(?:[eE][+-]?\d+)?%?"
+)
 _DATA = re.compile(  # ISO (como o leitor escreve), dd/mm/aaaa e hora
     r"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?|\d{1,2}/\d{1,2}/\d{2,4}|\d{2}:\d{2}(?::\d{2})?"
 )
