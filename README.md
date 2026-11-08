@@ -276,7 +276,7 @@ leitura falha com `lince.FormatoNaoSuportado`.
 | Apresentação | `.pptx` `.pptm` `.ppsx` `.ppsm` `.ppt` `.pps` `.pot` `.odp` | Slides, notas, tabelas e gráficos com os dados |
 | Planilha | `.xlsx` `.xlsm` `.xlsb` `.xls` `.ods` `.csv` `.tsv` | Abas como tabelas; CSV e TSV com separador e codificação detectados |
 | Imagem | `.png` `.jpg` `.jpeg` `.webp` `.tif` `.tiff` `.bmp` `.gif` | Pelo modelo de visão |
-| Página da web | `.html` `.htm` | Títulos, listas, tabelas e links; imagem embutida (`data:`) lida pela IA, imagem externa nunca baixada; texto oculto vai para os alertas |
+| Página da web | `.html` `.htm` | Títulos, listas, tabelas e links; imagem embutida (`data:`) lida pela IA, imagem externa nunca baixada; texto escondido pela própria tag vai para os alertas |
 | Texto | `.txt` `.md` `.json` `.yaml` `.yml` `.xml` `.tex` | Como está |
 
 Documento como código e edição: `.pptx` e `.pptm` (`.ppsx` só na leitura do código).
