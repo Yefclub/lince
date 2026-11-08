@@ -152,6 +152,7 @@ _CANDIDATO = re.compile(rb"[\x1a-\x1f\x29\x2a]\xf0")
 _MSODRAWINGGROUP, _CONTINUE = 0x00EB, 0x003C
 IMAGENS_MAX = 512  # imagens distintas por arquivo; acima disso é arquivo hostil ou repetição sem fim
 _METAFILE_MAX = 64 * 1024 * 1024  # EMF/WMF guardado comprimido: teto do descomprimido
+_PEDACO = 1024 * 1024  # a descompressão anda neste passo, cobrando o orçamento a cada pedaço
 _CABECALHOS_DIB = {12, 40, 52, 56, 64, 108, 124}  # BITMAPCOREHEADER, INFO, V2, V3, OS/2 2, V4 e V5
 
 
@@ -159,8 +160,6 @@ def _blips(b, orcamento):
     """(MIME, bytes) de cada BLIP do OfficeArt achado em `b`. O cabeçalho do registro é conferido inteiro (versão 0,
     instância do tipo, tamanho dentro do stream) antes de aceitar; metafile comprimido é descomprimido dentro do
     orçamento, e o que ele produz é cobrado mesmo quando a imagem é recusada."""
-    import zlib
-
     pos = 0
     while m := _CANDIDATO.search(b, pos):
         k, pos = m.start() - 2, m.start() + 1
@@ -179,18 +178,32 @@ def _blips(b, orcamento):
         orcamento.gastar(tam)
         dados = b[k + 8 + cab : k + 8 + tam]
         pos = k + 8 + tam
-        if extra == 34 and b[k + 8 + cab - 2] == 0:  # metafile com compressão DEFLATE
-            d = zlib.decompressobj()
-            try:
-                dados = d.decompress(dados, max(1, min(_METAFILE_MAX, orcamento.bytes)))
-            except zlib.error:
-                continue
-            orcamento.gastar(len(dados))
-            if d.unconsumed_tail:
-                continue  # descomprime além do teto: bomba
+        if extra == 34 and b[k + 8 + cab - 2] == 0 and (dados := _inflar(dados, orcamento)) is None:
+            continue  # metafile com DEFLATE quebrado ou além do teto
         if mime == "image/bmp" and (dados := _bmp_do_dib(dados)) is None:
             continue
         yield mime, dados
+
+
+def _inflar(dados, orcamento) -> bytes | None:
+    """Metafile com DEFLATE, descomprimido em pedaços, cada um cobrado do orçamento antes do seguinte: um fluxo que
+    quebra depois de muita saída já pagou o que produziu. None se quebrado ou além de _METAFILE_MAX."""
+    import zlib
+
+    d, partes, total = zlib.decompressobj(), [], 0
+    while True:
+        try:
+            pedaco = d.decompress(dados, _PEDACO)
+        except zlib.error:
+            return None
+        orcamento.gastar(len(pedaco))
+        total += len(pedaco)
+        if total > _METAFILE_MAX:
+            return None  # bomba
+        partes.append(pedaco)
+        if not (dados := d.unconsumed_tail):
+            break
+    return b"".join(partes) + d.flush()
 
 
 def _bmp_do_dib(dib: bytes) -> bytes | None:
@@ -245,10 +258,10 @@ def imagens(o, teto) -> tuple[list[tuple[str, bytes]], str | None]:
                 b = _desenhos_xls(b, orcamento)
             for mime, dados in _blips(b, orcamento):
                 if (marca := hashlib.sha256(dados).digest()) not in vistas and dados:
+                    if len(saida) >= IMAGENS_MAX:  # há mais uma: só agora é corte
+                        return saida, f"mais de {IMAGENS_MAX} imagens: o resto ficou de fora"
                     vistas.add(marca)
                     saida.append((mime, dados))
-                    if len(saida) >= IMAGENS_MAX:
-                        return saida, f"mais de {IMAGENS_MAX} imagens: o resto ficou de fora"
         except ValueError as e:  # orçamento esgotado: estrutura hostil neste stream
             return saida, str(e)
     return saida, None

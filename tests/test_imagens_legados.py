@@ -84,11 +84,36 @@ def test_registro_que_declara_mais_do_que_tem_e_ignorado():
     assert list(legados._blips(truncado + _png_blip("red"), legados.Orcamento(10**6)))[0][0] == "image/png"
 
 
-def test_teto_de_imagens_fica_registrado(monkeypatch):
+def test_teto_de_imagens_fica_registrado_so_quando_sobra(monkeypatch):
     monkeypatch.setattr(legados, "IMAGENS_MAX", 2)
     stream = b"".join(_png_blip(c) for c in ("red", "green", "blue"))
     achadas, corte = legados.imagens(_Ole(stream), len(stream))
     assert len(achadas) == 2 and "mais de 2 imagens" in corte
+    exato = b"".join(_png_blip(c) for c in ("red", "green"))
+    assert legados.imagens(_Ole(exato), len(exato)) == (
+        [("image/png", _png("red")), ("image/png", _png("green"))],
+        None,
+    )
+
+
+def test_metafile_que_quebra_depois_de_muita_saida_paga_o_que_produziu():
+    fluxo = bytearray(zlib.compress(b"\x00" * 8 * 1024 * 1024))
+    fluxo[-1] ^= 0xFF  # adler32 errado: o erro só vem no fim, depois de 8 MB descomprimidos
+    bomba = _blip(0xF01A, 0x3D4, b"\x00" * 32 + b"\x00\xfe", bytes(fluxo))
+    stream = _png_blip("red") + bomba * 4
+    achadas, corte = legados.imagens(_Ole(stream), len(stream))
+    assert [m for m, _ in achadas] == ["image/png"] and "orçamento" in corte
+
+
+def test_jpeg_cmyk_e_com_dois_uids_sao_aceitos():
+    b = io.BytesIO()
+    Image.new("RGB", (60, 60), "#2561C1").save(b, "JPEG")
+    jpeg = b.getvalue()
+    cmyk = _blip(0xF01D, 0x6E2, b"\x00", jpeg)
+    dois_uids = _blip(0xF01D, 0x46B, b"\x00" * 16 + b"\x00", jpeg)  # o segundo UID vem antes do byte de marca
+    for registro in (cmyk, dois_uids):
+        [(mime, dados)] = list(legados._blips(registro, legados.Orcamento(10**6)))
+        assert mime == "image/jpeg" and Image.open(io.BytesIO(dados)).size == (60, 60)
 
 
 def test_stream_cheio_de_candidatos_nao_prende_a_leitura():
