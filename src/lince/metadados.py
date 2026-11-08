@@ -201,21 +201,25 @@ _CABECALHO_XLSX = re.compile(  # (?<!/) : <oddHeader/> vazio não engole o eleme
 BINARIOS_OLE = {".doc", ".xls", ".ppt", ".pps", ".pot"}
 
 
+# o que o zipfile levanta numa parte que não lê: CRC errado, cifrada, compressão estranha
+ERROS_DE_PARTE = (
+    zipfile.BadZipFile,
+    RuntimeError,
+    NotImplementedError,
+    EOFError,
+    OSError,
+    KeyError,
+    ValueError,
+    zlib.error,
+    lzma.LZMAError,
+)
+
+
 def _ler_parte(z, parte, ilegiveis):
-    """Bytes da parte, ou None (registrada) se ela não puder ser lida: CRC errado, cifrada, compressão estranha."""
+    """Bytes da parte, ou None (registrada) se ela não puder ser lida."""
     try:
         return z.read(parte)
-    except (
-        zipfile.BadZipFile,
-        RuntimeError,
-        NotImplementedError,
-        EOFError,
-        OSError,
-        KeyError,
-        ValueError,
-        zlib.error,
-        lzma.LZMAError,
-    ):
+    except ERROS_DE_PARTE:
         ilegiveis.append(parte)
         return None
 

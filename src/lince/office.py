@@ -12,7 +12,7 @@ from xml.etree import ElementTree as ET  # noqa: F401
 
 from . import legados
 from .limites import xml_ou_nada
-from .metadados import BINARIOS_OLE, ODF
+from .metadados import BINARIOS_OLE, ERROS_DE_PARTE, ODF
 from .seguranca import remover_ocultos, texto_oculto_docx
 
 NS = {
@@ -336,7 +336,13 @@ def planejar_office(path, pasta, ext=None):
 
     ext = ext or os.path.splitext(path)[1].lower()
     # CSV e TSV não têm assinatura: o formato vai explícito (o anydoc detecta separador e codificação)
-    doc = anydoc.to_document(open(path, "rb").read(), format="csv" if ext in (".csv", ".tsv") else None)
+    grande = ext in (".xlsx", ".xlsm") and _celulas_declaradas(path) > _CELULAS_ANYDOC_MAX
+    # planilha grande não passa pelo anydoc, que monta o documento inteiro na memória (1,2 GB para 100 mil linhas)
+    doc = (
+        None
+        if grande
+        else anydoc.to_document(open(path, "rb").read(), format="csv" if ext in (".csv", ".tsv") else None)
+    )
     tarefas, ilegiveis = [], []
     svgs, sentinela = [], f"LINCE{secrets.token_hex(8)}S"  # SVGs desenhados juntos no fim, num lote só
     vistas = set()  # imagens já lidas (sha256): o armazém dos binários não as repete
@@ -360,7 +366,7 @@ def planejar_office(path, pasta, ext=None):
         tarefas.append({"id": tid, "modo": "imagem", "ancora": onde})
         return f"{{{{IA:{tid}}}}}"
 
-    md, _ = serializar(doc, ler_imagem)
+    md = _xlsx_em_fluxo(path, ilegiveis) if grande else serializar(doc, ler_imagem)[0]
     if ext in BINARIOS_OLE:  # o leitor do corpo quase não entrega as imagens do .doc, .xls e .ppt: o armazém, sim
 
         def imagens_legado():
@@ -622,6 +628,125 @@ def _imagens_xlsx(path, ilegiveis) -> list[tuple[str, str, bytes]]:
                         celula = ""  # âncora absoluta: sem célula
                     achadas.append((f"aba {aba.get('name')}{celula}", _mime(alvo), z.read(alvo)))
     return achadas
+
+
+# Planilha grande, lida em fluxo (openpyxl read_only), com os mesmos tetos do conversor que o Orbital usava
+_CELULAS_ANYDOC_MAX = 200_000  # células declaradas acima das quais a planilha não passa pelo anydoc
+LINHAS_POR_ABA_MAX = 5_000
+CELULAS_POR_ABA_MAX = 200_000
+CELULAS_TOTAL_MAX = 500_000
+CARACTERES_POR_CELULA_MAX = 500
+_VARREDURA_MAX = 10 * CELULAS_TOTAL_MAX  # células lidas, vazias inclusive: uma linha em XFD vale 16.384
+_BYTES_POR_CELULA = 20  # aba sem <dimension>: estimativa pelo tamanho do XML descompactado
+_DIMENSAO = re.compile(rb'<(?:\w+:)?dimension\s+ref="([A-Z]{1,3})(\d+)(?::([A-Z]{1,3})(\d+))?"')
+
+
+def _celulas_declaradas(path) -> int:
+    """Células de cada parte do pacote pelo maior entre o que a <dimension> declara e o que o tamanho da parte
+    comporta, sem ler as células. Não depende de onde nem com que nome o pacote guarda as abas (o openpyxl abre a aba
+    pelo nome que a relação dá, com qualquer extensão), nem da dimensão, que pode mentir para menos; exagerar só
+    desvia para a leitura em fluxo, que escreve igual. Barato: os primeiros bytes de cada parte."""
+    from openpyxl.utils import column_index_from_string
+
+    total = 0
+    with zipfile.ZipFile(path) as z:
+        for info in z.infolist():
+            try:
+                with z.open(info) as f:
+                    m = _DIMENSAO.search(f.read(4096))
+            except ERROS_DE_PARTE:  # parte que não abre (cifrada, compressão estranha) conta só pelo tamanho
+                m = None
+            declaradas = 0
+            if m and m.group(3):
+                largura = column_index_from_string(m.group(3).decode()) - column_index_from_string(m.group(1).decode())
+                declaradas = (largura + 1) * (int(m.group(4)) - int(m.group(2)) + 1)
+            total += max(declaradas, info.file_size // _BYTES_POR_CELULA)
+    return total
+
+
+def _celula(v) -> str:
+    """O valor como o leitor do corpo escreve: data ISO, número inteiro sem .0, booleano TRUE/FALSE, texto aparado,
+    | escapado, no máximo CARACTERES_POR_CELULA_MAX caracteres."""
+    import datetime
+
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "TRUE" if v else "FALSE"
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    if isinstance(v, datetime.datetime) and v.time() == datetime.time(0):
+        v = v.date()
+    texto = " ".join(str(v).split())
+    if len(texto) > CARACTERES_POR_CELULA_MAX:
+        texto = f"{texto[:CARACTERES_POR_CELULA_MAX]}…[+{len(texto) - CARACTERES_POR_CELULA_MAX} caracteres]"
+    return texto.replace("|", "\\|")
+
+
+def _xlsx_em_fluxo(path, ilegiveis) -> str:
+    """Corpo da planilha grande, aba por aba (as ocultas e as vazias ficam de fora, como no leitor do corpo), em
+    tabela Markdown, lida em fluxo. Acima dos tetos, o resto da aba (ou as abas seguintes) não entra, e o aviso fica
+    no próprio texto e em `ilegiveis`: quem lê nunca toma o recorte pelo todo. Os tetos contam as células que saem
+    no texto (a tabela é retangular) e as que só foram varridas: a <dimension> do arquivo não é confiável, nem para
+    mais nem para menos."""
+    from openpyxl import load_workbook
+
+    partes, total, varridas, esgotado = [], 0, 0, None
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        visiveis = [ws for ws in wb.worksheets if ws.sheet_state == "visible"]
+        for ws in visiveis:
+            titulo = f"## {ws.title}\n\n" if len(visiveis) > 1 else ""  # aba única vai sem título, como no corpo
+            if esgotado:
+                aviso = f"aba {ws.title}: {esgotado} atingido antes dela"
+                partes.append(f"{titulo}[TRUNCADO: {aviso}; ela não está nesta leitura.]")
+                ilegiveis.append(aviso)
+                continue
+            ws.reset_dimensions()  # lê as linhas que existem, não as que a <dimension> declara
+            linhas, largura, cortada, vazias, inicio = [], 0, False, 0, None
+            for valores in ws.iter_rows(values_only=True):
+                varridas += len(valores) + 1
+                if varridas > _VARREDURA_MAX:
+                    cortada, esgotado = True, f"teto de {_VARREDURA_MAX} células varridas do documento"
+                    break
+                cheias = [i for i, v in enumerate(valores) if _celula(v)]
+                if not cheias:
+                    vazias += bool(linhas)  # linha vazia entre linhas com dados entra na tabela, como no corpo
+                    continue
+                nova, n = max(largura, cheias[-1] + 1), len(linhas) + vazias + 1
+                if nova * n > CELULAS_TOTAL_MAX - total:
+                    cortada, esgotado = True, f"teto de {CELULAS_TOTAL_MAX} células do documento"
+                    break
+                if n > LINHAS_POR_ABA_MAX + 1 or nova * n > CELULAS_POR_ABA_MAX:
+                    cortada = True
+                    break
+                linhas += [[]] * vazias + [[_celula(v) for v in valores[: cheias[-1] + 1]]]
+                largura, vazias = nova, 0
+                inicio = cheias[0] if inicio is None else min(inicio, cheias[0])
+            total += largura * len(linhas)
+            if not linhas:
+                if cortada:  # o teto chegou antes da primeira linha: a aba não some sem aviso
+                    aviso = f"aba {ws.title}: {esgotado} atingido antes dela"
+                    partes.append(f"{titulo}[TRUNCADO: {aviso}; ela não está nesta leitura.]")
+                    ilegiveis.append(aviso)
+                continue
+            corpo = [
+                (linha + [""] * (largura - len(linha)))[inicio:] for linha in linhas
+            ]  # colunas à esquerda vazias saem
+            tabela = ["| " + " | ".join(corpo[0]) + " |", "|" + " --- |" * (largura - inicio)]
+            tabela += ["| " + " | ".join(linha) + " |" for linha in corpo[1:]]
+            texto = titulo + "\n".join(tabela)
+            if cortada:
+                aviso = f"aba {ws.title} entregue com {len(linhas) - 1} linhas de dados por limite de extração"
+                texto += (
+                    f"\n\n[TRUNCADO: {aviso}. O restante NÃO está nesta leitura; não afirme nada sobre ele. Para a"
+                    " análise completa, use o arquivo original.]"
+                )
+                ilegiveis.append(aviso)
+            partes.append(texto)
+    finally:
+        wb.close()
+    return "\n\n".join(partes)
 
 
 def _nao_lida(onde, mime, ilegiveis) -> str:
