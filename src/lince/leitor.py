@@ -103,9 +103,8 @@ class Leitor:
     def _planejar(self, caminho, pasta):
         os.makedirs(f"{pasta}/ia", exist_ok=True)
         ext = _extensao_lida(caminho)
-        if ext == ".pdf":
-            with PDFIUM:  # só a PDFium é serial: Office, HTML e texto de outros documentos seguem em paralelo
-                plano = planejar_pdf(caminho, pasta)
+        if ext == ".pdf":  # toma a trava da PDFium por faixa: Office, HTML, texto e outros PDFs seguem em paralelo
+            plano = planejar_pdf(caminho, pasta)
         elif ext in IMAGEM:
             plano = _plano_imagem(caminho, pasta)
         elif ext in TEXTO:
@@ -143,7 +142,8 @@ class Leitor:
     # ------------------------------------------------------------------ leitura
     def ler(self, caminho: str | Path, prazo: float | None = None) -> Resultado:
         """`prazo`: segundos, a partir de agora, para o documento (o chat lê com prazo; a base, sem). A extração
-        nativa conta: no PDF, a página que começa depois do prazo entra só com o texto (pendência registrada).
+        nativa conta: no PDF, a página que começa depois do prazo entra só com o texto, e a faixa de páginas que não
+        cabe nele não é lida (pendências registradas; a primeira faixa sempre entra).
         Nenhuma leitura pela IA começa depois do prazo, e a que está em curso no `OpenAICompativel` é cortada (com a
         folga da rede), sem novas tentativas: o que não coube vira a pendência "prazo esgotado" e o texto nativo sai
         completo. Provedor próprio lê o que sobra em `lince.prazo_restante()`."""
@@ -159,7 +159,7 @@ class Leitor:
         with tempfile.TemporaryDirectory(prefix="lince-") as pasta:
             plano = self.planejar(caminho, pasta)
             cobertura = Cobertura(
-                paginas=len(plano.get("paginas", [])) or 1,
+                paginas=_paginas(plano),
                 rotas={p["i"] + 1: p["rota"] for p in plano.get("paginas", [])},
             )
             cobertura.pendentes += plano.get("pendentes", [])
@@ -180,7 +180,8 @@ class Leitor:
         """Fase 1: extrai o texto e devolve as leituras que a IA precisa fazer, sem chamar modelo nenhum. Quem chama
         lê cada `TarefaVisual` com o seu modelo (custo, roteamento, cache e cancelamento são dele) e passa as respostas
         para `concluir`. O teto `max_leituras` vale aqui: o que passar dele fica nas pendências. `prazo` vale para a
-        extração, como em `ler`: no PDF, a página que começa depois dele entra só com o texto."""
+        extração, como em `ler`: no PDF, a página que começa depois dele entra só com o texto, e a faixa que não cabe
+        nele não é lida."""
         if prazo is not None and not (math.isfinite(prazo) and prazo > 0):
             raise ValueError("prazo precisa ser um número de segundos maior que zero")
         token = LIMITE.set(time.monotonic() + prazo if prazo is not None else None)
@@ -234,7 +235,7 @@ class Leitor:
         ids = {t.id for t in plano.tarefas}
         respostas = {k: v for k, v in (respostas or {}).items() if k in ids and isinstance(v, str)}
         cobertura = Cobertura(
-            paginas=len(estado.get("paginas", [])) or 1,
+            paginas=_paginas(estado),
             rotas={p["i"] + 1: p["rota"] for p in estado.get("paginas", [])},
             leituras_ia=len(respostas),
         )
@@ -321,17 +322,16 @@ class Leitor:
         alvos = [t for t in plano.get("tarefas_originais", []) if "caixa" in t and _precisa_rever(R.get(t["id"], ""))]
         if not alvos:
             return []
-        usos = []
-        with PDFIUM:
-            doc = pdfium.PdfDocument(caminho)
-            preparados = []
-            try:  # fechado dentro da trava, mesmo com exceção: o finalizador da PDFium não roda fora dela
-                for t in alvos:  # renderizar em 4–8x custa: para assim que o prazo vence
-                    if _vencido():
-                        break
+        usos, preparados = [], []
+        for t in alvos:  # renderizar em 4–8x custa: para assim que o prazo vence
+            if _vencido():
+                break
+            with PDFIUM:  # um recorte por vez: outro PDF entra entre eles (a trava é justa)
+                doc = pdfium.PdfDocument(caminho)
+                try:  # fechado dentro da trava, mesmo com exceção: o finalizador da PDFium não roda fora dela
                     preparados.append((t, _recortes_ampliados(doc, t, io)))
-            finally:
-                doc.close()
+                finally:
+                    doc.close()
 
         def um(item):
             if _vencido():
@@ -510,6 +510,12 @@ def _com_estrutura(r: Resultado, plano) -> Resultado:
         r.estrutura["paginas"] = r.cobertura.paginas
     r.estrutura.update(secoes(r.markdown, pdf=plano["tipo"] == "pdf", apresentacao=bool(plano.get("slides"))))
     return r
+
+
+def _paginas(plano) -> int:
+    """Páginas do documento, inclusive as que o prazo ou o teto deixaram sem ler (estão nas pendências)."""
+    total = plano.get("paginas_total")
+    return total if isinstance(total, int) and total > 0 else len(plano.get("paginas", [])) or 1
 
 
 def _vencido() -> bool:
