@@ -548,3 +548,14 @@ def test_alternativo_da_midia_na_ordem_e_todas_as_fontes_ficam(tmp_path):
         ("source", "https://x/b.mp4"),
         ("track", "https://x/leg.vtt"),
     ]
+
+
+def test_fontes_irmas_e_aninhadas_ficam_todas_na_ordem(tmp_path):
+    # irmãs, cada uma com outra aninhada (fechar a de fora impede o libxml2 de aninhar a seguinte)
+    irmas = "".join(
+        f'<source src="https://x/{n}.mp4"><source src="https://x/{n}b.mp4"></source></source>' for n in range(3)
+    )
+    raiz = lxml_html.document_fromstring(f'<video>{irmas}<track src="https://x/leg.vtt"></video>')
+    _tirar_oculto(raiz)
+    fontes = [f.get("src").removeprefix("https://x/") for f in raiz.find(".//video")]
+    assert fontes == ["0.mp4", "0b.mp4", "1.mp4", "1b.mp4", "2.mp4", "2b.mp4", "leg.vtt"]

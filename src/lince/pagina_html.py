@@ -342,11 +342,11 @@ def _tirar_oculto(raiz) -> list:
                 continue
             # a mídia fica com os atributos e os <source>/<track> que o navegador usaria: os filhos diretos e a cadeia
             # que o parser HTML4 do libxml2 aninha um dentro do outro; fonte de dentro do alternativo não conta
-            faixas, cadeia = [], [f for f in el if f.tag in ("source", "track")]
-            while cadeia:
-                f = cadeia.pop(0)
+            faixas, cadeia = [], [f for f in reversed(el) if f.tag in ("source", "track")]
+            while cadeia:  # pilha: ordem do documento e custo linear, com milhares de fontes irmãs ou aninhadas
+                f = cadeia.pop()
                 faixas.append((f.tag, dict(f.attrib)))
-                cadeia[:0] = [g for g in f if g.tag in ("source", "track")]
+                cadeia.extend(g for g in reversed(f) if g.tag in ("source", "track"))
             for f in list(el):
                 el.remove(f)
             el.text = None
