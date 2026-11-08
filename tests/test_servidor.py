@@ -374,6 +374,7 @@ def test_cache_do_servidor_vale_entre_envios(pdf_com_figura):
     assert contador.chamadas == 1  # o segundo envio não paga a mesma imagem
     assert not primeiro["uso"][0]["cache"] and segundo["uso"][0]["cache"]
     assert "Lapa 3500" in segundo["markdown"]
+    assert segundo["estrutura"]["paginas"] == 1  # a estrutura vem junto na API (e o contrato a valida)
 
 
 def test_cache_do_servidor_e_separado_por_token(pdf_com_figura):

@@ -206,6 +206,7 @@ class Servico:
                 "cobertura": asdict(r.cobertura),
                 "alertas_injecao": r.alertas_injecao,
                 "uso": [asdict(u) for u in r.uso],
+                "estrutura": r.estrutura,
             }
             if sessao.get("codigo"):
                 doc["resultado"].update(_codigo_do_documento(doc))
