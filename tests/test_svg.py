@@ -290,6 +290,8 @@ def test_desenho_so_mostra_texto_que_ficou_no_corpo(tmp_path):
         '<use href="#s" font-size="0.5"/></svg>',
         "f.svg": f'<svg xmlns="http://www.w3.org/2000/svg" width="300" height="150"><style>text{{display:inline'
         f' !important}}</style>{azul}<text y="80" font-size="40" style="display:none">{oculto}</text></svg>',
+        "i.svg": f'<svg xmlns="http://www.w3.org/2000/svg" width="300" height="150"><style>'
+        f'<text id="t" y="80" font-size="40">{oculto}</text></style>{azul}<use href="#t"/></svg>',
         "h.svg": '<svg xmlns="http://www.w3.org/2000/svg" xmlns:x="http://www.w3.org/1999/xlink" width="300"'
         f' height="150"><style id="s">/* {oculto} */</style>{azul}'
         '<text x="5" y="80" font-size="30"><tref x:href="#s"/></text></svg>',
@@ -298,9 +300,8 @@ def test_desenho_so_mostra_texto_que_ficou_no_corpo(tmp_path):
         p = tmp_path / nome
         p.write_text(conteudo, encoding="utf-8")
         r, vistas = _ler_vendo(p)
-        assert oculto not in r.markdown and (r.alertas_injecao or nome in ("g.html", "h.svg")), (
-            nome
-        )  # g, h: só no desenho
+        # h: o texto nunca esteve no corpo, então não há alerta; o que importa é o desenho
+        assert oculto not in r.markdown and (r.alertas_injecao or nome == "h.svg"), nome
         assert len(vistas) == 1, nome
         for img in vistas:  # o desenho sai, só com a caixa azul: nenhum traço de letra
             assert (37, 97, 193) in (cores := {c for _, c in _imagem(img).getcolors(1 << 24)}), nome

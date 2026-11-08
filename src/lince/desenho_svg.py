@@ -1,7 +1,8 @@
 """Desenho de SVG em PNG pelo resvg, para a IA ler o diagrama como ela lê uma imagem.
 
-O SVG nunca busca nada fora dele: toda referência que não seja a um trecho do próprio documento (#id) ou a dado
-embutido (data:) é tirada antes de desenhar, porque o resvg leria um arquivo local que o documento apontasse. O
+O SVG nunca busca nada fora dele: toda referência que não seja a um trecho do próprio documento (#id) ou a imagem
+raster embutida (data: com PNG, JPEG, GIF ou WebP) é tirada antes de desenhar, porque o resvg leria um arquivo local
+que o documento apontasse, e um SVG embutido traria texto que a limpeza do oculto não vê. O <tref> também sai. O
 desenho roda num processo à parte (`_desenhar.py`), com teto de tempo e de memória.
 Sem o resvg instalado, quem chama segue com o texto do SVG.
 """

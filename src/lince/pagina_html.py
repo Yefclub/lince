@@ -340,7 +340,12 @@ def _tirar_oculto(raiz, svgs=None) -> list:
         dono = dono if dono is not None or el.tag != "svg" else el
         em_svg = dono is not None
         if el.tag in _SEM_CONTEUDO:
-            if not (em_svg and el.tag == "style"):  # o <style> do SVG fica para o desenho; não é texto do corpo
+            if em_svg and el.tag == "style":  # o <style> do SVG fica para o desenho só com o CSS: um elemento
+                for f in list(el):  # dentro dele não passaria pela limpeza e um <use> o desenharia
+                    if conteudo := " ".join(" ".join(f.itertext()).split()):
+                        ocultos.append(("conteúdo que o navegador não mostra", conteudo))
+                    el.remove(f)
+            else:
                 _esvaziar(el)
             continue
         efetivas = _efetivas(el, em_svg, px, raiz_px)
