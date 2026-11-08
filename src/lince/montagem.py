@@ -279,8 +279,8 @@ def tamanho_da_saida(e, respostas) -> int:
 
     def leitura(tid):
         tid = e.get("iguais", {}).get(tid, tid)
-        # a maior entre a do item (já dividida, no esforço máximo e na releitura) e a do lote: conta por cima
-        # em qualquer forma das respostas, inclusive as de quem chama, antes do filtro por id
+        # a maior entre a do item (já dividida, no esforço máximo e na releitura) e a do lote: a chave de um não
+        # esconde o outro, inclusive nas respostas de quem chama, antes do filtro por id
         return max(len(respostas.get(tid, "")), len(respostas.get(lote_de.get(tid), ""))) + 64
 
     total = len(e.get("md", "")) + sum(len(x) for x in e.get("extras", []))
