@@ -185,8 +185,9 @@ logotipo do cabeçalho).
 
 Fotos, capturas e figuras (JPEG, PNG, bitmap e TIFF) vão para a IA e a leitura entra numa seção **Imagens do
 documento**, depois do texto: esses formatos não guardam a posição da imagem junto do texto. A imagem que o Lince já
-lia no lugar certo do `.doc` não é lida de novo. Desenhos vetoriais (EMF, WMF e PICT, comuns em diagramas e gráficos
-colados) ficam marcados como não lidos e registrados em `partes_ilegiveis`, nunca somem em silêncio.
+lia no lugar certo do `.doc` não é lida de novo. Desenhos vetoriais EMF e WMF, comuns em diagramas e gráficos
+colados, também são desenhados e lidos pela IA. O PICT do Mac fica marcado como não lido e registrado em
+`partes_ilegiveis`, nunca some em silêncio.
 
 #### Seguro com arquivo hostil
 
@@ -350,11 +351,10 @@ do Office e a preservação das macros. Alguns arquivos `.xlsb` ainda falham na 
 
 **Imagem que não abre não derruba mais o documento do Office**
 
-Um documento do Word, do PowerPoint ou do LibreOffice com uma imagem em formato que o Lince ainda não desenha (EMF e
-WMF, comuns em diagramas colados do Visio e em gráficos copiados do Excel) ou com a imagem corrompida falhava inteiro,
-sem texto nenhum. Agora o documento é lido normalmente: a imagem fica marcada no lugar em que aparecia, com
-o formato (por exemplo `[imagem 1: imagem EMF não lida]`), e entra em `partes_ilegiveis`, para a plataforma saber o
-que ficou de fora.
+Um documento do Word, do PowerPoint ou do LibreOffice com uma imagem que não abre (corrompida, ou EMF e WMF quando o
+desenhista não está instalado, como no Python 3.15) falhava inteiro, sem texto nenhum. Agora o documento é lido
+normalmente: a imagem fica marcada no lugar em que aparecia, com o formato (por exemplo
+`[imagem 1: imagem EMF não lida]`), e entra em `partes_ilegiveis`, para a plataforma saber o que ficou de fora.
 
 #### SVG dentro do Office
 
@@ -391,7 +391,8 @@ desenha. Numa planilha de 100 mil linhas, a leitura caiu de 17 para 7 segundos.
 Junto vieram três correções:
 
 - A imagem numa coluna depois da Z (AA, AB...) passou a vir com a célula certa.
-- A imagem EMF ou WMF colada numa planilha, que antes sumia sem aviso, agora fica marcada como não lida.
+- A imagem EMF ou WMF colada numa planilha, que antes sumia sem aviso, agora entra na leitura (desenhada e lida pela
+  IA, ou marcada como não lida quando o desenhista não está instalado).
 - Planilhas com macro (`.xlsm`) passaram a ter imagens e gráficos lidos como as `.xlsx`.
 
 ### Segurança
