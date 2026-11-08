@@ -593,3 +593,50 @@ def test_teto_de_saida_conta_a_leitura_em_lote_tambem_no_esforco_maximo(tmp_path
     r = leitor.ler(tmp_path / "selos.pdf")
     assert r.markdown.count("Selo z") == 1 and "Anexo com os selos de certificação." in r.markdown  # a que cabe entra
     assert len([p for p in r.cobertura.pendentes if p.endswith("resultado grande demais")]) == 2  # as outras, não
+
+
+def test_teto_de_saida_conta_o_json_do_lote_como_a_montagem_escreve(tmp_path, monkeypatch):
+    from PIL import Image
+
+    import lince.leitor as leitor_mod
+
+    c = canvas.Canvas(str(tmp_path / "selos.pdf"), pagesize=A4)
+    c.drawString(60, 810, "Anexo com os selos de certificação.")
+    for k in range(13):  # treze recortes pequenos: um lote de doze e um lote de um item só
+        Image.new("RGB", (400, 120), (20 * k, 0, 120)).save(tmp_path / f"s{k}.png")
+        c.drawImage(str(tmp_path / f"s{k}.png"), 60 + 260 * (k % 2), 740 - 110 * (k // 2), width=200, height=60)
+    c.save()
+    plano = lince.Leitor().preparar(tmp_path / "selos.pdf")
+    (sozinho,) = [lid for lid, itens in plano.estado["lotes"].items() if len(itens) == 1]
+    # o item vem como lista em JSON compacto: na montagem, ela volta a texto com ", " entre os valores, 1,5x maior
+    respostas = {sozinho: json.dumps({"1": [0] * 10_000}, separators=(",", ":"))}
+    monkeypatch.setattr(leitor_mod, "SAIDA_MAX", 25_000)  # cabe a resposta do lote (20 mil), não o que ela vira
+    r = lince.Leitor().concluir(plano, respostas)
+    assert len(r.markdown) <= 25_000 and "[0, 0" not in r.markdown
+    assert f"{sozinho}: resultado grande demais" in r.cobertura.pendentes
+    assert "Anexo com os selos de certificação." in r.markdown
+    monkeypatch.setattr(leitor_mod, "SAIDA_MAX", 40_000)  # com folga, a leitura entra, e ainda dentro do teto
+    r = lince.Leitor().concluir(plano, respostas)
+    assert "[0, 0" in r.markdown and len(r.markdown) <= 40_000
+
+
+def test_teto_de_saida_conta_o_comentario_e_as_juncoes_de_cada_pagina(tmp_path, monkeypatch):
+    from PIL import Image
+
+    import lince.leitor as leitor_mod
+
+    Image.new("RGB", (800, 400), "navy").save(tmp_path / "f.png")
+    c = canvas.Canvas(str(tmp_path / "longo.pdf"), pagesize=A4)
+    for k in range(300):
+        c.drawString(60, 780, f"Seção {k + 1} do relatório.")
+        if k == 0:
+            c.drawImage(str(tmp_path / "f.png"), 60, 400, width=400, height=200)
+        c.showPage()
+    c.save()
+    ia = lince.FuncaoLeitor(lambda img, i: "Gráfico de barras da moagem anual.", "m")
+    tamanho = len(lince.Leitor(ia=ia, agrupar=False).ler(tmp_path / "longo.pdf").markdown)
+    monkeypatch.setattr(leitor_mod, "SAIDA_MAX", tamanho - 1)  # o texto com a leitura passa do teto por um caractere
+    r = lince.Leitor(ia=ia, agrupar=False).ler(tmp_path / "longo.pdf")
+    assert len(r.markdown) <= tamanho - 1 and "Gráfico de barras" not in r.markdown
+    assert any(p.endswith("resultado grande demais") for p in r.cobertura.pendentes)
+    assert r.markdown.count("do relatório.") == 300  # o texto nativo sai inteiro
