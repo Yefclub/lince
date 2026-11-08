@@ -131,3 +131,29 @@ def test_pict_aninhado_sem_fim_nao_prende_a_leitura():
     inicio = time.monotonic()
     legados.imagens_rtf(hostil)
     assert time.monotonic() - inicio < 5
+
+
+def test_imagem_flutuante_do_word_le_o_pib_e_pula_o_shprslt(tmp_path):
+    hexa = _png("#2561C1").hex().encode()
+    p = tmp_path / "flutuante.rtf"
+    p.write_bytes(
+        b"{\\rtf1\\ansi{\\header {\\shp{\\*\\shpinst\\shpleft0{\\sp{\\sn pib}{\\sv {\\pict\\pngblip "
+        + hexa
+        + b"}}}}{\\shprslt\\par\\pard {\\pict\\wmetafile8\\picw120 010009000003}\\par}}}Corpo.\\par}"
+    )
+    r, vistas = _ler(p)
+    assert len(vistas) == 1 and "WMF" not in r.markdown and not r.metadados.get("partes_ilegiveis")
+
+
+def test_teto_de_imagens_do_cabecalho(tmp_path, monkeypatch):
+    monkeypatch.setattr(legados, "IMAGENS_MAX", 2)
+    picts = b"".join(b"{\\pict\\pngblip " + _png(c).hex().encode() + b"}" for c in ("red", "green", "blue"))
+    achadas, completo = legados.imagens_rtf(b"{\\rtf1{\\header " + picts + b"}}")
+    assert len(achadas) == 2 and completo is False
+    d = Document()
+    for c in ("red", "green", "blue"):
+        d.sections[0].header.paragraphs[0].add_run().add_picture(io.BytesIO(_png(c)), width=Inches(1))
+    p = tmp_path / "muitos.docx"
+    d.save(p)
+    r, vistas = _ler(p)
+    assert len(vistas) == 2 and any("mais de 2" in x for x in r.metadados["partes_ilegiveis"])

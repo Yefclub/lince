@@ -492,7 +492,7 @@ def _fim_do_grupo(s: bytes, i: int) -> int:
 
 
 # \\pict a ler, e os grupos que trazem uma cópia de reserva da mesma imagem (o WMF do \\nonshppict) e são pulados
-_PICT = re.compile(rb"\{\\(?:(pict)|nonshppict|\*\\shprslt)(?![a-z])")
+_PICT = re.compile(rb"\{\\(?:(pict)|nonshppict|(?:\*\\)?shprslt)(?![a-z])")
 _TIPO_PICT = re.compile(rb"\\(pngblip|jpegblip|emfblip|wmetafile|dibitmap)(?![a-z])")
 _MIME_PICT = {b"pngblip": "image/png", b"jpegblip": "image/jpeg", b"emfblip": "image/x-emf",
               b"wmetafile": "image/x-wmf", b"dibitmap": "image/bmp"}  # fmt: skip
