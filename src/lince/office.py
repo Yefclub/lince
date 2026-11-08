@@ -1,6 +1,6 @@
 """Office (DOCX, PPTX, XLSX, ODF, RTF, EPUB, legados): anydoc + gráficos nativos, setas de fluxograma e imagens."""
 
-import hashlib  # noqa: F401
+import hashlib
 import io  # noqa: F401
 import json  # noqa: F401
 import os  # noqa: F401
@@ -9,7 +9,9 @@ import secrets
 import zipfile  # noqa: F401
 from xml.etree import ElementTree as ET  # noqa: F401
 
+from . import legados
 from .limites import xml_ou_nada
+from .metadados import BINARIOS_OLE
 from .seguranca import remover_ocultos, texto_oculto_docx
 
 NS = {
@@ -186,12 +188,14 @@ def planejar_office(path, pasta, ext=None):
     doc = anydoc.to_document(open(path, "rb").read(), format="csv" if ext in (".csv", ".tsv") else None)
     tarefas, ilegiveis = [], []
     svgs, sentinela = [], f"LINCE{secrets.token_hex(8)}S"  # SVGs desenhados juntos no fim, num lote só
+    vistas = set()  # imagens já lidas (sha256): o armazém dos binários não as repete
 
     def ler_imagem(data, mime, onde):
         """A imagem vira tarefa da IA; a que não abre (EMF, WMF, formato quebrado) fica marcada no lugar e
         registrada, nunca derruba o documento. SVG fica com uma marca provisória e é desenhado no fim."""
         from PIL import Image
 
+        vistas.add(hashlib.sha256(data).digest())
         tid = f"img{len(tarefas) + 1:02d}"
         try:
             Image.open(io.BytesIO(data)).convert("RGB").save(f"{pasta}/ia/{tid}.png")
@@ -206,6 +210,24 @@ def planejar_office(path, pasta, ext=None):
         return f"{{{{IA:{tid}}}}}"
 
     md, _ = serializar(doc, ler_imagem)
+    if ext in BINARIOS_OLE:  # o leitor do corpo quase não entrega as imagens do .doc, .xls e .ppt: o armazém, sim
+
+        def imagens_legado():
+            nonlocal md
+            import olefile
+
+            if not olefile.isOleFile(path):  # RTF ou HTML salvo com a extensão antiga: não há armazém
+                return
+            with olefile.OleFileIO(path) as o:
+                achadas, corte = legados.imagens(o, os.path.getsize(path))
+            if corte:
+                ilegiveis.append(f"imagens do documento: {corte}")
+            novas = [(m, d) for m, d in achadas if hashlib.sha256(d).digest() not in vistas and min(_tam(d)) >= 48]
+            if novas:
+                md += "\n\n**Imagens do documento** (o formato não guarda a posição delas no texto):\n\n"
+                md += "\n\n".join(ler_imagem(d, m, f"imagem do documento {n}") for n, (m, d) in enumerate(novas, 1))
+
+        _complemento(imagens_legado, "imagens do documento", ilegiveis)
     seguranca = []
     if ext == ".docx":
         ocultos = texto_oculto_docx(path)

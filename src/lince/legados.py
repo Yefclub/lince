@@ -7,6 +7,7 @@ trabalho (bytes percorridos, copiados e decodificados, textos guardados) sai de 
 stream, então nenhuma estrutura sobreposta ou repetida multiplica o custo."""
 
 import codecs
+import hashlib
 import itertools
 import re
 import struct
@@ -136,6 +137,142 @@ def xls(o, teto) -> dict:
                     orcamento.guardar(bordas, texto)
     saida["bordas"] = list(bordas)
     return saida
+
+
+# ---------- Imagens dos binários (OfficeArt) ----------
+
+# BLIP do OfficeArt (o armazém de imagens do Word, do Excel e do PowerPoint 97-2003): tipo do registro -> (MIME,
+# instância com um UID, bytes de cabeçalho depois do UID). A instância seguinte indica um segundo UID.
+_BLIPS = {0xF01A: ("image/x-emf", (0x3D4,), 34), 0xF01B: ("image/x-wmf", (0x216,), 34),
+          0xF01C: ("image/pict", (0x542,), 34), 0xF01D: ("image/jpeg", (0x46A, 0x6E2), 1),
+          0xF02A: ("image/jpeg", (0x46A, 0x6E2), 1), 0xF01E: ("image/png", (0x6E0,), 1),
+          0xF01F: ("image/bmp", (0x7A8,), 1), 0xF029: ("image/tiff", (0x6E4,), 1)}  # fmt: skip
+# o tipo do registro (byte baixo, depois 0xF0) de cada BLIP: a busca anda em C, não byte a byte
+_CANDIDATO = re.compile(rb"[\x1a-\x1f\x29\x2a]\xf0")
+_MSODRAWINGGROUP, _CONTINUE = 0x00EB, 0x003C
+IMAGENS_MAX = 512  # imagens distintas por arquivo; acima disso é arquivo hostil ou repetição sem fim
+_METAFILE_MAX = 64 * 1024 * 1024  # EMF/WMF guardado comprimido: teto do descomprimido
+_PEDACO = 1024 * 1024  # a descompressão anda neste passo, cobrando o orçamento a cada pedaço
+# onde o OfficeArt guarda as imagens: Pictures no PowerPoint, o Workbook (ou Book, no Excel 5) e, no Word, o Data
+# (imagens em linha), o WordDocument (o armazém das flutuantes) e a tabela, onde há gerador que grava o bloco
+_STREAMS_DE_IMAGEM = ("Pictures", "Workbook", "Book", "Data", "WordDocument", "0Table", "1Table")
+_CABECALHOS_DIB = {12, 40, 52, 56, 64, 108, 124}  # BITMAPCOREHEADER, INFO, V2, V3, OS/2 2, V4 e V5
+
+
+def _blips(b, orcamento):
+    """(MIME, bytes) de cada BLIP do OfficeArt achado em `b`. O cabeçalho do registro é conferido inteiro (versão 0,
+    instância do tipo, tamanho dentro do stream) antes de aceitar; metafile comprimido é descomprimido dentro do
+    orçamento, e o que ele produz é cobrado mesmo quando a imagem é recusada."""
+    pos = 0
+    while m := _CANDIDATO.search(b, pos):
+        k, pos = m.start() - 2, m.start() + 1
+        if k < 0 or k + 8 > len(b):
+            continue
+        vi, tipo, tam = struct.unpack_from("<HHI", b, k)
+        mime, instancias, extra = _BLIPS[tipo]
+        if vi & 0xF or k + 8 + tam > len(b):
+            continue
+        dois_uids = (vi >> 4) - 1 in instancias
+        if vi >> 4 not in instancias and not dois_uids:
+            continue
+        cab = 16 * (2 if dois_uids else 1) + extra
+        if cab > tam:
+            continue
+        orcamento.gastar(tam)
+        dados = b[k + 8 + cab : k + 8 + tam]
+        pos = k + 8 + tam
+        if extra == 34 and b[k + 8 + cab - 2] == 0 and (dados := _inflar(dados, orcamento)) is None:
+            continue  # metafile com DEFLATE quebrado ou além do teto
+        if mime == "image/bmp" and (dados := _bmp_do_dib(dados)) is None:
+            continue
+        yield mime, dados
+
+
+def _inflar(dados, orcamento) -> bytes | None:
+    """Metafile com DEFLATE, descomprimido em pedaços, cada um cobrado do orçamento antes do seguinte: um fluxo que
+    quebra depois de muita saída já pagou o que produziu. None se quebrado ou além de _METAFILE_MAX."""
+    import zlib
+
+    d, partes, total = zlib.decompressobj(), [], 0
+    while True:
+        try:
+            pedaco = d.decompress(dados, _PEDACO)
+        except zlib.error:
+            return None
+        orcamento.gastar(len(pedaco))
+        total += len(pedaco)
+        if total > _METAFILE_MAX:
+            return None  # bomba
+        partes.append(pedaco)
+        if not (dados := d.unconsumed_tail):
+            break
+    try:
+        partes.append(d.flush())  # o resto que o zlib guardou: no máximo uma cópia pendente
+    except zlib.error:
+        return None
+    return b"".join(partes) if d.eof else None  # fluxo cortado antes do fim não é metafile válido
+
+
+def _bmp_do_dib(dib: bytes) -> bytes | None:
+    """O OfficeArt guarda o bitmap sem o cabeçalho de arquivo BMP: o Pillow só abre com ele na frente. Cabeçalho
+    fora do padrão devolve None. O início dos pixels conta a paleta e, no cabeçalho de 40 bytes com BI_BITFIELDS,
+    as máscaras de cor que vêm depois dele."""
+    if len(dib) < 16 or (tam_cab := struct.unpack_from("<I", dib, 0)[0]) not in _CABECALHOS_DIB or tam_cab > len(dib):
+        return None
+    if tam_cab == 12:  # BITMAPCOREHEADER: paleta de 3 bytes por cor
+        bits = struct.unpack_from("<H", dib, 10)[0]
+        paleta = 3 * (1 << bits) if bits <= 8 else 0
+    else:
+        bits = struct.unpack_from("<H", dib, 14)[0]
+        compressao = struct.unpack_from("<I", dib, 16)[0] if tam_cab >= 20 else 0
+        cores = struct.unpack_from("<I", dib, 32)[0] if tam_cab >= 36 else 0
+        if bits <= 8:
+            cores = cores if 0 < cores <= 1 << bits else 1 << bits
+        elif cores > 1 << 16:
+            return None
+        mascaras = {3: 12, 6: 16}.get(compressao, 0) if tam_cab == 40 else 0
+        paleta = 4 * cores + mascaras
+    if 14 + tam_cab + paleta > 14 + len(dib):
+        return None
+    return b"BM" + struct.pack("<IHHI", 14 + len(dib), 0, 0, 14 + tam_cab + paleta) + dib
+
+
+def _desenhos_xls(b, orcamento) -> bytes:
+    """O armazém de imagens do Excel vem em MSODRAWINGGROUP, partido em CONTINUE a cada 8 KB: remonta os pedaços."""
+    partes, juntando = [], False
+    for tipo, d in _registros(b, 0, orcamento):
+        if tipo == _MSODRAWINGGROUP:
+            partes.append(d)
+            juntando = True
+        elif tipo == _CONTINUE and juntando:
+            partes.append(d)
+        else:
+            juntando = False
+    return b"".join(partes)
+
+
+def imagens(o, teto) -> tuple[list[tuple[str, bytes]], str | None]:
+    """Imagens distintas do .doc, .xls ou .ppt (armazém OfficeArt), na ordem em que estão gravadas, e o motivo do
+    corte quando a busca parou antes do fim (teto de imagens ou orçamento esgotado); o que já foi achado fica. A
+    posição no documento não é recuperada: quem chama as põe juntas depois do texto."""
+    vistas, saida = set(), []
+    for nome in _STREAMS_DE_IMAGEM:  # nomes fixos: um arquivo com milhares de streams não multiplica o trabalho
+        if not o.exists(nome):
+            continue
+        try:
+            b = ler_stream(o, nome, teto)
+            orcamento = Orcamento(len(b))
+            if nome in ("Workbook", "Book") and len(b) >= 8 and struct.unpack_from("<H", b, 0)[0] == _BOF:
+                b = _desenhos_xls(b, orcamento)
+            for mime, dados in _blips(b, orcamento):
+                if (marca := hashlib.sha256(dados).digest()) not in vistas and dados:
+                    if len(saida) >= IMAGENS_MAX:  # há mais uma: só agora é corte
+                        return saida, f"mais de {IMAGENS_MAX} imagens: o resto ficou de fora"
+                    vistas.add(marca)
+                    saida.append((mime, dados))
+        except (ValueError, OSError, TypeError) as e:  # stream hostil, cadeia de setores cortada, storage no lugar
+            return saida, f"{type(e).__name__}: {e}"[:200]  # do stream: o que já foi achado fica
+    return saida, None
 
 
 # ---------- PowerPoint 97-2003 ----------

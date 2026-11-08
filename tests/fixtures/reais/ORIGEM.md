@@ -12,6 +12,9 @@ e `NOTICE-Apache-Tika.txt`). Arquivos tirados dos conjuntos de teste públicos d
 | --- | --- |
 | `poi_SampleDoc.docx`, `poi_SimpleMacro.docm`, `poi_SimpleMacro.doc`, `poi_DiffFirstPageHeadFoot.doc`, `poi_HeaderFooterUnicode.doc` | apache/poi `test-data/document/` (mesmo nome, sem o prefixo `poi_`) |
 | `poi_SampleSS.xlsx`, `poi_SimpleMacro.xlsm`, `poi_SimpleMacro.xls`, `poi_sample.xlsb`, `poi_testVarious.xlsb`, `poi_EmbeddedChartHeaderTest.xls`, `poi_47251_1.xls`, `poi_TwoSheetsOneHidden.xls`, `poi_45761.xls`, `poi_60405.xls` | apache/poi `test-data/spreadsheet/` (mesmo nome, sem o prefixo `poi_`) |
+| `poi_vector_image.doc` | apache/poi `test-data/document/vector_image.doc` |
+| `poi_SimpleWithImages.xls` | apache/poi `test-data/spreadsheet/SimpleWithImages.xls` |
+| `poi_pictures.ppt` | apache/poi `test-data/slideshow/pictures.ppt` |
 | `poi_SampleShow.pptx`, `poi_SampleShow.ppt`, `poi_SimpleMacro.pptm`, `poi_SimpleMacro.ppt`, `poi_headers_footers.ppt`, `poi_slide_master.ppt` | apache/poi `test-data/slideshow/` (mesmo nome, sem o prefixo `poi_`) |
 | `test*.*` (PDF, Word, Excel, PowerPoint, ODF, RTF, EPUB, HTML, SVG, CSV, imagens) | apache/tika, pastas `test-documents/` dos módulos de parser, mesmo nome |
 
@@ -41,3 +44,9 @@ Servem para provar o roteamento pela extensão; o formato binário é o mesmo.
 
 `texto.tsv`, `texto.txt`, `texto.md`, `texto.json`, `texto.yaml`, `texto.yml`, `texto.xml`, `texto.tex` (MIT, como o
 resto do repositório).
+
+## Gerados pelo Lince
+
+`lince_imagem_em_linha.doc`: Word 97-2003 com um parágrafo, uma imagem PNG sintética (caixa e círculo coloridos) e
+outro parágrafo, montado com python-docx e convertido para `.doc` pelo LibreOffice. Sem dado de pessoa ou empresa;
+serve para provar que a imagem que o leitor do corpo já entrega não é lida duas vezes.
