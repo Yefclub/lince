@@ -59,6 +59,9 @@ CABECALHOS_MAX = {"x-ia-url": 2048, "x-ia-modelo": 200, "x-ia-chave": 4096}
 ERROS_HTTP = {400: "requisicao-invalida", 404: "rota-inexistente", 405: "metodo-nao-permitido"}
 LISTA_MAX = 200
 ESFORCOS = {"padrao", "max"}
+MODOS = {"leitura", "tarefas"}  # tarefas: o Lince não chama a IA; devolve o que ela precisa ler e monta depois
+PLANO_VALIDADE = 24 * 3600  # plano devolvido no modo tarefas vale um dia para a montagem
+PLANO_MAX = 64 * 1024 * 1024  # plano descompactado (texto e estado do documento): acima disso é hostil
 PRAZO_MIN, PRAZO_MAX = 1, 3600  # segundos por documento; o chat usa poucos, a base não manda prazo
 MIDIA = {
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -161,6 +164,7 @@ class Servico:
         self.retidos: dict[str, int] = {}  # bytes de resultado em memória por cliente (sessões em curso e concluídas)
         self.trava = threading.Lock()
         self.fila = Fila(self._ler, DOCS_SIMULTANEOS)
+        self.segredo_aberto = os.urandom(32)  # sem tokens: o plano só vale nesta instância
 
     # ---------------------------------------------------------------- identidade e limites
     def cliente(self, request: Request) -> str:
@@ -173,6 +177,13 @@ class Servico:
             if any(hmac.compare_digest(dado, t.encode()) for t in self.tokens):
                 return hashlib.sha256(dado).hexdigest()[:16]
         raise Problema(401, "nao-autorizado", "Token ausente ou inválido", cabecalhos={"WWW-Authenticate": "Bearer"})
+
+    def segredo(self, request: Request) -> bytes:
+        """Chave que sela o plano do modo tarefas: derivada do token, vale em qualquer instância que o aceite."""
+        if not self.tokens:
+            return self.segredo_aberto
+        m = re.match(r"Bearer\s+(.+)", request.headers.get("authorization", ""))
+        return hashlib.sha256(b"lince-plano\0" + m.group(1).strip().encode()).digest()
 
     def reservar(self, cliente, n=1) -> bool:
         """Conferir e ocupar as vagas numa só operação: envios paralelos não furam o teto."""
@@ -199,15 +210,19 @@ class Servico:
             doc["estado"], doc["inicio"] = "lendo", time.time()
             cache = CacheComEscopo(self.cache, sessao["cliente"]) if self.cache else None
             leitor = Leitor(ia=sessao["ia"], esforco=sessao["esforco"], cache=cache)
+            if sessao.get("modo") == "tarefas":
+                plano = leitor.preparar(doc["arquivo"])
+                doc["resultado"] = {
+                    "tarefas": plano.para_json()["tarefas"],  # imagem em base64
+                    "pendentes": plano.pendentes,
+                    "plano": selar(sessao["segredo"], sessao["cliente"], plano),
+                }
+                if sessao.get("codigo"):
+                    doc["resultado"].update(_codigo_do_documento(doc))
+                estado = "pronto"
+                return
             r = leitor.ler(doc["arquivo"], prazo=sessao.get("prazo"))
-            doc["resultado"] = {
-                "markdown": r.markdown,
-                "metadados": r.metadados,
-                "cobertura": asdict(r.cobertura),
-                "alertas_injecao": r.alertas_injecao,
-                "uso": [asdict(u) for u in r.uso],
-                "estrutura": r.estrutura,
-            }
+            doc["resultado"] = _resultado_api(r)
             if sessao.get("codigo"):
                 doc["resultado"].update(_codigo_do_documento(doc))
             estado = "pronto"
@@ -302,6 +317,59 @@ class Servico:
                 404, "sessao-nao-encontrada", "Sessão não encontrada", "Não existe, expirou ou é de outro token."
             )
         return x
+
+
+# -------------------------------------------------------------------- plano do modo tarefas
+def selar(segredo: bytes, cliente: str, plano) -> str:
+    """O plano (texto e estado do documento, sem as imagens) compactado e assinado: a montagem não guarda nada no
+    servidor, e só o mesmo token monta, dentro de PLANO_VALIDADE."""
+    import base64
+    import zlib
+
+    corpo = {"v": 1, "c": cliente, "t": time.time(), "estado": plano.estado, "pendentes": plano.pendentes,
+             "tarefas": [t.id for t in plano.tarefas]}  # fmt: skip
+    dados = base64.urlsafe_b64encode(zlib.compress(json.dumps(corpo, ensure_ascii=False).encode(), 6)).decode()
+    return dados + "." + base64.urlsafe_b64encode(hmac.digest(segredo, dados.encode(), "sha256")).decode()
+
+
+def abrir(segredo: bytes, cliente: str, selado: str):
+    """O plano de `selar`, conferido: assinatura, dono, validade e tamanho. Levanta Problema."""
+    import base64
+    import binascii
+    import zlib
+
+    from .tipos import Plano, TarefaVisual
+
+    dados, _, assinatura = (selado or "").partition(".")
+    esperada = base64.urlsafe_b64encode(hmac.digest(segredo, dados.encode(), "sha256")).decode()
+    if not dados or not hmac.compare_digest(assinatura, esperada):
+        raise Problema(
+            422, "plano-invalido", "Plano inválido", "Não veio deste serviço para este token, ou foi alterado."
+        )
+    try:
+        d = zlib.decompressobj()
+        corpo = json.loads(d.decompress(base64.urlsafe_b64decode(dados), PLANO_MAX))
+        if d.unconsumed_tail:
+            raise ValueError("grande demais")
+    except (binascii.Error, zlib.error, ValueError) as e:
+        raise Problema(422, "plano-invalido", "Plano inválido", str(e)[:200]) from None
+    if corpo.get("c") != cliente:
+        raise Problema(422, "plano-invalido", "Plano inválido", "É de outro token.")
+    if time.time() - corpo.get("t", 0) > PLANO_VALIDADE:
+        raise Problema(422, "plano-expirado", "Plano expirado", f"Vale {PLANO_VALIDADE // 3600} h depois da leitura.")
+    tarefas = [TarefaVisual(i, "", b"", "", "", 0) for i in corpo["tarefas"]]
+    return Plano(tarefas, corpo["estado"], corpo["pendentes"])
+
+
+def _resultado_api(r) -> dict:
+    return {
+        "markdown": r.markdown,
+        "metadados": r.metadados,
+        "cobertura": asdict(r.cobertura),
+        "alertas_injecao": r.alertas_injecao,
+        "uso": [asdict(u) for u in r.uso],
+        "estrutura": r.estrutura,
+    }
 
 
 # -------------------------------------------------------------------- representação (contrato)
@@ -444,7 +512,7 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=No
             raise _limite_pendentes()
         reservadas, sessao, form = 1, None, None
         try:
-            form = await request.form(max_files=ARQUIVOS_MAX, max_fields=ARQUIVOS_MAX + 4)
+            form = await request.form(max_files=ARQUIVOS_MAX, max_fields=ARQUIVOS_MAX + 5)
             arquivos = [a for a in form.getlist("arquivo") if hasattr(a, "read")]
             if not arquivos:
                 raise Problema(400, "arquivo-ausente", "Envie ao menos um campo multipart 'arquivo'")
@@ -469,6 +537,13 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=No
                 prazo = int(prazo)
             else:
                 prazo = None
+            modo = str(form.get("modo") or "leitura")
+            if modo not in MODOS:
+                raise Problema(400, "modo-invalido", "modo deve ser 'leitura' ou 'tarefas'")
+            if modo == "tarefas" and (ia is not None or esforco == "max"):
+                raise Problema(
+                    400, "modo-invalido", "No modo tarefas a IA é de quem chama", "Sem X-IA-* e sem esforco=max."
+                )
             pedir_codigo = str(form.get("codigo") or "nao")
             if pedir_codigo not in ("sim", "nao"):
                 raise Problema(400, "codigo-invalido", "codigo deve ser 'sim' ou 'nao'")
@@ -486,8 +561,9 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=No
                         f"{a.filename!r}: aceitos {', '.join(sorted(FORMATOS))}",
                     )
             sessao = await _receber(
-                s, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=pedir_codigo == "sim", prazo=prazo
-            )
+                s, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=pedir_codigo == "sim", prazo=prazo,
+                modo=modo, segredo=s.segredo(request),
+            )  # fmt: skip
         finally:
             if form is not None:
                 await form.close()  # o spool do multipart sai do disco já: o documento foi copiado
@@ -654,6 +730,29 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=No
     async def edicao(request: Request):
         return await {"GET": edicao_arquivo, "HEAD": edicao_arquivo, "DELETE": edicao_apagar}[request.method](request)
 
+    async def montar(request: Request):
+        cliente = s.cliente(request)
+        tamanho = request.headers.get("content-length")
+        if not tamanho or not tamanho.isdigit():
+            raise Problema(411, "tamanho-ausente", "Content-Length obrigatório", "Upload chunked não é aceito.")
+        if int(tamanho) > TAMANHO_MAX:
+            raise Problema(413, "envio-grande", "Envio grande demais", f"Teto de {TAMANHO_MAX // 2**20} MB por envio.")
+        try:
+            pedido = json.loads(await request.body())
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise Problema(400, "montagem-invalida", "O corpo precisa ser JSON", str(e)[:200]) from None
+        respostas = pedido.get("respostas") if isinstance(pedido, dict) else None
+        if not isinstance(respostas, dict) or not all(isinstance(v, str) for v in respostas.values()):
+            raise Problema(400, "montagem-invalida", 'Envie {"plano": ..., "respostas": {id: texto}}')
+        plano = abrir(s.segredo(request), cliente, str(pedido.get("plano") or ""))
+        if not s.reservar(cliente, 1):  # a montagem conta como documento pendente enquanto roda
+            raise _limite_pendentes()
+        try:
+            r = await asyncio.to_thread(Leitor().concluir, plano, respostas)
+        finally:
+            s.liberar(cliente)
+        return JSONResponse(_resultado_api(r))
+
     async def limpeza(app):
         async def laco():
             while True:
@@ -672,6 +771,7 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=No
             Route("/v1/sessoes", sessoes, methods=["GET", "POST"]),
             Route("/v1/sessoes/{id:str}", sessao, methods=["GET", "DELETE"], name="sessao"),
             Route("/v1/edicoes", editar, methods=["POST"]),
+            Route("/v1/montagens", montar, methods=["POST"]),
             Route("/v1/edicoes/{id:str}/arquivo", edicao, methods=["GET", "DELETE"], name="edicao_arquivo"),
         ],
         exception_handlers={Problema: erro_de_contrato, HTTPException: erro_http, Exception: erro_interno},
@@ -703,7 +803,10 @@ async def _varrer(s: Servico, nome, arquivo):
         ) from None
 
 
-async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=False, prazo=None):
+async def _receber(
+    s: Servico, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=False, prazo=None, modo="leitura",
+    segredo=b"",
+):  # fmt: skip
     """Grava o lote, calcula hash e tamanho, aplica a idempotência e põe os documentos na fila."""
     pasta = tempfile.mkdtemp(prefix="lince-api-")
     try:
@@ -732,7 +835,7 @@ async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave
         if sum(d["bytes"] for d in itens) > TAMANHO_MAX:
             raise Problema(413, "envio-grande", "Envio grande demais", f"Teto de {TAMANHO_MAX // 2**20} MB por envio.")
         provedor = getattr(ia, "identidade", None)
-        conteudo = [referencia, esforco, provedor, codigo, [(d["nome"], d["sha256"]) for d in itens], prazo]
+        conteudo = [referencia, esforco, provedor, codigo, [(d["nome"], d["sha256"]) for d in itens], prazo, modo]
         impressao = hashlib.sha256(json.dumps(conteudo).encode()).hexdigest()
         s.limpar()
         if chave_idem:  # repetição ou chave reusada: responde antes de varrer (o envio aceito já foi varrido)
@@ -765,6 +868,8 @@ async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave
                 "esforco": esforco,
                 "prazo": prazo,
                 "codigo": codigo,
+                "modo": modo,
+                "segredo": segredo,
                 "ia": ia,
                 "criada_em": time.time(),
                 "concluida_em": None,

@@ -28,7 +28,7 @@ from .office import planejar_office
 from .pagina_html import planejar_html, planejar_svg
 from .pdf import planejar_pdf
 from .provedores import LeitorVisual
-from .tipos import Cobertura, PrazoEsgotado, Resultado, Uso
+from .tipos import Cobertura, Plano, PrazoEsgotado, Resultado, Uso
 
 TEXTO = {".txt", ".md", ".json", ".yaml", ".yml", ".tex", ".xml"}
 IMAGEM = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
@@ -169,23 +169,69 @@ class Leitor:
             if self.esforco == "max" and self.ia is not None and plano["tipo"] == "pdf" and not _vencido():
                 respostas = distribuir_lotes(plano, respostas)
                 usos += self._segunda_passada(str(caminho), plano, respostas, cobertura)
-            if self.ia is not None:  # resposta vazia não pode virar lacuna silenciosa no documento
-                lidos = distribuir_lotes(plano, respostas)
-                ja = {p.split(":", 1)[0] for p in cobertura.pendentes}
-                # item de um lote que já tem pendência (erro, prazo) não é "resposta vazia"
-                ja |= {tid for lid, itens in (plano.get("lotes") or {}).items() if lid in ja for _, tid in itens}
-                cobertura.pendentes += [
-                    f"{t['id']}: resposta vazia da IA"
-                    for t in plano.get("tarefas_originais", [])
-                    if t["id"] not in ja and not str(lidos.get(t["id"], "")).strip()
-                ]
-            if plano["tipo"] == "imagem":
-                md = "\n\n".join(respostas.get(t["id"], "") for t in plano["tarefas"])
-                meta = dict(plano.get("meta_arquivo") or {})
-            else:
-                md = montar(pasta, respostas)
-                meta = json.loads(Path(f"{pasta}/metadados.json").read_text(encoding="utf-8"))
-            return _com_estrutura(Resultado(md, meta, cobertura, usos), plano)
+            return _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias=self.ia is not None)
+
+    # ------------------------------------------------------------------ em duas fases (a IA é de quem chama)
+    def preparar(self, caminho: str | Path) -> Plano:
+        """Fase 1: extrai o texto e devolve as leituras que a IA precisa fazer, sem chamar modelo nenhum. Quem chama
+        lê cada `TarefaVisual` com o seu modelo (custo, roteamento, cache e cancelamento são dele) e passa as respostas
+        para `concluir`. O teto `max_leituras` vale aqui: o que passar dele fica nas pendências."""
+        from PIL import Image
+
+        from .tipos import TarefaVisual
+
+        with tempfile.TemporaryDirectory(prefix="lince-") as pasta:
+            plano = self.planejar(caminho, pasta)
+            tarefas, pendentes = plano.get("tarefas", []), []
+            if self.max_leituras is not None and len(tarefas) > self.max_leituras:
+                pendentes = [f"{t['id']}: teto de leituras" for t in tarefas[self.max_leituras :]]
+                tarefas = plano["tarefas"] = tarefas[: self.max_leituras]
+            faixas = len(tarefas) if plano["tipo"] == "imagem" else None
+            visuais = []
+            for t in tarefas:
+                img = Path(f"{pasta}/ia/{t['id']}.png").read_bytes()
+                instr = instrucao(t, self.prompt, faixas)
+                with Image.open(f"{pasta}/ia/{t['id']}.png") as im:
+                    w, h = im.size
+                pagina = t.get("pagina")
+                visuais.append(
+                    TarefaVisual(
+                        id=t["id"],
+                        tipo=t["modo"],
+                        imagem=img,
+                        instrucao=instr,
+                        chave=chave(img, instr, "", VERSAO_PROMPT),
+                        tokens_estimados=round(w * h / 750 + len(instr) / 4),
+                        pagina=pagina + 1 if isinstance(pagina, int) else None,
+                        caixa=t.get("caixa"),
+                        onde="" if t["modo"] in ("lote", "pagina") or pagina is not None else t.get("ancora", ""),
+                        itens=[
+                            {"n": it["n"], "tarefa": it["tarefa"], "tipo": it["modo"], "onde": it.get("ancora", "")}
+                            for it in t.get("itens", [])
+                        ],
+                    )
+                )
+        return Plano(visuais, plano, pendentes)
+
+    def concluir(self, plano: Plano, respostas: dict[str, str]) -> Resultado:
+        """Fase 2: monta o resultado com as respostas de quem chamou ({id da tarefa: texto}). Tarefa sem resposta
+        fica pendente ("sem resposta"), com o nativo no lugar; resposta a id que não está no plano é ignorada."""
+        estado = json.loads(json.dumps(plano.estado))  # cópia: o mesmo plano pode ser concluído de novo
+        ids = {t.id for t in plano.tarefas}
+        respostas = {k: v for k, v in (respostas or {}).items() if k in ids and isinstance(v, str)}
+        cobertura = Cobertura(
+            paginas=len(estado.get("paginas", [])) or 1,
+            rotas={p["i"] + 1: p["rota"] for p in estado.get("paginas", [])},
+            leituras_ia=len(respostas),
+        )
+        cobertura.pendentes += estado.get("pendentes", []) + list(plano.pendentes)
+        cobertura.pendentes += [f"{t.id}: sem resposta" for t in plano.tarefas if t.id not in respostas]
+        if estado["tipo"] == "texto":
+            return _com_estrutura(Resultado(estado["md"], estado.get("meta_arquivo", {}), cobertura), estado)
+        with tempfile.TemporaryDirectory(prefix="lince-") as pasta:
+            with open(f"{pasta}/plano.json", "w", encoding="utf-8") as f:
+                json.dump(estado, f, ensure_ascii=False)
+            return _resultado(pasta, estado, respostas, cobertura, [], conferir_vazias=True)
 
     def _ler_tarefas(self, plano, tarefas, pasta, cobertura):
         respostas, usos = {}, []
@@ -352,6 +398,28 @@ def _extensao_lida(caminho: str) -> str:
 
 def _avisar_cache(e):
     logging.getLogger("lince").warning("cache indisponível, lendo sem ele: %s: %s", type(e).__name__, str(e)[:200])
+
+
+def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
+    """O fim da leitura, igual com a IA do Lince ou com a de quem chama: pendência de resposta vazia, montagem do
+    texto e dos metadados, estrutura."""
+    if conferir_vazias:  # resposta vazia não pode virar lacuna silenciosa no documento
+        lidos = distribuir_lotes(plano, respostas)
+        ja = {p.split(":", 1)[0] for p in cobertura.pendentes}
+        # item de um lote que já tem pendência (erro, prazo, sem resposta) não é "resposta vazia"
+        ja |= {tid for lid, itens in (plano.get("lotes") or {}).items() if lid in ja for _, tid in itens}
+        cobertura.pendentes += [
+            f"{t['id']}: resposta vazia da IA"
+            for t in plano.get("tarefas_originais", [])
+            if t["id"] not in ja and not str(lidos.get(t["id"], "")).strip()
+        ]
+    if plano["tipo"] == "imagem":
+        md = "\n\n".join(respostas.get(t["id"], "") for t in plano["tarefas"])
+        meta = dict(plano.get("meta_arquivo") or {})
+    else:
+        md = montar(pasta, respostas)
+        meta = json.loads(Path(f"{pasta}/metadados.json").read_text(encoding="utf-8"))
+    return _com_estrutura(Resultado(md, meta, cobertura, usos), plano)
 
 
 def _com_estrutura(r: Resultado, plano) -> Resultado:

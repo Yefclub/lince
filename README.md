@@ -65,6 +65,23 @@ leitor = lince.Leitor(
   envio de uma imagem grande ou um DNS lento podem passar alguns segundos do prazo. Provedor próprio lê o tempo que sobra em `lince.prazo_restante()` e pode levantar `lince.PrazoEsgotado`.
 - 429 e 5xx do provedor são repetidos com espera exponencial e `Retry-After`.
 - Falha da IA nunca derruba o documento: a leitura nativa fica e a pendência é registrada.
+- `Uso.custo_usd` traz o custo da chamada quando o provedor informa (`usage.cost`, como no OpenRouter).
+
+### Em duas fases: a IA é de quem chama
+
+Para quem já tem controle de custo, modelos e cache próprios, o Lince não precisa chamar IA nenhuma:
+
+```python
+leitor = lince.Leitor()
+plano = leitor.preparar("relatorio.pdf")      # texto extraído + o que a IA precisa ler
+respostas = {t.id: meu_modelo(t.imagem, t.instrucao) for t in plano.tarefas}
+r = leitor.concluir(plano, respostas)         # o mesmo Resultado que sairia com a IA do Lince
+```
+
+Cada `TarefaVisual` traz a imagem (PNG), a instrução, o tipo (imagem, página escaneada, figura, tabela, fórmula ou
+lote de recortes), onde ela está (página e caixa no PDF, `imagem 3` no Office), `chave` (hash da imagem, da instrução
+e da versão do prompt, para o seu cache) e `tokens_estimados`. A tarefa sem resposta fica em `cobertura.pendentes`
+com o texto nativo no lugar. `plano.para_json()` e `lince.Plano.de_json()` levam o plano entre processos.
 
 ## API HTTP
 
@@ -98,6 +115,7 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
 | `GET /v1/sessoes/{id}` | Estado da sessão e de cada documento; o que já terminou vem com `markdown`, `metadados`, `cobertura`, `alertas_injecao`, `uso` (tokens por leitura) e `estrutura`. Aceita `Prefer: wait=N`. |
 | `GET /v1/sessoes?referencia=…` | Sessões do token ainda não entregues, da mais nova para a mais antiga (resumo, sem o conteúdo lido). |
 | `DELETE /v1/sessoes/{id}` | Confirma o recebimento (ou cancela o que ainda não foi lido) e apaga a sessão na hora. |
+| `POST /v1/montagens` | Segunda fase do modo `tarefas`: recebe `{"plano", "respostas": {id: texto}}` e devolve o resultado montado. |
 | `GET /v1/openapi.json`, `GET /saude` | Contrato; serviço no ar e versões. |
 
 - **Idempotência**: repetir o envio com a mesma `Idempotency-Key` antes da entrega devolve a mesma sessão (`200`),
@@ -106,6 +124,9 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   (`urn:lince:erro:<codigo>`) e `instance` igual ao `X-Request-Id`. O `X-Request-Id` enviado volta em toda
   resposta, o que facilita o rastreio entre os dois sistemas.
 - **Sem `X-IA-URL`**: só a extração nativa; o que precisava de IA aparece em `cobertura.pendentes`.
+- **Modo `tarefas`** (`-F modo=tarefas`): o Lince não chama IA. Cada documento volta com `tarefas` (imagem em base64,
+  instrução, onde está, `chave` de cache e `tokens_estimados`) e um `plano` opaco, assinado para o token e válido por
+  24 h. Quem chama lê as imagens com o próprio modelo e manda `POST /v1/montagens`; nada fica guardado no servidor.
 - **Prazo**: com `prazo=20`, cada documento tem 20 s a partir do início da leitura dele (a espera na fila não
   conta; a extração nativa conta, mas não é interrompida); o que a IA não leu a tempo aparece em
   `cobertura.pendentes` como `prazo esgotado`.

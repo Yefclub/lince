@@ -131,7 +131,7 @@ class _Provedor(BaseHTTPRequestHandler):
             {
                 "model": "m",
                 "choices": [{"message": {"content": "Gráfico (barras): Moagem"}}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0012},  # como o OpenRouter manda
             }
         ).encode()
         self.send_response(200)
@@ -160,7 +160,7 @@ def test_limite_do_provedor_e_repetido_e_custo_e_registrado(tmp_path):
     srv.shutdown()
     assert "Gráfico (barras): Moagem" in r.markdown
     assert _Provedor.chamadas == 3  # duas recusas 429 + a leitura
-    assert [c.tokens_saida for c in custos] == [5]
+    assert [(c.tokens_saida, c.custo_usd) for c in custos] == [(5, 0.0012)]
 
 
 def test_cache_nao_paga_a_mesma_leitura_duas_vezes(tmp_path):

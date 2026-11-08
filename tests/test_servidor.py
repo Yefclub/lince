@@ -669,3 +669,65 @@ def test_xlsx_lido_como_codigo_e_editado(api):
     assert r.status_code == 201 and r.json()["codigo"]["abas"][0]["celulas"][0]["valor"] == 15
     novo = openpyxl.load_workbook(io.BytesIO(api.get(r.headers["location"], headers=A).content))
     assert novo["Fretes"]["A1"].value == 15 and novo["Fretes"]["A2"].value == "=A1*2"
+
+
+# ------------------------------------------------------------------ modo tarefas (a IA é de quem chama)
+def _docx_com_imagens():
+    import io
+
+    from docx import Document
+    from docx.shared import Inches
+    from PIL import Image, ImageDraw
+
+    d = Document()
+    d.add_paragraph("Relatório de moagem.")
+    for cor in ("navy", "darkgreen"):
+        im = Image.new("RGB", (600, 300), "white")
+        ImageDraw.Draw(im).rectangle([50, 50, 400, 250], fill=cor)
+        b = io.BytesIO()
+        im.save(b, "PNG")
+        d.add_picture(io.BytesIO(b.getvalue()), width=Inches(3))
+    out = io.BytesIO()
+    d.save(out)
+    return out.getvalue()
+
+
+def _montar(api, corpo, cab=A):
+    return conforme(api.post("/v1/montagens", json=corpo, headers=cab), "/v1/montagens", "post")
+
+
+def test_modo_tarefas_devolve_o_que_ler_e_monta_com_as_respostas(api, tmp_path):
+    import base64
+
+    import lince
+
+    docx = _docx_com_imagens()
+    s = conforme(enviar(api, ("r.docx", docx), {**A, **ESPERA}, modo="tarefas"), "/v1/sessoes", "post").json()
+    preparo = s["itens"][0]["resultado"]
+    assert [t["onde"] for t in preparo["tarefas"]] == ["imagem 1", "imagem 2"]
+    assert all(base64.b64decode(t["imagem"]).startswith(b"\x89PNG") for t in preparo["tarefas"])
+    respostas = {t["id"]: f"Figura {k}." for k, t in enumerate(preparo["tarefas"], 1)}
+    r = _montar(api, {"plano": preparo["plano"], "respostas": respostas}).json()
+    (tmp_path / "r.docx").write_bytes(docx)
+    ordem = iter(["Figura 1.", "Figura 2."])
+    direto = lince.Leitor(ia=lince.FuncaoLeitor(lambda img, instr: next(ordem), "m"), concorrencia=1).ler(
+        tmp_path / "r.docx"
+    )
+    assert r["markdown"] == direto.markdown and r["cobertura"]["pendentes"] == [] and r["uso"] == []
+
+
+def test_plano_alterado_ou_de_outro_token_nao_monta(api):
+    s = enviar(api, ("r.docx", _docx_com_imagens()), {**A, **ESPERA}, modo="tarefas").json()
+    plano = s["itens"][0]["resultado"]["plano"]
+    dados, _, assinatura = plano.partition(".")
+    alterado = dados[:-4] + ("AAAA" if dados[-4:] != "AAAA" else "BBBB") + "." + assinatura
+    for corpo, cab in (({"plano": alterado, "respostas": {}}, A), ({"plano": plano, "respostas": {}}, B)):
+        r = _montar(api, corpo, cab)
+        assert r.status_code == 422 and r.json()["type"] == "urn:lince:erro:plano-invalido"
+    assert _montar(api, {"plano": plano}).status_code == 400  # sem respostas
+
+
+def test_modo_tarefas_nao_aceita_provedor(api, pdf):
+    cab = {**A, "X-IA-URL": "https://exemplo.invalid/v1", "X-IA-Modelo": "m"}
+    r = conforme(enviar(api, ("a.pdf", pdf), cab, modo="tarefas"), "/v1/sessoes", "post")
+    assert r.status_code == 400 and r.json()["type"] == "urn:lince:erro:modo-invalido"
