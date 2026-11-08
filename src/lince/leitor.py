@@ -342,7 +342,7 @@ def _com_estrutura(r: Resultado, plano) -> Resultado:
     r.estrutura = dict(r.metadados.pop("estrutura", None) or {})
     if plano["tipo"] == "pdf":
         r.estrutura["paginas"] = r.cobertura.paginas
-    r.estrutura.update(secoes(r.markdown))
+    r.estrutura.update(secoes(r.markdown, pdf=plano["tipo"] == "pdf"))
     return r
 
 

@@ -141,22 +141,26 @@ def xls(o, teto) -> dict:
 # ---------- PowerPoint 97-2003 ----------
 
 _CONTEINER, _VBA_INFO, _VBA_INFO_ATOM, _CABECALHOS_RODAPES, _CSTRING = 0xF, 0x03FF, 0x0400, 0x0FD9, 0x0FBA
-_USER_EDIT, _PERSIST_DIRECTORY, _EDICOES_MAX, _SLIDE = 0x0FF5, 0x1772, 4096, 0x03EE
+_USER_EDIT, _PERSIST_DIRECTORY, _EDICOES_MAX = 0x0FF5, 0x1772, 4096
+_DOCUMENTO, _LISTA_SLIDES, _SLIDE_PERSIST = 0x03E8, 0x0FF0, 0x03F3
 
 
 def _objetos_vivos(b, usuario, orcamento):
     """Posições dos objetos da versão atual: Current User → último UserEditAtom → diretórios de persistência, do mais
     novo ao mais antigo (MS-PPT 2.3). Assim o salvamento rápido, que deixa versões antigas no stream, não traz macro
-    ou rodapé que já foram apagados. None se a cadeia não fecha: quem chama varre o stream inteiro."""
+    ou rodapé que já foram apagados. Devolve (posições, id persistente do documento), ou None se a cadeia não fecha:
+    quem chama varre o stream inteiro."""
     if len(usuario) < 20:
         return None
-    edicao, vistos, posicoes = struct.unpack_from("<I", usuario, 16)[0], set(), {}
+    edicao, vistos, posicoes, documento = struct.unpack_from("<I", usuario, 16)[0], set(), {}, None
     while edicao and edicao not in vistos and len(vistos) < _EDICOES_MAX:
         vistos.add(edicao)
         orcamento.gastar(36)
         if edicao + 36 > len(b) or struct.unpack_from("<H", b, edicao + 2)[0] != _USER_EDIT:
             return None
-        anterior, diretorio = struct.unpack_from("<II", b, edicao + 16)
+        anterior, diretorio, ref_doc = struct.unpack_from("<III", b, edicao + 16)
+        if documento is None:
+            documento = ref_doc  # docPersistIdRef do UserEditAtom mais novo
         if diretorio + 8 > len(b) or struct.unpack_from("<H", b, diretorio + 2)[0] != _PERSIST_DIRECTORY:
             return None
         fim = min(diretorio + 8 + struct.unpack_from("<I", b, diretorio + 4)[0], len(b))
@@ -170,21 +174,44 @@ def _objetos_vivos(b, usuario, orcamento):
             i += 4 + 4 * quantos
         edicao = anterior
     validas = sorted({p for p in posicoes.values() if p + 8 <= len(b)})
-    return validas or None
+    return (validas, posicoes.get(documento)) if validas else None
+
+
+def _slides_ppt(b, doc, orcamento):
+    """Slides de verdade: SlidePersistAtom (0x03F3) da SlideListWithText de instância 0 do DocumentContainer
+    (MS-PPT 2.4.14.3). O tipo SlideContainer sozinho contaria também o mestre de título e slides apagados que um
+    salvamento rápido deixou mapeados."""
+    if doc is None or doc + 8 > len(b) or struct.unpack_from("<H", b, doc + 2)[0] != _DOCUMENTO:
+        return None
+    i, fim = doc + 8, min(doc + 8 + struct.unpack_from("<I", b, doc + 4)[0], len(b))
+    while i + 8 <= fim:
+        orcamento.gastar(8)
+        ver, tipo, tam = struct.unpack_from("<HHI", b, i)
+        if tipo == _LISTA_SLIDES and ver >> 4 == 0:
+            j, fim_lista, n = i + 8, min(i + 8 + tam, fim), 0
+            while j + 8 <= fim_lista:
+                orcamento.gastar(8)
+                _, t, tt = struct.unpack_from("<HHI", b, j)
+                n += t == _SLIDE_PERSIST
+                j += 8 + tt
+            return n
+        i += 8 + tam
+    return 0  # documento sem lista de slides: apresentação vazia
 
 
 def ppt(o, teto) -> dict:
     """Macro (VBAInfoAtom com fHasMacros) e textos de cabeçalho, rodapé e data dos slides e das anotações."""
     b = ler_stream(o, "PowerPoint Document", teto)
     orcamento = Orcamento(len(b))
-    vivos = _objetos_vivos(b, ler_stream(o, "Current User", teto), orcamento) if o.exists("Current User") else None
+    cadeia = _objetos_vivos(b, ler_stream(o, "Current User", teto), orcamento) if o.exists("Current User") else None
+    vivos, doc = cadeia if cadeia else (None, None)
     if vivos is None:
         pilha = [(0, len(b), None)]
     else:  # cada objeto vivo é um registro: o tamanho dele delimita a varredura
         pilha = [(p, min(p + 8 + struct.unpack_from("<I", b, p + 4)[0], len(b)), None) for p in vivos]
     saida, bordas = {"macro": False}, {}
-    if vivos is not None:  # só com a cadeia de edições: a varredura do stream inteiro contaria versões antigas
-        saida["slides"] = sum(1 for p in vivos if struct.unpack_from("<H", b, p + 2)[0] == _SLIDE)
+    if (slides := _slides_ppt(b, doc, orcamento)) is not None:  # sem a cadeia de edições, não há o que contar
+        saida["slides"] = slides
     while pilha:
         i, fim, pai = pilha.pop()
         while i + 8 <= fim:

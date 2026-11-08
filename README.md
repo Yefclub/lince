@@ -14,7 +14,7 @@ r.markdown          # corpo do documento
 r.metadados         # versão, rodapé, marca d'água, propriedades, comentários, alertas de injeção
 r.cobertura         # rotas por página, leituras pela IA, leituras do cache, pendências
 r.uso               # custo de cada leitura (para o seu ledger)
-r.estrutura         # páginas, slides, abas (e quais são ocultas), seções com a posição no Markdown
+r.estrutura         # páginas, slides, abas (e quais são ocultas), seções com a posição no Markdown (pontos de código)
 ```
 
 ## O que ele faz

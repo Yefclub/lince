@@ -971,7 +971,7 @@
             "description": "Por que `codigo` é nulo."
           },
           "estrutura": {
-            "description": "Para navegar e indexar. `paginas` (PDF), `slides` (apresentações) e `abas` (planilhas, na ordem, com as ocultas marcadas) vêm do próprio arquivo, não do Markdown. `secoes` são os títulos do Markdown com o nível e a posição (`inicio`, em caracteres); `inicio_das_paginas` diz onde cada página do PDF começa no Markdown.",
+            "description": "Para navegar e indexar. `paginas` (PDF), `slides` (apresentações) e `abas` (planilhas, na ordem, com as ocultas marcadas) vêm do próprio arquivo, não do Markdown. `secoes` são os títulos do Markdown (fora de bloco de código) com o nível e a posição; `inicio_das_paginas` (só PDF) diz onde cada página começa no Markdown. Posições (`inicio`) são em pontos de código Unicode, não em unidades UTF-16: em JavaScript, conte por `Array.from(markdown)`. Acima de 2000 títulos, a lista para e `secoes_cortadas` vem `true`.",
             "type": "object",
             "required": [
               "secoes"
@@ -1045,6 +1045,9 @@
                     }
                   }
                 }
+              },
+              "secoes_cortadas": {
+                "type": "boolean"
               }
             }
           }

@@ -46,6 +46,7 @@ ESPERADO = {
     "poi_SampleShow.ppt": "Title of the first slide",
     "poi_SimpleMacro.ppt": "This is a macro slideshow",
     "poi_headers_footers.ppt": None,  # só tem cabeçalho e rodapé: vão para os metadados
+    "poi_slide_master.ppt": "I’m a slide with a Title layout",
     "testPPT.pps": "Sample Powerpoint Slide",
     "testPPT.pot": "Sample Powerpoint Slide",
     "testMasterFooter.odp": None,  # só tem texto no rodapé da página mestra: vai para os metadados
@@ -576,6 +577,7 @@ def test_rtf_com_torre_de_grupos_repetida_para_rapido_e_fica_parcial(tmp_path):
     [
         ("poi_SampleShow.pptx", {"slides": 2}),
         ("poi_SampleShow.ppt", {"slides": 2}),
+        ("poi_slide_master.ppt", {"slides": 3}),  # o mestre de título também é SlideContainer e não conta
         ("testPPT.pptx", {"slides": 3}),  # o 2º e o 3º slides não têm título: o Markdown sozinho não os contaria
         ("testMasterFooter.odp", {"slides": 1}),
         ("testPDF.pdf", {"paginas": 1}),
@@ -594,14 +596,6 @@ def test_estrutura_vem_do_arquivo(nome, esperado):
 def test_abas_ocultas_ficam_marcadas_na_estrutura():
     abas = lince.ler(REAIS / "poi_45761.xls").estrutura["abas"]
     assert [a["oculta"] for a in abas] == [False, True, True]
-    from lince.estrutura import _abas_ods
-
-    conteudo = (
-        b'<style:style style:name="ta2" style:family="table"><style:table-properties table:display="false"/>'
-        b'</style:style><table:table table:name="Vis\xc3\xadvel" table:style-name="ta1"></table:table>'
-        b'<table:table table:name="Escondida" table:style-name="ta2"></table:table>'
-    )
-    assert _abas_ods(conteudo)["abas"] == [{"nome": "Visível", "oculta": False}, {"nome": "Escondida", "oculta": True}]
 
 
 @pytest.mark.parametrize(

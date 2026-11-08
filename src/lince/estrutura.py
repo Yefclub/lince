@@ -1,37 +1,53 @@
 """Estrutura do documento para quem navega ou indexa: páginas, slides, abas e seções do Markdown.
 
 Os números vêm do próprio arquivo, não do Markdown: slide sem título e aba vazia também contam. Estrutura é auxílio:
-arquivo fora do padrão fica sem ela, nunca derruba a leitura."""
+arquivo fora do padrão fica sem ela, nunca derruba a leitura. Posições (`inicio`) são em pontos de código Unicode,
+como `len()` do Python; em JavaScript, conte por `Array.from(texto)` (um emoji ocupa duas unidades UTF-16)."""
 
 import re
 import struct
 import zipfile
 
+from defusedxml.ElementTree import iterparse
+
 from .limites import xml_ou_nada
 
 SECOES_MAX = 2000  # documento com mais títulos que isso é índice de livro: as primeiras bastam para navegar
-_TITULO = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
-_CERCA = re.compile(r"^(```|~~~)")
-_PAGINA = re.compile(r"^<!-- página (\d+) ")
+_TITULO = re.compile(r"(#{1,6})[ \t]+(\S.*?)[ \t]*\r?")  # título ATX; linha quebrada só em \n, como no Markdown
+_CERCA = re.compile(r" {0,3}(`{3,}|~{3,})(.*?)\r?")
+_PAGINA = re.compile(r"<!-- página ([1-9]\d*) · \w+ -->\r?")  # exatamente o que a montagem do PDF escreve
 _PPTX = {".pptx", ".pptm", ".ppsx", ".ppsm"}
 _XLSX = {".xlsx", ".xlsm"}
-_S = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_ODF_TABLE = "{urn:oasis:names:tc:opendocument:xmlns:table:1.0}"
+_ODF_STYLE = "{urn:oasis:names:tc:opendocument:xmlns:style:1.0}"
 
 
-def secoes(md: str) -> dict:
-    """Títulos do Markdown (fora de bloco de código) com nível e posição, e onde começa cada página do PDF."""
-    titulos, paginas, pos, cerca = [], [], 0, None
-    for linha in md.splitlines(keepends=True):
-        if m := _CERCA.match(linha):
-            cerca = None if cerca == m.group(1) else (cerca or m.group(1))
-        elif cerca is None:
-            if (m := _TITULO.match(linha)) and len(titulos) < SECOES_MAX:
+def secoes(md: str, pdf: bool = False) -> dict:
+    """Títulos do Markdown fora de bloco de código (cercas pela regra do CommonMark), com nível e posição. No PDF,
+    também onde começa cada página: o marcador é do próprio Lince e fecha qualquer cerca deixada aberta (uma resposta
+    da IA cortada no teto não apaga as âncoras das páginas seguintes)."""
+    titulos, paginas, pos, cerca = [], [], 0, None  # cerca aberta: (caractere, tamanho)
+    cortadas = False
+    for linha in md.split("\n"):
+        if pdf and (m := _PAGINA.fullmatch(linha)):
+            paginas.append({"pagina": int(m.group(1)), "inicio": pos})
+            cerca = None
+        elif m := _CERCA.fullmatch(linha):
+            marca, resto = m.group(1), m.group(2)
+            if cerca is None:
+                if not (marca[0] == "`" and "`" in resto):  # ```x``` na linha é código inline, não cerca
+                    cerca = (marca[0], len(marca))
+            elif marca[0] == cerca[0] and len(marca) >= cerca[1] and not resto.strip():
+                cerca = None  # fecha só com o mesmo caractere, pelo menos o mesmo tamanho e sem texto depois
+        elif cerca is None and (m := _TITULO.fullmatch(linha)):
+            if len(titulos) < SECOES_MAX:
                 titulos.append({"titulo": m.group(2), "nivel": len(m.group(1)), "inicio": pos})
-            elif m := _PAGINA.match(linha):
-                paginas.append({"pagina": int(m.group(1)), "inicio": pos})
-        pos += len(linha)
+            else:
+                cortadas = True
+        pos += len(linha) + 1
     saida = {"secoes": titulos}
+    if cortadas:
+        saida["secoes_cortadas"] = True
     if paginas:
         saida["inicio_das_paginas"] = paginas
     return saida
@@ -42,15 +58,17 @@ def estrutura_arquivo(path, ext) -> dict:
     try:
         with zipfile.ZipFile(path) as z:
             if ext in _PPTX:
-                return {"slides": sum(1 for n in z.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", n))}
+                raiz = xml_ou_nada(z.read("ppt/presentation.xml"))
+                if raiz is None:
+                    return {}
+                return {"slides": sum(1 for el in raiz.iter() if el.tag.endswith("}sldId"))}  # a lista que vale
             if ext in _XLSX:
-                return _abas_xlsx(z)
+                return _abas_xlsx(z.read("xl/workbook.xml"))
             if ext == ".xlsb":
                 return _abas_xlsb(z.read("xl/workbook.bin"))
-            if ext == ".ods":
-                return _abas_ods(z.read("content.xml"))
-            if ext == ".odp":
-                return {"slides": z.read("content.xml").count(b"<draw:page ")}
+            if ext in (".ods", ".odp"):
+                with z.open("content.xml") as f:
+                    return _odf(f, ext)
     except MemoryError:
         raise
     except Exception:  # noqa: BLE001 — sem estrutura, a leitura segue igual
@@ -58,15 +76,16 @@ def estrutura_arquivo(path, ext) -> dict:
     return {}
 
 
-def _abas_xlsx(z) -> dict:
-    raiz = xml_ou_nada(z.read("xl/workbook.xml"))
+def _abas_xlsx(dados) -> dict:
+    raiz = xml_ou_nada(dados)
     if raiz is None:
         return {}
-    abas = [
+    abas = [  # pelo nome local: vale também no OOXML Strict, que usa outro namespace
         {"nome": s.get("name", ""), "oculta": s.get("state") in ("hidden", "veryHidden")}
-        for s in raiz.iter(f"{_S}sheet")
+        for s in raiz.iter()
+        if s.tag.endswith("}sheet")
     ]
-    return {"abas": abas}
+    return {"abas": abas} if abas else {}
 
 
 def _abas_xlsb(b: bytes) -> dict:
@@ -100,24 +119,26 @@ def _abas_xlsb(b: bytes) -> dict:
     return {"abas": abas} if abas else {}
 
 
-def _abas_ods(c: bytes) -> dict:
-    """Nomes das tabelas do content.xml; oculta quando o estilo dela tem table:display="false". Por regex nos bytes:
-    a planilha pode ser enorme e só os atributos interessam."""
-    ocultos = {
-        m.group(1)
-        for m in re.finditer(
-            rb'<style:style style:name="([^"]+)" style:family="table"[^>]*>(.*?)</style:style>', c, re.S
-        )
-        if b'table:display="false"' in m.group(2)
-    }
-    abas = []
-    for m in re.finditer(rb"<table:table ([^>]*)>", c):
-        attrs = dict(re.findall(rb'([\w:-]+)="([^"]*)"', m.group(1)))
-        if b"table:name" in attrs:
-            abas.append(
-                {
-                    "nome": attrs[b"table:name"].decode("utf-8", "replace"),
-                    "oculta": attrs.get(b"table:style-name") in ocultos,
-                }
-            )
+def _odf(arquivo, ext) -> dict:
+    """content.xml em leitura incremental (expat: linear, sem expansão de entidades), limpando cada elemento: a
+    planilha pode ser enorme e só os nomes das tabelas e os estilos que as escondem interessam."""
+    ocultos, abas, slides, estilo = set(), [], 0, None
+    for evento, el in iterparse(arquivo, events=("start", "end")):
+        if evento == "start":
+            if el.tag == f"{_ODF_STYLE}style" and el.get(f"{_ODF_STYLE}family") == "table":
+                estilo = el.get(f"{_ODF_STYLE}name")
+            elif el.tag == f"{_ODF_STYLE}table-properties" and estilo and el.get(f"{_ODF_TABLE}display") == "false":
+                ocultos.add(estilo)
+            elif el.tag == f"{_ODF_TABLE}table" and ext == ".ods":
+                nome = el.get(f"{_ODF_TABLE}name")
+                if nome is not None:
+                    abas.append({"nome": nome, "oculta": el.get(f"{_ODF_TABLE}style-name") in ocultos})
+            elif el.tag == "{urn:oasis:names:tc:opendocument:xmlns:drawing:1.0}page":
+                slides += 1
+            continue
+        if el.tag == f"{_ODF_STYLE}style":
+            estilo = None
+        el.clear()
+    if ext == ".odp":
+        return {"slides": slides}
     return {"abas": abas} if abas else {}
