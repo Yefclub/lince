@@ -279,6 +279,8 @@ def tamanho_da_saida(e, respostas) -> int:
 
     def leitura(tid):
         tid = e.get("iguais", {}).get(tid, tid)
+        if tid in respostas:  # já dividida por item (esforço máximo, releitura): o lote não está mais nas respostas
+            return len(respostas[tid]) + 64
         return len(respostas.get(lote_de.get(tid, tid), "")) + 64
 
     total = len(e.get("md", "")) + sum(len(x) for x in e.get("extras", []))

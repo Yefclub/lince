@@ -569,3 +569,24 @@ def test_leitura_copiada_alem_do_teto_de_saida_fica_pendente_e_o_texto_nativo_sa
     r = lince.Leitor(ia=ia, agrupar=False).ler(arq)
     assert "Logo z" not in r.markdown and "Anexo do contrato de fornecimento." in r.markdown
     assert any(p.endswith("resultado grande demais") for p in r.cobertura.pendentes)
+
+
+def test_teto_de_saida_conta_a_leitura_em_lote_tambem_no_esforco_maximo(tmp_path, monkeypatch):
+    from PIL import Image
+
+    import lince.leitor as leitor_mod
+
+    c = canvas.Canvas(str(tmp_path / "selos.pdf"), pagesize=A4)
+    c.drawString(60, 800, "Anexo com os selos de certificação.")
+    for k, cor in enumerate(("navy", "darkred", "darkgreen")):  # três recortes pequenos: viram um lote
+        Image.new("RGB", (400, 120), cor).save(tmp_path / f"s{k}.png")
+        c.drawImage(str(tmp_path / f"s{k}.png"), 60, 600 - 200 * k, width=200, height=60)
+    c.save()
+    ia = lince.FuncaoLeitor(lambda img, i: json.dumps({str(n): "Selo " + "z" * 5000 for n in range(1, 13)}), "m")
+    leitor = lince.Leitor(ia=ia, esforco="max")  # no esforço máximo, a resposta do lote já chega dividida por item
+    r = leitor.ler(tmp_path / "selos.pdf")
+    assert r.markdown.count("Selo z") == 3 and r.cobertura.leituras_ia == 1  # uma chamada leu os três
+    monkeypatch.setattr(leitor_mod, "SAIDA_MAX", 10_000)  # três leituras de 5 KB passam de 10 mil caracteres
+    r = leitor.ler(tmp_path / "selos.pdf")
+    assert "Selo z" not in r.markdown and "Anexo com os selos de certificação." in r.markdown
+    assert any(p.endswith("resultado grande demais") for p in r.cobertura.pendentes)
