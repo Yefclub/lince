@@ -11,7 +11,6 @@ import argparse
 import datetime
 import hashlib
 import io
-import resource
 import sys
 import tempfile
 import threading
@@ -152,6 +151,10 @@ def planilha_grande(pasta, linhas):
 
 
 def _rss_mb():
+    try:
+        import resource
+    except ImportError:  # Windows: sem o pico de memória do processo
+        return 0
     pico = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return pico / 1024 / (1024 if sys.platform == "darwin" else 1)  # bytes no macOS, KiB no Linux
 

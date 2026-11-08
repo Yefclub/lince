@@ -154,3 +154,138 @@ def test_pptx_fonte_minuscula_e_cor_do_fundo(tmp_path):
 
     assert _pptx(tmp_path, minuscula)
     assert _pptx(tmp_path, branca)
+
+
+def _visivel(p, *trechos):
+    r = lince.ler(p)
+    return all(t in r.markdown for t in trechos) and "texto_oculto_removido" not in r.metadados
+
+
+def test_texto_branco_em_celula_escura_ou_de_tabela_com_estilo_e_visivel(tmp_path):
+    def monta(d):
+        escura = d.add_table(rows=1, cols=1).cell(0, 0)
+        shd = etree.SubElement(escura._tc.get_or_add_tcPr(), qn("w:shd"))
+        shd.set(qn("w:val"), "clear")
+        shd.set(qn("w:fill"), "1F3864")
+        escura.paragraphs[0].add_run("Cabeçalho branco sobre azul").font.color.rgb = RGBColor(255, 255, 255)
+        t = d.add_table(rows=1, cols=1)
+        t.cell(0, 0).paragraphs[0].add_run("Branco pintado pelo estilo").font.color.rgb = RGBColor(255, 255, 255)
+        estilo = etree.SubElement(t._tbl.tblPr, qn("w:tblStyle"))
+        estilo.set(qn("w:val"), "GradeEscura")  # o estilo pode pintar a célula: o fundo é incerto
+
+    assert _visivel(_docx(tmp_path, monta), "Cabeçalho branco sobre azul", "Branco pintado pelo estilo")
+
+
+def test_cor_do_tema_com_tom_vale_a_cor_gravada(tmp_path):
+    def monta(d):
+        cor = etree.SubElement(d.add_paragraph().add_run("Cinza do tema escurecido")._r.get_or_add_rPr(), qn("w:color"))
+        cor.set(qn("w:val"), "7F7F7F")
+        cor.set(qn("w:themeColor"), "background1")
+        cor.set(qn("w:themeShade"), "80")  # Branco, Plano de Fundo 1, Mais Escuro 50%: cinza visível
+
+    assert _visivel(_docx(tmp_path, monta), "Cinza do tema escurecido")
+
+
+def test_oculto_pelo_estilo_normal_sem_pstyle(tmp_path):
+    def monta(d):
+        d.styles["Normal"].font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+        d.add_paragraph(INJECAO)
+
+    d = Document()
+    monta(d)
+    t = d.add_paragraph().add_run("Texto visível do contrato de fornecimento.")
+    t.font.color.rgb = RGBColor(0, 0, 0)
+    p = tmp_path / "normal.docx"
+    d.save(p)
+    assert _oculto_saiu(p)
+
+
+def test_pptx_texto_branco_sobre_fundo_de_imagem_ou_forma_com_estilo_fica(tmp_path):
+    import io as _io
+
+    from PIL import Image as _Image
+    from pptx.oxml.ns import qn as pqn
+
+    def fundo_imagem(prs, s):
+        foto = _io.BytesIO()
+        _Image.new("RGB", (100, 100), "black").save(foto, "PNG")
+        s.shapes.add_picture(foto, 0, 0, prs.slide_width, prs.slide_height)
+        bg = etree.SubElement(s._element.find(pqn("p:cSld")), pqn("p:bg"))
+        s._element.find(pqn("p:cSld")).insert(0, bg)
+        pr = etree.SubElement(bg, pqn("p:bgPr"))
+        etree.SubElement(pr, pqn("a:blipFill"))
+        etree.SubElement(pr, pqn("a:effectLst"))
+        caixa = s.shapes.add_textbox(Inches(1), Inches(3), Inches(6), Inches(1)).text_frame.paragraphs[0].add_run()
+        caixa.text = "Legenda branca sobre a foto"
+        caixa.font.color.rgb = PRGB(0xFF, 0xFF, 0xFF)
+
+    prs = Presentation()
+    fundo_imagem(prs, prs.slides.add_slide(prs.slide_layouts[6]))
+    s = prs.slides.add_slide(prs.slide_layouts[6])  # fundo branco: o que decide é a forma
+    forma = s.shapes.add_shape(1, Inches(1), Inches(5), Inches(4), Inches(1))  # retângulo: o tema pinta de accent1
+    run = forma.text_frame.paragraphs[0].add_run()
+    run.text, run.font.color.rgb = "Botão branco", PRGB(0xFF, 0xFF, 0xFF)
+    caixa = s.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
+    sem = caixa._element.spPr.find(pqn("a:noFill"))
+    sem.addprevious(etree.Element(pqn("a:blipFill")))  # caixa preenchida com imagem no lugar de "sem preenchimento"
+    sem.getparent().remove(sem)
+    run = caixa.text_frame.paragraphs[0].add_run()
+    run.text, run.font.color.rgb = "Texto branco sobre a textura", PRGB(0xFF, 0xFF, 0xFF)
+    p = tmp_path / "foto.pptx"
+    prs.save(p)
+    assert _visivel(p, "Legenda branca sobre a foto", "Botão branco", "Texto branco sobre a textura")
+
+
+def test_pptx_forma_em_grupo_nao_e_tomada_como_fora_do_slide(tmp_path):
+    prs = Presentation()
+    s = prs.slides.add_slide(prs.slide_layouts[6])
+    longe = Emu(prs.slide_width * 3)
+    grupo = s.shapes.add_group_shape()
+    grupo.shapes.add_textbox(longe + Inches(1), Inches(1), Inches(3), Inches(1)).text_frame.text = "Texto do grupo"
+    xfrm = grupo._element.grpSpPr.get_or_add_xfrm()
+    xfrm.get_or_add_off().x, xfrm.get_or_add_off().y = 0, 0
+    xfrm.get_or_add_chOff().x, xfrm.get_or_add_chOff().y = longe, 0  # o grupo traz o interno de volta ao slide
+    p = tmp_path / "grupo.pptx"
+    prs.save(p)
+    assert _visivel(p, "Texto do grupo")
+
+
+def test_midia_com_crc_errado_nao_derruba_a_apresentacao(tmp_path):
+    import io as _io
+
+    from PIL import Image as _Image
+
+    prs = Presentation()
+    s = prs.slides.add_slide(prs.slide_layouts[5])
+    s.shapes.title.text = "Resultados do trimestre"
+    foto = _io.BytesIO()
+    _Image.new("RGB", (200, 100), "navy").save(foto, "PNG")
+    s.shapes.add_picture(foto, Inches(1), Inches(2))
+    p = tmp_path / "crc.pptx"
+    prs.save(p)
+    dados = bytearray(p.read_bytes())
+    i = dados.rfind(b"ppt/media/image1.png")  # a última ocorrência é a do diretório central: estraga o CRC lá
+    dados[dados.rfind(b"PK\x01\x02", 0, i) + 16] ^= 0xFF
+    p.write_bytes(bytes(dados))
+    assert "Resultados do trimestre" in lince.ler(p).markdown  # a cópia com as marcas de slide não quebra a leitura
+
+
+def test_cadeia_de_estilos_enorme_nao_custa_quadratico(tmp_path):
+    import time
+
+    d = Document()
+    estilos = d.styles.element
+    for k in range(3000):
+        st = etree.SubElement(estilos, qn("w:style"))
+        st.set(qn("w:type"), "paragraph")
+        st.set(qn("w:styleId"), f"E{k}")
+        if k:
+            etree.SubElement(st, qn("w:basedOn")).set(qn("w:val"), f"E{k - 1}")
+    for _ in range(2000):
+        par = d.add_paragraph("linha")
+        etree.SubElement(par._p.get_or_add_pPr(), qn("w:pStyle")).set(qn("w:val"), "E2999")
+    p = tmp_path / "cadeia.docx"
+    d.save(p)
+    inicio = time.monotonic()
+    seguranca.texto_oculto_docx(p)
+    assert time.monotonic() - inicio < 5

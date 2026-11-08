@@ -20,7 +20,6 @@ from pathlib import Path
 from lxml import etree
 
 from ._prazo import prazo_restante
-from ._trava import sem_pdfium
 
 LADO_PX = 1600  # o lado maior do desenho: legível para a IA sem gerar imagem enorme
 LADO_MIN_PX = 800  # desenho pequeno é ampliado até aqui (4x o tamanho declarado, no máximo LADO_PX)
@@ -158,14 +157,13 @@ def desenhar_lote(itens) -> list[str]:
         if (sobra := teto - (time.monotonic() - inicio)) <= 0:
             break
         try:
-            with sem_pdfium():  # o desenho não usa a PDFium: os outros documentos seguem enquanto ele roda
-                fim = subprocess.run(  # noqa: S603 — o próprio Python e um script do pacote; o SVG vai pela entrada
-                    [sys.executable, "-I", str(FILHO)],
-                    input=json.dumps(trabalho[k:]),
-                    capture_output=True,
-                    text=True,
-                    timeout=sobra,
-                )
+            fim = subprocess.run(  # noqa: S603 — o próprio Python e um script do pacote; o desenho vai pela entrada
+                [sys.executable, "-I", str(FILHO)],
+                input=json.dumps(trabalho[k:]),
+                capture_output=True,
+                text=True,
+                timeout=sobra,
+            )
             saida, morreu, cortado = fim.stdout, fim.returncode != 0, False
         except subprocess.TimeoutExpired as e:  # o run mata o filho; o que ele já concluiu vale
             saida = e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout or ""

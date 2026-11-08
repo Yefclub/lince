@@ -731,3 +731,48 @@ def test_modo_tarefas_nao_aceita_provedor(api, pdf):
     cab = {**A, "X-IA-URL": "https://exemplo.invalid/v1", "X-IA-Modelo": "m"}
     r = conforme(enviar(api, ("a.pdf", pdf), cab, modo="tarefas"), "/v1/sessoes", "post")
     assert r.status_code == 400 and r.json()["type"] == "urn:lince:erro:modo-invalido"
+
+
+def _pdf_com_desenho():
+    import io
+
+    c_buf = io.BytesIO()
+    c = canvas.Canvas(c_buf, pagesize=A4)
+    c.drawString(60, 780, "Moagem anual por unidade, em mil toneladas.")
+    for k, h in enumerate((120, 200, 80)):  # gráfico de barras vetorial
+        c.rect(100 + 60 * k, 400, 40, h, fill=1)
+    c.save()
+    return c_buf.getvalue()
+
+
+def test_modo_tarefas_com_pdf_segue_o_contrato_e_respeita_o_prazo(api, monkeypatch):
+    import lince.pdf
+
+    s = conforme(enviar(api, ("g.pdf", _pdf_com_desenho()), {**A, **ESPERA}, modo="tarefas"), "/v1/sessoes", "post")
+    preparo = s.json()["itens"][0]["resultado"]
+    assert preparo["tarefas"] and {t["tipo"] for t in preparo["tarefas"]} <= {"desenho", "imagem", "lote"}
+    monkeypatch.setattr(lince.pdf, "PAGINAS_ANALISE_MAX", 0)  # o teto (como o prazo) vem nas pendências do preparo
+    s = enviar(api, ("g.pdf", _pdf_com_desenho()), {**A, **ESPERA}, modo="tarefas").json()
+    assert any("teto de 0 páginas" in p for p in s["itens"][0]["resultado"]["pendentes"])
+
+
+def test_plano_vencido_grande_ou_forjado_nao_monta(api, monkeypatch):
+    import hashlib
+
+    import lince.servidor as srv
+    from lince.tipos import Plano
+
+    s = enviar(api, ("r.docx", _docx_com_imagens()), {**A, **ESPERA}, modo="tarefas").json()
+    plano = s["itens"][0]["resultado"]["plano"]
+    monkeypatch.setattr(srv, "PLANO_VALIDADE", -1)
+    r = _montar(api, {"plano": plano, "respostas": {}})
+    assert r.status_code == 422 and r.json()["type"] == "urn:lince:erro:plano-expirado"
+    monkeypatch.undo()
+    segredo = hashlib.sha256(b"lince-plano\0token-a").digest()  # quem tem o token assina o que quiser
+    cliente = hashlib.sha256(b"token-a").hexdigest()[:16]
+    forjado = srv.selar(segredo, cliente, Plano([], {"tipo": "pdf", "paginas": [{"rota": "x"}]}, []))
+    r = _montar(api, {"plano": forjado, "respostas": {}})
+    assert r.status_code == 422 and r.json()["type"] == "urn:lince:erro:plano-invalido"  # 422, nunca 500
+    monkeypatch.setattr(srv, "PLANO_MAX", 10)
+    s = enviar(api, ("r.docx", _docx_com_imagens()), {**A, **ESPERA}, modo="tarefas").json()
+    assert s["itens"][0]["estado"] == "falhou" and "acima do teto" in s["itens"][0]["erro"]

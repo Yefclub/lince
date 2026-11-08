@@ -657,6 +657,7 @@ def rtf(dados: bytes, ler_rtf) -> tuple[list[str], bool]:
 
 # ---------------------------------------------------------------------------------------------------- XLSB tolerante
 _XLSB_CELULAS_MAX = 500_000  # o mesmo teto de células do documento da leitura em fluxo do .xlsx
+_XLSB_COLUNAS_MAX = 16_384  # a última coluna do Excel (XFD): coluna maior que isso é arquivo hostil
 
 
 def _registros_xlsb(b: bytes):
@@ -701,12 +702,12 @@ def _rk(v):
     return x / 100 if v & 1 else x
 
 
-def xlsb_tolerante(path) -> tuple[list[tuple[str, list[list[str]]]], bool]:
-    """Abas visíveis do .xlsb e as linhas de cada uma, lidas registro a registro, para quando o leitor do corpo
-    recusa o arquivo: linha (BrtRowHdr), células de valor e de fórmula com o resultado guardado, e as strings
-    compartilhadas. Devolve também se o teto de células cortou algo."""
+def xlsb_tolerante(path) -> tuple[list[tuple[str, dict[int, dict[int, object]]]], bool]:
+    """Abas visíveis do .xlsb, cada uma como {linha: {coluna: valor}}, lidas registro a registro, para quando o
+    leitor do corpo recusa o arquivo: linha (BrtRowHdr), células de valor e de fórmula com o resultado guardado, e
+    as strings compartilhadas. Coluna além da última do Excel é ignorada, e o teto conta o retângulo que a tabela
+    ocuparia (linhas x largura), não só os registros. Devolve também se o teto cortou algo."""
     import posixpath
-    import re
     import zipfile
 
     from lxml import etree
@@ -720,8 +721,8 @@ def xlsb_tolerante(path) -> tuple[list[tuple[str, list[list[str]]]], bool]:
                     sst.append(_texto_largo(d, 1)[0])
         rels = {}
         if "xl/_rels/workbook.bin.rels" in nomes:
-            raiz = etree.fromstring(z.read("xl/_rels/workbook.bin.rels"), etree.XMLParser(resolve_entities=False))
-            for r in raiz:
+            parser = etree.XMLParser(resolve_entities=False, no_network=True, load_dtd=False)
+            for r in etree.fromstring(z.read("xl/_rels/workbook.bin.rels"), parser):
                 rels[r.get("Id")] = posixpath.normpath(posixpath.join("xl", r.get("Target") or ""))
         abas = []
         for tipo, d in _registros_xlsb(z.read("xl/workbook.bin")):
@@ -736,25 +737,24 @@ def xlsb_tolerante(path) -> tuple[list[tuple[str, list[list[str]]]], bool]:
                     abas.append((nome, rels.get(rid)))
         saida, total, cortado = [], 0, False
         for nome, parte in abas:
-            if parte not in nomes or not re.search(r"\.bin$", parte):
+            if parte not in nomes:
                 continue
-            linhas, linha = {}, None
+            linhas, linha, largura = {}, None, 0
             for tipo, d in _registros_xlsb(z.read(parte)):
                 if tipo == 0x00 and len(d) >= 4:  # BrtRowHdr
                     linha = linhas.setdefault(struct.unpack_from("<I", d, 0)[0], {})
                     continue
                 if linha is None or not 1 <= tipo <= 11 or len(d) < 8:
                     continue
-                if total >= _XLSB_CELULAS_MAX:
-                    cortado = True
-                    break
                 col, v = struct.unpack_from("<I", d, 0)[0], d[8:]
-                if tipo in (2,) and len(v) >= 4:
+                if col >= _XLSB_COLUNAS_MAX:
+                    continue
+                if tipo == 2 and len(v) >= 4:
                     valor = _rk(struct.unpack_from("<I", v, 0)[0])
                 elif tipo in (5, 9) and len(v) >= 8:
                     valor = struct.unpack_from("<d", v, 0)[0]
                 elif tipo in (4, 10) and v:
-                    valor = "TRUE" if v[0] else "FALSE"
+                    valor = bool(v[0])
                 elif tipo == 7 and len(v) >= 4:
                     k = struct.unpack_from("<I", v, 0)[0]
                     valor = sst[k] if k < len(sst) else ""
@@ -762,14 +762,14 @@ def xlsb_tolerante(path) -> tuple[list[tuple[str, list[list[str]]]], bool]:
                     valor = _texto_largo(v, 0)[0]
                 else:
                     continue
-                if isinstance(valor, float) and valor.is_integer():
-                    valor = int(valor)
-                linha[col] = " ".join(str(valor).split())
-                total += 1
-            if linhas:
-                largura = max((max(c) + 1 for c in linhas.values() if c), default=0)
-                tabela = [[linhas[r].get(c, "") for c in range(largura)] for r in sorted(linhas) if linhas[r]]
-                saida.append((nome, tabela))
+                nova = max(largura, col + 1)
+                if total + nova * (len(linhas) or 1) > _XLSB_CELULAS_MAX:  # o retângulo que a tabela ocuparia
+                    cortado = True
+                    break
+                linha[col], largura = valor, nova
+            if any(linhas.values()):
+                saida.append((nome, linhas))
+                total += largura * len(linhas)
             if cortado:
                 break
     return saida, cortado

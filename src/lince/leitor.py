@@ -131,7 +131,8 @@ class Leitor:
                 if p["aba"] is None and len(visiveis) == 1:
                     p["aba"] = visiveis[0]
             estrutura["perfil_tabular"] = perfis
-        plano["iguais"] = _deduplicar(plano, pasta)  # a mesma imagem (logo em todo slide) é lida uma vez
+        # a mesma imagem (logo em todo slide) é lida uma vez; faixas de uma imagem avulsa são partes dela, não cópias
+        plano["iguais"] = _deduplicar(plano, pasta) if plano["tipo"] != "imagem" else {}
         plano["tarefas_originais"] = list(plano.get("tarefas", []))
         if self.agrupar and plano["tipo"] in ("pdf", "office"):
             plano["tarefas"], plano["lotes"] = agrupar(plano["tarefas"], pasta)
@@ -175,10 +176,20 @@ class Leitor:
             return _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias=self.ia is not None)
 
     # ------------------------------------------------------------------ em duas fases (a IA é de quem chama)
-    def preparar(self, caminho: str | Path) -> Plano:
+    def preparar(self, caminho: str | Path, prazo: float | None = None) -> Plano:
         """Fase 1: extrai o texto e devolve as leituras que a IA precisa fazer, sem chamar modelo nenhum. Quem chama
         lê cada `TarefaVisual` com o seu modelo (custo, roteamento, cache e cancelamento são dele) e passa as respostas
-        para `concluir`. O teto `max_leituras` vale aqui: o que passar dele fica nas pendências."""
+        para `concluir`. O teto `max_leituras` vale aqui: o que passar dele fica nas pendências. `prazo` vale para a
+        extração, como em `ler`: no PDF, a página que começa depois dele entra só com o texto."""
+        if prazo is not None and not (math.isfinite(prazo) and prazo > 0):
+            raise ValueError("prazo precisa ser um número de segundos maior que zero")
+        token = LIMITE.set(time.monotonic() + prazo if prazo is not None else None)
+        try:
+            return self._preparar(caminho)
+        finally:
+            LIMITE.reset(token)
+
+    def _preparar(self, caminho):
         from PIL import Image
 
         from .tipos import TarefaVisual
@@ -314,11 +325,13 @@ class Leitor:
         with PDFIUM:
             doc = pdfium.PdfDocument(caminho)
             preparados = []
-            for t in alvos:  # renderizar em 4–8x custa: para assim que o prazo vence
-                if _vencido():
-                    break
-                preparados.append((t, _recortes_ampliados(doc, t, io)))
-            doc.close()
+            try:  # fechado dentro da trava, mesmo com exceção: o finalizador da PDFium não roda fora dela
+                for t in alvos:  # renderizar em 4–8x custa: para assim que o prazo vence
+                    if _vencido():
+                        break
+                    preparados.append((t, _recortes_ampliados(doc, t, io)))
+            finally:
+                doc.close()
 
         def um(item):
             if _vencido():
@@ -477,7 +490,7 @@ def _imagens(plano, lidos) -> list[dict]:
         return out
     slide = None
     for k, pedaco in enumerate([plano.get("md", "")] + list(plano.get("extras", []))):
-        for m in re.finditer(r"<!-- slide (\d+) -->|\{\{IA:(\w+)\}\}", pedaco):
+        for m in re.finditer(r"(?m)^<!-- slide (\d+) -->$|\{\{IA:(\w+)\}\}", pedaco):
             if m.group(1):
                 slide = int(m.group(1))
             else:
@@ -490,7 +503,7 @@ def _com_estrutura(r: Resultado, plano) -> Resultado:
     r.estrutura = dict(r.metadados.pop("estrutura", None) or {})
     if plano["tipo"] == "pdf":
         r.estrutura["paginas"] = r.cobertura.paginas
-    r.estrutura.update(secoes(r.markdown, pdf=plano["tipo"] == "pdf"))
+    r.estrutura.update(secoes(r.markdown, pdf=plano["tipo"] == "pdf", apresentacao=bool(plano.get("slides"))))
     return r
 
 

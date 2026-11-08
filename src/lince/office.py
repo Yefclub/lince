@@ -15,7 +15,7 @@ from lxml import etree
 from . import legados, perfil_tabular
 from .limites import xml_ou_nada
 from .metadados import BINARIOS_OLE, ERROS_DE_PARTE, ODF
-from .seguranca import NAO_CONFERIDO, XMLIlegivel, remover_ocultos, texto_oculto_docx, texto_oculto_pptx
+from .seguranca import NAO_CONFERIDO, XMLIlegivel, _xml, remover_ocultos, texto_oculto_docx, texto_oculto_pptx
 
 NS = {
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
@@ -349,10 +349,16 @@ def planejar_office(path, pasta, ext=None):
             dados = _com_marcas_de_slide(dados, marca)
         try:
             doc = anydoc.to_document(dados, format="csv" if ext in (".csv", ".tsv") else None)
-        except anydoc.ConvertError:
+        except anydoc.ConvertError as recusa:
             if ext != ".xlsb":
                 raise
-            doc = None  # .xlsb fora da especificação (gravadores antigos): lido registro a registro, abaixo
+            doc = None  # .xlsb fora da especificação (gravadores antigos): lido registro a registro
+            try:
+                md_xlsb = _xlsb_tolerante(path, ilegiveis_xlsb := [])
+            except MemoryError:
+                raise
+            except Exception:  # noqa: BLE001 — o leitor tolerante também não abre: vale o erro do leitor do corpo
+                raise recusa from None
     tarefas, ilegiveis, pendentes = [], [], []  # pendentes: o que entra em cobertura.pendentes, com o motivo
     svgs, sentinela = [], f"LINCE{secrets.token_hex(8)}S"  # desenhos vetoriais, juntos no fim, num lote só
     vistas = set()  # imagens já lidas (sha256): o armazém dos binários não as repete
@@ -379,11 +385,13 @@ def planejar_office(path, pasta, ext=None):
     if grande:
         md, perfis = _xlsx_em_fluxo(path, ilegiveis)
     elif doc is None:
-        md, perfis = _xlsb_tolerante(path, ilegiveis)
+        (md, perfis), ilegiveis[:0] = md_xlsb, ilegiveis_xlsb
     else:
         md = serializar(doc, ler_imagem)[0]
         perfis = _perfis(doc) if ext in PLANILHAS else []
-        md = re.sub(rf"(?m)^{marca}(\d+)X$", r"<!-- slide \1 -->", md)
+        if ext in PPTX:  # o texto do slide que imita a marca não vira marca: só a do Lince numera os slides
+            md = re.sub(r"(?m)^(<!-- slide \d+ -->)$", r"\\\1", md)
+            md = re.sub(rf"(?m)^{marca}(\d+)X$", r"<!-- slide \1 -->", md)
     if ext in BINARIOS_OLE:  # o leitor do corpo quase não entrega as imagens do .doc, .xls e .ppt: o armazém, sim
 
         def imagens_legado():
@@ -423,7 +431,9 @@ def planejar_office(path, pasta, ext=None):
     if conferir:
         try:
             ocultos = conferir(path)
-        except XMLIlegivel:  # não conferido é suspeita, nunca "nada oculto": vira alerta
+        except MemoryError:
+            raise
+        except Exception:  # noqa: BLE001 — XML hostil, parte cifrada ou CRC errado: não conferido é suspeita, vira alerta
             ocultos = []
             seguranca.append({"tecnicas": ["não conferido"], "texto": "", "alerta": NAO_CONFERIDO})
         if ocultos:
@@ -514,6 +524,7 @@ def planejar_office(path, pasta, ext=None):
         "ilegiveis": ilegiveis,
         "perfil_tabular": perfis,
         "pendentes": pendentes,
+        "slides": ext in PPTX,  # só a apresentação tem <!-- slide N --> com a posição na estrutura
     }
 
 
@@ -793,23 +804,32 @@ def _xlsx_em_fluxo(path, ilegiveis) -> tuple[str, list[dict]]:
 
 
 def _xlsb_tolerante(path, ilegiveis) -> tuple[str, list[dict]]:
-    """Corpo do .xlsb que o leitor do corpo recusa, em tabela Markdown como o resto (uma aba sem título)."""
+    """Corpo do .xlsb que o leitor do corpo recusa, escrito como o das outras planilhas: célula pelo `_celula`,
+    colunas vazias à esquerda fora, linha vazia entre linhas com dado mantida, aba única sem título."""
     abas, cortado = legados.xlsb_tolerante(path)
     ilegiveis.append("corpo do .xlsb lido registro a registro: o arquivo não segue a especificação")
     if cortado:
         ilegiveis.append(f"células além de {legados._XLSB_CELULAS_MAX}: o resto ficou de fora")
     partes, perfis = [], []
     for nome, linhas in abas:
-        largura = max(len(lin) for lin in linhas)
-        corpo = [[c.replace("|", "\\|") for c in lin + [""] * (largura - len(lin))] for lin in linhas]
+        cheias = {r: {c: t for c, v in cel.items() if (t := _celula(v))} for r, cel in linhas.items()}
+        cheias = {r: cel for r, cel in cheias.items() if cel}
+        if not cheias:
+            continue
+        inicio = min(min(cel) for cel in cheias.values())
+        largura = max(max(cel) for cel in cheias.values()) + 1 - inicio
+        corpo = [
+            [cheias.get(r, {}).get(inicio + c, "") for c in range(largura)] for r in range(min(cheias), max(cheias) + 1)
+        ]
         tabela = ["| " + " | ".join(corpo[0]) + " |", "|" + " --- |" * largura]
         tabela += ["| " + " | ".join(lin) + " |" for lin in corpo[1:]]
-        partes.append((f"## {nome}\n\n" if len(abas) > 1 else "") + "\n".join(tabela))
+        partes.append((nome, "\n".join(tabela)))
         aba = perfil_tabular.Aba(nome)
-        for lin in linhas:
-            aba.linha(lin)
-        perfis.append(aba.montar())
-    return "\n\n".join(partes), perfis
+        for lin in corpo:
+            aba.linha([c.replace("\\|", "|") for c in lin])
+        perfis.append(aba.montar(cortado))
+    md = "\n\n".join((f"## {n}\n\n" if len(partes) > 1 else "") + t for n, t in partes)
+    return md, perfis
 
 
 def _texto_simples(blocos) -> str:
@@ -851,7 +871,6 @@ _P = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
 
 def _slides_pptx(z, nomes) -> list[str]:
     """As partes dos slides na ordem da apresentação (sldIdLst), como o PowerPoint numera."""
-    from .seguranca import XMLIlegivel, _xml
 
     try:
         raiz = _xml(z.read("ppt/presentation.xml"))
@@ -866,13 +885,17 @@ def _com_marcas_de_slide(dados: bytes, marca: str) -> bytes:
     """Cópia do pacote com uma caixa de texto invisível ("<marca>N X", tamanho 1, no canto) no começo de cada slide:
     o leitor do corpo a escreve antes do resto do slide, e ela vira <!-- slide N -->. Slide que não abre fica sem
     marca (o texto dele segue com o slide anterior); pacote que não abre segue sem marca nenhuma."""
-    from .seguranca import XMLIlegivel, _xml
-
     try:
-        zi = zipfile.ZipFile(io.BytesIO(dados))
-    except zipfile.BadZipFile:
+        return _marcar(dados, marca)
+    except MemoryError:
+        raise
+    except Exception:  # noqa: BLE001 — pacote que não dá para copiar (CRC, parte cifrada): segue sem marca
         return dados
-    with zi:
+
+
+def _marcar(dados, marca):
+
+    with zipfile.ZipFile(io.BytesIO(dados)) as zi:
         nomes = set(zi.namelist())
         ordem = {parte: n for n, parte in enumerate(_slides_pptx(zi, nomes), 1)}
         saida = io.BytesIO()

@@ -111,13 +111,10 @@ def _iguais(a, b):
     return a is not None and b is not None and sum(abs(x - y) for x, y in zip(a, b, strict=True)) < 60
 
 
-def _esquema_do_tema(z):
-    """Cores do tema (dk1, lt1, accent1...) do DrawingML, para resolver themeColor."""
-    nome = next((n for n in z.namelist() if re.fullmatch(r"(word|ppt)/theme/theme\d*\.xml", n)), None)
-    if nome is None:
-        return {}
+def _esquema(raiz) -> dict:
+    """Cores do esquema de um tema DrawingML (dk1, lt1, accent1...)."""
     cores = {}
-    for el in _xml(z.read(nome)).iter(f"{_A}clrScheme"):
+    for el in raiz.iter(f"{_A}clrScheme"):
         for cor in el:
             filho = next(iter(cor), None)
             if filho is not None:
@@ -130,58 +127,104 @@ def _local(el):
     return el.tag.rsplit("}", 1)[-1] if isinstance(el.tag, str) else ""
 
 
+_CADEIA_MAX = 64  # profundidade de basedOn: o Word não passa disso; arquivo forjado com mais não custa mais
+
+
 class _EstilosWord:
-    """Propriedades de run e parágrafo pela cadeia do Word: run, estilo de caractere, estilo de parágrafo (com
-    basedOn) e padrão do documento."""
+    """Propriedades de run e parágrafo pela cadeia do Word: run, estilo de caractere, estilo de parágrafo (o padrão,
+    quando o parágrafo não diz qual) com basedOn, e padrão do documento. Memoriza cada propriedade por estilo: o custo
+    é linear no documento, por mais longa que seja a cadeia."""
 
     def __init__(self, raiz):
-        self.estilos, self.padrao = {}, None
+        self.estilos, self.padrao, self.paragrafo_padrao, self.memoria = {}, None, None, {}
         if raiz is None:
             return
         for st in raiz.iter(f"{_W}style"):
             base = st.find(f"{_W}basedOn")
             self.estilos[st.get(f"{_W}styleId")] = (base.get(f"{_W}val") if base is not None else None, st)
+            if st.get(f"{_W}type") == "paragraph" and st.get(f"{_W}default") in ("1", "true"):
+                self.paragrafo_padrao = st.get(f"{_W}styleId")
         self.padrao = raiz.find(f"{_W}docDefaults/{_W}rPrDefault/{_W}rPr")
 
-    def cadeia(self, sid):
-        vistos = set()
-        while sid and sid in self.estilos and sid not in vistos:
-            vistos.add(sid)
-            base, st = self.estilos[sid]
-            yield st
-            sid = base
+    def _do_estilo(self, sid, caminho):
+        """O primeiro `caminho` (rPr/x ou pPr/x) pela cadeia de basedOn do estilo, memorizado."""
+        chave = (sid, caminho)
+        if chave not in self.memoria:
+            achado, vistos, atual = None, set(), sid
+            while atual and atual in self.estilos and atual not in vistos and len(vistos) < _CADEIA_MAX:
+                vistos.add(atual)
+                base, st = self.estilos[atual]
+                if (achado := st.find(caminho)) is not None:
+                    break
+                atual = base
+            self.memoria[chave] = achado
+        return self.memoria[chave]
+
+    def _estilo_do_paragrafo(self, ppr):
+        ps = ppr.find(f"{_W}pStyle") if ppr is not None else None
+        return ps.get(f"{_W}val") if ps is not None else self.paragrafo_padrao
 
     def run(self, rpr, ppr, nome):
-        """O primeiro valor de `nome` (filho de rPr) pela cadeia, ou None."""
-        fontes = [rpr]
+        """O valor de `nome` (filho de rPr) pela cadeia, ou None."""
+        if rpr is not None and (el := rpr.find(f"{_W}{nome}")) is not None:
+            return el
         if rpr is not None and (rs := rpr.find(f"{_W}rStyle")) is not None:
-            fontes += [st.find(f"{_W}rPr") for st in self.cadeia(rs.get(f"{_W}val"))]
-        if ppr is not None and (ps := ppr.find(f"{_W}pStyle")) is not None:
-            fontes += [st.find(f"{_W}rPr") for st in self.cadeia(ps.get(f"{_W}val"))]
-        fontes.append(self.padrao)
-        for f in fontes:
-            if f is not None and (el := f.find(f"{_W}{nome}")) is not None:
+            if (el := self._do_estilo(rs.get(f"{_W}val"), f"{_W}rPr/{_W}{nome}")) is not None:
                 return el
-        return None
+        if (el := self._do_estilo(self._estilo_do_paragrafo(ppr), f"{_W}rPr/{_W}{nome}")) is not None:
+            return el
+        return self.padrao.find(f"{_W}{nome}") if self.padrao is not None else None
 
     def sombreamento_paragrafo(self, ppr):
-        fontes = [ppr]
-        if ppr is not None and (ps := ppr.find(f"{_W}pStyle")) is not None:
-            fontes += [st.find(f"{_W}pPr") for st in self.cadeia(ps.get(f"{_W}val"))]
-        for f in fontes:
-            if f is not None and (el := f.find(f"{_W}shd")) is not None and _rgb(el.get(f"{_W}fill")):
-                return _rgb(el.get(f"{_W}fill"))
+        el = ppr.find(f"{_W}shd") if ppr is not None else None
+        if el is None:
+            el = self._do_estilo(self._estilo_do_paragrafo(ppr), f"{_W}pPr/{_W}shd")
+        return _fundo_do_sombreamento(el)
+
+
+def _fundo_do_sombreamento(shd):
+    """Cor que o sombreamento pinta atrás do texto: `fill`, ou `color` no padrão sólido; None se não houver."""
+    if shd is None:
         return None
+    if (shd.get(f"{_W}val") or "").lower() == "solid":
+        return _rgb(shd.get(f"{_W}color"))
+    return _rgb(shd.get(f"{_W}fill"))
 
 
 def _ligado(el):
     return el is not None and (el.get(f"{_W}val") or "true").lower() not in ("0", "false", "off")
 
 
+_INCERTO = object()  # fundo que o Lince não sabe dizer (estilo de tabela, imagem): a cor não decide nada
+
+
+def _fundo_do_run(run, fundo_par, pagina):
+    """O que fica atrás do run: o sombreamento do parágrafo, o da célula (ou da tabela) em que ele está, a página.
+    Tabela com estilo e sem sombreamento próprio é incerta: o estilo pode pintar a célula."""
+    if fundo_par is not None:
+        return fundo_par
+    el = run.getparent()
+    while el is not None:
+        if el.tag == f"{_W}tc":
+            tc = el.find(f"{_W}tcPr/{_W}shd")
+            if (cor := _fundo_do_sombreamento(tc)) is not None:
+                return cor
+        if el.tag == f"{_W}tbl":
+            tbl = el.find(f"{_W}tblPr")
+            if tbl is not None and (cor := _fundo_do_sombreamento(tbl.find(f"{_W}shd"))) is not None:
+                return cor
+            if tbl is not None and tbl.find(f"{_W}tblStyle") is not None:
+                return _INCERTO
+        el = el.getparent()
+    return pagina
+
+
 def texto_oculto_docx(path):
     """Texto do corpo do Word que a IA leria e o humano não vê: vanish, fonte minúscula e cor igual ao fundo dela
-    (destaque, sombreamento do run ou do parágrafo, fundo da página), com a cor vinda do run, do estilo ou do tema.
-    Levanta XMLIlegivel se o corpo, os estilos ou o tema não puderem ser lidos."""
+    (destaque, sombreamento do run, do parágrafo, da célula, fundo da página), com a cor vinda do run, do estilo ou
+    do tema. Só conclui "cor igual ao fundo" quando as duas cores são certas: com tom de tema, vale a cor que o Word
+    gravou; com fundo incerto, o texto fica. Levanta XMLIlegivel se o corpo, os estilos ou o tema não puderem ser
+    lidos."""
     out = []
     with zipfile.ZipFile(path) as z:
         nomes = set(z.namelist())
@@ -189,13 +232,13 @@ def texto_oculto_docx(path):
             return out
         raiz = _xml(z.read("word/document.xml"))
         estilos = _EstilosWord(_xml(z.read("word/styles.xml")) if "word/styles.xml" in nomes else None)
-        tema = _esquema_do_tema(z)
+        tema = next((n for n in sorted(nomes) if re.fullmatch(r"word/theme/theme\d*\.xml", n)), None)
+        tema = _esquema(_xml(z.read(tema))) if tema else {}
     fundo = raiz.find(f"{_W}background")
-    pagina = _rgb(fundo.get(f"{_W}color")) if fundo is not None else None
-    pagina = pagina or (255, 255, 255)
+    pagina = (_rgb(fundo.get(f"{_W}color")) if fundo is not None else None) or (255, 255, 255)
     for par in raiz.iter(f"{_W}p"):
         ppr = par.find(f"{_W}pPr")
-        fundo_par = estilos.sombreamento_paragrafo(ppr) or pagina
+        fundo_par = estilos.sombreamento_paragrafo(ppr)
         for r in par.iter(f"{_W}r"):
             txt = "".join(t.text or "" for t in r.iter(f"{_W}t"))
             if not txt.strip():
@@ -209,92 +252,133 @@ def texto_oculto_docx(path):
                 out.append(("fonte minúscula", txt))
                 continue
             cor_el = estilos.run(rpr, ppr, "color")
-            cor = None
-            if cor_el is not None:
-                cor = tema.get(_TEMA.get(cor_el.get(f"{_W}themeColor"), cor_el.get(f"{_W}themeColor") or ""))
-                cor = cor or _rgb(cor_el.get(f"{_W}val"))
-            if cor is None:  # automática: o Word escolhe a que contrasta com o fundo
+            if cor_el is None:  # automática: o Word escolhe a que contrasta com o fundo
                 continue
+            cor = _rgb(cor_el.get(f"{_W}val"))
+            if (nome := cor_el.get(f"{_W}themeColor")) and not (
+                cor_el.get(f"{_W}themeTint") or cor_el.get(f"{_W}themeShade")
+            ):  # tema sem tom: a cor é a do tema; com tom, a que o Word gravou em val
+                cor = tema.get(_TEMA.get(nome, nome))
             destaque = estilos.run(rpr, ppr, "highlight")
-            shd = estilos.run(rpr, ppr, "shd")
-            atras = (
-                (_rgb(_DESTAQUES.get(destaque.get(f"{_W}val"), "")) if destaque is not None else None)
-                or (_rgb(shd.get(f"{_W}fill")) if shd is not None else None)
-                or fundo_par
-            )
-            if _iguais(cor, atras):
+            atras = _rgb(_DESTAQUES.get(destaque.get(f"{_W}val"), "")) if destaque is not None else None
+            atras = atras or _fundo_do_sombreamento(estilos.run(rpr, ppr, "shd")) or _fundo_do_run(r, fundo_par, pagina)
+            if atras is not _INCERTO and _iguais(cor, atras):
                 out.append(("cor igual ao fundo", txt))
     return out
 
 
+_P = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+_MAPA_PADRAO = {"bg1": "lt1", "tx1": "dk1", "bg2": "lt2", "tx2": "dk2"}
+
+
+def _cor_drawingml(el, tema, mapa):
+    """Cor de um elemento de cor DrawingML (srgbClr, sysClr, schemeClr), ou None quando não é certa (tem
+    transformação de luminosidade, tom ou transparência, ou é a cor do marcador phClr)."""
+    if el is None or len(el):  # lumMod, lumOff, tint, shade, alpha...: a cor final não é a do esquema
+        return None
+    nome = _local(el)
+    if nome == "srgbClr":
+        return _rgb(el.get("val"))
+    if nome == "sysClr":
+        return _rgb(el.get("lastClr"))
+    if nome == "schemeClr":
+        val = el.get("val")
+        return tema.get(mapa.get(val, _MAPA_PADRAO.get(val, val)))
+    return None
+
+
+def _preenchimento(el, tema, mapa):
+    """Cor de um spPr/bgPr: a do solidFill quando é certa; _INCERTO para imagem, degradê ou cor incerta; None sem
+    preenchimento declarado."""
+    if el is None:
+        return None
+    if el.find(f"{_A}noFill") is not None:
+        return None
+    if (solido := el.find(f"{_A}solidFill")) is not None:
+        return _cor_drawingml(next(iter(solido), None), tema, mapa) or _INCERTO
+    if any(el.find(f"{_A}{t}") is not None for t in ("blipFill", "gradFill", "pattFill", "grpFill")):
+        return _INCERTO
+    return None
+
+
 def texto_oculto_pptx(path):
     """Texto dos slides que a IA leria e o humano não vê: caixa fora do slide, fonte minúscula e cor igual ao fundo
-    (preenchimento da forma ou fundo do slide, do layout ou do mestre), com cor de tema resolvida. Levanta
-    XMLIlegivel se o pacote não puder ser lido."""
+    (preenchimento da forma, ou fundo do slide, do layout ou do mestre, com o tema e o mapa de cores do mestre do
+    slide). Só conclui "cor igual ao fundo" quando as duas cores são certas: fundo de imagem, degradê, estilo do tema
+    ou cor com transformação deixam o texto onde está. Levanta XMLIlegivel se o pacote não puder ser lido."""
     from pptx import Presentation
-    from pptx.enum.dml import MSO_COLOR_TYPE, MSO_FILL
     from pptx.util import Pt
 
     try:
         prs = Presentation(path)
-        with zipfile.ZipFile(path) as z:
-            tema = _esquema_do_tema(z)
+        W, H = prs.slide_width or 0, prs.slide_height or 0
+        out, temas = [], {}
+        for slide in prs.slides:
+            mestre = slide.slide_layout.slide_master
+            if id(mestre) not in temas:
+                rel = next((r for r in mestre.part.rels.values() if r.reltype.endswith("/theme")), None)
+                tema = _esquema(_xml(rel.target_part.blob)) if rel is not None else {}
+                clr = mestre._element.find(f"{_P}clrMap")
+                mapa = dict(clr.attrib) if clr is not None else {}
+                temas[id(mestre)] = (tema, mapa)
+            tema, mapa = temas[id(mestre)]
+            fundo = (255, 255, 255)
+            for camada in (slide, slide.slide_layout, mestre):  # o primeiro que declara fundo vale
+                bg = camada._element.find(f"{_P}cSld/{_P}bg")
+                if bg is None:
+                    continue
+                bgpr, bgref = bg.find(f"{_P}bgPr"), bg.find(f"{_P}bgRef")
+                if bgpr is not None:
+                    fundo = _preenchimento(bgpr, tema, mapa) or _INCERTO
+                else:  # bgRef: estilo de fundo do tema; sólido com a cor do bgRef é certo, o resto não
+                    fundo = _INCERTO
+                    if bgref is not None and int(bgref.get("idx") or 0) in (0, 1001):
+                        fundo = _cor_drawingml(next(iter(bgref), None), tema, mapa) or _INCERTO
+                break
+            for sh in slide.shapes:  # o teste de fora do slide só vale para a forma solta (no grupo, a posição é dele)
+                for forma, solta in [(sh, True)] + [(f, False) for f in _dentro_do_grupo(sh)]:
+                    out += _oculto_na_forma(forma, solta, W, H, fundo, tema, mapa, Pt)
+        return out
     except XMLIlegivel:
         raise
-    except Exception as e:  # noqa: BLE001 — o python-pptx levanta de tudo com pacote hostil
-        raise XMLIlegivel(str(e)) from None
-    W, H = prs.slide_width or 0, prs.slide_height or 0
+    except MemoryError:
+        raise
+    except Exception as e:  # noqa: BLE001 — o python-pptx levanta de tudo com pacote hostil: não conferido
+        raise XMLIlegivel(f"{type(e).__name__}: {str(e)[:200]}") from None
 
-    def cor(fmt):
-        try:
-            if fmt.type == MSO_COLOR_TYPE.RGB:
-                return _rgb(str(fmt.rgb))
-            if fmt.type == MSO_COLOR_TYPE.SCHEME:
-                nome = str(fmt.theme_color).split(".")[-1].split(" ")[0].lower()
-                chave = {"background_1": "lt1", "text_1": "dk1", "background_2": "lt2", "text_2": "dk2"}.get(
-                    nome, nome.replace("_", "")
-                )
-                return tema.get(chave)
-        except (AttributeError, KeyError, ValueError, TypeError):
-            return None
-        return None
 
-    def preenchimento(fill):
-        try:
-            return cor(fill.fore_color) if fill.type == MSO_FILL.SOLID else None
-        except (AttributeError, TypeError, ValueError):
-            return None
+def _dentro_do_grupo(sh):
+    if sh.shape_type == 6:  # grupo
+        for f in sh.shapes:
+            yield f
+            yield from _dentro_do_grupo(f)
 
-    def formas(shapes):
-        for sh in shapes:
-            yield sh
-            if sh.shape_type == 6:  # grupo
-                yield from formas(sh.shapes)
 
+def _oculto_na_forma(sh, solta, W, H, fundo, tema, mapa, Pt):
+    if not getattr(sh, "has_text_frame", False) or not sh.text_frame.text.strip():
+        return []
+    x, y, w, h = sh.left or 0, sh.top or 0, sh.width or 0, sh.height or 0
+    if solta and W and H and (x + w <= 0 or y + h <= 0 or x >= W or y >= H):
+        return [("fora do slide", sh.text_frame.text)]
+    sppr = sh._element.find(f"{_P}spPr")
+    atras = _preenchimento(sppr, tema, mapa)
+    if atras is None and sh._element.find(f"{_P}style/{_A}fillRef") is not None:
+        ref = sh._element.find(f"{_P}style/{_A}fillRef")
+        atras = _INCERTO if int(ref.get("idx") or 0) else None  # o estilo do tema pinta a forma
+    atras = fundo if atras is None else atras
     out = []
-    for slide in prs.slides:
-        camadas = (slide, slide.slide_layout, slide.slide_layout.slide_master)
-        fundos = (preenchimento(o.background.fill) for o in camadas if getattr(o, "background", None) is not None)
-        fundo = next((c for c in fundos if c), (255, 255, 255))
-        for sh in formas(slide.shapes):
-            if not getattr(sh, "has_text_frame", False) or not sh.has_text_frame:
+    for par in sh.text_frame.paragraphs:
+        for run in par.runs:
+            if not run.text.strip():
                 continue
-            txt_forma = sh.text_frame.text
-            if not txt_forma.strip():
+            if run.font.size is not None and run.font.size <= Pt(2.5):
+                out.append(("fonte minúscula", run.text))
                 continue
-            x, y, w, h = sh.left or 0, sh.top or 0, sh.width or 0, sh.height or 0
-            if W and H and (x + w <= 0 or y + h <= 0 or x >= W or y >= H):
-                out.append(("fora do slide", txt_forma))
-                continue
-            atras = preenchimento(sh.fill) if hasattr(sh, "fill") else None
-            for par in sh.text_frame.paragraphs:
-                for run in par.runs:
-                    if not run.text.strip():
-                        continue
-                    if run.font.size is not None and run.font.size <= Pt(2.5):
-                        out.append(("fonte minúscula", run.text))
-                    elif _iguais(cor(run.font.color), atras or fundo):
-                        out.append(("cor igual ao fundo", run.text))
+            rpr = run._r.find(f"{_A}rPr")
+            solido = rpr.find(f"{_A}solidFill") if rpr is not None else None
+            cor = _cor_drawingml(next(iter(solido), None), tema, mapa) if solido is not None else None
+            if atras is not _INCERTO and _iguais(cor, atras):
+                out.append(("cor igual ao fundo", run.text))
     return out
 
 

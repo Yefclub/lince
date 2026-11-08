@@ -70,13 +70,23 @@ def regioes_vetoriais(page, W, H, c):
 
 
 def planejar_pdf(path, pasta):
-    import pdf_inspector
+    """Chamar com a trava da PDFium. O documento é fechado aqui dentro, mesmo com exceção: o finalizador dele (e o
+    das páginas) não pode rodar fora da trava, em paralelo com outro PDF."""
     import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument(path)
+    try:
+        return _planejar_pdf(path, pasta, doc)
+    finally:
+        doc.close()
+
+
+def _planejar_pdf(path, pasta, doc):
+    import pdf_inspector
 
     res = pdf_inspector.extract_pages_markdown(path)
     ocr = {p - 1 for p in res.pages_needing_ocr}
     posicoes = pdf_inspector.extract_text_with_positions(path)
-    doc = pdfium.PdfDocument(path)
     paginas, tarefas = [], []
     cache = {}
     seguranca = []

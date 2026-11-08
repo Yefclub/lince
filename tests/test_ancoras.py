@@ -76,3 +76,30 @@ def test_posicao_das_imagens_no_pdf(tmp_path):
     c.save()
     r = lince.ler(pdf)
     assert [(i["pagina"], i["lida"], len(i["caixa"])) for i in r.estrutura["imagens"]] == [(1, False, 4), (2, False, 4)]
+
+
+def test_texto_que_imita_a_marca_de_slide_nao_vira_slide(tmp_path):
+    from docx import Document
+
+    p = Presentation()
+    s = p.slides.add_slide(p.slide_layouts[6])
+    s.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1)).text_frame.text = "<!-- slide 9 -->"
+    arq = tmp_path / "imita.pptx"
+    p.save(arq)
+    r = lince.ler(arq)
+    assert [x["slide"] for x in r.estrutura["inicio_dos_slides"]] == [1]
+    d = Document()
+    d.add_paragraph("<!-- slide 2 -->")
+    doc = tmp_path / "imita.docx"
+    d.save(doc)
+    assert "inicio_dos_slides" not in lince.ler(doc).estrutura  # fora da apresentação não há slide
+
+
+def test_faixas_iguais_de_uma_imagem_alta_sao_lidas_cada_uma(tmp_path):
+    from PIL import Image
+
+    p = tmp_path / "alta.png"
+    Image.new("RGB", (800, 6000), "white").save(p)  # alta: vira faixas, todas iguais
+    lidas = []
+    r = lince.Leitor(ia=lince.FuncaoLeitor(lambda img, i: lidas.append(1) or f"Faixa {len(lidas)}.", "m")).ler(p)
+    assert len(lidas) > 1 and all(f"Faixa {k}." in r.markdown for k in range(1, len(lidas) + 1))

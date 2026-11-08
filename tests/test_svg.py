@@ -12,7 +12,7 @@ from PIL import Image
 
 import lince
 from lince import desenho_svg
-from lince._trava import PDFIUM, sem_pdfium
+from lince._trava import PDFIUM
 from lince.pagina_html import DESENHOS_MAX
 
 DIAGRAMA = (
@@ -266,14 +266,6 @@ def test_desenho_nao_segura_a_trava_da_pdfium(tmp_path, monkeypatch):
         PDFIUM.release()
     t.join()
     assert pegou  # um PDF de outro documento não espera o desenho
-
-
-def test_trava_volta_inteira_depois_do_desenho_mesmo_com_erro():
-    with PDFIUM, PDFIUM:  # duas voltas, como num planejamento aninhado
-        with contextlib.suppress(RuntimeError), sem_pdfium():
-            raise RuntimeError("falha no meio do desenho")
-        PDFIUM.release()  # a thread segura as duas voltas de novo: soltar e retomar não falha
-        PDFIUM.acquire()
 
 
 def test_desenho_so_mostra_texto_que_ficou_no_corpo(tmp_path):

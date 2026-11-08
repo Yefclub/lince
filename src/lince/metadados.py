@@ -30,7 +30,11 @@ def metadados_arquivo(path, ext=None):
 
         try:
             with PDFIUM:
-                info = pdfium.PdfDocument(path).get_metadata_dict()
+                doc = pdfium.PdfDocument(path)
+                try:
+                    info = doc.get_metadata_dict()
+                finally:
+                    doc.close()
             meta["propriedades"] = {k: v for k, v in info.items() if v}
         except Exception:  # noqa: BLE001, S110 — PDF sem propriedades legíveis: segue sem elas
             pass

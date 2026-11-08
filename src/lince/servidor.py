@@ -211,10 +211,10 @@ class Servico:
             cache = CacheComEscopo(self.cache, sessao["cliente"]) if self.cache else None
             leitor = Leitor(ia=sessao["ia"], esforco=sessao["esforco"], cache=cache)
             if sessao.get("modo") == "tarefas":
-                plano = leitor.preparar(doc["arquivo"])
+                plano = leitor.preparar(doc["arquivo"], prazo=sessao.get("prazo"))
                 doc["resultado"] = {
                     "tarefas": plano.para_json()["tarefas"],  # imagem em base64
-                    "pendentes": plano.pendentes,
+                    "pendentes": plano.estado.get("pendentes", []) + plano.pendentes,
                     "plano": selar(sessao["segredo"], sessao["cliente"], plano),
                 }
                 if sessao.get("codigo"):
@@ -321,14 +321,18 @@ class Servico:
 
 # -------------------------------------------------------------------- plano do modo tarefas
 def selar(segredo: bytes, cliente: str, plano) -> str:
-    """O plano (texto e estado do documento, sem as imagens) compactado e assinado: a montagem não guarda nada no
-    servidor, e só o mesmo token monta, dentro de PLANO_VALIDADE."""
+    """O plano (texto e estado do documento, sem as imagens) compactado e assinado com uma chave derivada do token:
+    a montagem não guarda nada no servidor, só o mesmo token monta, dentro de PLANO_VALIDADE, e ninguém altera o
+    plano no caminho. Quem tem o token pode assinar um estado próprio: por isso a montagem o confere como entrada."""
     import base64
     import zlib
 
     corpo = {"v": 1, "c": cliente, "t": time.time(), "estado": plano.estado, "pendentes": plano.pendentes,
              "tarefas": [t.id for t in plano.tarefas]}  # fmt: skip
-    dados = base64.urlsafe_b64encode(zlib.compress(json.dumps(corpo, ensure_ascii=False).encode(), 6)).decode()
+    texto = json.dumps(corpo, ensure_ascii=False).encode()
+    if len(texto) > PLANO_MAX:  # a montagem recusaria: falha já aqui, antes de quem chama pagar as leituras
+        raise ValueError(f"plano de {len(texto) // 2**20} MB, acima do teto de {PLANO_MAX // 2**20} MB da montagem")
+    dados = base64.urlsafe_b64encode(zlib.compress(texto, 6)).decode()
     return dados + "." + base64.urlsafe_b64encode(hmac.digest(segredo, dados.encode(), "sha256")).decode()
 
 
@@ -342,10 +346,8 @@ def abrir(segredo: bytes, cliente: str, selado: str):
 
     dados, _, assinatura = (selado or "").partition(".")
     esperada = base64.urlsafe_b64encode(hmac.digest(segredo, dados.encode(), "sha256")).decode()
-    if not dados or not hmac.compare_digest(assinatura, esperada):
-        raise Problema(
-            422, "plano-invalido", "Plano inválido", "Não veio deste serviço para este token, ou foi alterado."
-        )
+    if not dados or not hmac.compare_digest(assinatura.encode("utf-8", "replace"), esperada.encode()):
+        raise Problema(422, "plano-invalido", "Plano inválido", "Não foi assinado para este token, ou foi alterado.")
     try:
         d = zlib.decompressobj()
         corpo = json.loads(d.decompress(base64.urlsafe_b64decode(dados), PLANO_MAX))
@@ -359,6 +361,61 @@ def abrir(segredo: bytes, cliente: str, selado: str):
         raise Problema(422, "plano-expirado", "Plano expirado", f"Vale {PLANO_VALIDADE // 3600} h depois da leitura.")
     tarefas = [TarefaVisual(i, "", b"", "", "", 0) for i in corpo["tarefas"]]
     return Plano(tarefas, corpo["estado"], corpo["pendentes"])
+
+
+PLANO_PAGINAS_MAX = 100_000
+PLANO_TAREFAS_MAX = 20_000
+PLANO_TRABALHO_MAX = 2_000_000  # por página: regiões x blocos, o que a montagem compara uma com a outra
+
+
+def _montar_pedido(segredo, cliente, corpo):
+    """O corpo de POST /v1/montagens até o resultado. O plano é entrada de quem tem o token (a assinatura só prova
+    que é dele e que não mudou no caminho): a forma e os tetos são conferidos antes da montagem, e o que ela não
+    entende vira 422, nunca erro interno."""
+    try:
+        pedido = json.loads(corpo)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise Problema(400, "montagem-invalida", "O corpo precisa ser JSON", str(e)[:200]) from None
+    respostas = pedido.get("respostas") if isinstance(pedido, dict) else None
+    if not isinstance(respostas, dict) or not all(isinstance(v, str) for v in respostas.values()):
+        raise Problema(400, "montagem-invalida", 'Envie {"plano": ..., "respostas": {id: texto}}')
+    plano = abrir(segredo, cliente, str(pedido.get("plano") or ""))
+    try:
+        _conferir_estado(plano.estado)
+        return Leitor().concluir(plano, respostas)
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as e:
+        raise Problema(422, "plano-invalido", "Plano inválido", f"{type(e).__name__}: {str(e)[:200]}") from None
+
+
+def _conferir_estado(e):
+    """Forma e tetos do estado do plano, para a montagem não ter custo sem limite com um estado montado à mão."""
+
+    def lista(x, tipo, maximo, nome):
+        if not isinstance(x, list) or len(x) > maximo or not all(isinstance(i, tipo) for i in x):
+            raise ValueError(f"{nome} fora da forma ou acima de {maximo}")
+
+    if not isinstance(e, dict) or e.get("tipo") not in ("pdf", "office", "imagem", "texto"):
+        raise ValueError("tipo do plano")
+    lista(e.get("tarefas", []), dict, PLANO_TAREFAS_MAX, "tarefas")
+    lista(e.get("tarefas_originais", []), dict, PLANO_TAREFAS_MAX, "tarefas_originais")
+    lista(e.get("extras", []), str, PLANO_TAREFAS_MAX, "extras")
+    if not isinstance(e.get("md", ""), str) or not isinstance(e.get("iguais", {}), dict):
+        raise ValueError("md ou iguais")
+    lotes = e.get("lotes") or {}
+    if (
+        not isinstance(lotes, dict)
+        or sum(len(v) if isinstance(v, list) else 0 for v in lotes.values()) > PLANO_TAREFAS_MAX
+    ):
+        raise ValueError("lotes")
+    lista(e.get("paginas", []), dict, PLANO_PAGINAS_MAX, "paginas")
+    for p in e.get("paginas", []):
+        if not isinstance(p.get("md", ""), str) or p.get("rota") not in ("nativa", "regioes", "pagina"):
+            raise ValueError("página")
+        lista(p.get("regioes", []), dict, PLANO_TAREFAS_MAX, "regiões")
+        lista(p.get("tabelas", []), str, PLANO_TAREFAS_MAX, "tabelas")
+        lista(p.get("formulas", []), str, PLANO_TAREFAS_MAX, "fórmulas")
+        if len(p.get("regioes", [])) * (p.get("md", "").count("\n\n") + 1) > PLANO_TRABALHO_MAX:
+            raise ValueError("página com regiões e blocos demais")
 
 
 def _resultado_api(r) -> dict:
@@ -737,18 +794,17 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=No
             raise Problema(411, "tamanho-ausente", "Content-Length obrigatório", "Upload chunked não é aceito.")
         if int(tamanho) > TAMANHO_MAX:
             raise Problema(413, "envio-grande", "Envio grande demais", f"Teto de {TAMANHO_MAX // 2**20} MB por envio.")
-        try:
-            pedido = json.loads(await request.body())
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            raise Problema(400, "montagem-invalida", "O corpo precisa ser JSON", str(e)[:200]) from None
-        respostas = pedido.get("respostas") if isinstance(pedido, dict) else None
-        if not isinstance(respostas, dict) or not all(isinstance(v, str) for v in respostas.values()):
-            raise Problema(400, "montagem-invalida", 'Envie {"plano": ..., "respostas": {id: texto}}')
-        plano = abrir(s.segredo(request), cliente, str(pedido.get("plano") or ""))
-        if not s.reservar(cliente, 1):  # a montagem conta como documento pendente enquanto roda
+        with s.trava:
+            cheio = s.acima_do_teto(cliente)
+        if cheio:
+            raise _limite_retencao()
+        if not s.reservar(cliente, 1):  # a vaga antes do corpo: pedidos em paralelo não somam memória sem teto
             raise _limite_pendentes()
         try:
-            r = await asyncio.to_thread(Leitor().concluir, plano, respostas)
+            corpo = await request.body()
+            segredo = s.segredo(request)
+            # leitura do JSON, abertura do plano e montagem fora do laço de eventos: os outros clientes seguem
+            r = await asyncio.to_thread(_montar_pedido, segredo, cliente, corpo)
         finally:
             s.liberar(cliente)
         return JSONResponse(_resultado_api(r))

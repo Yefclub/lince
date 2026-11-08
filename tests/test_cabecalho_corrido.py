@@ -121,3 +121,23 @@ def test_so_sai_a_linha_curta_da_borda_em_que_so_o_numero_da_pagina_varia():
 def test_cabecalho_que_pesaria_demais_no_texto_nao_sai():
     nativas = _paginas(*([f"Relatório - folha {n}", "Dado."] for n in range(1, 5)))
     assert _sem_cabecalho_corrido(nativas) == set() and all("folha" in b[0] for _, b in nativas)
+
+
+def test_numero_sozinho_so_sai_se_for_o_da_pagina():
+    corpo = "\n".join(f"Cláusula {k}: o texto de verdade do contrato de fornecimento de grãos." for k in range(8))
+    ano = _paginas(*([corpo, "2026"] for _ in range(4)))  # o mesmo número em toda página não é número de página
+    assert _sem_cabecalho_corrido(ano) == set() and all(b[1] == "2026" for _, b in ano)
+    total = _paginas(*([corpo, str(40 + 3 * n)] for n in range(4)))  # muda, mas não com a página
+    _sem_cabecalho_corrido(total)
+    assert [b[1] for _, b in total] == ["40", "43", "46", "49"]
+    paginas = _paginas(*([corpo, str(n + 1)] for n in range(4)))
+    _sem_cabecalho_corrido(paginas)
+    assert all(b[1] == "" for _, b in paginas)
+
+
+def test_numero_impresso_deslocado_do_indice_ainda_e_cabecalho():
+    corpo = "\n".join(f"Cláusula {k}: o texto de verdade do contrato de fornecimento de grãos." for k in range(8))
+    # capa e sumário sem número: a página física 3 é a "1" impressa
+    nativas = _paginas(*([f"Relatório anual — {n - 1}", corpo, str(n - 1)] for n in range(2, 7)))
+    assert _sem_cabecalho_corrido(nativas) == {"Relatório anual — #"}
+    assert all(b[0] == "" and b[2] == "" for _, b in nativas)

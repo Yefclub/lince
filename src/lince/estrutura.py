@@ -26,7 +26,7 @@ _ODF_TABLE = "{urn:oasis:names:tc:opendocument:xmlns:table:1.0}"
 _ODF_STYLE = "{urn:oasis:names:tc:opendocument:xmlns:style:1.0}"
 
 
-def secoes(md: str, pdf: bool = False) -> dict:
+def secoes(md: str, pdf: bool = False, apresentacao: bool = False) -> dict:
     """Títulos do Markdown fora de bloco de código (cercas pela regra do CommonMark), com nível e posição. No PDF,
     também onde começa cada página: o marcador é do próprio Lince e fecha qualquer cerca deixada aberta (uma resposta
     da IA cortada no teto não apaga as âncoras das páginas seguintes)."""
@@ -36,7 +36,7 @@ def secoes(md: str, pdf: bool = False) -> dict:
         if pdf and (m := _PAGINA.fullmatch(linha)):
             paginas.append({"pagina": int(m.group(1)), "inicio": pos})
             cerca = None
-        elif not pdf and (m := _SLIDE.fullmatch(linha)):
+        elif apresentacao and (m := _SLIDE.fullmatch(linha)):
             slides.append({"slide": int(m.group(1)), "inicio": pos})
             cerca = None
         elif m := _CERCA.fullmatch(linha):

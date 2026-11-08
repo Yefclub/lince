@@ -635,3 +635,68 @@ def test_titulo_dentro_de_bloco_de_codigo_nao_e_secao():
 
     md = "# Um\n\n```python\n# comentário, não título\n```\n\n## Dois\n"
     assert [s["titulo"] for s in secoes(md)["secoes"]] == ["Um", "Dois"]
+
+
+def _registro_xlsb(tipo, dados=b""):
+    def varint(n):
+        out = bytearray()
+        while True:
+            out.append((n & 0x7F) | (0x80 if n > 0x7F else 0))
+            n >>= 7
+            if not n:
+                return bytes(out)
+
+    t = bytes([tipo]) if tipo < 0x80 else bytes([(tipo & 0x7F) | 0x80, tipo >> 7])
+    return t + varint(len(dados)) + dados
+
+
+def _xlsb(tmp_path, celulas):
+    """Pacote .xlsb mínimo (uma aba) com as células dadas: [(linha, coluna, número)]; linha sem células = só formato."""
+    import struct
+    import zipfile
+
+    def larga(t):
+        return struct.pack("<I", len(t)) + t.encode("utf-16-le")
+
+    livro = _registro_xlsb(0x9C, struct.pack("<II", 0, 1) + larga("rId1") + larga("Dados"))
+    aba = b""
+    for linha, coluna, valor in celulas:
+        aba += _registro_xlsb(0x00, struct.pack("<I", linha) + b"\x00" * 8)
+        if coluna is not None:
+            aba += _registro_xlsb(0x05, struct.pack("<II", coluna, 0) + struct.pack("<d", valor))
+    rels = (
+        '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="worksheet" Target="worksheets/sheet1.bin"/></Relationships>'
+    )
+    p = tmp_path / "hostil.xlsb"
+    with zipfile.ZipFile(p, "w") as z:
+        z.writestr("xl/workbook.bin", livro)
+        z.writestr("xl/_rels/workbook.bin.rels", rels)
+        z.writestr("xl/worksheets/sheet1.bin", aba)
+    return p
+
+
+def test_xlsb_tolerante_tem_teto_na_largura_e_aguenta_aba_so_de_formato(tmp_path, monkeypatch):
+    from lince import legados, office
+
+    hostil = _xlsb(
+        tmp_path, [(0, 0, 1.0), (1, 4_000_000_000, 2.0), (2, 16_000, 3.0)] + [(k, 1, k) for k in range(3, 60)]
+    )
+    monkeypatch.setattr(legados, "_XLSB_CELULAS_MAX", 1000)
+    abas, cortado = legados.xlsb_tolerante(hostil)
+    assert cortado and all(max(cel) < legados._XLSB_COLUNAS_MAX for _, linhas in abas for cel in linhas.values() if cel)
+    so_formato = _xlsb(tmp_path, [(0, None, 0), (1, None, 0)])
+    md, perfis = office._xlsb_tolerante(so_formato, [])
+    assert md == "" and perfis == []
+
+
+def test_xlsb_que_nenhum_leitor_abre_falha_com_o_erro_do_leitor_do_corpo(tmp_path):
+    import zipfile
+
+    import anydoc
+
+    p = tmp_path / "quebrado.xlsb"
+    with zipfile.ZipFile(p, "w") as z:
+        z.writestr("[Content_Types].xml", "<Types/>")
+    with pytest.raises(anydoc.ConvertError):
+        lince.ler(p)

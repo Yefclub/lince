@@ -153,13 +153,30 @@ CABECALHO_MAX = 80  # linha de cabeçalho/rodapé corrido é curta; parágrafo q
 FRACAO_MAX = 0.25  # se a remoção levaria mais que isso do texto nativo do documento, nada sai
 
 
+DESLOCAMENTO_MAX = 50  # número impresso = índice da página + d (capa e páginas iniciais sem número): |d| até isto
+_ROMANOS = [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
+            (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")]  # fmt: skip
+
+
+def _numero(token) -> int | None:
+    """Valor de um número de página escrito em algarismos ou em romanos (minúsculos ou maiúsculos)."""
+    if token.isdigit():
+        return int(token)
+    t, valor = token.lower(), 0
+    for v, r in _ROMANOS:
+        while t.startswith(r):
+            valor, t = valor + v, t[len(r) :]
+    return valor if valor and not t and len(token) <= 8 else None
+
+
 def _sem_cabecalho_corrido(nativas) -> set[str]:
     """Tira das páginas nativas (índice, blocos) o cabeçalho/rodapé corrido e devolve o que saiu, para os metadados.
     Só sai a linha curta, na borda da página, igual em quase todas as páginas, em que só o número da própria página
-    varia ("Página 3 de 12", "Relatório anual — 3"); a linha só com o número da página na primeira ou na última
-    posição também sai. Valor, data e número de documento que mudam entre páginas não casam, a página escaneada e o
-    texto lido pela IA não passam por aqui, título (linha com #) nunca sai e, se o que sairia passa de FRACAO_MAX do
-    texto nativo do documento, nada sai."""
+    varia ("Página 3 de 12", "Relatório anual — 3"), com um deslocamento constante entre o número impresso e o índice
+    da página (a capa sem número desloca todos); a linha só com o número da página, na primeira ou na última posição,
+    também sai, com o mesmo deslocamento em quase todas as páginas. Valor, data e número de documento que mudam entre
+    páginas não casam, a página escaneada e o texto lido pela IA não passam por aqui, título (linha com #) nunca sai
+    e, se o que sairia passa de FRACAO_MAX do texto nativo do documento, nada sai."""
     from collections import Counter
 
     def linhas(blocos):
@@ -172,29 +189,52 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
         ]
 
     def chaves(ln, pagina):
-        """Cada forma da linha com uma ocorrência do número da página trocada por #."""
+        """(forma da linha com um número trocado por #, deslocamento desse número em relação à página)."""
         t = ln.strip()
         if len(t) > CABECALHO_MAX or t.startswith(("#", "|", "<!--", "> [")):  # título ("Capítulo 3") é conteúdo
             return set()
-        achados = list(re.finditer(rf"(?<![\d.,/]){pagina}(?![\d.,/])", t))
-        return {t[: m.start()] + "#" + t[m.end() :] for m in achados}
+        out = set()
+        for m in re.finditer(r"(?<![\w.,/])(\d{1,4}|[ivxlcdm]{1,8})(?![\w.,/])", t, flags=re.I):
+            v = _numero(m.group())
+            forma = t[: m.start()] + "#" + t[m.end() :]
+            if v is not None and abs(v - pagina) <= DESLOCAMENTO_MAX and re.search(r"[^\W\d]", forma):
+                out.add((forma, v - pagina))  # só número (sem palavra) é o caso de so_numero
+        return out
+
+    def so_numero(ln, pagina):
+        """Deslocamento do número de página que é a linha inteira ("3", "- 3 -", "Página 3 de 12", "iv"), ou None."""
+        t = ln.strip()
+        if not re.fullmatch(NUM_PAGINA, t, flags=re.I):
+            return None
+        m = re.search(r"\d{1,4}|[ivxlc]{1,6}", t, flags=re.I)
+        v = _numero(m.group()) if m else None
+        return v - pagina if v is not None and abs(v - pagina) <= DESLOCAMENTO_MAX else None
 
     bordas = {}
     for i, blocos in nativas:
         cheias = linhas(blocos)
         bordas[i] = cheias[:2] + cheias[-2:]
     n = len(nativas)
+    minimo = max(3, 0.6 * n)
     freq = Counter(c for i, _ in nativas for c in {c for _, _, ln in bordas[i] for c in chaves(ln, i + 1)})
-    moveis = {c for c, v in freq.items() if n >= 3 and v >= max(3, 0.6 * n)}
+    moveis = {c for c, v in freq.items() if n >= 3 and v >= minimo}
+    extremos = {}
+    for i, blocos in nativas:
+        cheias = linhas(blocos)
+        extremos[i] = [
+            (k, j, ln, d) for k, j, ln in (cheias[:1] + cheias[-1:]) if (d := so_numero(ln, i + 1)) is not None
+        ]
+    desloc = Counter(d for e in extremos.values() for d in {x[3] for x in e})
+    numeros = {d for d, v in desloc.items() if n >= 2 and v >= max(2, 0.6 * n)}
     tirar, total = {}, 0
     for i, blocos in nativas:
         cheias = linhas(blocos)
         total += sum(len(ln.strip()) for _, _, ln in cheias)
         for k, j, ln in bordas[i]:
             if achadas := [c for c in chaves(ln, i + 1) if c in moveis]:
-                tirar[(i, k, j)] = (ln, achadas[0])
-        for k, j, ln in (cheias[:1] + cheias[-1:]) if cheias else []:
-            if re.fullmatch(NUM_PAGINA, ln.strip(), flags=re.I):
+                tirar[(i, k, j)] = (ln, achadas[0][0])
+        for k, j, ln, d in extremos[i]:
+            if d in numeros:
                 tirar.setdefault((i, k, j), (ln, None))
     if sum(len(ln.strip()) for ln, _ in tirar.values()) > FRACAO_MAX * total:
         return set()  # cabeçalho que pesaria tanto assim no texto não é cabeçalho: o documento fica como está
@@ -202,5 +242,4 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
         for k in sorted({k for (pi, k, _) in tirar if pi == i}):
             partes = blocos[k].split("\n")
             blocos[k] = "\n".join(ln for j, ln in enumerate(partes) if (i, k, j) not in tirar)
-    saiu = {c for _, c in tirar.values() if c}
-    return saiu
+    return {c for _, c in tirar.values() if c}

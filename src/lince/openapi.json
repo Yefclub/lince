@@ -1518,12 +1518,12 @@
             "enum": [
               "imagem",
               "pagina",
-              "figura",
+              "desenho",
               "tabela",
               "formula",
               "lote"
             ],
-            "description": "`lote` é uma folha com recortes pequenos numerados; a resposta esperada é o JSON pedido na instrução, e `itens` diz o que é cada recorte."
+            "description": "`imagem` (Office, HTML, imagem inteira do PDF), `pagina` (página escaneada), `desenho` (gráfico ou diagrama vetorial do PDF), `tabela` (tabela duvidosa), `formula` e `lote`: uma folha com recortes pequenos numerados; a resposta esperada é o JSON pedido na instrução, e `itens` diz o que é cada recorte."
           },
           "imagem": {
             "type": "string",
@@ -1620,7 +1620,7 @@
           },
           "plano": {
             "type": "string",
-            "description": "O texto e o estado do documento, compactados e assinados para este token. Opaco: mande de volta como veio, em até 24 h."
+            "description": "O texto e o estado do documento, compactados e assinados com uma chave derivada do token: só o mesmo token monta, em até 24 h, e ninguém o altera no caminho. Opaco: mande de volta como veio. Plano acima de 64 MB descompactados faz o documento falhar já nesta fase."
           },
           "codigo": {
             "description": "Presente com `codigo=sim`. Nulo se o formato não tem código.",

@@ -79,7 +79,7 @@ respostas = {t.id: meu_modelo(t.imagem, t.instrucao) for t in plano.tarefas}
 r = leitor.concluir(plano, respostas)         # o mesmo Resultado que sairia com a IA do Lince
 ```
 
-Cada `TarefaVisual` traz a imagem (PNG), a instrução, o tipo (imagem, página escaneada, figura, tabela, fórmula ou
+Cada `TarefaVisual` traz a imagem (PNG), a instrução, o tipo (imagem, página escaneada, desenho, tabela, fórmula ou
 lote de recortes), onde ela está (página e caixa no PDF, `imagem 3` no Office), `chave` (hash da imagem, da instrução
 e da versão do prompt, para o seu cache) e `tokens_estimados`. A tarefa sem resposta fica em `cobertura.pendentes`
 com o texto nativo no lugar. `plano.para_json()` e `lince.Plano.de_json()` levam o plano entre processos.

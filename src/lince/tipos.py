@@ -61,7 +61,7 @@ class TarefaVisual:
     traz recortes pequenos numerados e a resposta esperada é o JSON pedido na instrução; `itens` diz o que é cada um."""
 
     id: str
-    tipo: str  # imagem | pagina | figura | tabela | formula | lote
+    tipo: str  # imagem | pagina | desenho | tabela | formula | lote
     imagem: bytes  # PNG
     instrucao: str
     chave: str
