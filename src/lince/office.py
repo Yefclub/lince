@@ -642,16 +642,17 @@ _DIMENSAO = re.compile(rb'<(?:\w+:)?dimension\s+ref="([A-Z]{1,3})(\d+)(?::([A-Z]
 
 
 def _celulas_declaradas(path) -> int:
-    """Células de cada parte que o workbook aponta (as abas estão onde as relações dele dizem, não só em
-    xl/worksheets/) pelo maior entre o que a <dimension> declara e o que o tamanho do XML comporta (a dimensão pode
-    mentir para menos), sem ler as células. Barato: só os primeiros bytes de cada parte."""
+    """Células de cada parte XML do pacote pelo maior entre o que a <dimension> declara e o que o tamanho do XML
+    comporta, sem ler as células. Não depende de onde o pacote diz que estão as abas nem da dimensão, que podem mentir
+    para menos; exagerar só desvia para a leitura em fluxo, que escreve igual. Barato: os primeiros bytes de cada
+    parte."""
     from openpyxl.utils import column_index_from_string
 
     total = 0
     with zipfile.ZipFile(path) as z:
-        nomes = set(z.namelist())
-        for parte in set(_alvos(z, "xl/workbook.xml", nomes).values()) & nomes:
-            info = z.getinfo(parte)
+        for info in z.infolist():
+            if not info.filename.lower().endswith(".xml"):
+                continue
             with z.open(info) as f:
                 m = _DIMENSAO.search(f.read(4096))
             declaradas = 0

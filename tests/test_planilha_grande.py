@@ -119,17 +119,16 @@ def test_dimensao_mentirosa_pequena_ainda_desvia_do_anydoc(tmp_path):
     assert office._celulas_declaradas(p) >= xml // office._BYTES_POR_CELULA > 4
 
 
-def test_aba_fora_de_worksheets_conta_na_estimativa(tmp_path):
+@pytest.mark.parametrize("de,para", [("worksheets/", "dados/"), ("workbook.xml", "livro.xml")])
+def test_partes_em_outro_lugar_contam_na_estimativa(tmp_path, de, para):
     p = _planilha(tmp_path, linhas=50)
     q = tmp_path / "movida.xlsx"
     with zipfile.ZipFile(p) as zi, zipfile.ZipFile(q, "w") as zo:
-        for n in zi.namelist():
-            dados = zi.read(n).replace(b"worksheets/", b"dados/")
-            zo.writestr(n.replace("xl/worksheets/", "xl/dados/"), dados)
-    assert (
-        office._celulas_declaradas(q) == office._celulas_declaradas(p)
-        and lince.ler(q).markdown == lince.ler(p).markdown
-    )
+        for n in zi.namelist():  # o nome muda na parte e em toda referência a ela (relações e tipos de conteúdo)
+            zo.writestr(n.replace(de, para), zi.read(n).replace(de.encode(), para.encode()))
+        abas = sum(i.file_size // office._BYTES_POR_CELULA for i in zo.infolist() if "/dados/" in i.filename or
+                   "/worksheets/" in i.filename)  # fmt: skip
+    assert office._celulas_declaradas(q) >= abas > 0 and lince.ler(q).markdown == lince.ler(p).markdown
 
 
 def test_linha_larga_conta_a_tabela_inteira_no_teto(tmp_path, monkeypatch):
