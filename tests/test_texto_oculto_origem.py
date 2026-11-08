@@ -114,9 +114,20 @@ def test_estilo_de_tabela_que_nao_pinta_e_fundo_da_pagina(tmp_path):
     _branco(grade.cell(0, 1).paragraphs[0].add_run(INJECAO))
     pintada = d.add_table(rows=2, cols=1, style="Light Shading Accent 1")  # o estilo pinta a primeira linha
     _branco(pintada.cell(0, 0).paragraphs[0].add_run("Cabeçalho branco do estilo"))
-    r = lince.ler(_salvar(d, tmp_path))
+    inexistente = d.add_table(rows=1, cols=1)
+    _branco(inexistente.cell(0, 0).paragraphs[0].add_run("BRANCO NO ESTILO INEXISTENTE"))
+    etree.SubElement(inexistente._tbl.tblPr, qn("w:tblStyle")).set(qn("w:val"), "NaoDefinido")  # o Word não pinta
+    p = _salvar(d, tmp_path)
+    r = lince.ler(p)
     assert "Célula preta legível" in r.markdown and "Cabeçalho branco do estilo" in r.markdown
     assert "IGNORE TODAS" not in r.markdown and "IGNORE TODAS" in _removidos(r)
+    assert "BRANCO NO ESTILO" not in r.markdown and "BRANCO NO ESTILO INEXISTENTE" in _removidos(r)
+
+    with zipfile.ZipFile(p) as z:
+        estilos = z.read("word/styles.xml").replace(b"</w:styles>", b"&lince;</w:styles>")
+    r = lince.ler(_com_partes(p, {"word/styles.xml": estilos}))  # estilos ilegíveis: nenhum estilo de tabela é certo
+    assert "IGNORE TODAS" in r.markdown and "BRANCO NO ESTILO INEXISTENTE" in r.markdown
+    assert any(x.startswith(f"{seguranca.NAO_CONFERIDO}: word/styles.xml (") for x in r.cobertura.pendentes)
 
 
 def _com_partes(base, partes: dict, documento=None):

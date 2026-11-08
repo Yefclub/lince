@@ -204,8 +204,8 @@ class _EstilosWord:
     quando o parágrafo não diz qual) com basedOn, e padrão do documento. Memoriza cada propriedade por estilo: o custo
     é linear no documento, por mais longa que seja a cadeia."""
 
-    def __init__(self, raiz):
-        self.estilos, self.padrao, self.memoria = {}, None, {}
+    def __init__(self, raiz, ilegivel=False):
+        self.estilos, self.padrao, self.memoria, self.ilegivel = {}, None, {}, ilegivel
         self.paragrafo_padrao = self.tabela_padrao = None
         if raiz is None:
             return
@@ -259,11 +259,11 @@ class _EstilosWord:
     def tabela_pinta(self, sid) -> bool:
         """O estilo da tabela (o padrão, sem tblStyle) pinta alguma célula: há sombreamento na cadeia, inteiro ou
         condicional (primeira linha, faixas). Table Grid e os estilos só de borda não pintam. Estilo citado e não
-        definido também conta como pintado: não há como saber o que o autor quis."""
-        if sid is None and (sid := self.tabela_padrao) is None:
-            return False
-        if sid not in self.estilos:
+        definido vale como o padrão, como o Word desenha; com styles.xml ilegível, nenhum estilo é certo."""
+        if self.ilegivel:
             return True
+        if (sid is None or sid not in self.estilos) and (sid := self.tabela_padrao) is None:
+            return False
         chave = (sid, "pinta")
         if chave not in self.memoria:
             self.memoria[chave] = any(_pinta(shd) for st in self._cadeia(sid) for shd in st.iter(f"{_W}shd"))
@@ -529,7 +529,8 @@ def _conferir_word(z, alvo) -> tuple:
             falhas.append(f"{nome} ({_motivo(e)})")
             return None
 
-    estilos = _EstilosWord(arvore("word/styles.xml") if "word/styles.xml" in nomes else None)
+    raiz = arvore("word/styles.xml") if "word/styles.xml" in nomes else None
+    estilos = _EstilosWord(raiz, ilegivel=raiz is None and "word/styles.xml" in nomes)
     tema = next((n for n in sorted(nomes) if re.fullmatch(r"word/theme/theme\d*\.xml", n)), None)
     tema = _esquema(raiz) if tema and (raiz := arvore(tema)) is not None else {}
     corpo = arvore("word/document.xml") if "word/document.xml" in nomes else None

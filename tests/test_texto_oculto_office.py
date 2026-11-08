@@ -169,10 +169,14 @@ def test_texto_branco_em_celula_escura_ou_de_tabela_com_estilo_e_visivel(tmp_pat
         shd.set(qn("w:val"), "clear")
         shd.set(qn("w:fill"), "1F3864")
         escura.paragraphs[0].add_run("Cabeçalho branco sobre azul").font.color.rgb = RGBColor(255, 255, 255)
+        grade = d.styles.add_style("GradeEscura", 3).element  # estilo de tabela que pinta a célula: fundo incerto
+        shd = etree.SubElement(etree.SubElement(grade, qn("w:tcPr")), qn("w:shd"))
+        shd.set(qn("w:val"), "clear")
+        shd.set(qn("w:fill"), "1F3864")
         t = d.add_table(rows=1, cols=1)
         t.cell(0, 0).paragraphs[0].add_run("Branco pintado pelo estilo").font.color.rgb = RGBColor(255, 255, 255)
         estilo = etree.SubElement(t._tbl.tblPr, qn("w:tblStyle"))
-        estilo.set(qn("w:val"), "GradeEscura")  # o estilo pode pintar a célula: o fundo é incerto
+        estilo.set(qn("w:val"), "GradeEscura")
 
     assert _visivel(_docx(tmp_path, monta), "Cabeçalho branco sobre azul", "Branco pintado pelo estilo")
 
