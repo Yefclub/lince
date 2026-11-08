@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Lince",
-    "version": "1.5.1",
+    "version": "1.6.0",
     "summary": "Leitor único de documentos para bases de conhecimento e IA.",
     "description": "Cada envio (um documento ou um lote) cria uma **sessão**. Quem chama marca a sessão com uma `referencia` própria (o id do usuário ou do processo no sistema de origem) e recupera os resultados pela sessão ou pela referência.\n\nO documento não é guardado: o arquivo é apagado assim que lido. Só se o servidor tiver cache ligado, a transcrição que a IA fez de cada recorte ou página fica no Redis por alguns dias, separada por token, para não ser paga de novo. O resultado fica em memória só até ser **entregue**: a primeira resposta que traz a sessão `concluida` (o `POST` com `Prefer: wait` ou um `GET`) é a entrega. Depois dela, a sessão fica 60 s para o cliente repetir o pedido se a resposta se perdeu, e então some; `DELETE` confirma o recebimento e apaga na hora. Resultado não buscado é descartado 15 min depois de concluída. `expira_em` sempre diz até quando a sessão existe. Cada token pode ter até 256 MB de resultado esperando entrega; acima disso, novos envios recebem 429 até buscar o que é dele.\n\nO modelo de visão é de quem chama, informado em cada envio (`X-IA-URL`, `X-IA-Modelo`, `X-IA-Chave`); a chave não é guardada nem registrada.\n\nErros seguem a RFC 9457 (`application/problem+json`). Toda resposta traz `X-Request-Id`.\n\n**Documento como código.** Com `codigo=sim`, cada documento de formato editável (PPTX, DOCX, XLSX) traz também `resultado.codigo`: a estrutura do documento com ids estáveis tirados do próprio arquivo (slide, forma, parágrafo, célula, série de gráfico). Com esses ids, `POST /v1/edicoes` aplica operações nomeadas e devolve o arquivo novo, alterando só as partes tocadas; o resto do pacote sai idêntico em bytes.\n\n**Antivírus.** Se o serviço estiver configurado com ClamAV, todo arquivo é varrido antes de ser lido ou editado: arquivo infectado recusa o envio inteiro ou a edição (422 `arquivo-infectado`) e antivírus fora do ar recusa com 503 `antivirus-indisponivel` (nunca lê sem varrer).",
     "license": {
@@ -112,6 +112,12 @@
                       "sim"
                     ],
                     "default": "nao"
+                  },
+                  "prazo": {
+                    "description": "Segundos para cada documento, contados do início da leitura dele (a espera na fila não conta; a extração nativa conta, mas não é interrompida). Nenhuma leitura pela IA começa depois do prazo, e a que está em curso é cortada quando ele vence (com a folga da rede); o que não coube vira a pendência `prazo esgotado` em `cobertura.pendentes`, e o texto nativo sai completo. A chamada cortada pode ser cobrada pelo provedor sem aparecer em `uso`. Sem prazo, o documento é lido até o fim.",
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 3600
                   }
                 }
               },
