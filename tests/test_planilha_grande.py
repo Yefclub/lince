@@ -133,6 +133,24 @@ def test_partes_em_outro_lugar_contam_na_estimativa(tmp_path, de, para):
     assert office._celulas_declaradas(q) >= abas > 0 and lince.ler(q).markdown == lince.ler(p).markdown
 
 
+def test_parte_que_nao_abre_nao_derruba_a_estimativa(tmp_path):
+    p = _planilha(tmp_path)
+    q = tmp_path / "cifrada.xlsx"
+    with zipfile.ZipFile(p) as zi, zipfile.ZipFile(q, "w") as zo:
+        for n in zi.namelist():
+            zo.writestr(n, zi.read(n))
+        zo.writestr("xl/media/image1.png", b"\x89PNG" + b"\x00" * 8000)
+    dados = bytearray(q.read_bytes())  # liga o bit de cifra da mídia no cabeçalho local e no diretório central
+    for assinatura, deslocamento in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        i = dados.rfind(assinatura)
+        dados[i + deslocamento] |= 1
+    q.write_bytes(bytes(dados))
+    with zipfile.ZipFile(q) as z:
+        assert z.getinfo("xl/media/image1.png").flag_bits & 1
+    assert office._celulas_declaradas(q) >= 8000 // office._BYTES_POR_CELULA
+    assert lince.ler(q).markdown == lince.ler(p).markdown
+
+
 def test_linha_larga_conta_a_tabela_inteira_no_teto(tmp_path, monkeypatch):
     monkeypatch.setattr(office, "_CELULAS_ANYDOC_MAX", 0)
     monkeypatch.setattr(office, "CELULAS_POR_ABA_MAX", 10**9)  # só o teto do documento segura

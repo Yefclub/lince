@@ -12,7 +12,7 @@ from xml.etree import ElementTree as ET  # noqa: F401
 
 from . import legados
 from .limites import xml_ou_nada
-from .metadados import BINARIOS_OLE, ODF
+from .metadados import BINARIOS_OLE, ERROS_DE_PARTE, ODF
 from .seguranca import remover_ocultos, texto_oculto_docx
 
 NS = {
@@ -651,8 +651,11 @@ def _celulas_declaradas(path) -> int:
     total = 0
     with zipfile.ZipFile(path) as z:
         for info in z.infolist():
-            with z.open(info) as f:
-                m = _DIMENSAO.search(f.read(4096))
+            try:
+                with z.open(info) as f:
+                    m = _DIMENSAO.search(f.read(4096))
+            except ERROS_DE_PARTE:  # parte que não abre (cifrada, compressão estranha) conta só pelo tamanho
+                m = None
             declaradas = 0
             if m and m.group(3):
                 largura = column_index_from_string(m.group(3).decode()) - column_index_from_string(m.group(1).decode())
