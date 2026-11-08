@@ -13,7 +13,7 @@ from defusedxml.ElementTree import iterparse
 from .limites import xml_ou_nada
 
 SECOES_MAX = 2000  # documento com mais títulos que isso é índice de livro: as primeiras bastam para navegar
-_TITULO = re.compile(r"(#{1,6})[ \t]+(\S.*?)[ \t]*\r?")  # título ATX; linha quebrada só em \n, como no Markdown
+_TITULO = re.compile(r"(#{1,6})[ \t]+(\S.*)")  # título ATX (linear: o fim é aparado fora do regex)
 _CERCA = re.compile(r" {0,3}(`{3,}|~{3,})(.*?)\r?")
 _PAGINA = re.compile(r"<!-- página ([1-9]\d*) · \w+ -->\r?")  # exatamente o que a montagem do PDF escreve
 _PPTX = {".pptx", ".pptm", ".ppsx", ".ppsm"}
@@ -41,7 +41,8 @@ def secoes(md: str, pdf: bool = False) -> dict:
                 cerca = None  # fecha só com o mesmo caractere, pelo menos o mesmo tamanho e sem texto depois
         elif cerca is None and (m := _TITULO.fullmatch(linha)):
             if len(titulos) < SECOES_MAX:
-                titulos.append({"titulo": m.group(2), "nivel": len(m.group(1)), "inicio": pos})
+                titulo = m.group(2).rstrip(" \t\r")
+                titulos.append({"titulo": titulo, "nivel": len(m.group(1)), "inicio": pos})
             else:
                 cortadas = True
         pos += len(linha) + 1
@@ -61,7 +62,9 @@ def estrutura_arquivo(path, ext) -> dict:
                 raiz = xml_ou_nada(z.read("ppt/presentation.xml"))
                 if raiz is None:
                     return {}
-                return {"slides": sum(1 for el in raiz.iter() if el.tag.endswith("}sldId"))}  # a lista que vale
+                # só o sldIdLst filho da raiz: as seções do PowerPoint 2010+ repetem cada slide em p14:sldIdLst
+                listas = [lista for lista in raiz if lista.tag.endswith("}sldIdLst")]
+                return {"slides": sum(1 for s in (listas[0] if listas else []) if s.tag.endswith("}sldId"))}
             if ext in _XLSX:
                 return _abas_xlsx(z.read("xl/workbook.xml"))
             if ext == ".xlsb":

@@ -64,8 +64,11 @@ def test_slides_do_pptx_pela_lista_da_apresentacao(tmp_path):
     with zipfile.ZipFile(tmp_path / "a.pptx", "w") as z:
         z.writestr(
             "ppt/presentation.xml",
-            '<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:sldIdLst>'
-            '<p:sldId id="256"/><p:sldId id="257"/></p:sldIdLst></p:presentation>',
+            '<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+            'xmlns:p14="http://schemas.microsoft.com/office/powerpoint/2010/main"><p:sldIdLst>'
+            '<p:sldId id="256"/><p:sldId id="257"/></p:sldIdLst><p:extLst><p:ext><p14:sectionLst>'
+            '<p14:section name="Abertura"><p14:sldIdLst><p14:sldId id="256"/><p14:sldId id="257"/></p14:sldIdLst>'
+            "</p14:section></p14:sectionLst></p:ext></p:extLst></p:presentation>",  # seções repetem os slides
         )
         for n in (1, 2, 3):  # a parte slide3 é órfã: não está na lista e não conta
             z.writestr(f"ppt/slides/slide{n}.xml", "<x/>")
@@ -86,6 +89,7 @@ def test_marcador_de_pagina_so_no_pdf_e_resiste_a_cerca_aberta():
     assert [p["pagina"] for p in s["inicio_das_paginas"]] == [1, 2]  # a cerca aberta não apagou a página 2
     assert [x["titulo"] for x in s["secoes"]] == ["Seção 2"]
     assert "inicio_das_paginas" not in secoes(md + "<!-- página 0 · x -->\n")  # fora do PDF, não há página
+    assert "inicio_das_paginas" not in secoes("<!-- página 0 · nativa -->\n", pdf=True)  # página 0 não existe
 
 
 def test_posicoes_em_pontos_de_codigo_com_crlf_emoji_e_form_feed():
@@ -100,3 +104,10 @@ def test_secoes_alem_do_teto_sao_marcadas_como_cortadas():
     s = secoes("".join(f"# T{n}\n" for n in range(SECOES_MAX + 5)))
     assert len(s["secoes"]) == SECOES_MAX and s["secoes_cortadas"] is True
     assert "secoes_cortadas" not in secoes("# Só uma\n")
+
+
+def test_titulo_com_muitos_espacos_nao_prende_a_leitura():
+    inicio = time.monotonic()
+    s = secoes("# x" + " " * 200_000 + "y\n# Fim   \r\n")["secoes"]
+    assert time.monotonic() - inicio < 2  # o regex anterior era quadrático nessa linha
+    assert s[0]["titulo"].startswith("x ") and s[0]["titulo"].endswith("y") and s[1]["titulo"] == "Fim"
