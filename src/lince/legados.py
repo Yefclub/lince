@@ -154,8 +154,8 @@ IMAGENS_MAX = 512  # imagens distintas por arquivo; acima disso é arquivo hosti
 _METAFILE_MAX = 64 * 1024 * 1024  # EMF/WMF guardado comprimido: teto do descomprimido
 _PEDACO = 1024 * 1024  # a descompressão anda neste passo, cobrando o orçamento a cada pedaço
 # onde o OfficeArt guarda as imagens: Pictures no PowerPoint, o Workbook (ou Book, no Excel 5) e, no Word, o Data
-# (imagens em linha) e o WordDocument (o armazém das flutuantes)
-_STREAMS_DE_IMAGEM = ("Pictures", "Workbook", "Book", "Data", "WordDocument")
+# (imagens em linha), o WordDocument (o armazém das flutuantes) e a tabela, onde há gerador que grava o bloco
+_STREAMS_DE_IMAGEM = ("Pictures", "Workbook", "Book", "Data", "WordDocument", "0Table", "1Table")
 _CABECALHOS_DIB = {12, 40, 52, 56, 64, 108, 124}  # BITMAPCOREHEADER, INFO, V2, V3, OS/2 2, V4 e V5
 
 
@@ -270,8 +270,8 @@ def imagens(o, teto) -> tuple[list[tuple[str, bytes]], str | None]:
                         return saida, f"mais de {IMAGENS_MAX} imagens: o resto ficou de fora"
                     vistas.add(marca)
                     saida.append((mime, dados))
-        except ValueError as e:  # stream maior que o arquivo ou orçamento esgotado: estrutura hostil
-            return saida, str(e)
+        except (ValueError, OSError, TypeError) as e:  # stream hostil, cadeia de setores cortada, storage no lugar
+            return saida, f"{type(e).__name__}: {e}"[:200]  # do stream: o que já foi achado fica
     return saida, None
 
 

@@ -216,3 +216,29 @@ def test_flush_quebrado_nao_derruba_o_resto(monkeypatch):
     stream = _png_blip("red") + _blip(0xF01A, 0x3D4, b"\x00" * 32 + b"\x00\xfe", zlib.compress(b"EMF" * 100))
     achadas, corte = legados.imagens(_Ole(stream), len(stream))
     assert [m for m, _ in achadas] == ["image/png"] and corte is None
+
+
+def test_imagens_do_word_saem_do_data_e_do_worddocument():
+    for nome in ("Data", "WordDocument", "1Table"):
+
+        class _Word(_Ole):
+            def exists(self, n, nome=nome):
+                return n == nome
+
+        ole = _Word(_png_blip("red"))
+        achadas, corte = legados.imagens(ole, 10**6)
+        assert ole.lidos == [nome] and len(achadas) == 1 and corte is None, nome
+
+
+def test_cadeia_de_setores_cortada_corta_sem_perder_o_que_foi_achado():
+    class _Cortado(_Ole):
+        def exists(self, nome):
+            return nome in ("Pictures", "Data")
+
+        def openstream(self, nome):
+            if nome == "Data":
+                raise OSError("unexpected end of chain")
+            return super().openstream(nome)
+
+    achadas, corte = legados.imagens(_Cortado(_png_blip("red")), 10**6)
+    assert len(achadas) == 1 and "OSError" in corte
