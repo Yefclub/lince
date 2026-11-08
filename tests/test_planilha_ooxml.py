@@ -112,7 +112,7 @@ def test_alvos_relativos_como_o_excel_grava(tmp_path):
     assert len(vistas) == 1 and "**Imagem (aba Painel, célula AB5):**" in r.markdown
 
 
-def test_ancora_absoluta_mesma_midia_e_alvo_externo(tmp_path):
+def test_ancora_absoluta_e_mesma_midia_duas_vezes(tmp_path):
     ancora = rb"<oneCellAnchor><from>.*?</from>(<ext[^>]*/>)(<pic>.*?</pic>)<clientData/></oneCellAnchor>"
     p = _reescrever(
         _planilha(tmp_path),
@@ -120,14 +120,6 @@ def test_ancora_absoluta_mesma_midia_e_alvo_externo(tmp_path):
         {
             "xl/drawings/drawing1.xml": [
                 (ancora, rb'<absoluteAnchor><pos x="0" y="0"/>\1\2<clientData/></absoluteAnchor>' * 2),  # a mesma, 2x
-            ],
-            "xl/drawings/_rels/drawing1.xml.rels": [
-                (
-                    rb"</Relationships>",
-                    b'<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/'
-                    b'officeDocument/2006/relationships/image" Target="file:///etc/x.png" TargetMode="External"/>'
-                    b"</Relationships>",
-                ),
             ],
         },
     )
@@ -206,3 +198,26 @@ def test_cada_aba_e_lida_uma_vez_e_fechada_mesmo_com_erro(tmp_path, monkeypatch)
     fechados.clear()
     lince.ler(p)
     assert fechados  # o erro na aba não deixa o arquivo aberto
+
+
+def test_imagem_por_relacao_externa_nao_e_lida(tmp_path):
+    base = _planilha(tmp_path)
+    p = tmp_path / "externa.xlsx"
+    with zipfile.ZipFile(base) as zi, zipfile.ZipFile(p, "w") as zo:
+        for n in zi.namelist():
+            dados = zi.read(n)
+            if n == "xl/drawings/drawing1.xml":  # uma segunda âncora, igual à da imagem, mas pela relação rId9
+                ancora = re.search(rb"<oneCellAnchor>(?:(?!</oneCellAnchor>).)*?<pic>.*?</oneCellAnchor>", dados, re.S)
+                dados = dados.replace(
+                    b"</wsDr>", re.sub(rb'r:embed="[^"]+"', b'r:embed="rId9"', ancora.group(0)) + b"</wsDr>"
+                )
+            elif n == "xl/drawings/_rels/drawing1.xml.rels":
+                dados = dados.replace(
+                    b"</Relationships>",
+                    b'<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/'
+                    b'image" Target="../media/externa.png" TargetMode="External"/></Relationships>',
+                )
+            zo.writestr(n, dados)
+        zo.writestr("xl/media/externa.png", _png("red"))  # existe no pacote: só o TargetMode a barra
+    r, vistas = _ler(p)
+    assert len(vistas) == 1 and Image.open(io.BytesIO(vistas[0])).convert("RGB").getpixel((5, 5)) == (37, 97, 193)
