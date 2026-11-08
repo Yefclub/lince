@@ -370,8 +370,9 @@ def selar(segredo: bytes, cliente: str, plano, kid: str = "") -> str:
 
 
 def abrir(segredo: bytes, cliente: str, selado: str, kid: str = ""):
-    """O plano de `selar`, conferido: chave, assinatura, dono, validade e tamanho. Levanta Problema. O plano sem `kid`
-    (selado antes dele existir) só tem a assinatura conferida."""
+    """O plano de `selar`, conferido: assinatura, dono, validade e tamanho. Levanta Problema. O `kid` só diz por que a
+    assinatura não conferiu (outra chave ou plano alterado); o plano sem ele (selado antes dele existir) é recusado
+    como inválido."""
     import base64
     import binascii
     import zlib
@@ -380,16 +381,17 @@ def abrir(segredo: bytes, cliente: str, selado: str, kid: str = ""):
 
     dados, _, assinatura = (selado or "").partition(".")
     assinatura, _, do_plano = assinatura.partition(".")
-    if do_plano and kid and not hmac.compare_digest(do_plano.encode("utf-8", "replace"), kid.encode()):
-        raise Problema(
-            422,
-            "plano-de-outra-chave",
-            "Plano de outra chave",
-            "Selado por uma chave que este servidor não tem (reinício sem LINCE_SEGREDO ou réplica com outro segredo):"
-            " refaça a fase 1.",
-        )
     esperada = base64.urlsafe_b64encode(hmac.digest(segredo, dados.encode("utf-8", "replace"), "sha256")).decode()
     if not dados or not hmac.compare_digest(assinatura.encode("utf-8", "replace"), esperada.encode()):
+        # a assinatura vem primeiro: o `kid` não é assinado e só escolhe o motivo da recusa, nunca a decide
+        if do_plano and kid and not hmac.compare_digest(do_plano.encode("utf-8", "replace"), kid.encode()):
+            raise Problema(
+                422,
+                "plano-de-outra-chave",
+                "Plano de outra chave",
+                "Selado por uma chave que este servidor não tem (reinício sem LINCE_SEGREDO ou réplica com outro"
+                " segredo): refaça a fase 1.",
+            )
         raise Problema(422, "plano-invalido", "Plano inválido", "Não foi assinado para este token, ou foi alterado.")
     try:
         d = zlib.decompressobj()
@@ -658,11 +660,14 @@ def criar_app(
                 )
             max_tarefas = form.get("max_tarefas")
             if max_tarefas is not None and max_tarefas != "":
-                if not re.fullmatch(r"\d{1,9}", str(max_tarefas)) or int(max_tarefas) < 1 or modo != "tarefas":
+                digitos = str(max_tarefas).lstrip("0")
+                if not re.fullmatch(r"\d+", str(max_tarefas)) or not digitos or modo != "tarefas":
                     raise Problema(
                         400, "max-tarefas-invalido", "max_tarefas deve ser um inteiro maior que zero, no modo tarefas"
                     )
-                max_tarefas = int(max_tarefas)
+                # qualquer inteiro maior que zero, e o acima do teto vale o teto (contrato); dez algarismos já passam
+                # dele, então o resto nem é convertido (int() de milhares de algarismos é lento ou recusado)
+                max_tarefas = min(TAREFAS_POR_DOCUMENTO, int(digitos[:10]))
             else:
                 max_tarefas = None
             pedir_codigo = str(form.get("codigo") or "nao")

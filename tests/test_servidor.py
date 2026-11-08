@@ -846,6 +846,9 @@ def test_plano_de_antes_do_reinicio_pede_a_fase_1_de_novo_e_o_alterado_e_invalid
         r = _montar(antes, {"plano": adulterado, "respostas": {}})  # chave conhecida, assinatura que não confere
         assert r.status_code == 422 and r.json()["type"] == "urn:lince:erro:plano-invalido"
     assert _montar(antes, {"plano": plano, "respostas": {}}).status_code == 200
+    for kid_mexido in (kid[:-3], "outra-chave", ""):  # o kid não é assinado: a assinatura que confere decide
+        r = _montar(antes, {"plano": f"{dados}.{assinatura}.{kid_mexido}".rstrip("."), "respostas": {}})
+        assert r.status_code == 200
 
 
 def test_id_da_chave_e_o_mesmo_com_o_mesmo_segredo_e_nao_revela_o_segredo():
@@ -972,7 +975,10 @@ def test_modo_tarefas_tem_teto_por_documento_e_por_sessao(api, monkeypatch):
     assert sum(len(i["resultado"]["tarefas"]) for i in itens) == 3  # o lote inteiro cabe no teto da sessão
     sobra = [p for i in itens for p in i["resultado"]["pendentes"] if p.endswith("teto de tarefas da sessão")]
     assert len(sobra) == 1
-    for campos in ({"max_tarefas": "0"}, {"max_tarefas": "dez"}):
+    monkeypatch.setattr(srv, "TAREFAS_POR_DOCUMENTO", 200)
+    for grande in ("1" + "0" * 12, "9" * 5000):  # qualquer inteiro maior que zero, como no contrato: vale o teto
+        assert len(preparo(max_tarefas=grande)["tarefas"]) == 2
+    for campos in ({"max_tarefas": "0"}, {"max_tarefas": "000"}, {"max_tarefas": "dez"}, {"max_tarefas": "-3"}):
         r = conforme(enviar(api, ("r.docx", b"x"), A, modo="tarefas", **campos), "/v1/sessoes", "post")
         assert r.status_code == 400 and r.json()["type"] == "urn:lince:erro:max-tarefas-invalido"
     r = conforme(enviar(api, ("r.docx", b"x"), A, max_tarefas="3"), "/v1/sessoes", "post")  # só no modo tarefas
