@@ -13,7 +13,7 @@ e `NOTICE-Apache-Tika.txt`). Arquivos tirados dos conjuntos de teste públicos d
 | `poi_SampleDoc.docx`, `poi_SimpleMacro.docm`, `poi_SimpleMacro.doc`, `poi_DiffFirstPageHeadFoot.doc`, `poi_HeaderFooterUnicode.doc` | apache/poi `test-data/document/` (mesmo nome, sem o prefixo `poi_`) |
 | `poi_SampleSS.xlsx`, `poi_SimpleMacro.xlsm`, `poi_SimpleMacro.xls`, `poi_sample.xlsb`, `poi_testVarious.xlsb`, `poi_EmbeddedChartHeaderTest.xls`, `poi_47251_1.xls`, `poi_TwoSheetsOneHidden.xls`, `poi_45761.xls`, `poi_60405.xls` | apache/poi `test-data/spreadsheet/` (mesmo nome, sem o prefixo `poi_`) |
 | `poi_SampleShow.pptx`, `poi_SampleShow.ppt`, `poi_SimpleMacro.pptm`, `poi_SimpleMacro.ppt`, `poi_headers_footers.ppt`, `poi_slide_master.ppt` | apache/poi `test-data/slideshow/` (mesmo nome, sem o prefixo `poi_`) |
-| `test*.*` (PDF, Word, Excel, PowerPoint, ODF, RTF, EPUB, CSV, imagens) | apache/tika, pastas `test-documents/` dos módulos de parser, mesmo nome |
+| `test*.*` (PDF, Word, Excel, PowerPoint, ODF, RTF, EPUB, HTML, CSV, imagens) | apache/tika, pastas `test-documents/` dos módulos de parser, mesmo nome |
 
 **Modificados pelo Lince:** nomes de pessoas e de empresas foram trocados por "Autor de teste" (ou texto neutro do
 mesmo tamanho), para que nenhum fixture traga dado real de pessoa ou empresa. Nos pacotes zip (OOXML, ODF, EPUB)
@@ -34,6 +34,7 @@ Servem para provar o roteamento pela extensão; o formato binário é o mesmo.
 
 - `testPPT.pps` e `testPPT.pot`: cópias de `testPPT.ppt`.
 - `testJPEG.jpeg`: cópia de `testJPEG.jpg`.
+- `testHTML.htm`: cópia de `testHTML.html`.
 - `testTIFF.tiff`: cópia de `testTIFF.tif`.
 
 ## Escritos à mão para o Lince

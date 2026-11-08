@@ -257,9 +257,9 @@ def test_planilhas_em_texto_sao_lidas_com_separador_e_codificacao_detectados(api
 
 
 def test_formato_nao_suportado_recusa_o_lote_antes_de_entrar_na_fila(api, pdf):
-    r = conforme(enviar(api, [("bom.pdf", pdf), ("pagina.html", b"<p>oi</p>")], A), "/v1/sessoes", "post")
+    r = conforme(enviar(api, [("bom.pdf", pdf), ("mensagem.eml", b"From: a@b\n\noi")], A), "/v1/sessoes", "post")
     assert r.status_code == 415 and r.json()["type"] == "urn:lince:erro:formato-nao-suportado"
-    assert "pagina.html" in r.json()["detail"] and ".pdf" in r.json()["detail"]
+    assert "mensagem.eml" in r.json()["detail"] and ".pdf" in r.json()["detail"]
     assert api.app.state.servico.sessoes == {} and api.app.state.servico.vagas == {}
 
 

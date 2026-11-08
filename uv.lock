@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.12' and sys_platform == 'emscripten'",
@@ -319,6 +319,19 @@ wheels = [
 ]
 
 [[package]]
+name = "html-to-markdown"
+version = "3.20.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6e/45/10dd5297e1de9fb4fcd9f81a5858ba7fbad710c418bfb7d4ca79c1c34d63/html_to_markdown-3.20.0.tar.gz", hash = "sha256:a9b48ad4c7e6c382ef1098b8841ed3e54a14535c605e63d632ea1f756089b1ce", size = 6075285, upload-time = "2026-11-04T23:06:33.851Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/be/46/e629feef335f84148d64183f02827db98bb82c56a9a8c128baff91a77a14/html_to_markdown-3.20.0-cp311-abi3-macosx_10_12_x86_64.whl", hash = "sha256:709dd10bbec7e4fe9210783b92b20d8dd7de91f102df8b4e6c6821fe9ce23370", size = 8492322, upload-time = "2026-11-04T23:06:23.639Z" },
+    { url = "https://files.pythonhosted.org/packages/bd/c4/dfe181381afc7551d9470345c77df19538645b2e9cfbc7aa0af56138eb12/html_to_markdown-3.20.0-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:3c8a0b4078cbd3d8ab1c2f73cb9e7c963560c717e250a58cdfdf1e915b881a89", size = 8012638, upload-time = "2026-11-04T23:06:26.357Z" },
+    { url = "https://files.pythonhosted.org/packages/a1/c1/0d815a591872bf1b226242f464856f9352181987e06dca9cb42a5f4a8a6d/html_to_markdown-3.20.0-cp311-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:5002d8fd19e4d4d55a1ea324638f7c3e0cd842500705fa69392e3f400cd4ed2f", size = 8248762, upload-time = "2026-11-04T23:06:27.937Z" },
+    { url = "https://files.pythonhosted.org/packages/91/63/a6afbb9dc091f5b3064a3a26c2005c5a2e70ccb60791e4027f97730cbfde/html_to_markdown-3.20.0-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:c61085ec9d58843163a322329273cd9ab5d41f3cdd020f28fc168398ff4b9523", size = 8758426, upload-time = "2026-11-04T23:06:29.608Z" },
+    { url = "https://files.pythonhosted.org/packages/34/c8/9b02dae80fd6358f88cb0206928f0907d6811d51d807edc9c45b3c04f341/html_to_markdown-3.20.0-cp311-abi3-win_amd64.whl", hash = "sha256:6193b08a5ed7ff2a73a3a6688fc4bc2247d3bca27663ad01a772537f1295bdac", size = 8811998, upload-time = "2026-11-04T23:06:31.897Z" },
+]
+
+[[package]]
 name = "httpcore2"
 version = "2.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -507,6 +520,7 @@ source = { editable = "." }
 dependencies = [
     { name = "defusedxml" },
     { name = "firecrawl-anydoc" },
+    { name = "html-to-markdown" },
     { name = "lxml" },
     { name = "olefile" },
     { name = "openpyxl" },
@@ -543,6 +557,7 @@ dev = [
 requires-dist = [
     { name = "defusedxml", specifier = ">=0.7" },
     { name = "firecrawl-anydoc", specifier = "==0.2.4" },
+    { name = "html-to-markdown", specifier = ">=3.20,<4" },
     { name = "lxml", specifier = ">=6.1" },
     { name = "olefile", specifier = ">=0.47,<1" },
     { name = "openpyxl", specifier = ">=3.1.5,<4" },

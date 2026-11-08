@@ -32,6 +32,15 @@ def metadados_arquivo(path, ext=None):
         except Exception:  # noqa: BLE001, S110 — PDF sem propriedades legíveis: segue sem elas
             pass
         return meta
+    if ext in (".html", ".htm"):
+        from .pagina_html import metadados_html
+
+        try:
+            return metadados_html(path)
+        except MemoryError:
+            raise
+        except Exception:  # noqa: BLE001 — sem propriedades legíveis: o corpo segue lido
+            return meta
     if ext in ODF:
         meta = _metadados_odf(path, meta, ext)
         if estrutura := estrutura_arquivo(path, ext):

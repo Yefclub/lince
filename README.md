@@ -276,6 +276,7 @@ leitura falha com `lince.FormatoNaoSuportado`.
 | Apresentação | `.pptx` `.pptm` `.ppsx` `.ppsm` `.ppt` `.pps` `.pot` `.odp` | Slides, notas, tabelas e gráficos com os dados |
 | Planilha | `.xlsx` `.xlsm` `.xlsb` `.xls` `.ods` `.csv` `.tsv` | Abas como tabelas; CSV e TSV com separador e codificação detectados |
 | Imagem | `.png` `.jpg` `.jpeg` `.webp` `.tif` `.tiff` `.bmp` `.gif` | Pelo modelo de visão |
+| Página da web | `.html` `.htm` | Títulos, listas, tabelas e links; imagem embutida (`data:`) lida pela IA, imagem externa nunca baixada; texto oculto vai para os alertas |
 | Texto | `.txt` `.md` `.json` `.yaml` `.yml` `.xml` `.tex` | Como está |
 
 Documento como código e edição: `.pptx` e `.pptm` (`.ppsx` só na leitura do código).
@@ -287,12 +288,12 @@ ganha `macros: true`: VBA no Office (OOXML, inclusive `.xlsb`, e `.doc`, `.xls`,
 (`.xlsx`, `.xlsm`, `.xlsb` e `.xls`) e macro do LibreOffice. A macro nunca é executada.
 
 Cada extensão da tabela é testada no CI com um arquivo real em `tests/fixtures/reais/`: os de Word, Excel,
-PowerPoint, OpenDocument, RTF, EPUB, PDF, CSV e imagem vêm dos conjuntos de teste públicos do Apache POI e do Apache
-Tika, gravados pelos próprios programas; `.pps`, `.pot`, `.jpeg` e `.tiff` são cópias com outra extensão, e os de
+PowerPoint, OpenDocument, RTF, EPUB, PDF, HTML, CSV e imagem vêm dos conjuntos de teste públicos do Apache POI e do
+Apache Tika, gravados pelos próprios programas; `.pps`, `.pot`, `.htm`, `.jpeg` e `.tiff` são cópias com outra extensão, e os de
 texto foram escritos à mão. Limite conhecido: `.xlsb` gravado fora da especificação falha na leitura com erro claro
 do documento (um de 23 arquivos reais testados; nenhum outro leitor livre testado o abre).
 
-HTML, e-mail (`.eml`, `.msg`) e arquivos compactados (`.zip`) ainda não são aceitos.
+E-mail (`.eml`, `.msg`) e arquivos compactados (`.zip`) ainda não são aceitos.
 
 ## Instalação
 
@@ -312,7 +313,7 @@ lince relatorio.pdf --url https://openrouter.ai/api/v1 --modelo seu/modelo --cha
 Todas com licença permissiva: [anydoc](https://github.com/firecrawl/anydoc) (MIT),
 [pdf-inspector](https://github.com/firecrawl/pdf-inspector) (MIT), [pypdfium2](https://github.com/pypdfium2-team/pypdfium2)
 (Apache-2.0/BSD-3), openpyxl (MIT), python-pptx (MIT), Pillow (MIT-CMU), lxml (BSD-3), defusedxml (PSF),
-[olefile](https://github.com/decalage2/olefile) (BSD-2); na API, Starlette e Uvicorn (BSD-3) e
+[olefile](https://github.com/decalage2/olefile) (BSD-2), [html-to-markdown](https://github.com/xberg-io/html-to-markdown) (MIT); na API, Starlette e Uvicorn (BSD-3) e
 python-multipart (Apache-2.0). Nada de GPL/AGPL. O CI e o build da imagem reprovam qualquer dependência fora
 dessa lista, e a imagem leva `THIRD_PARTY_NOTICES.md` gerado do que foi instalado.
 

@@ -25,12 +25,14 @@ from .limites import LADO_MAX_PX, conferir_zip
 from .metadados import metadados_arquivo
 from .montagem import montar
 from .office import planejar_office
+from .pagina_html import planejar_html
 from .pdf import planejar_pdf
 from .provedores import LeitorVisual
 from .tipos import Cobertura, PrazoEsgotado, Resultado, Uso
 
 TEXTO = {".txt", ".md", ".json", ".yaml", ".yml", ".tex", ".xml"}
 IMAGEM = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+HTML = {".html", ".htm"}
 OFFICE = {  # lidos pelo anydoc (com gráficos, fluxogramas e imagens à parte)
     ".docx",
     ".docm",
@@ -54,7 +56,7 @@ OFFICE = {  # lidos pelo anydoc (com gráficos, fluxogramas e imagens à parte)
     ".csv",
     ".tsv",
 }
-FORMATOS = frozenset({".pdf"} | IMAGEM | TEXTO | OFFICE)  # o que o Lince lê; a API recusa o resto com 415
+FORMATOS = frozenset({".pdf"} | IMAGEM | TEXTO | HTML | OFFICE)  # o que o Lince lê; a API recusa o resto com 415
 
 
 class FormatoNaoSuportado(anydoc.UnsupportedError):
@@ -106,6 +108,8 @@ class Leitor:
             plano = _plano_imagem(caminho, pasta)
         elif ext in TEXTO:
             plano = {"tipo": "texto", "md": _texto(caminho), "tarefas": []}
+        elif ext in HTML:
+            plano = planejar_html(caminho, pasta)
         else:
             if zipfile.is_zipfile(caminho):  # Office, ODF, EPUB: conferido antes de qualquer descompactação
                 conferir_zip(caminho)

@@ -94,10 +94,10 @@ def test_formato_vem_do_conteudo_quando_a_extensao_nao_diz(tmp_path, pdf_tres_pa
     pdf = tmp_path / "relatorio.bin"
     pdf.write_bytes(open(pdf_tres_paginas, "rb").read())
     assert lince.ler(pdf).cobertura.rotas == lince.ler(pdf_tres_paginas).cobertura.rotas != {}  # roteado como PDF
-    html = tmp_path / "pagina.html"
-    html.write_text("<p>oi</p>")
+    eml = tmp_path / "mensagem.eml"
+    eml.write_text("From: a@b\nSubject: oi\n\noi")
     with pytest.raises(lince.FormatoNaoSuportado):
-        lince.ler(html)
+        lince.ler(eml)
 
 
 def test_documento_sem_injecao_nao_gera_alerta(tmp_path):
