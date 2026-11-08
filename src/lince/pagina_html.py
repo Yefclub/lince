@@ -5,7 +5,8 @@ atributos de apresentação do SVG) sai do corpo e vira alerta. O style é lido 
 
 Limites (a página não é renderizada): cor do texto contra o fundo (branco sobre azul é visível), estilo de classe numa
 folha <style>, calc(), font-size sem unidade do modo quirks, <foreignObject> tratado como SVG e conteúdo de
-<symbol>/<defs> desenhado por <use> (vai para o alerta). Imagem
+<symbol>/<defs> desenhado por <use> (vai para o alerta), e técnicas que o Lince não avalia: content-visibility,
+transform:scale(0), filter, clip-path e hidden num elemento do SVG. Imagem
 embutida (data:) é lida pela IA; imagem externa nunca é baixada (o Lince não busca nada na rede por causa de um
 documento)."""
 
@@ -28,15 +29,25 @@ _SEM_CONTEUDO = {"script", "style", "noscript", "template", "iframe", "object", 
 # apresentação do SVG (display="none", font-size="0"...) só vale se o style não declara a mesma propriedade.
 _PROPRIEDADES = ("display", "opacity", "visibility", "font-size", "font")
 _MANTEM = {"inherit", "unset", "revert", "revert-layer"}  # em propriedade herdada, é o valor do pai
-_ABSOLUTAS = {"px", "pt", "pc", "cm", "mm", "in", "q", "rem"}
-_RELATIVAS = {"em", "ex", "ch", "cap", "ic", "lh", "rlh"}
-_DISPLAY = {"none", "block", "inline", "inline-block", "flex", "inline-flex", "grid", "inline-grid", "flow",
-            "flow-root",
+FONTE_INVISIVEL_PX = 1  # até 1px a letra não se lê: conta como escondida (como fonte minúscula no Word e no PDF)
+_PX = {"px": 1, "pt": 96 / 72, "pc": 16, "in": 96, "cm": 96 / 2.54, "mm": 96 / 25.4, "q": 96 / 101.6}
+_DO_PAI = {"em": 1, "ex": 0.5, "ch": 0.5, "cap": 0.7, "ic": 1, "lh": 1.2}  # múltiplos aproximados da fonte do pai
+_DA_RAIZ = {"rem": 1, "rex": 0.5, "rch": 0.5, "rcap": 0.7, "ric": 1, "rlh": 1.2}
+_TELA = {"vw", "vh", "vi", "vb", "vmin", "vmax", "svw", "svh", "lvw", "lvh", "dvw", "dvh", "svmin", "svmax", "lvmin",
+         "lvmax", "dvmin", "dvmax", "cqw", "cqh", "cqi", "cqb", "cqmin", "cqmax"}  # fmt: skip
+_TELA_PX = 10  # 1vw numa tela de 1000px: só importa saber que não é zero
+_TAMANHOS = {"xx-small": 9, "x-small": 10, "small": 13, "medium": 16, "large": 18, "x-large": 24, "xx-large": 32,
+             "xxx-large": 48}  # fmt: skip
+_FONTES_DO_SISTEMA = {"caption", "icon", "menu", "message-box", "small-caption", "status-bar"}
+_PREFIXO_FONT = {"normal", "italic", "oblique", "small-caps", "bold", "bolder", "lighter", "ultra-condensed",
+                 "extra-condensed", "condensed", "semi-condensed", "semi-expanded", "expanded", "extra-expanded",
+                 "ultra-expanded"}  # fmt: skip
+_GLOBAIS = _MANTEM | {"initial", "default"}
+_DISPLAY = {"none", "block", "inline", "inline-block", "flex", "inline-flex", "grid", "inline-grid", "flow-root",
             "table", "inline-table", "table-row", "table-cell", "table-column", "table-row-group", "table-column-group",
             "table-header-group", "table-footer-group", "table-caption", "list-item", "contents", "run-in", "ruby",
             "ruby-base", "ruby-text", "ruby-base-container", "ruby-text-container", "math", "-webkit-box",
             "-webkit-inline-box", "-ms-flexbox", "-ms-inline-flexbox"}  # fmt: skip
-_TAMANHOS = {"xx-small", "x-small", "small", "medium", "large", "x-large", "xx-large", "xxx-large"}
 # partes do SVG que nunca são desenhadas: o texto delas não aparece
 _SVG_NAO_DESENHA = {"defs", "symbol", "clippath", "mask", "pattern", "marker", "metadata", "desc", "lineargradient",
                     "radialgradient", "filter"}  # fmt: skip
@@ -147,85 +158,121 @@ def _tokens(valor) -> list:
     return [t for t in valor if t.type not in ("whitespace", "comment")]
 
 
-def _classificar(nome, tokens):
-    """O que a declaração diz, ou None se o navegador a descarta. display: "none"/"outro"; opacity: número;
-    visibility e font-size: "esconde", "mostra", "herda" (vale o do pai)."""
-    if len(tokens) == 1 and tokens[0].type == "ident" and tokens[0].lower_value in _MANTEM:
-        return "herda"
-    if nome == "display":  # palavra desconhecida: o navegador descarta a declaração e vale a anterior
-        if any(t.type != "ident" or t.lower_value not in _DISPLAY for t in tokens):
-            return None
-        return "none" if len(tokens) == 1 and tokens[0].lower_value == "none" else "outro"
+def _classificar(nome, tokens, pai_px, raiz_px, atributo_svg=False):
+    """O que a declaração diz, ou None se o navegador a descarta (aí vale a anterior).
+    display: "none"/"outro"; opacity: número; visibility: "esconde"/"mostra"/"herda"; font-size: px calculado."""
+    unico = tokens[0] if len(tokens) == 1 else None
+    global_ = (
+        unico.lower_value if unico is not None and unico.type == "ident" and unico.lower_value in _GLOBAIS else None
+    )
+    if nome == "display":  # uma palavra só: combinações de duas palavras raras inline ficam como inválidas
+        if global_:
+            return "outro"  # o valor do pai ou o inicial (inline): o pai está à mostra
+        ok = unico is not None and unico.type == "ident" and unico.lower_value in _DISPLAY
+        return ("none" if unico.lower_value == "none" else "outro") if ok else None
     if nome == "opacity":
-        if len(tokens) == 1 and tokens[0].type in ("number", "percentage"):
-            return tokens[0].value / (100 if tokens[0].type == "percentage" else 1)
+        if global_:
+            return 1.0
+        if unico is not None and unico.type in ("number", "percentage"):
+            return unico.value / (100 if unico.type == "percentage" else 1)
         return None
     if nome == "visibility":
-        if len(tokens) == 1 and tokens[0].type == "ident":
-            v = tokens[0].lower_value
-            return "esconde" if v in ("hidden", "collapse") else ("mostra" if v == "visible" else None)
-        return None
+        if global_:
+            return "mostra" if global_ == "initial" else "herda"
+        v = unico.lower_value if unico is not None and unico.type == "ident" else None
+        return "esconde" if v in ("hidden", "collapse") else ("mostra" if v == "visible" else None)
+    if global_:  # font-size e font
+        return 16.0 if global_ == "initial" else pai_px
     if nome == "font-size":
-        return _tamanho(tokens[0]) if len(tokens) == 1 else None
-    return _tamanho_do_atalho(tokens)  # font
+        return _px(unico, pai_px, raiz_px, atributo_svg) if unico is not None else None
+    return _px_do_atalho(tokens, pai_px, raiz_px)
 
 
-def _tamanho(t):
-    """Fonte zero (ou até 1px) esconde; tamanho absoluto mostra; relativo (em, %, smaller) herda do pai."""
+def _px(t, pai_px, raiz_px, atributo_svg=False):
+    """Tamanho da fonte em px como o navegador calcula; None se o valor é inválido."""
     if t.type in ("dimension", "percentage", "number") and t.value < 0:
         return None
-    if t.type == "number":
-        return "esconde" if t.value == 0 else None  # sem unidade só o 0 é válido
+    if t.type == "number":  # sem unidade: só o 0, a não ser no atributo de apresentação do SVG (px)
+        return float(t.value) if atributo_svg or t.value == 0 else None
     if t.type == "percentage":
-        return "esconde" if t.value == 0 else "herda"
+        return pai_px * t.value / 100
     if t.type == "dimension":
-        unidade = t.lower_unit
-        if t.value == 0 or (unidade == "px" and t.value <= 1):
-            return "esconde"
-        return "mostra" if unidade in _ABSOLUTAS else ("herda" if unidade in _RELATIVAS else None)
+        u = t.lower_unit
+        if u in _PX:
+            return t.value * _PX[u]
+        if u in _DO_PAI:
+            return t.value * pai_px * _DO_PAI[u]
+        if u in _DA_RAIZ:
+            return t.value * raiz_px * _DA_RAIZ[u]
+        if u in _TELA:
+            return t.value * _TELA_PX
+        return None
     if t.type == "ident":
         v = t.lower_value
-        return "mostra" if v in _TAMANHOS else ("herda" if v in ("smaller", "larger") else None)
+        if v in _TAMANHOS:
+            return float(_TAMANHOS[v])
+        return {"smaller": pai_px / 1.2, "larger": pai_px * 1.2}.get(v)
     return None
 
 
-def _tamanho_do_atalho(tokens):
-    """font: [estilo/variante/peso] tamanho[/altura] família — sem família, o navegador descarta a declaração."""
-    for k, t in enumerate(tokens):
-        e_tamanho = t.type in ("dimension", "percentage") or (t.type == "number" and t.value == 0) or (
-            t.type == "ident" and t.lower_value in _TAMANHOS | {"smaller", "larger"})  # fmt: skip
-        if not e_tamanho:
-            if t.type == "ident" or (t.type == "number" and 1 <= t.value <= 1000):
-                continue  # italic, bold, small-caps, 400...
-            return None
-        resto = tokens[k + 1 :]
-        if resto and resto[0].type == "literal" and resto[0].value == "/":
-            resto = resto[2:]  # altura da linha
-        familia = resto and all(
-            r.type in ("ident", "string") or (r.type == "literal" and r.value == ",") for r in resto
+def _px_do_atalho(tokens, pai_px, raiz_px):
+    """font: [estilo, variante, peso, largura] tamanho[/altura] família[, família…], ou uma fonte do sistema. Fora
+    dessa gramática, o navegador descarta a declaração."""
+    if len(tokens) == 1 and tokens[0].type == "ident" and tokens[0].lower_value in _FONTES_DO_SISTEMA:
+        return 13.0
+    k, vistos = 0, set()
+    while k < len(tokens) and k < 4:  # prefixo: palavras da lista fechada ou peso de 1 a 1000, sem repetir
+        t = tokens[k]
+        chave = t.lower_value if t.type == "ident" and t.lower_value in _PREFIXO_FONT else None
+        if chave is None and t.type == "number" and 1 <= t.value <= 1000:
+            chave = "peso"
+        if chave is None or (chave in vistos and chave != "normal"):
+            break
+        vistos.add(chave)
+        k += 1
+    if k >= len(tokens) or (tamanho := _px(tokens[k], pai_px, raiz_px)) is None:
+        return None
+    resto = tokens[k + 1 :]
+    if resto and resto[0].type == "literal" and resto[0].value == "/":
+        altura = resto[1] if len(resto) > 1 else None
+        valida = altura is not None and (
+            altura.type in ("number", "percentage")
+            or (altura.type == "dimension" and altura.lower_unit in _PX | _DO_PAI | _DA_RAIZ)
+            or (altura.type == "ident" and altura.lower_value == "normal")
         )
-        return _tamanho(t) if familia else None
-    return None
+        if not valida:
+            return None
+        resto = resto[2:]
+    itens, atual = [], []
+    for r in resto + [None]:  # família: lista separada por vírgula; cada item é uma string ou idents seguidos
+        if r is None or (r.type == "literal" and r.value == ","):
+            itens.append(atual)
+            atual = []
+        else:
+            atual.append(r)
+    for item in itens:
+        so_string = len(item) == 1 and item[0].type == "string"
+        so_idents = item and all(x.type == "ident" and x.lower_value not in _GLOBAIS for x in item)
+        if not (so_string or so_idents):
+            return None
+    return tamanho
 
 
-def _efetivas(el, em_svg) -> dict:
+def _efetivas(el, em_svg, pai_px, raiz_px) -> dict:
     """Valor que vale para cada propriedade no próprio elemento, pela cascata do CSS."""
     normais, importantes = {}, {}
     for d in tinycss2.parse_blocks_contents(el.get("style") or "", skip_comments=True, skip_whitespace=True):
-        if d.type != "declaration":
+        if d.type != "declaration" or d.lower_name not in _PROPRIEDADES or not (tokens := _tokens(d.value)):
             continue
         nome = "font-size" if d.lower_name == "font" else d.lower_name
-        tokens = _tokens(d.value)
-        if d.lower_name not in _PROPRIEDADES or not tokens:
-            continue
-        if (valor := _classificar(d.lower_name, tokens)) is not None:
+        if (valor := _classificar(d.lower_name, tokens, pai_px, raiz_px)) is not None:
             (importantes if d.important else normais)[nome] = valor
     efetivas = {**normais, **importantes}
     if em_svg:  # atributo de apresentação: abaixo de qualquer declaração do style
         for nome in ("display", "opacity", "visibility", "font-size"):
             if nome not in efetivas and (atributo := el.get(nome)) is not None:
                 tokens = _tokens(tinycss2.parse_component_value_list(atributo))
-                if tokens and (valor := _classificar(nome, tokens)) is not None:
+                if tokens and (valor := _classificar(nome, tokens, pai_px, raiz_px, atributo_svg=True)) is not None:
                     efetivas[nome] = valor
     return efetivas
 
@@ -233,46 +280,46 @@ def _efetivas(el, em_svg) -> dict:
 def _tirar_oculto(raiz) -> list:
     """Tira o que não aparece (scripts, estilos, <noscript>, partes do SVG que não são desenhadas) e o texto
     escondido, antes de olhar as imagens: imagem dentro de bloco oculto não é paga nem lida. Percurso com pilha, sem
-    recursão, levando o estado herdado (fonte zero, invisível): o texto de um nó escondido sai mesmo que um
-    descendente volte a aparecer. O(1) por nó, mais o tamanho do style."""
-    ocultos, pilha = [], [(raiz, False, False, False)]  # (elemento, fonte zero, invisível, dentro de SVG)
+    recursão, levando o estado herdado (tamanho da fonte em px, invisível): o texto de um nó escondido sai mesmo que
+    um descendente volte a aparecer. O(1) por nó, mais o tamanho do style."""
+    ocultos, raiz_px = [], 16.0
+    pilha = [(raiz, 16.0, False, False)]  # (elemento, fonte herdada em px, invisível, dentro de SVG)
     while pilha:
-        el, zero, invisivel, em_svg = pilha.pop()
+        el, px, invisivel, em_svg = pilha.pop()
         if not isinstance(el.tag, str):
             continue
         if el.tag in _SEM_CONTEUDO:
             _esvaziar(el)
             continue
-        tecnica = "atributo hidden" if el.get("hidden") is not None else None
         em_svg = em_svg or el.tag == "svg"
-        tecnica = tecnica or ("parte do SVG que não é desenhada" if em_svg and el.tag in _SVG_NAO_DESENHA else None)
-        # no mesmo elemento, qualquer declaração que esconde, esconde (CSS descarta valor inválido e dá precedência
-        # ao !important; sem reproduzir isso, o lado seguro é o alerta, nunca deixar texto escondido no corpo). A
-        # ordem só serve para desfazer o que vem do pai; inherit/unset/revert ficam com o valor do pai.
-        efetivas = _efetivas(el, em_svg)
-        esconde_tudo = efetivas.get("display") == "none" or (
-            isinstance(efetivas.get("opacity"), float) and efetivas["opacity"] <= 0
-        )
-        if (vis := efetivas.get("visibility")) in ("esconde", "mostra"):
-            invisivel = vis == "esconde"
-        if (fonte := efetivas.get("font-size")) in ("esconde", "mostra"):
-            zero = fonte == "esconde"
-        tecnica = tecnica or ("estilo que esconde" if esconde_tudo else None)
+        efetivas = _efetivas(el, em_svg, px, raiz_px)
+        tecnica = None
+        if el.get("hidden") is not None and efetivas.get("display") != "outro":  # display do autor vence o hidden
+            tecnica = "atributo hidden"
+        elif em_svg and el.tag in _SVG_NAO_DESENHA:
+            tecnica = "parte do SVG que não é desenhada"
+        elif efetivas.get("display") == "none" or efetivas.get("opacity", 1.0) <= 0:
+            tecnica = "estilo que esconde"
         if tecnica:  # sem volta: nenhum descendente desfaz display:none, opacity:0 nem hidden
             if conteudo := " ".join(el.text_content().split()):
                 ocultos.append((tecnica, conteudo))
             _esvaziar(el)
             continue
+        if (vis := efetivas.get("visibility")) in ("esconde", "mostra"):
+            invisivel = vis == "esconde"
+        px = efetivas.get("font-size", px)
+        if el is raiz:
+            raiz_px = px
         if invisivel and el.tag == "img":  # imagem invisível não é lida (com fonte zero, a imagem aparece)
             _esvaziar(el)
             continue
-        if zero or invisivel:  # o texto deste nó e o que vem entre os filhos estão escondidos
+        if px <= FONTE_INVISIVEL_PX or invisivel:  # o texto deste nó e o que vem entre os filhos estão escondidos
             tecnica = "estilo que esconde" if invisivel else "fonte zero"
             for dono, campo in [(el, "text")] + [(f, "tail") for f in el]:
                 if (t := getattr(dono, campo)) and t.strip():
                     ocultos.append((tecnica, " ".join(t.split())))
                     setattr(dono, campo, None)
-        pilha.extend((f, zero, invisivel, em_svg) for f in reversed(list(el)))
+        pilha.extend((f, px, invisivel, em_svg) for f in reversed(list(el)))
     return ocultos
 
 
