@@ -35,6 +35,11 @@ ESPERADO = {
     "testFooter.odt": "Here is some text on page 2",
     "testRTF.rtf": "Test d’indexation Word",
     "testRTFVarious.rtf": "Here is a text box",
+    "testHTML.html": "# Test Indexation Html",
+    "testHTML.htm": "[Indexation](http://www.apache.org/) du fichier",
+    "testHTML_utf8.html": "åäö",
+    "testHTML_charset_utf16le.html": "This is a sample text",  # UTF-16 com BOM
+    "testXHTML.html": "[XHTML document](http://www.w3.org/TR/xhtml1/)",
     "testEPUB.epub": "This is the text for chapter One",
     "testPPT.pptx": "Attachment Test",
     "poi_SampleShow.pptx": "Title of the first slide",
