@@ -232,8 +232,11 @@ def planejar_office(path, pasta, ext=None):
 
         def imagens_bordas():
             nonlocal md
-            achadas = _imagens_das_bordas(path, ext, ilegiveis)
-            novas = [(m, d) for m, d in achadas if hashlib.sha256(d).digest() not in vistas and min(_tam(d)) >= 48]
+            achadas, novas = _imagens_das_bordas(path, ext, ilegiveis), []
+            for m, d in achadas:  # a mesma imagem em várias seções (ou também no corpo) é lida uma vez
+                if (marca := hashlib.sha256(d).digest()) not in vistas and min(_tam(d)) >= 48:
+                    vistas.add(marca)
+                    novas.append((m, d))
             if novas:
                 md += "\n\n**Imagens do cabeçalho e do rodapé:**\n\n"
                 md += "\n\n".join(
@@ -320,24 +323,28 @@ def _imagens_das_bordas(path, ext, ilegiveis) -> list[tuple[str, bytes]]:
         if not completo:
             ilegiveis.append("imagens do cabeçalho e do rodapé (parcial)")
         return achadas
-    achadas = []
+    alvos = []  # nomes no zip, sem repetir: o mesmo logotipo em várias seções ou páginas mestras é lido uma vez
     with zipfile.ZipFile(path) as z:
         nomes = set(z.namelist())
         if ext in ODF:
             raiz = xml_ou_nada(z.read("styles.xml")) if "styles.xml" in nomes else None
             for borda in raiz.iter() if raiz is not None else ():
                 if borda.tag.rsplit("}", 1)[-1] in _ODF_BORDAS:
-                    for im in borda.iter():
-                        if im.tag.rsplit("}", 1)[-1] == "image" and (alvo := im.get(_XLINK)) in nomes:
-                            achadas.append((_mime(alvo), z.read(alvo)))
-            return achadas
-        for parte in sorted(n for n in nomes if re.fullmatch(r"word/_rels/(header|footer)\d*\.xml\.rels", n)):
-            rels = xml_ou_nada(z.read(parte))
-            for r in rels if rels is not None else ():
-                alvo = "word/" + (r.get("Target") or "").lstrip("/").removeprefix("word/")
-                if (r.get("Type") or "").endswith("/image") and r.get("TargetMode") != "External" and alvo in nomes:
-                    achadas.append((_mime(alvo), z.read(alvo)))
-    return achadas
+                    alvos += [im.get(_XLINK) for im in borda.iter() if im.tag.rsplit("}", 1)[-1] == "image"]
+        else:
+            for parte in sorted(n for n in nomes if re.fullmatch(r"word/_rels/(header|footer)\d*\.xml\.rels", n)):
+                rels = xml_ou_nada(z.read(parte))
+                alvos += [
+                    "word/" + (r.get("Target") or "").lstrip("/").removeprefix("word/")
+                    for r in (rels if rels is not None else ())
+                    if (r.get("Type") or "").endswith("/image")
+                    and r.get("TargetMode") != "External"
+                    and not (r.get("Target") or "").lower().endswith(".svg")  # o Office grava o PNG de reserva junto
+                ]
+        alvos = [a for a in dict.fromkeys(alvos) if a in nomes]
+        if len(alvos) > legados.IMAGENS_MAX:
+            ilegiveis.append(f"imagens do cabeçalho e do rodapé: mais de {legados.IMAGENS_MAX}; o resto ficou de fora")
+        return [(_mime(a), z.read(a)) for a in alvos[: legados.IMAGENS_MAX]]
 
 
 def _nao_lida(onde, mime, ilegiveis) -> str:

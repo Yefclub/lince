@@ -491,18 +491,44 @@ def _fim_do_grupo(s: bytes, i: int) -> int:
     return -1 if prof else i
 
 
-_PICT = re.compile(rb"\{\\pict(?![a-z])")
+# \\pict a ler, e os grupos que trazem uma cópia de reserva da mesma imagem (o WMF do \\nonshppict) e são pulados
+_PICT = re.compile(rb"\{\\(?:(pict)|nonshppict|\*\\shprslt)(?![a-z])")
 _TIPO_PICT = re.compile(rb"\\(pngblip|jpegblip|emfblip|wmetafile|dibitmap)(?![a-z])")
 _MIME_PICT = {b"pngblip": "image/png", b"jpegblip": "image/jpeg", b"emfblip": "image/x-emf",
               b"wmetafile": "image/x-wmf", b"dibitmap": "image/bmp"}  # fmt: skip
-_SUBGRUPO = re.compile(rb"\{[^{}]*\}")  # {\*\blipuid ...} e afins dentro do \pict
 _PALAVRA = re.compile(rb"\\[a-z]+-?\d* ?")
 
 
+def _nivel_de_cima(seg: bytes) -> bytes | None:
+    """O conteúdo do grupo sem os subgrupos ({\\*\\picprop{\\sp...}}, {\\*\\blipuid ...}), em qualquer profundidade."""
+    partes, pos = [], 0
+    while (k := seg.find(b"{", pos)) >= 0:
+        partes.append(seg[pos:k])
+        if (pos := _fim_do_grupo(seg, k + 1)) < 0:
+            return None
+    partes.append(seg[pos:])
+    return b"".join(partes)
+
+
+def _pict(seg: bytes) -> tuple[str, bytes] | None:
+    """(MIME, bytes) de um \\pict em hexadecimal, ou None se o tipo não é conhecido ou o conteúdo não é hexadecimal
+    (\\bin, quebrado). O bitmap cru (\\dibitmap) ganha o cabeçalho de arquivo BMP."""
+    if (topo := _nivel_de_cima(seg)) is None or not (tipo := _TIPO_PICT.search(topo)):
+        return None
+    try:
+        imagem = bytes.fromhex(re.sub(rb"\s", b"", _PALAVRA.sub(b"", topo)).decode("ascii"))
+    except ValueError:
+        return None
+    if tipo.group(1) == b"dibitmap":
+        imagem = _bmp_do_dib(imagem)
+    return (_MIME_PICT[tipo.group(1)], imagem) if imagem else None
+
+
 def imagens_rtf(dados: bytes) -> tuple[list[tuple[str, bytes]], bool]:
-    """Imagens (\\pict em hexadecimal) dos grupos \\header e \\footer, com os mesmos tetos de rtf(). Devolve também se
-    todos os grupos foram lidos. O bitmap cru (\\dibitmap) ganha o cabeçalho de arquivo BMP."""
-    vistos, saida, percorridos = set(), [], 0
+    """Imagens (\\pict em hexadecimal) dos grupos \\header e \\footer, com os mesmos tetos de rtf(), distintas e até
+    IMAGENS_MAX. Devolve também se a leitura foi completa. A busca anda para a frente: cada \\pict (ou cópia de
+    reserva) é percorrido uma vez, mesmo aninhado."""
+    vistos, saida, marcas, percorridos = set(), [], set(), 0
     for m in _GRUPO_BORDA.finditer(dados):
         fim = _fim_do_grupo(dados, m.end())
         if fim < 0:
@@ -516,18 +542,16 @@ def imagens_rtf(dados: bytes) -> tuple[list[tuple[str, bytes]], bool]:
         vistos.add(corpo)
         if len(vistos) > _GRUPOS_MAX:
             return saida, False
-        for p in _PICT.finditer(corpo):
-            if (fim_p := _fim_do_grupo(corpo, p.end())) < 0 or not (tipo := _TIPO_PICT.search(corpo, p.end(), fim_p)):
-                continue
-            hexa = re.sub(rb"\s", b"", _PALAVRA.sub(b"", _SUBGRUPO.sub(b"", corpo[p.end() : fim_p - 1])))
-            try:  # só hexadecimal: \\bin (binário cru) e conteúdo quebrado ficam de fora
-                imagem = bytes.fromhex(hexa.decode("ascii"))
-            except ValueError:
-                continue
-            if tipo.group(1) == b"dibitmap" and (imagem := _bmp_do_dib(imagem)) is None:
-                continue
-            if imagem:
-                saida.append((_MIME_PICT[tipo.group(1)], imagem))
+        pos = 0
+        while p := _PICT.search(corpo, pos):
+            if (pos := _fim_do_grupo(corpo, p.end())) < 0:
+                break
+            if p.group(1) and (achada := _pict(corpo[p.end() : pos - 1])):
+                if (marca := hashlib.sha256(achada[1]).digest()) not in marcas:
+                    if len(saida) >= IMAGENS_MAX:
+                        return saida, False
+                    marcas.add(marca)
+                    saida.append(achada)
     return saida, True
 
 
