@@ -1,12 +1,11 @@
 """HTML salvo (página, relatório exportado, e-mail em HTML): Markdown pelo html-to-markdown. Texto escondido sem
 ambiguidade (atributo hidden; display:none, opacity:0, visibility:hidden e fonte zero no estilo da própria tag ou nos
-atributos de apresentação do SVG) sai do corpo e vira alerta. Na dúvida, o lado é o alerta: no mesmo elemento,
-qualquer declaração que esconde, esconde.
+atributos de apresentação do SVG) sai do corpo e vira alerta. O style é lido pelo tinycss2, com a cascata do CSS
+(última declaração válida, !important vence, valor inválido descartado) e herança de visibility e font-size.
 
 Limites (a página não é renderizada): cor do texto contra o fundo (branco sobre azul é visível), estilo de classe numa
-folha <style>, comentário e escape dentro do CSS (display:/**/none), calc(), font-size sem unidade do modo quirks,
-<foreignObject> tratado como SVG, conteúdo de <symbol>/<defs> desenhado por <use> e declaração que desfaz o oculto no
-mesmo elemento (display:none;display:block, visibility:hidden;visibility:inherit): esses vão para o alerta. Imagem
+folha <style>, calc(), font-size sem unidade do modo quirks, <foreignObject> tratado como SVG e conteúdo de
+<symbol>/<defs> desenhado por <use> (vai para o alerta). Imagem
 embutida (data:) é lida pela IA; imagem externa nunca é baixada (o Lince não busca nada na rede por causa de um
 documento)."""
 
@@ -17,23 +16,27 @@ import re
 import secrets
 
 import html_to_markdown
+import tinycss2
 from lxml import etree
 from lxml import html as lxml_html
 
 IMAGEM_MAX = 20 * 1024 * 1024  # bytes de uma imagem embutida; maior que isso fica marcada, sem leitura
 PROFUNDIDADE_MAX = 2048  # o libxml2 com huge_tree corta aí; o html-to-markdown recebe o mesmo teto
 _SEM_CONTEUDO = {"script", "style", "noscript", "template", "iframe", "object", "embed", "head"}
-# Estilo da própria tag lido como declarações, a última vence (como no CSS); o atributo de apresentação do SVG
-# (display="none", font-size="0"...) vale como declaração anterior ao style. Sem renderizar a página, só isto conta.
+# Estilo da própria tag lido pelo tinycss2 (a sintaxe do CSS: comentário, escape, string, url(), !important), com a
+# cascata do CSS: vale a última declaração válida, e !important vence; valor inválido é descartado. O atributo de
+# apresentação do SVG (display="none", font-size="0"...) só vale se o style não declara a mesma propriedade.
 _PROPRIEDADES = ("display", "opacity", "visibility", "font-size", "font")
 _MANTEM = {"inherit", "unset", "revert", "revert-layer"}  # em propriedade herdada, é o valor do pai
-_FONTE_ZERO = re.compile(r"(?:0(?:\.0+)?(?:px|pt|em|rem|%)?|0?\.\d+px|1px)", re.I)
-_TAMANHO_ABSOLUTO = re.compile(
-    r"(?:\d+(?:\.\d+)?|\.\d+)(?:px|pt|pc|cm|mm|in|q|rem)|xx-small|x-small|small|medium|large|x-large|xx-large|xxx-large",
-    re.I | re.ASCII,  # sem espaço antes da unidade e sem dígito Unicode: o navegador descarta os dois
-)  # só valor válido desfaz o zero herdado; em, %, smaller/larger e inválidos mantêm o pai
-_NUMERO_CSS = re.compile(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)%?", re.I | re.ASCII)  # ASCII: sem inf, nan, ٠
-_TAMANHO_NO_ATALHO = re.compile(r"(?<![\w.])(0|[\d.]+(?:px|pt|em|rem|%))(?=\s*/|\s|$)", re.I)  # font: 0/0 a
+_ABSOLUTAS = {"px", "pt", "pc", "cm", "mm", "in", "q", "rem"}
+_RELATIVAS = {"em", "ex", "ch", "cap", "ic", "lh", "rlh"}
+_DISPLAY = {"none", "block", "inline", "inline-block", "flex", "inline-flex", "grid", "inline-grid", "flow",
+            "flow-root",
+            "table", "inline-table", "table-row", "table-cell", "table-column", "table-row-group", "table-column-group",
+            "table-header-group", "table-footer-group", "table-caption", "list-item", "contents", "run-in", "ruby",
+            "ruby-base", "ruby-text", "ruby-base-container", "ruby-text-container", "math", "-webkit-box",
+            "-webkit-inline-box", "-ms-flexbox", "-ms-inline-flexbox"}  # fmt: skip
+_TAMANHOS = {"xx-small", "x-small", "small", "medium", "large", "x-large", "xx-large", "xxx-large"}
 # partes do SVG que nunca são desenhadas: o texto delas não aparece
 _SVG_NAO_DESENHA = {"defs", "symbol", "clippath", "mask", "pattern", "marker", "metadata", "desc", "lineargradient",
                     "radialgradient", "filter"}  # fmt: skip
@@ -140,16 +143,91 @@ def planejar_html(path, pasta) -> dict:
     return plano
 
 
-def _declaracoes(el, em_svg) -> list:
-    """(propriedade, valor) na ordem em que valem: atributos de apresentação (só no SVG; no HTML o navegador os
-    ignora), depois o style."""
-    saida = [] if not em_svg else [(n, el.get(n).strip().lower()) for n in _PROPRIEDADES[:4] if el.get(n) is not None]
-    for parte in (el.get("style") or "").split(";"):
-        nome, _, valor = parte.partition(":")
-        nome = nome.strip().lower()
-        if nome in _PROPRIEDADES:
-            saida.append((nome, valor.lower().replace("!important", "").strip()))
-    return saida
+def _tokens(valor) -> list:
+    return [t for t in valor if t.type not in ("whitespace", "comment")]
+
+
+def _classificar(nome, tokens):
+    """O que a declaração diz, ou None se o navegador a descarta. display: "none"/"outro"; opacity: número;
+    visibility e font-size: "esconde", "mostra", "herda" (vale o do pai)."""
+    if len(tokens) == 1 and tokens[0].type == "ident" and tokens[0].lower_value in _MANTEM:
+        return "herda"
+    if nome == "display":  # palavra desconhecida: o navegador descarta a declaração e vale a anterior
+        if any(t.type != "ident" or t.lower_value not in _DISPLAY for t in tokens):
+            return None
+        return "none" if len(tokens) == 1 and tokens[0].lower_value == "none" else "outro"
+    if nome == "opacity":
+        if len(tokens) == 1 and tokens[0].type in ("number", "percentage"):
+            return tokens[0].value / (100 if tokens[0].type == "percentage" else 1)
+        return None
+    if nome == "visibility":
+        if len(tokens) == 1 and tokens[0].type == "ident":
+            v = tokens[0].lower_value
+            return "esconde" if v in ("hidden", "collapse") else ("mostra" if v == "visible" else None)
+        return None
+    if nome == "font-size":
+        return _tamanho(tokens[0]) if len(tokens) == 1 else None
+    return _tamanho_do_atalho(tokens)  # font
+
+
+def _tamanho(t):
+    """Fonte zero (ou até 1px) esconde; tamanho absoluto mostra; relativo (em, %, smaller) herda do pai."""
+    if t.type in ("dimension", "percentage", "number") and t.value < 0:
+        return None
+    if t.type == "number":
+        return "esconde" if t.value == 0 else None  # sem unidade só o 0 é válido
+    if t.type == "percentage":
+        return "esconde" if t.value == 0 else "herda"
+    if t.type == "dimension":
+        unidade = t.lower_unit
+        if t.value == 0 or (unidade == "px" and t.value <= 1):
+            return "esconde"
+        return "mostra" if unidade in _ABSOLUTAS else ("herda" if unidade in _RELATIVAS else None)
+    if t.type == "ident":
+        v = t.lower_value
+        return "mostra" if v in _TAMANHOS else ("herda" if v in ("smaller", "larger") else None)
+    return None
+
+
+def _tamanho_do_atalho(tokens):
+    """font: [estilo/variante/peso] tamanho[/altura] família — sem família, o navegador descarta a declaração."""
+    for k, t in enumerate(tokens):
+        e_tamanho = t.type in ("dimension", "percentage") or (t.type == "number" and t.value == 0) or (
+            t.type == "ident" and t.lower_value in _TAMANHOS | {"smaller", "larger"})  # fmt: skip
+        if not e_tamanho:
+            if t.type == "ident" or (t.type == "number" and 1 <= t.value <= 1000):
+                continue  # italic, bold, small-caps, 400...
+            return None
+        resto = tokens[k + 1 :]
+        if resto and resto[0].type == "literal" and resto[0].value == "/":
+            resto = resto[2:]  # altura da linha
+        familia = resto and all(
+            r.type in ("ident", "string") or (r.type == "literal" and r.value == ",") for r in resto
+        )
+        return _tamanho(t) if familia else None
+    return None
+
+
+def _efetivas(el, em_svg) -> dict:
+    """Valor que vale para cada propriedade no próprio elemento, pela cascata do CSS."""
+    normais, importantes = {}, {}
+    for d in tinycss2.parse_blocks_contents(el.get("style") or "", skip_comments=True, skip_whitespace=True):
+        if d.type != "declaration":
+            continue
+        nome = "font-size" if d.lower_name == "font" else d.lower_name
+        tokens = _tokens(d.value)
+        if d.lower_name not in _PROPRIEDADES or not tokens:
+            continue
+        if (valor := _classificar(d.lower_name, tokens)) is not None:
+            (importantes if d.important else normais)[nome] = valor
+    efetivas = {**normais, **importantes}
+    if em_svg:  # atributo de apresentação: abaixo de qualquer declaração do style
+        for nome in ("display", "opacity", "visibility", "font-size"):
+            if nome not in efetivas and (atributo := el.get(nome)) is not None:
+                tokens = _tokens(tinycss2.parse_component_value_list(atributo))
+                if tokens and (valor := _classificar(nome, tokens)) is not None:
+                    efetivas[nome] = valor
+    return efetivas
 
 
 def _tirar_oculto(raiz) -> list:
@@ -171,33 +249,14 @@ def _tirar_oculto(raiz) -> list:
         # no mesmo elemento, qualquer declaração que esconde, esconde (CSS descarta valor inválido e dá precedência
         # ao !important; sem reproduzir isso, o lado seguro é o alerta, nunca deixar texto escondido no corpo). A
         # ordem só serve para desfazer o que vem do pai; inherit/unset/revert ficam com o valor do pai.
-        # esconder: qualquer declaração que esconde, esconde. Desfazer o herdado: só se a ÚLTIMA declaração da
-        # propriedade é um valor válido que desfaz, e o style não tem aspas nem parênteses (onde um ";" de string ou
-        # url() poderia forjar uma declaração). Fora isso, fica o do pai; o erro possível vai para o alerta.
-        esconde_tudo, esconde_vis, esconde_fonte, ultima_vis, ultimo_tamanho = False, False, False, None, None
-        for nome, valor in _declaracoes(el, em_svg):
-            if nome == "display" and valor == "none":
-                esconde_tudo = True
-            elif nome == "opacity" and (m := _NUMERO_CSS.fullmatch(valor)):
-                esconde_tudo |= float(m.group(1)) <= 0
-            elif nome == "visibility":
-                esconde_vis |= valor in ("hidden", "collapse")
-                ultima_vis = valor
-            elif nome in ("font-size", "font"):
-                tamanho = (
-                    valor if nome == "font-size" else (m.group(1) if (m := _TAMANHO_NO_ATALHO.search(valor)) else valor)
-                )
-                esconde_fonte |= bool(_FONTE_ZERO.fullmatch(tamanho))
-                ultimo_tamanho = tamanho
-        pode_desfazer = not any(c in (el.get("style") or "") for c in "\"'(")
-        if esconde_vis:
-            invisivel = True
-        elif pode_desfazer and ultima_vis == "visible":
-            invisivel = False
-        if esconde_fonte:
-            zero = True
-        elif pode_desfazer and ultimo_tamanho is not None and _TAMANHO_ABSOLUTO.fullmatch(ultimo_tamanho):
-            zero = False  # tamanho próprio absoluto válido: volta a aparecer
+        efetivas = _efetivas(el, em_svg)
+        esconde_tudo = efetivas.get("display") == "none" or (
+            isinstance(efetivas.get("opacity"), float) and efetivas["opacity"] <= 0
+        )
+        if (vis := efetivas.get("visibility")) in ("esconde", "mostra"):
+            invisivel = vis == "esconde"
+        if (fonte := efetivas.get("font-size")) in ("esconde", "mostra"):
+            zero = fonte == "esconde"
         tecnica = tecnica or ("estilo que esconde" if esconde_tudo else None)
         if tecnica:  # sem volta: nenhum descendente desfaz display:none, opacity:0 nem hidden
             if conteudo := " ".join(el.text_content().split()):

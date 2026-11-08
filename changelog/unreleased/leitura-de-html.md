@@ -10,7 +10,9 @@ propriedades.
 #### As mesmas proteções do resto
 
 Texto que a pessoa não vê sai do corpo e gera alerta, como no Word e no PDF: marcado como oculto ou escondido pelo
-estilo da própria tag (`display:none`, `opacity:0`, `visibility:hidden` ou fonte zero, inclusive com `!important`).
+estilo da própria tag (`display:none`, `opacity:0`, `visibility:hidden` ou fonte zero). O estilo é lido com as regras
+do CSS, como o navegador: vale a última declaração válida, `!important` vence, e comentário ou escape no meio não
+enganam a leitura.
 Assim, uma instrução escondida numa página para enganar a IA é detectada. O que só a renderização da página
 decide fica de fora, para não apagar conteúdo visível: a cor do texto contra o fundo (branco sobre azul é visível) e
 o estilo definido por classe numa folha de estilos. O estilo de esconder vale para tudo o que vem dentro dele: só o trecho que volta a ter

@@ -313,7 +313,7 @@ lince relatorio.pdf --url https://openrouter.ai/api/v1 --modelo seu/modelo --cha
 Todas com licença permissiva: [anydoc](https://github.com/firecrawl/anydoc) (MIT),
 [pdf-inspector](https://github.com/firecrawl/pdf-inspector) (MIT), [pypdfium2](https://github.com/pypdfium2-team/pypdfium2)
 (Apache-2.0/BSD-3), openpyxl (MIT), python-pptx (MIT), Pillow (MIT-CMU), lxml (BSD-3), defusedxml (PSF),
-[olefile](https://github.com/decalage2/olefile) (BSD-2), [html-to-markdown](https://github.com/xberg-io/html-to-markdown) (MIT); na API, Starlette e Uvicorn (BSD-3) e
+[olefile](https://github.com/decalage2/olefile) (BSD-2), [html-to-markdown](https://github.com/xberg-io/html-to-markdown) (MIT), tinycss2 (BSD-3); na API, Starlette e Uvicorn (BSD-3) e
 python-multipart (Apache-2.0). Nada de GPL/AGPL. O CI e o build da imagem reprovam qualquer dependência fora
 dessa lista, e a imagem leva `THIRD_PARTY_NOTICES.md` gerado do que foi instalado.
 

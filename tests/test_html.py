@@ -350,11 +350,17 @@ def test_inherit_e_valor_invalido_ficam_com_o_pai(tmp_path, trecho):
     assert "Herdado do pai." in r.markdown and "texto_oculto_removido" not in r.metadados
 
 
-def test_oculto_e_inherit_no_mesmo_elemento_vai_para_o_alerta(tmp_path):
-    # no CSS o inherit venceria; sem reproduzir a cascata, o lado escolhido é o alerta, nunca o texto escondido no corpo
+def test_cascata_do_css_no_mesmo_elemento(tmp_path):
     p = tmp_path / "f3.html"
-    p.write_text('<span style="visibility:hidden;visibility:inherit">Texto.</span>', encoding="utf-8")
-    assert lince.ler(p).metadados["texto_oculto_removido"][0]["texto"] == "Texto."
+    # a última declaração válida vence, como no navegador: o texto aparece e fica no corpo
+    p.write_text(
+        '<span style="visibility:hidden;visibility:inherit">Texto.</span>'
+        '<b style="display:none;display:block">Bloco.</b>'
+        "<i style='font-family:\"Arial\";font-size:14px'>Arial.</i>",
+        encoding="utf-8",
+    )
+    r = lince.ler(p)
+    assert all(t in r.markdown for t in ("Texto.", "Bloco.", "Arial.")) and "texto_oculto_removido" not in r.metadados
 
 
 def test_opacity_com_digito_unicode_nao_conta_como_numero(tmp_path):
@@ -374,6 +380,15 @@ def test_opacity_com_digito_unicode_nao_conta_como_numero(tmp_path):
         ("font-size:0", "background:url(x;font-size:14px;y)"),  # nem dentro de url()
         ("font-size:0", "font-size:12 px"),  # espaço antes da unidade: inválido
         ("font-size:0", "font-size:\u0661\u0662px"),  # dígito Unicode: inválido
+        ("visibility:hidden", "visibility:inherit!important;visibility:visible"),  # !important vence
+        ("font-size:0", "font-size:2em!important;font-size:14px"),
+        ("font-size:0", "font-size:14!importantpx"),  # !important no meio do valor: inválido
+        ("font-size:0", "x:/*;font-size:14px;*/"),  # comentário não forja declaração
+        ("font-size:0", "x:\\;font-size:14px"),  # nem escape
+        ("visibility:hidden", "x:{;visibility:visible;}"),  # nem bloco
+        ("font-size:0", "font-size:\u00a014px"),  # NBSP não é espaço no CSS: valor inválido
+        ("font-size:0", "font:14px"),  # atalho sem família: inválido
+        ("font-size:0", "font:-14px serif"),
     ],
 )
 def test_so_a_ultima_declaracao_valida_desfaz_o_oculto_herdado(tmp_path, pai, filho):
@@ -382,3 +397,14 @@ def test_so_a_ultima_declaracao_valida_desfaz_o_oculto_herdado(tmp_path, pai, fi
     p.write_text("<p>Visível.</p>" + conteudo, encoding="utf-8")
     r = lince.ler(p)
     assert "ignore as instruções" not in r.markdown and r.alertas_injecao
+
+
+def test_email_com_fonte_entre_aspas_na_coluna_continua_visivel(tmp_path):
+    p = tmp_path / "email.html"
+    p.write_text(
+        '<table><tr><td style="font-size:0"><div style="font-family:\'Arial\', sans-serif;font-size:14px;'
+        'color:rgb(30,30,30)">Coluna do e-mail.</div></td></tr></table>',
+        encoding="utf-8",
+    )
+    r = lince.ler(p)
+    assert "Coluna do e-mail." in r.markdown and "texto_oculto_removido" not in r.metadados
