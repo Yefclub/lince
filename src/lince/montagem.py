@@ -60,27 +60,15 @@ def montar(pasta, respostas):
         partes.append(md)
         partes.extend(plano["extras"])
         corpo = "\n\n".join(partes)
-        # rodapé de slide/página repetido e número de slide: saem do corpo, vão para os metadados
-        from collections import Counter
-
-        linhas = [ln.strip() for ln in corpo.splitlines()]
-        # sem páginas: só a repetição EXATA de linha curta conta (rodapé de slide); número não é trocado,
-        # para não confundir linhas de dado parecidas ("Lote 12 aprovado" / "Lote 13 aprovado")
-        freq = Counter(
-            ln for ln in linhas if 10 <= len(ln) <= 120 and not ln.startswith(("|", "#", "<!--", "-", "*", ">"))
-        )
-        moveis = {k for k, v in freq.items() if v >= 3}
-        corpo = "\n".join(
-            ln
-            for ln in corpo.splitlines()
-            if ln.strip() not in moveis and not re.fullmatch(r"\s*\d{1,3}\s*/\s*\d{1,3}\s*", ln)
-        )
-        return _metadados(pasta, plano, acabamento(corpo), moveis)
+        # sem páginas não há cabeçalho corrido no corpo: o do Word vem das partes header/footer (metadados) e o leitor
+        # do corpo não entrega os placeholders de rodapé, número e data do slide; a repetição no corpo é conteúdo
+        return _metadados(pasta, plano, acabamento(corpo), set())
+    paginas = []  # por página: o texto já pronto (escaneada) ou (cabeçalho, blocos nativos, inserções da IA)
     for p in plano["paginas"]:
         cab = f"<!-- página {p['i'] + 1} · {p['rota']} -->"
         if p["rota"] == "pagina":
             ids = p.get("tarefas") or [p["tarefa"]]
-            partes.append(cab + "\n" + "\n\n".join(bloco_ia(t, "página") for t in ids))
+            paginas.append(cab + "\n" + "\n\n".join(bloco_ia(t, "página") for t in ids))
             continue
         tabelas = p.get("tabelas", [])
         trocadas = {
@@ -140,44 +128,75 @@ def montar(pasta, respostas):
                 if r["depois_de"] and r["depois_de"] in b:
                     alvo = k
             inserir.setdefault(alvo, []).append(bloco_ia(r["tarefa"], "figura"))
+        paginas.append((cab, limpos, inserir))
+    moveis = _sem_cabecalho_corrido([(k, pg[1]) for k, pg in enumerate(paginas) if not isinstance(pg, str)])
+    partes = []
+    for pg in paginas:
+        if isinstance(pg, str):
+            partes.append(pg)
+            continue
+        cab, limpos, inserir = pg
         saida = [cab] + inserir.get(-1, [])
         for k, b in enumerate(limpos):
-            saida.append(b)
+            if b.strip():
+                saida.append(b)
             saida.extend(inserir.get(k, []))
         partes.append("\n\n".join(saida))
-    # Cabeçalho/rodapé corrido: linha que se repete em todas as páginas (ou em muitas) sai do corpo.
+    return _metadados(pasta, plano, acabamento("\n\n".join(partes)), moveis)
+
+
+CABECALHO_MAX = 80  # linha de cabeçalho/rodapé corrido é curta; parágrafo que o leitor juntou numa linha, não
+FRACAO_MAX = 0.25  # se a remoção levaria mais que isso do texto nativo do documento, nada sai
+
+
+def _sem_cabecalho_corrido(nativas) -> set[str]:
+    """Tira das páginas nativas (índice, blocos) o cabeçalho/rodapé corrido e devolve o que saiu, para os metadados.
+    Só sai a linha curta, na borda da página, igual em quase todas as páginas, em que só o número da própria página
+    varia ("Página 3 de 12", "Relatório anual — 3"); a linha só com o número da página na primeira ou na última
+    posição também sai. Valor, data e número de documento que mudam entre páginas não casam, a página escaneada e o
+    texto lido pela IA não passam por aqui, título (linha com #) nunca sai e, se o que sairia passa de FRACAO_MAX do
+    texto nativo do documento, nada sai."""
     from collections import Counter
 
-    n_pag = len(plano["paginas"])
+    def linhas(blocos):
+        return [  # o bloco que traz leitura da IA (tabela ou fórmula trocada) fica de fora
+            (k, j, ln)
+            for k, b in enumerate(blocos)
+            if "<!-- lido pela IA" not in b
+            for j, ln in enumerate(b.split("\n"))
+            if ln.strip()
+        ]
 
-    def chave(ln):  # nº de página e números que mudam por página não impedem reconhecer a repetição
-        return re.sub(r"\d+", "#", re.sub(r"\s*(\d+|[ivxlc]+)$", "", ln.strip(), flags=re.I))
+    def chaves(ln, pagina):
+        """Cada forma da linha com uma ocorrência do número da página trocada por #."""
+        t = ln.strip()
+        if len(t) > CABECALHO_MAX or t.startswith(("#", "|", "<!--", "> [")):  # título ("Capítulo 3") é conteúdo
+            return set()
+        achados = list(re.finditer(rf"(?<![\d.,/]){pagina}(?![\d.,/])", t))
+        return {t[: m.start()] + "#" + t[m.end() :] for m in achados}
 
-    def bordas(pt, n=3):
-        """Só as primeiras e as últimas linhas da página podem ser cabeçalho/rodapé corrido."""
-        cheias = [ln for ln in pt.splitlines() if ln.strip() and not ln.startswith("<!--")]
-        return set(cheias[:n] + cheias[-n:])
-
-    freq = Counter(k for pt in partes for k in {chave(ln) for ln in bordas(pt)} if len(k) >= 15)
-    moveis = {
-        k
-        for k, v in freq.items()
-        if n_pag >= 2 and (v == n_pag or v >= max(3, 0.3 * n_pag)) and not k.startswith(("<!--", "|", "#", "> ["))
-    }
-    originais = {}
-    for pt in partes:
-        for ln in bordas(pt):
-            if chave(ln) in moveis:
-                originais.setdefault(chave(ln), re.sub(r"\s*(\d+|[ivxlc]+)$", "", ln.strip(), flags=re.I))
-
-    def limpa(pt):
-        borda = bordas(pt)
-        linhas = [ln for ln in pt.splitlines() if not (ln in borda and chave(ln) in moveis)]
-        cheias = [k for k, ln in enumerate(linhas) if ln.strip() and not ln.startswith("<!--")]
-        extremos = set(cheias[:1] + cheias[-1:])  # nº de página só vale na 1ª e na última linha da página
-        return "\n".join(
-            ln for k, ln in enumerate(linhas) if not (k in extremos and re.fullmatch(NUM_PAGINA, ln, flags=re.I))
-        )
-
-    partes = [limpa(pt) for pt in partes]
-    return _metadados(pasta, plano, acabamento("\n\n".join(partes)), set(originais.values()))
+    bordas = {}
+    for i, blocos in nativas:
+        cheias = linhas(blocos)
+        bordas[i] = cheias[:2] + cheias[-2:]
+    n = len(nativas)
+    freq = Counter(c for i, _ in nativas for c in {c for _, _, ln in bordas[i] for c in chaves(ln, i + 1)})
+    moveis = {c for c, v in freq.items() if n >= 3 and v >= max(3, 0.6 * n)}
+    tirar, total = {}, 0
+    for i, blocos in nativas:
+        cheias = linhas(blocos)
+        total += sum(len(ln.strip()) for _, _, ln in cheias)
+        for k, j, ln in bordas[i]:
+            if achadas := [c for c in chaves(ln, i + 1) if c in moveis]:
+                tirar[(i, k, j)] = (ln, achadas[0])
+        for k, j, ln in (cheias[:1] + cheias[-1:]) if cheias else []:
+            if re.fullmatch(NUM_PAGINA, ln.strip(), flags=re.I):
+                tirar.setdefault((i, k, j), (ln, None))
+    if sum(len(ln.strip()) for ln, _ in tirar.values()) > FRACAO_MAX * total:
+        return set()  # cabeçalho que pesaria tanto assim no texto não é cabeçalho: o documento fica como está
+    for i, blocos in nativas:
+        for k in sorted({k for (pi, k, _) in tirar if pi == i}):
+            partes = blocos[k].split("\n")
+            blocos[k] = "\n".join(ln for j, ln in enumerate(partes) if (i, k, j) not in tirar)
+    saiu = {c for _, c in tirar.values() if c}
+    return saiu
