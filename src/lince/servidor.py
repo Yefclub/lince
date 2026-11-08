@@ -410,6 +410,8 @@ def _tamanho_da_saida(e, respostas) -> int:
     total += sum(n * leitura(tid) for tid, n in marcas.items())
     for p in e.get("paginas", []):
         total += len(p.get("md", "")) + sum(leitura(r.get("tarefa", "")) for r in p.get("regioes", []))
+        if p.get("rota") == "pagina":  # página escaneada: cada metade lida entra inteira
+            total += sum(leitura(t) for t in (p.get("tarefas") or [p.get("tarefa", "")]))
         tabelas, formulas = p.get("tabelas", []), p.get("formulas", [])
         for tipo, k in re.findall(r"\{\{(TABELA|FORMULA):(\d+)\}\}", p.get("md", "")):
             nativo = tabelas if tipo == "TABELA" else formulas

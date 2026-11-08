@@ -488,12 +488,13 @@ def _imagens(plano, lidos) -> list[dict]:
         for p in plano.get("posicoes", []):
             item(p["id"])
         return out
+    ids = {t["id"] for t in plano.get("tarefas_originais", [])} | set(iguais)  # a marca que o texto imita não conta
     slide = None
     for k, pedaco in enumerate([plano.get("md", "")] + list(plano.get("extras", []))):
         for m in re.finditer(r"(?m)^<!-- slide (\d+) -->$|\{\{IA:(\w+)\}\}", pedaco):
             if m.group(1):
                 slide = int(m.group(1))
-            else:
+            elif m.group(2) in ids:
                 item(m.group(2), {"slide": slide} if slide is not None and k == 0 else None)
     return out
 

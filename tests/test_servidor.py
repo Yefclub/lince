@@ -781,6 +781,10 @@ def test_plano_vencido_grande_ou_forjado_nao_monta(api, monkeypatch):
     copias = srv.selar(servidor, cliente, Plano([], {"tipo": "office", "md": "{{IA:x}}" * 1000}, []))
     r = _montar(api, {"plano": copias, "respostas": {"x": "y" * 1000}})
     assert r.status_code == 413 and r.json()["type"] == "urn:lince:erro:saida-grande"
+    paginas = [{"i": k, "rota": "pagina", "md": "", "tarefas": [f"p{k:03d}"], "regioes": []} for k in range(200)]
+    escaneado = {"tipo": "pdf", "paginas": paginas, "iguais": {f"p{k:03d}": "p000" for k in range(1, 200)}}
+    plano = srv.selar(servidor, cliente, Plano([], escaneado, []))
+    assert _montar(api, {"plano": plano, "respostas": {"p000": "z" * 1000}}).status_code == 413  # cada página conta
     monkeypatch.setattr(srv, "PLANO_MAX", 10)
     s = enviar(api, ("r.docx", _docx_com_imagens()), {**A, **ESPERA}, modo="tarefas").json()
     assert s["itens"][0]["estado"] == "falhou" and "acima do teto" in s["itens"][0]["erro"]
@@ -846,6 +850,7 @@ def test_documento_com_marca_literal_no_texto_e_montado_com_o_texto_intacto(api)
         and r.json()["markdown"].count("{{IA:img01}}") == 2
         and "{{TABELA:itens}}" in r.json()["markdown"]
     )
+    assert not r.json()["estrutura"].get("imagens")  # nem imagem fantasma na estrutura
 
 
 def test_lince_segredo_curto_recusa_a_subida_e_o_certo_chega_ao_servico(monkeypatch):
