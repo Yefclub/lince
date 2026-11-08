@@ -108,10 +108,29 @@ def test_emf_dentro_do_word_e_desenhado_e_lido_no_lugar(tmp_path):
     assert not r.metadados.get("partes_ilegiveis")
 
 
-def test_emf_no_word_sem_o_desenhista_fica_marcado(tmp_path, monkeypatch):
+@pytest.mark.skipif(
+    sys.version_info >= (3, 15), reason="o metafile-render ainda não instala no 3.15 (o fallback tem teste)"
+)
+def test_emf_com_tipo_declarado_errado_e_reconhecido_pela_assinatura(tmp_path):
+    r, vistas = _ler(_docx_com(tmp_path, "png", "image/png", _emf_real()))  # o pacote diz PNG; o conteúdo é EMF
+    assert len(vistas) == 1 and r.markdown.index("Antes.") < r.markdown.index("Lido pela IA.")
+
+
+@pytest.mark.parametrize("ext,mime", [("emf", "image/x-emf"), ("png", "image/png")])
+def test_emf_no_word_sem_o_desenhista_fica_marcado_como_emf(tmp_path, monkeypatch, ext, mime):
     monkeypatch.setitem(sys.modules, "metafile_render", None)
-    r, vistas = _ler(_docx_com(tmp_path, "emf", "image/x-emf", _emf_real()))
+    r, vistas = _ler(_docx_com(tmp_path, ext, mime, _emf_real()))
     assert not vistas and "[imagem 1: imagem EMF não lida]" in r.markdown
+
+
+def test_assinaturas_de_wmf_e_emf():
+    from lince.office import _metafile
+
+    assert _metafile(b"\x00" * 40 + b" EMF" + b"\x00" * 20, "image/png") == "image/x-emf"
+    assert _metafile(b"\xd7\xcd\xc6\x9a" + b"\x00" * 20, None) == "image/x-wmf"  # placeable
+    for cabecalho in (b"\x01\x00\x09\x00\x00\x03", b"\x02\x00\x09\x00\x00\x01"):  # padrão, versões 3 e 1
+        assert _metafile(cabecalho + b"\x00" * 20, None) == "image/x-wmf"
+    assert _metafile(b"\x89PNG\r\n\x1a\n" + b"\x00" * 50, "image/png") is None
 
 
 SVG_AZUL = (

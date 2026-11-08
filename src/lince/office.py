@@ -802,15 +802,19 @@ def _nao_lida(onde, mime, ilegiveis) -> str:
     return f"[{onde}: imagem {_FORMATOS.get((mime or '').lower(), mime or 'sem tipo')} não lida]"
 
 
-def _metafile(data, mime) -> bool:
-    """EMF ou WMF, pelo tipo declarado ou pela assinatura (o armazém dos binários nem sempre declara)."""
-    if (mime or "").lower() in ("image/x-emf", "image/emf", "image/x-wmf", "image/wmf"):
-        return True
-    return (
-        data[40:44] == b" EMF"
-        or data[:4] == b"\xd7\xcd\xc6\x9a"
-        or data[:6] in (b"\x01\x00\x09\x00\x00\x03", b"\x02\x00\x09\x00\x00\x03")
-    )
+_METAFILES = {"image/x-emf", "image/emf", "image/x-wmf", "image/wmf"}
+
+
+def _metafile(data, mime) -> str | None:
+    """O tipo do EMF ou WMF, pela assinatura (o tipo declarado pode ser genérico, como o image/png que a extensão
+    desconhecida recebe) ou, sem ela, pelo tipo declarado; None se não for metafile."""
+    if data[40:44] == b" EMF":
+        return "image/x-emf"
+    if data[:4] == b"\xd7\xcd\xc6\x9a" or (
+        data[:1] in (b"\x01", b"\x02") and data[1:6] in (b"\x00\x09\x00\x00\x01", b"\x00\x09\x00\x00\x03")
+    ):
+        return "image/x-wmf"  # placeable ou cabeçalho padrão (memória ou disco, qualquer versão)
+    return (mime or "").lower() if (mime or "").lower() in _METAFILES else None
 
 
 def _desenhar_svgs(svgs, pasta, tarefas, ilegiveis):
@@ -823,8 +827,8 @@ def _desenhar_svgs(svgs, pasta, tarefas, ilegiveis):
 
     lote, trocas = [], {}
     for k, (data, mime, onde) in enumerate(svgs):
-        if _metafile(data, mime):
-            desenho, mime = data, mime or ("image/x-emf" if data[40:44] == b" EMF" else "image/x-wmf")
+        if tipo := _metafile(data, mime):
+            desenho, mime = data, tipo
         else:
             mime = "image/svg+xml"
             try:
