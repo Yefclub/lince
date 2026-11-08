@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1.7
-# Serviço HTTP do Lince. Dependências travadas pelo uv.lock; roda sem root.
+# Serviço HTTP do Lince. Dependências travadas pelo uv.lock; roda sem root. Python 3.14: o metafile-render (EMF e
+# WMF) ainda não instala no 3.15.
 
 FROM ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 AS uv
 
-FROM python:3.15-slim@sha256:94d3426f1def7db4a106a232ac121bfd975393e5dfd40a619b955fae45fe7913 AS build
+FROM python:3.14-slim@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f AS build
 COPY --from=uv /uv /usr/local/bin/uv
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
 WORKDIR /app
@@ -17,7 +18,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY scripts/licencas.py scripts/excecoes-de-licenca.toml ./
 RUN .venv/bin/python -I licencas.py --checar && .venv/bin/python -I licencas.py --gerar THIRD_PARTY_NOTICES.md
 
-FROM python:3.15-slim@sha256:94d3426f1def7db4a106a232ac121bfd975393e5dfd40a619b955fae45fe7913
+FROM python:3.14-slim@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
 # DejaVu: fonte dos números na folha de recortes agrupados (licença Bitstream Vera, permissiva)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends fonts-dejavu-core \

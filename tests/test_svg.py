@@ -237,7 +237,7 @@ def test_filho_que_morre_perde_so_o_desenho_em_que_estava(tmp_path, monkeypatch)
     falso = tmp_path / "filho.py"
     falso.write_text(
         "import json, os, sys\n"
-        "for i, (svg, lado, destino) in enumerate(json.load(sys.stdin)):\n"
+        "for i, (tipo, svg, lado, destino) in enumerate(json.load(sys.stdin)):\n"
         "    if 'MORRE' in svg:\n"
         "        os.abort()\n"
         "    open(destino, 'wb').write(b'png')\n"

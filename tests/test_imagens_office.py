@@ -5,7 +5,9 @@ import re
 import sys
 import time
 import zipfile
+from pathlib import Path
 
+import pytest
 from docx import Document
 from docx.shared import Inches
 from PIL import Image
@@ -83,6 +85,33 @@ def test_svg_dentro_do_word_e_desenhado_e_lido(tmp_path):
     cores = {c for _, c in Image.open(io.BytesIO(vistas[0])).convert("RGB").getcolors(1 << 24)}
     assert (37, 97, 193) in cores
     assert r.markdown.index("Antes.") < r.markdown.index("Lido pela IA.") < r.markdown.index("Depois.")
+
+
+def _emf_real():
+    """O EMF do Word 97 de teste do Apache POI (um desenho vetorial de verdade)."""
+    import olefile
+
+    from lince import legados
+
+    p = Path(__file__).parent / "fixtures" / "reais" / "poi_vector_image.doc"
+    with olefile.OleFileIO(p) as o:
+        return next(d for m, d in legados.imagens(o, p.stat().st_size)[0] if m == "image/x-emf")
+
+
+@pytest.mark.skipif(
+    sys.version_info >= (3, 15), reason="o metafile-render ainda não instala no 3.15 (o fallback tem teste)"
+)
+def test_emf_dentro_do_word_e_desenhado_e_lido_no_lugar(tmp_path):
+    r, vistas = _ler(_docx_com(tmp_path, "emf", "image/x-emf", _emf_real()))
+    assert len(vistas) == 1 and Image.open(io.BytesIO(vistas[0])).size[0] > 0
+    assert r.markdown.index("Antes.") < r.markdown.index("Lido pela IA.") < r.markdown.index("Depois.")
+    assert not r.metadados.get("partes_ilegiveis")
+
+
+def test_emf_no_word_sem_o_desenhista_fica_marcado(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "metafile_render", None)
+    r, vistas = _ler(_docx_com(tmp_path, "emf", "image/x-emf", _emf_real()))
+    assert not vistas and "[imagem 1: imagem EMF não lida]" in r.markdown
 
 
 SVG_AZUL = (
