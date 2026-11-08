@@ -5,7 +5,6 @@ import io  # noqa: F401
 import json  # noqa: F401
 import os  # noqa: F401
 import re  # noqa: F401
-import secrets
 import zipfile  # noqa: F401
 from xml.etree import ElementTree as ET  # noqa: F401
 
@@ -83,7 +82,7 @@ def montar(pasta, respostas):
     plano = json.load(open(f"{pasta}/plano.json", encoding="utf-8"))
     R = {k: sem_repeticao(v) for k, v in distribuir_lotes(plano, respostas).items()}
     iguais = plano.get("iguais", {})  # a mesma imagem em outro lugar: a mesma leitura
-    marca = secrets.token_hex(8)  # a âncora provisória que o documento não tem como imitar
+    marca = os.urandom(8).hex()  # a âncora provisória que o documento não tem como imitar
 
     def lido(tid):
         leitora = iguais.get(tid, tid)
