@@ -119,7 +119,9 @@ def test_dimensao_mentirosa_pequena_ainda_desvia_do_anydoc(tmp_path):
     assert office._celulas_declaradas(p) >= xml // office._BYTES_POR_CELULA > 4
 
 
-@pytest.mark.parametrize("de,para", [("worksheets/", "dados/"), ("workbook.xml", "livro.xml")])
+@pytest.mark.parametrize(
+    "de,para", [("worksheets/", "dados/"), ("workbook.xml", "livro.xml"), ("sheet1.xml", "sheet1.dat")]
+)
 def test_partes_em_outro_lugar_contam_na_estimativa(tmp_path, de, para):
     p = _planilha(tmp_path, linhas=50)
     q = tmp_path / "movida.xlsx"
@@ -127,7 +129,7 @@ def test_partes_em_outro_lugar_contam_na_estimativa(tmp_path, de, para):
         for n in zi.namelist():  # o nome muda na parte e em toda referência a ela (relações e tipos de conteúdo)
             zo.writestr(n.replace(de, para), zi.read(n).replace(de.encode(), para.encode()))
         abas = sum(i.file_size // office._BYTES_POR_CELULA for i in zo.infolist() if "/dados/" in i.filename or
-                   "/worksheets/" in i.filename)  # fmt: skip
+                   "/worksheets/s" in i.filename)  # fmt: skip
     assert office._celulas_declaradas(q) >= abas > 0 and lince.ler(q).markdown == lince.ler(p).markdown
 
 

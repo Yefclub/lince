@@ -642,17 +642,15 @@ _DIMENSAO = re.compile(rb'<(?:\w+:)?dimension\s+ref="([A-Z]{1,3})(\d+)(?::([A-Z]
 
 
 def _celulas_declaradas(path) -> int:
-    """Células de cada parte XML do pacote pelo maior entre o que a <dimension> declara e o que o tamanho do XML
-    comporta, sem ler as células. Não depende de onde o pacote diz que estão as abas nem da dimensão, que podem mentir
-    para menos; exagerar só desvia para a leitura em fluxo, que escreve igual. Barato: os primeiros bytes de cada
-    parte."""
+    """Células de cada parte do pacote pelo maior entre o que a <dimension> declara e o que o tamanho da parte
+    comporta, sem ler as células. Não depende de onde nem com que nome o pacote guarda as abas (o openpyxl abre a aba
+    pelo nome que a relação dá, com qualquer extensão), nem da dimensão, que pode mentir para menos; exagerar só
+    desvia para a leitura em fluxo, que escreve igual. Barato: os primeiros bytes de cada parte."""
     from openpyxl.utils import column_index_from_string
 
     total = 0
     with zipfile.ZipFile(path) as z:
         for info in z.infolist():
-            if not info.filename.lower().endswith(".xml"):
-                continue
             with z.open(info) as f:
                 m = _DIMENSAO.search(f.read(4096))
             declaradas = 0
