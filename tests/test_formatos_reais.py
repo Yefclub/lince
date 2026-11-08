@@ -86,8 +86,9 @@ ESPERADO = {
     "testTIFF.tiff": None,
     "testBMP.bmp": None,
     "testGIF.gif": None,
+    "testSVG.svg": None,  # só um retângulo: o desenho vai para a IA
 }
-IMAGENS = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".gif"}
+IMAGENS = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".gif", ".svg"}
 
 
 def test_todo_formato_aceito_tem_arquivo_real():

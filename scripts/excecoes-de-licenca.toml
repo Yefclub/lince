@@ -1,0 +1,26 @@
+# Exceções declaradas da checagem de licença (scripts/licencas.py).
+#
+# Entra aqui só o pacote cuja licença é permissiva mas o metadado não diz isso de forma que a checagem leia
+# (campo vazio, classificadores ambíguos). Cada exceção vale para UMA versão: atualizou o pacote, a checagem
+# reprova até alguém conferir a licença da versão nova e atualizar `versao` aqui. Exceção de pacote que não está
+# mais instalado também reprova, para a lista não acumular entrada velha.
+#
+# Campos: pacote (nome da distribuição), versao (exata), licenca (SPDX, tem de estar na lista permitida),
+# motivo (por que o metadado não basta) e evidencia (onde a licença foi conferida).
+
+[[excecao]]
+pacote = "pypdfium2"
+versao = "5.14.0"
+licenca = "BSD-3-Clause OR Apache-2.0"
+motivo = "o metadado não traz expressão SPDX limpa"
+evidencia = """LICENSES/ do pacote; o binário do PDFium traz os textos de terceiros (FreeType FTL, libjpeg-turbo, \
+OpenJPEG, libpng, zlib, lcms, ICU, abseil...), todos permissivos"""
+
+[[excecao]]
+pacote = "resvg_py"
+versao = "0.5.0"
+licenca = "MIT"
+motivo = "o PyPI não traz o campo de licença"
+evidencia = """resvg_py-0.5.0.dist-info/licenses/LICENSE (texto MIT, Copyright 2024 baseplate-admin); o binário \
+embute o resvg e as crates dele (usvg, tiny-skia, rustybuzz, ttf-parser, fontdb, roxmltree), MIT, Apache-2.0 ou \
+BSD-3-Clause"""
