@@ -2,6 +2,7 @@
 
 import io
 import struct
+import time
 import zlib
 from pathlib import Path
 
@@ -45,12 +46,71 @@ def _blip(tipo, inst, cab, dados):
     return struct.pack("<HHI", inst << 4, tipo, len(corpo)) + corpo
 
 
-def test_armazem_hostil_nao_gasta_sem_limite():
-    bomba = zlib.compress(b"\x00" * (legados._METAFILE_MAX + 1))  # metafile que descomprime além do teto
-    cab_emf = b"\x00" * 32 + b"\x00\xfe"  # compressão 0 (DEFLATE), filtro 0xFE
-    truncado = struct.pack("<HHI", 0x6E0 << 4, 0xF01E, 10**6) + b"\x89PNG"  # declara mais bytes do que tem
-    achados = list(legados._blips(_blip(0xF01A, 0x3D4, cab_emf, bomba) + truncado, legados.Orcamento(10**9)))
-    assert achados == []
+def _png(cor, lado=60):
+    b = io.BytesIO()
+    Image.new("RGB", (lado, lado), cor).save(b, "PNG")
+    return b.getvalue()
+
+
+class _Ole:
+    """OLE de um stream só, com o que `legados.imagens` usa."""
+
+    def __init__(self, dados):
+        self.dados = dados
+
+    def listdir(self):
+        return [["Pictures"]]
+
+    def get_size(self, nome):
+        return len(self.dados)
+
+    def openstream(self, nome):
+        return io.BytesIO(self.dados)
+
+
+def _png_blip(cor):
+    return _blip(0xF01E, 0x6E0, b"\x00", _png(cor))
+
+
+def test_bomba_de_metafile_esgota_o_orcamento_e_o_que_veio_antes_fica():
+    bomba = _blip(0xF01A, 0x3D4, b"\x00" * 32 + b"\x00\xfe", zlib.compress(b"\x00" * 8 * 1024 * 1024))
+    stream = _png_blip("red") + bomba * 4
+    achadas, corte = legados.imagens(_Ole(stream), len(stream))
+    assert [m for m, _ in achadas] == ["image/png"] and "orçamento" in corte  # cada bomba paga o que descomprime
+
+
+def test_registro_que_declara_mais_do_que_tem_e_ignorado():
+    truncado = struct.pack("<HHI", 0x6E0 << 4, 0xF01E, 10**6) + b"\x89PNG"
+    assert list(legados._blips(truncado + _png_blip("red"), legados.Orcamento(10**6)))[0][0] == "image/png"
+
+
+def test_teto_de_imagens_fica_registrado(monkeypatch):
+    monkeypatch.setattr(legados, "IMAGENS_MAX", 2)
+    stream = b"".join(_png_blip(c) for c in ("red", "green", "blue"))
+    achadas, corte = legados.imagens(_Ole(stream), len(stream))
+    assert len(achadas) == 2 and "mais de 2 imagens" in corte
+
+
+def test_stream_cheio_de_candidatos_nao_prende_a_leitura():
+    stream = b"\x00\x00\x1e\xf0" * 2_000_000  # 8 MB de cabeçalhos falsos
+    inicio = time.monotonic()
+    assert list(legados._blips(stream, legados.Orcamento(len(stream)))) == []
+    assert time.monotonic() - inicio < 10
+
+
+def test_imagem_decorativa_do_armazem_nao_vai_para_a_ia(monkeypatch):
+    monkeypatch.setattr(
+        legados, "imagens", lambda o, teto: ([("image/png", _png("red", 16)), ("image/png", _png("blue"))], None)
+    )
+    r, vistas = _ler(REAIS / "poi_vector_image.doc")
+    assert len(vistas) == 1 and Image.open(io.BytesIO(vistas[0])).convert("RGB").getpixel((5, 5)) == (0, 0, 255)
+
+
+def test_extensao_antiga_que_nao_e_ole_nao_ganha_parte_ilegivel(tmp_path):
+    p = tmp_path / "relatorio.doc"
+    p.write_bytes(b"{\\rtf1\\ansi Relatorio em RTF.\\par}")
+    r = lince.ler(p)
+    assert "Relatorio em RTF." in r.markdown and not r.metadados.get("partes_ilegiveis")
 
 
 def test_bitmap_do_armazem_vira_bmp_que_abre():
@@ -59,3 +119,22 @@ def test_bitmap_do_armazem_vira_bmp_que_abre():
     dib = b.getvalue()[14:]  # o OfficeArt guarda sem o cabeçalho de arquivo
     [(mime, dados)] = list(legados._blips(_blip(0xF01F, 0x7A8, b"\x00", dib), legados.Orcamento(10**6)))
     assert mime == "image/bmp" and Image.open(io.BytesIO(dados)).convert("RGB").getpixel((5, 5)) == (37, 97, 193)
+
+
+def test_bitmap_de_32_bits_com_mascaras_abre_no_lugar_certo():
+    largura = altura = 4
+    mascaras = struct.pack("<III", 0x00FF0000, 0x0000FF00, 0x000000FF)
+    cab = struct.pack("<IiiHHIIiiII", 40, largura, altura, 1, 32, 3, 0, 0, 0, 0, 0)  # BI_BITFIELDS
+    pixels = struct.pack("<I", 0x002561C1) + struct.pack("<I", 0x0028B877) * (largura * altura - 1)
+    [(_, dados)] = list(
+        legados._blips(_blip(0xF01F, 0x7A8, b"\x00", cab + mascaras + pixels), legados.Orcamento(10**6))
+    )
+    im = Image.open(io.BytesIO(dados)).convert("RGB")
+    assert im.getpixel((0, altura - 1)) == (37, 97, 193) and im.getpixel((1, altura - 1)) == (40, 184, 119)  # de baixo
+
+
+def test_bitmap_com_cabecalho_hostil_e_ignorado_sem_perder_os_outros():
+    hostil = struct.pack("<IiiHHIIiiII", 0xFFFFFFFF, 4, 4, 1, 8, 0, 0, 0, 0, 0xFFFFFFFF, 0)
+    stream = _blip(0xF01F, 0x7A8, b"\x00", hostil) + _png_blip("red")
+    achadas, corte = legados.imagens(_Ole(stream), len(stream))
+    assert [m for m, _ in achadas] == ["image/png"] and corte is None

@@ -216,8 +216,12 @@ def planejar_office(path, pasta, ext=None):
             nonlocal md
             import olefile
 
+            if not olefile.isOleFile(path):  # RTF ou HTML salvo com a extensão antiga: não há armazém
+                return
             with olefile.OleFileIO(path) as o:
-                achadas = legados.imagens(o, os.path.getsize(path))
+                achadas, corte = legados.imagens(o, os.path.getsize(path))
+            if corte:
+                ilegiveis.append(f"imagens do documento: {corte}")
             novas = [(m, d) for m, d in achadas if hashlib.sha256(d).digest() not in vistas and min(_tam(d)) >= 48]
             if novas:
                 md += "\n\n**Imagens do documento** (o formato não guarda a posição delas no texto):\n\n"
