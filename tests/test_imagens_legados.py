@@ -242,3 +242,17 @@ def test_cadeia_de_setores_cortada_corta_sem_perder_o_que_foi_achado():
 
     achadas, corte = legados.imagens(_Cortado(_png_blip("red")), 10**6)
     assert len(achadas) == 1 and "OSError" in corte
+
+
+def test_storage_no_lugar_do_stream_corta_sem_perder_o_que_foi_achado():
+    class _Storage(_Ole):
+        def exists(self, nome):
+            return nome in ("Pictures", "Data")
+
+        def get_size(self, nome):
+            if nome == "Data":
+                raise TypeError("object is not an OLE stream")
+            return super().get_size(nome)
+
+    achadas, corte = legados.imagens(_Storage(_png_blip("red")), 10**6)
+    assert len(achadas) == 1 and "TypeError" in corte
