@@ -29,10 +29,10 @@ _PROPRIEDADES = ("display", "opacity", "visibility", "font-size", "font")
 _MANTEM = {"inherit", "unset", "revert", "revert-layer"}  # em propriedade herdada, é o valor do pai
 _FONTE_ZERO = re.compile(r"(?:0(?:\.0+)?(?:px|pt|em|rem|%)?|0?\.\d+px|1px)", re.I)
 _TAMANHO_ABSOLUTO = re.compile(
-    r"(?:\d+(?:\.\d+)?|\.\d+)\s*(?:px|pt|pc|cm|mm|in|q|rem)|xx-small|x-small|small|medium|large|x-large|xx-large|xxx-large",
-    re.I,
+    r"(?:\d+(?:\.\d+)?|\.\d+)(?:px|pt|pc|cm|mm|in|q|rem)|xx-small|x-small|small|medium|large|x-large|xx-large|xxx-large",
+    re.I | re.ASCII,  # sem espaço antes da unidade e sem dígito Unicode: o navegador descarta os dois
 )  # só valor válido desfaz o zero herdado; em, %, smaller/larger e inválidos mantêm o pai
-_NUMERO_CSS = re.compile(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)%?", re.I)  # ASCII: sem inf, nan, ٠
+_NUMERO_CSS = re.compile(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)%?", re.I | re.ASCII)  # ASCII: sem inf, nan, ٠
 _TAMANHO_NO_ATALHO = re.compile(r"(?<![\w.])(0|[\d.]+(?:px|pt|em|rem|%))(?=\s*/|\s|$)", re.I)  # font: 0/0 a
 # partes do SVG que nunca são desenhadas: o texto delas não aparece
 _SVG_NAO_DESENHA = {"defs", "symbol", "clippath", "mask", "pattern", "marker", "metadata", "desc", "lineargradient",
@@ -171,24 +171,33 @@ def _tirar_oculto(raiz) -> list:
         # no mesmo elemento, qualquer declaração que esconde, esconde (CSS descarta valor inválido e dá precedência
         # ao !important; sem reproduzir isso, o lado seguro é o alerta, nunca deixar texto escondido no corpo). A
         # ordem só serve para desfazer o que vem do pai; inherit/unset/revert ficam com o valor do pai.
-        esconde_tudo, vis, fonte = False, None, None
+        # esconder: qualquer declaração que esconde, esconde. Desfazer o herdado: só se a ÚLTIMA declaração da
+        # propriedade é um valor válido que desfaz, e o style não tem aspas nem parênteses (onde um ";" de string ou
+        # url() poderia forjar uma declaração). Fora isso, fica o do pai; o erro possível vai para o alerta.
+        esconde_tudo, esconde_vis, esconde_fonte, ultima_vis, ultimo_tamanho = False, False, False, None, None
         for nome, valor in _declaracoes(el, em_svg):
             if nome == "display" and valor == "none":
                 esconde_tudo = True
             elif nome == "opacity" and (m := _NUMERO_CSS.fullmatch(valor)):
                 esconde_tudo |= float(m.group(1)) <= 0
-            elif nome == "visibility" and valor not in _MANTEM:
-                vis = True if valor in ("hidden", "collapse") or vis is True else (False if valor == "visible" else vis)
+            elif nome == "visibility":
+                esconde_vis |= valor in ("hidden", "collapse")
+                ultima_vis = valor
             elif nome in ("font-size", "font"):
                 tamanho = (
-                    valor if nome == "font-size" else (m.group(1) if (m := _TAMANHO_NO_ATALHO.search(valor)) else "")
+                    valor if nome == "font-size" else (m.group(1) if (m := _TAMANHO_NO_ATALHO.search(valor)) else valor)
                 )
-                if _FONTE_ZERO.fullmatch(tamanho):
-                    fonte = True
-                elif fonte is not True and _TAMANHO_ABSOLUTO.fullmatch(tamanho):
-                    fonte = False  # tamanho próprio absoluto válido: volta a aparecer
-        invisivel = invisivel if vis is None else vis
-        zero = zero if fonte is None else fonte
+                esconde_fonte |= bool(_FONTE_ZERO.fullmatch(tamanho))
+                ultimo_tamanho = tamanho
+        pode_desfazer = not any(c in (el.get("style") or "") for c in "\"'(")
+        if esconde_vis:
+            invisivel = True
+        elif pode_desfazer and ultima_vis == "visible":
+            invisivel = False
+        if esconde_fonte:
+            zero = True
+        elif pode_desfazer and ultimo_tamanho is not None and _TAMANHO_ABSOLUTO.fullmatch(ultimo_tamanho):
+            zero = False  # tamanho próprio absoluto válido: volta a aparecer
         tecnica = tecnica or ("estilo que esconde" if esconde_tudo else None)
         if tecnica:  # sem volta: nenhum descendente desfaz display:none, opacity:0 nem hidden
             if conteudo := " ".join(el.text_content().split()):
