@@ -8,6 +8,7 @@ import base64
 import binascii
 import io
 import re
+import secrets
 
 import html_to_markdown
 from lxml import etree
@@ -20,34 +21,51 @@ _FIM = r"\s*(?:!\s*important\s*)?(?:;|$)"  # um \s* por trecho: dois seguidos to
 _ATRIBUTO = r"(?<![-\w])"  # a propriedade em si, não background-color, stroke-opacity, --color
 # escondem a subárvore inteira, sem volta: nenhum descendente desfaz display:none nem opacity:0
 _SEMPRE = re.compile(_ATRIBUTO + r"(?:display\s*:\s*none|opacity\s*:\s*0(?:\.0+)?)" + _FIM, re.I)
-# herdáveis: escondem só se nenhum descendente redefine a propriedade (layout de e-mail usa font-size:0 no <td>)
-_HERDAVEIS = [
-    ("visibility", re.compile(_ATRIBUTO + r"visibility\s*:\s*(?:hidden|collapse)" + _FIM, re.I)),
-    (
-        "font-size",
-        re.compile(_ATRIBUTO + r"font-size\s*:\s*(?:0(?:\.0+)?(?:px|pt|em|rem|%)?|0?\.\d+px|1px)" + _FIM, re.I),
-    ),
-]
-_MARCA = re.compile(r"LINCEMARCA\d+X")
+# herdáveis: o estado (fonte zero, invisível) desce pela pilha; o descendente com valor próprio absoluto volta a
+# aparecer, e o relativo (em, %, inherit) continua herdando o zero (2em de zero é zero)
+_FONTE = re.compile(_ATRIBUTO + r"font-size\s*:\s*([^;!]*)", re.I)
+_FONTE_ZERO = re.compile(r"\s*(?:0(?:\.0+)?(?:px|pt|em|rem|%)?|0?\.\d+px|1px)\s*", re.I)
+_FONTE_RELATIVA = re.compile(r"\s*(?:[\d.]+\s*(?:em|%)|inherit|smaller|larger)\s*", re.I)
+_VISIBILIDADE = re.compile(_ATRIBUTO + r"visibility\s*:\s*([a-z-]+)", re.I)
 _CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?\s*([\w.:-]+)""", re.I)
 _PROLOGO = re.compile(r"^\s*<\?xml[^>]*\?>", re.I)  # XHTML: o lxml recusa str com declaração de encoding
 # o que os navegadores fazem com o charset declarado (WHATWG Encoding): latin-1 e ASCII são windows-1252, e UTF-16
 # declarado sem BOM é lido como UTF-8 (o próprio <meta> só é legível se o arquivo não for UTF-16)
 # rótulos do WHATWG Encoding que o <meta> pode declarar (só codificações compatíveis com ASCII, as únicas em que o
-# próprio <meta> é legível), com o codec que o navegador usa; rótulo fora daqui é ignorado, como no navegador
+# próprio <meta> é legível), com o codec que o navegador usa. Fora daqui, o rótulo é ignorado: é o que o navegador
+# faz com rótulo desconhecido (x-user-defined e iso-2022-kr, raros, também caem aqui)
 _COMO_NAVEGADOR = {
-    **dict.fromkeys(["utf-8", "utf8", "unicode-1-1-utf-8", "utf-16", "utf-16le", "utf-16be", "unicode"], "utf-8"),
-    **dict.fromkeys(["iso-8859-1", "iso8859-1", "latin1", "latin-1", "l1", "cp819", "ascii", "us-ascii",
+    **dict.fromkeys(["utf-8", "utf8", "unicode-1-1-utf-8", "unicode11utf8", "unicode20utf8", "x-unicode20utf8",
+                     "utf-16", "utf-16le", "utf-16be", "unicode", "unicodefeff", "unicodefffe", "csunicode",
+                     "iso-10646-ucs-2", "ucs-2"], "utf-8"),
+    **dict.fromkeys(["iso-8859-1", "iso8859-1", "iso88591", "iso_8859-1", "iso_8859-1:1987", "iso-ir-100", "latin1",
+                     "latin-1", "l1", "cp819", "ibm819", "csisolatin1", "ascii", "us-ascii", "ansi_x3.4-1968",
                      "windows-1252", "cp1252", "x-cp1252"], "cp1252"),
-    **{f"windows-125{n}": f"cp125{n}" for n in range(9)},
-    **{f"iso-8859-{n}": f"iso8859-{n}" for n in (2, 3, 4, 5, 6, 7, 8, 10, 13, 14, 15, 16)},
-    **dict.fromkeys(["gbk", "gb2312", "gb18030", "x-gbk", "chinese"], "gb18030"),
-    **dict.fromkeys(["big5", "big5-hkscs", "x-x-big5"], "big5hkscs"),
-    **dict.fromkeys(["shift_jis", "shift-jis", "sjis", "windows-31j", "ms_kanji", "x-sjis"], "cp932"),
-    **dict.fromkeys(["euc-jp", "x-euc-jp"], "euc_jp"),
-    **dict.fromkeys(["euc-kr", "ks_c_5601-1987", "windows-949"], "cp949"),
-    "iso-2022-jp": "iso2022_jp", "koi8-r": "koi8_r", "koi8-u": "koi8_u", "macintosh": "mac_roman",
-    "windows-874": "cp874", "tis-620": "cp874",
+    **dict.fromkeys(["iso-8859-9", "iso8859-9", "iso88599", "iso_8859-9", "iso-ir-148", "latin5", "l5",
+                     "csisolatin5"], "cp1254"),
+    **dict.fromkeys(["iso-8859-11", "iso8859-11", "iso885911", "tis-620", "dos-874", "windows-874"], "cp874"),
+    **{k: f"cp125{n}" for n in range(9) for k in (f"windows-125{n}", f"cp125{n}", f"x-cp125{n}")},
+    **{k: f"iso8859-{n}" for n in (2, 3, 4, 5, 6, 7, 8, 10, 13, 14, 15, 16)
+       for k in (f"iso-8859-{n}", f"iso8859-{n}", f"iso8859{n}", f"iso_8859-{n}")},
+    **dict.fromkeys(["latin2", "l2", "csisolatin2"], "iso8859-2"), **dict.fromkeys(["latin3", "l3"], "iso8859-3"),
+    **dict.fromkeys(["latin4", "l4"], "iso8859-4"), **dict.fromkeys(["latin6", "l6"], "iso8859-10"),
+    **dict.fromkeys(["cyrillic", "csisolatincyrillic"], "iso8859-5"), **dict.fromkeys(["arabic"], "iso8859-6"),
+    **dict.fromkeys(["greek", "greek8"], "iso8859-7"),
+    **dict.fromkeys(["hebrew", "visual", "iso-8859-8-i", "logical", "csiso88598i"], "iso8859-8"),
+    **dict.fromkeys(["latin9", "l9"], "iso8859-15"),
+    **dict.fromkeys(["gbk", "gb2312", "gb_2312", "gb_2312-80", "csgb2312", "iso-ir-58", "gb18030", "x-gbk",
+                     "chinese"], "gb18030"),
+    **dict.fromkeys(["big5", "big5-hkscs", "x-x-big5", "cn-big5", "csbig5"], "big5hkscs"),
+    **dict.fromkeys(["shift_jis", "shift-jis", "sjis", "windows-31j", "ms_kanji", "ms932", "x-sjis",
+                     "csshiftjis"], "cp932"),
+    **dict.fromkeys(["euc-jp", "x-euc-jp", "cseucpkdfmtjapanese"], "euc_jp"),
+    **dict.fromkeys(["euc-kr", "ks_c_5601-1987", "ks_c_5601-1989", "ksc5601", "ksc_5601", "windows-949",
+                     "cseuckr", "korean"], "cp949"),
+    **dict.fromkeys(["iso-2022-jp", "csiso2022jp"], "iso2022_jp"),
+    **dict.fromkeys(["koi8-r", "koi8_r", "koi", "koi8", "cskoi8r"], "koi8_r"),
+    **dict.fromkeys(["koi8-u", "koi8-ru"], "koi8_u"),
+    **dict.fromkeys(["macintosh", "mac", "x-mac-roman", "csmacintosh"], "mac_roman"),
+    "ibm866": "cp866", "866": "cp866", "cp866": "cp866",
 }  # fmt: skip
 
 
@@ -80,7 +98,13 @@ def planejar_html(path, pasta) -> dict:
         plano["ilegiveis"].append(f"html: aninhado além de {PROFUNDIDADE_MAX} níveis; o resto ficou de fora")
     plano["propriedades"] = _propriedades(raiz)
     ocultos = _tirar_oculto(raiz)
-    marcas = _imagens(raiz, pasta, plano["tarefas"])
+    for svg in list(raiz.iter("svg")):  # o conversor descarta SVG inline: o texto dele (rótulos de gráfico) fica
+        rotulos = " ".join(" ".join(svg.itertext()).split())
+        troca = etree.Element("p")
+        troca.text, troca.tail = rotulos, svg.tail
+        svg.getparent().replace(svg, troca)
+    prefixo = _prefixo_livre(texto)
+    marcas = _imagens(raiz, pasta, plano["tarefas"], prefixo)
     for a in raiz.iter("a"):  # link para data: carregaria o arquivo inteiro em base64 para o texto
         if (a.get("href") or "").strip().lower().startswith("data:"):
             del a.attrib["href"]
@@ -94,7 +118,7 @@ def planejar_html(path, pasta) -> dict:
     r = html_to_markdown.convert(lxml_html.tostring(raiz, encoding="unicode"), opcoes)
     md = (r.content or "").strip()
     if marcas:  # uma passada só: um replace por marca seria quadrático com milhares de imagens
-        md = _MARCA.sub(lambda m: marcas.get(m.group(0), m.group(0)), md)
+        md = re.sub(prefixo + r"\d+X", lambda m: marcas.get(m.group(0), m.group(0)), md)
     plano["md"] = md
     if r.warnings:
         plano["ilegiveis"] += sorted({f"html: {w.message}"[:200] for w in r.warnings})
@@ -107,49 +131,60 @@ def planejar_html(path, pasta) -> dict:
 
 def _tirar_oculto(raiz) -> list:
     """Tira o que não aparece (scripts, estilos, <noscript>…) e o texto escondido, antes de olhar as imagens: imagem
-    dentro de bloco oculto não é paga nem lida. Percurso com pilha, sem recursão; a subárvore esvaziada não é visitada,
-    então oculto dentro de oculto conta uma vez. Esvaziar com clear(keep_tail=True) custa O(1) por elemento."""
-    ocultos, pilha = [], [raiz]
+    dentro de bloco oculto não é paga nem lida. Percurso com pilha, sem recursão, levando o estado herdado (fonte
+    zero, invisível): o texto de um nó escondido sai mesmo que um descendente volte a aparecer. O(1) por nó."""
+    ocultos, pilha = [], [(raiz, False, False)]  # (elemento, fonte zero herdada, invisível herdado)
     while pilha:
-        el = pilha.pop()
+        el, zero, invisivel = pilha.pop()
         if not isinstance(el.tag, str):
             continue
         if el.tag in _SEM_CONTEUDO:
-            el.clear(keep_tail=True)
+            _esvaziar(el)
             continue
         estilo = el.get("style") or ""
-        tecnica = "atributo hidden" if el.get("hidden") is not None else None
-        if not tecnica and _SEMPRE.search(estilo):
-            tecnica = "estilo que esconde"
-        if not tecnica:
-            for prop, padrao in _HERDAVEIS:
-                if padrao.search(estilo) and not _redefinida(el, prop):
-                    tecnica = "fonte zero" if prop == "font-size" else "estilo que esconde"
-                    break
-        if not tecnica:
-            pilha.extend(reversed(list(el)))
+        if el.get("hidden") is not None or _SEMPRE.search(estilo):  # sem volta: a subárvore inteira sai
+            if conteudo := " ".join(el.text_content().split()):
+                ocultos.append(("atributo hidden" if el.get("hidden") is not None else "estilo que esconde", conteudo))
+            _esvaziar(el)
             continue
-        if conteudo := " ".join(el.text_content().split()):
-            ocultos.append((tecnica, conteudo))
-        el.clear(keep_tail=True)
+        if m := _FONTE.search(estilo):
+            valor = m.group(1)
+            if _FONTE_ZERO.fullmatch(valor):
+                zero = True
+            elif not _FONTE_RELATIVA.fullmatch(valor):
+                zero = False  # tamanho próprio absoluto (px, pt, rem, medium…): volta a aparecer
+        if m := _VISIBILIDADE.search(estilo):
+            if m.group(1).lower() in ("hidden", "collapse"):
+                invisivel = True
+            elif m.group(1).lower() != "inherit":
+                invisivel = False
+        if invisivel and el.tag == "img":  # imagem invisível não é lida (com fonte zero, a imagem aparece)
+            _esvaziar(el)
+            continue
+        if zero or invisivel:  # o texto deste nó e o que vem entre os filhos estão escondidos
+            tecnica = "estilo que esconde" if invisivel else "fonte zero"
+            for dono, campo in [(el, "text")] + [(f, "tail") for f in el]:
+                if (t := getattr(dono, campo)) and t.strip():
+                    ocultos.append((tecnica, " ".join(t.split())))
+                    setattr(dono, campo, None)
+        pilha.extend((f, zero, invisivel) for f in reversed(list(el)))
     return ocultos
 
 
-def _redefinida(el, prop) -> bool:
-    """Algum descendente volta a declarar a propriedade (por exemplo font-size:14px dentro do <td> com font-size:0)?
-    Só é chamada para os poucos elementos com estilo de esconder."""
-    alvo = re.compile(_ATRIBUTO + prop + r"\s*:", re.I)
-    return any(alvo.search(d.get("style") or "") for d in el.iterdescendants() if isinstance(d.tag, str))
+def _esvaziar(el):
+    """Esvazia em O(1), mantendo o que vem depois (tail). Vira <span>: uma <img> ou <hr> esvaziada não deixa rastro."""
+    el.clear(keep_tail=True)
+    el.tag = "span"
 
 
-def _imagens(raiz, pasta, tarefas) -> dict:
+def _imagens(raiz, pasta, tarefas, prefixo) -> dict:
     """Imagem data: vira tarefa da IA (marca sentinela no lugar, trocada depois da conversão); decorativa sai;
     externa e ilegível ficam marcadas com o alt."""
     from PIL import Image
 
     marcas = {}
     for el in list(raiz.iter("img")):
-        src, alt = (el.get("src") or "").strip(), (el.get("alt") or "").strip()
+        src, alt = (el.get("src") or "").strip(), " ".join((el.get("alt") or "").split())  # alt com \n não abre bloco
         substituto = f"[imagem: {alt or 'sem descrição'}, externa, não lida]"
         if src.lower().startswith("data:image/"):
             carga = src.split(",", 1)[1] if "," in src else ""
@@ -168,13 +203,20 @@ def _imagens(raiz, pasta, tarefas) -> dict:
                 substituto = f"[imagem: {alt or 'sem descrição'}, embutida, ilegível]"
         # o texto entra como sentinela sem pontuação e volta depois da conversão: colchetes e chaves deixam o
         # conversor quadrático em parágrafo com milhares de imagens, e ele poderia escapar a marca da IA
-        marca = f"LINCEMARCA{len(marcas)}X" if substituto else ""
+        marca = f"{prefixo}{len(marcas)}X" if substituto else ""
         if marca:
             marcas[marca] = substituto
         troca = etree.Element("span")  # a imagem vira um <span> com o texto: troca em O(1), o tail fica
         troca.text, troca.tail = marca, el.tail
         el.getparent().replace(el, troca)
     return marcas
+
+
+def _prefixo_livre(texto) -> str:
+    """Prefixo da sentinela que não aparece no documento: o texto dele nunca é trocado por engano."""
+    while (prefixo := f"LINCE{secrets.token_hex(6)}M") in texto:
+        pass
+    return prefixo
 
 
 def _propriedades(raiz) -> dict:
