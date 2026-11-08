@@ -344,12 +344,12 @@ def planejar_office(path, pasta, ext=None):
         else anydoc.to_document(open(path, "rb").read(), format="csv" if ext in (".csv", ".tsv") else None)
     )
     tarefas, ilegiveis = [], []
-    svgs, sentinela = [], f"LINCE{secrets.token_hex(8)}S"  # SVGs desenhados juntos no fim, num lote só
+    svgs, sentinela = [], f"LINCE{secrets.token_hex(8)}S"  # desenhos vetoriais, juntos no fim, num lote só
     vistas = set()  # imagens já lidas (sha256): o armazém dos binários não as repete
 
     def ler_imagem(data, mime, onde):
-        """A imagem vira tarefa da IA; a que não abre (EMF, WMF, formato quebrado) fica marcada no lugar e
-        registrada, nunca derruba o documento. SVG fica com uma marca provisória e é desenhado no fim."""
+        """A imagem vira tarefa da IA; a que não abre (formato quebrado) fica marcada no lugar e registrada, nunca
+        derruba o documento. SVG, EMF e WMF ficam com uma marca provisória e são desenhados no fim, num lote só."""
         from PIL import Image
 
         vistas.add(hashlib.sha256(data).digest())
@@ -359,8 +359,8 @@ def planejar_office(path, pasta, ext=None):
         except MemoryError:  # falta de memória não é imagem ruim: derruba o documento, como no resto da leitura
             raise
         except Exception:  # noqa: BLE001 — decodificador do Pillow com arquivo hostil levanta de tudo
-            if "svg" in (mime or "").lower():
-                svgs.append((data, onde))
+            if "svg" in (mime or "").lower() or _metafile(data, mime):
+                svgs.append((data, mime, onde))
                 return f"{sentinela}{len(svgs) - 1}X"
             return _nao_lida(onde, mime, ilegiveis)
         tarefas.append({"id": tid, "modo": "imagem", "ancora": onde})
@@ -802,31 +802,52 @@ def _nao_lida(onde, mime, ilegiveis) -> str:
     return f"[{onde}: imagem {_FORMATOS.get((mime or '').lower(), mime or 'sem tipo')} não lida]"
 
 
+_METAFILES = {"image/x-emf", "image/emf", "image/x-wmf", "image/wmf"}
+
+
+def _metafile(data, mime) -> str | None:
+    """O tipo do EMF ou WMF, pela assinatura (o tipo declarado pode ser genérico, como o image/png que a extensão
+    desconhecida recebe) ou, sem ela, pelo tipo declarado; None se não for metafile."""
+    if data[40:44] == b" EMF":
+        return "image/x-emf"
+    if data[:4] == b"\xd7\xcd\xc6\x9a" or (
+        data[:1] in (b"\x01", b"\x02") and data[1:6] in (b"\x00\x09\x00\x00\x01", b"\x00\x09\x00\x00\x03")
+    ):
+        return "image/x-wmf"  # placeable ou cabeçalho padrão (memória ou disco, qualquer versão)
+    return (mime or "").lower() if (mime or "").lower() in _METAFILES else None
+
+
 def _desenhar_svgs(svgs, pasta, tarefas, ilegiveis):
-    """Desenha os SVGs do documento num lote só (o teto de tempo é do documento) e até DESENHOS_MAX; devolve a
-    troca de cada marca provisória pela tarefa da IA ou pela marca de imagem não lida."""
+    """Desenha os SVG, EMF e WMF do documento num lote só (o teto de tempo é do documento) e até DESENHOS_MAX;
+    devolve a troca de cada marca provisória pela tarefa da IA ou pela marca de imagem não lida."""
     from lxml import etree
 
     from .desenho_svg import desenhar_lote
     from .pagina_html import _SVG_XML, DESENHOS_MAX
 
     lote, trocas = [], {}
-    for k, (data, onde) in enumerate(svgs):
-        try:
-            svg = etree.fromstring(data, _SVG_XML)
-        except etree.XMLSyntaxError:
-            svg = None
-        if svg is None or etree.QName(svg).localname != "svg" or len(lote) >= DESENHOS_MAX:
-            trocas[k] = _nao_lida(onde, "image/svg+xml", ilegiveis)
+    for k, (data, mime, onde) in enumerate(svgs):
+        if tipo := _metafile(data, mime):
+            desenho, mime = data, tipo
+        else:
+            mime = "image/svg+xml"
+            try:
+                desenho = etree.fromstring(data, _SVG_XML)
+            except etree.XMLSyntaxError:
+                desenho = None
+            if desenho is not None and etree.QName(desenho).localname != "svg":
+                desenho = None
+        if desenho is None or len(lote) >= DESENHOS_MAX:
+            trocas[k] = _nao_lida(onde, mime, ilegiveis)
             continue
-        lote.append((k, onde, f"img{len(tarefas) + len(lote) + 1:02d}", svg))
-    feitos = desenhar_lote([(svg, f"{pasta}/ia/{tid}.png") for _, _, tid, svg in lote])
-    for (k, onde, tid, _), feito in zip(lote, feitos, strict=True):
+        lote.append((k, onde, mime, f"img{len(tarefas) + len(lote) + 1:02d}", desenho))
+    feitos = desenhar_lote([(desenho, f"{pasta}/ia/{tid}.png") for _, _, _, tid, desenho in lote])
+    for (k, onde, mime, tid, _), feito in zip(lote, feitos, strict=True):
         if feito == "lido":
             tarefas.append({"id": tid, "modo": "imagem", "ancora": onde})
             trocas[k] = f"{{{{IA:{tid}}}}}"
         else:
-            trocas[k] = _nao_lida(onde, "image/svg+xml", ilegiveis)
+            trocas[k] = _nao_lida(onde, mime, ilegiveis)
     return lambda m: trocas[int(m.group(1))]
 
 

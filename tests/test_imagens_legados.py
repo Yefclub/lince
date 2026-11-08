@@ -2,10 +2,12 @@
 
 import io
 import struct
+import sys
 import time
 import zlib
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 import lince
@@ -22,18 +24,28 @@ def _ler(p):
     return r.ler(p), vistas
 
 
+@pytest.mark.skipif(
+    sys.version_info >= (3, 15), reason="o metafile-render ainda não instala no 3.15 (o fallback tem teste)"
+)
 def test_imagens_do_ppt_do_xls_e_do_doc_sao_lidas_ou_registradas():
-    for nome, raster, nao_lidas in (
-        ("poi_pictures.ppt", 2, {"WMF", "image/pict", "EMF"}),  # JPEG e PNG para a IA
-        ("poi_SimpleWithImages.xls", 2, {"WMF", "EMF"}),
-        ("poi_vector_image.doc", 0, {"EMF"}),
+    for nome, lidas, nao_lidas in (
+        ("poi_pictures.ppt", 4, {"image/pict"}),  # JPEG, PNG, EMF e WMF para a IA; o PICT do Mac fica marcado
+        ("poi_SimpleWithImages.xls", 4, set()),
+        ("poi_vector_image.doc", 1, set()),  # o EMF desenhado
     ):
         r, vistas = _ler(REAIS / nome)
-        assert len(vistas) == raster, nome
+        assert len(vistas) == lidas, nome
         assert all(Image.open(io.BytesIO(v)).size[0] > 0 for v in vistas)
         for formato in nao_lidas:  # nunca some: fica marcada e registrada
             assert f"imagem {formato} não lida]" in r.markdown, (nome, formato)
-        assert len(r.metadados["partes_ilegiveis"]) == len(nao_lidas), nome
+        assert len(r.metadados.get("partes_ilegiveis", [])) == len(nao_lidas), nome
+
+
+def test_emf_e_wmf_sem_o_desenhista_ficam_marcados(monkeypatch):
+    monkeypatch.setitem(sys.modules, "metafile_render", None)  # o pacote não está instalado (Python 3.15)
+    r, vistas = _ler(REAIS / "poi_SimpleWithImages.xls")
+    assert len(vistas) == 2  # só as raster
+    assert "imagem WMF não lida]" in r.markdown and "imagem EMF não lida]" in r.markdown
 
 
 def test_imagem_que_o_corpo_ja_entrega_nao_e_lida_de_novo():

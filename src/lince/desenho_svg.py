@@ -3,10 +3,11 @@
 O SVG nunca busca nada fora dele: toda referência que não seja a um trecho do próprio documento (#id) ou a imagem
 raster embutida (data: com PNG, JPEG, GIF ou WebP) é tirada antes de desenhar, porque o resvg leria um arquivo local
 que o documento apontasse, e um SVG embutido traria texto que a limpeza do oculto não vê. O <tref> também sai. O
-desenho roda num processo à parte (`_desenhar.py`), com teto de tempo e de memória.
+desenho roda num processo à parte (`_desenhar.py`), com teto de tempo e de memória, no mesmo lote que os EMF/WMF.
 Sem o resvg instalado, quem chama segue com o texto do SVG.
 """
 
+import base64
 import copy
 import importlib.util
 import json
@@ -126,18 +127,27 @@ def _preparar(svg) -> tuple[str, dict] | None:
 
 
 def desenhar_lote(itens) -> list[str]:
-    """Desenha cada (svg, destino) em PNG, num processo à parte com teto de tempo e de memória. Para cada um:
-    "lido" (há o que ler), "branco" (nada desenhado), "ilegivel" (o resvg não o desenha), "tempo" (cortado pelo
-    teto ou pelo prazo do documento) ou "sem resvg" (não instalado)."""
+    """Desenha cada (desenho, destino) em PNG, num processo à parte com teto de tempo e de memória. O desenho é um SVG
+    (elemento lxml, pelo resvg) ou os bytes de um EMF/WMF (pelo metafile-render). Para cada um: "lido" (há o que
+    ler), "branco" (nada desenhado), "ilegivel" (o desenhista não o desenha), "tempo" (cortado pelo teto ou pelo
+    prazo do documento) ou "sem resvg"/"sem metafile-render" (não instalado)."""
     if not itens:
         return []
-    if importlib.util.find_spec("resvg_py") is None:
-        return ["sem resvg"] * len(itens)
     resultados, trabalho, indices = ["branco"] * len(itens), [], []
-    for i, (svg, destino) in enumerate(itens):
-        if (pronto := _preparar(svg)) is not None:
-            trabalho.append([pronto[0], pronto[1], str(destino)])
-            indices.append(i)
+    for i, (desenho, destino) in enumerate(itens):
+        if isinstance(desenho, bytes):
+            if importlib.util.find_spec("metafile_render") is None:
+                resultados[i] = "sem metafile-render"
+                continue
+            trabalho.append(["metafile", base64.b64encode(desenho).decode(), {}, str(destino)])
+        elif importlib.util.find_spec("resvg_py") is None:
+            resultados[i] = "sem resvg"
+            continue
+        elif (pronto := _preparar(desenho)) is not None:
+            trabalho.append(["svg", pronto[0], pronto[1], str(destino)])
+        else:
+            continue
+        indices.append(i)
     if not trabalho:
         return resultados
     inicio = time.monotonic()
