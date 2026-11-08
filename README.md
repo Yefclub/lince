@@ -276,7 +276,8 @@ leitura falha com `lince.FormatoNaoSuportado`.
 | Apresentação | `.pptx` `.pptm` `.ppsx` `.ppsm` `.ppt` `.pps` `.pot` `.odp` | Slides, notas, tabelas e gráficos com os dados |
 | Planilha | `.xlsx` `.xlsm` `.xlsb` `.xls` `.ods` `.csv` `.tsv` | Abas como tabelas; CSV e TSV com separador e codificação detectados |
 | Imagem | `.png` `.jpg` `.jpeg` `.webp` `.tif` `.tiff` `.bmp` `.gif` | Pelo modelo de visão |
-| Página da web | `.html` `.htm` | Títulos, listas, tabelas e links; imagem embutida (`data:`) lida pela IA, imagem externa nunca baixada; texto escondido pela própria tag vai para os alertas |
+| Página da web | `.html` `.htm` | Títulos, listas, tabelas e links; imagem embutida (`data:`) e desenho SVG lidos pela IA, imagem externa nunca baixada; texto escondido pela própria tag vai para os alertas |
+| Desenho vetorial | `.svg` | Desenhado (resvg) e lido pela IA; o texto do desenho fica no corpo e título e descrição vão para as propriedades. Referência a arquivo local ou endereço externo nunca entra no desenho |
 | Texto | `.txt` `.md` `.json` `.yaml` `.yml` `.xml` `.tex` | Como está |
 
 Documento como código e edição: `.pptx` e `.pptm` (`.ppsx` só na leitura do código).
@@ -288,7 +289,7 @@ ganha `macros: true`: VBA no Office (OOXML, inclusive `.xlsb`, e `.doc`, `.xls`,
 (`.xlsx`, `.xlsm`, `.xlsb` e `.xls`) e macro do LibreOffice. A macro nunca é executada.
 
 Cada extensão da tabela é testada no CI com um arquivo real em `tests/fixtures/reais/`: os de Word, Excel,
-PowerPoint, OpenDocument, RTF, EPUB, PDF, HTML, CSV e imagem vêm dos conjuntos de teste públicos do Apache POI e do
+PowerPoint, OpenDocument, RTF, EPUB, PDF, HTML, SVG, CSV e imagem vêm dos conjuntos de teste públicos do Apache POI e do
 Apache Tika, gravados pelos próprios programas; `.pps`, `.pot`, `.htm`, `.jpeg` e `.tiff` são cópias com outra extensão, e os de
 texto foram escritos à mão. Limite conhecido: `.xlsb` gravado fora da especificação falha na leitura com erro claro
 do documento (um de 23 arquivos reais testados; nenhum outro leitor livre testado o abre).

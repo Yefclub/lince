@@ -14,7 +14,7 @@ COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --extra servidor --no-editable
 # A imagem não sai com dependência de licença fora da lista; os créditos são gerados do que foi instalado.
-COPY scripts/licencas.py ./
+COPY scripts/licencas.py scripts/excecoes-de-licenca.toml ./
 RUN .venv/bin/python -I licencas.py --checar && .venv/bin/python -I licencas.py --gerar THIRD_PARTY_NOTICES.md
 
 FROM python:3.15-slim@sha256:94d3426f1def7db4a106a232ac121bfd975393e5dfd40a619b955fae45fe7913

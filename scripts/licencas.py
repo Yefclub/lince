@@ -4,13 +4,16 @@ Uso (no ambiente com só as dependências de produção):
     python scripts/licencas.py --checar           # falha se alguma licença estiver fora da lista
     python scripts/licencas.py --gerar ARQUIVO     # escreve a tabela de créditos
 
-Só entram licenças permissivas. Copyleft (GPL, LGPL, AGPL, SSPL, MPL, EUPL...) reprova.
+Só entram licenças permissivas. Copyleft (GPL, LGPL, AGPL, SSPL, MPL, EUPL...) reprova. Pacote permissivo cujo
+metadado não diz isso entra pelas exceções declaradas (`excecoes-de-licenca.toml`), presas à versão conferida.
 """
 
 import argparse
 import importlib.metadata as md
 import re
 import sys
+import tomllib
+from pathlib import Path
 
 PERMITIDAS = {
     "MIT",
@@ -31,26 +34,24 @@ CLASSIFICADORES = {
     "ISC License (ISCL)": "ISC",
     "Python Software Foundation License": "PSF-2.0",
 }
-# Conferidas à mão: o metadado não traz expressão SPDX limpa.
-REVISADAS = {
-    # BSD-3-Clause OR Apache-2.0 para o pypdfium2; o binário do PDFium traz os textos de terceiros
-    # (FreeType FTL, libjpeg-turbo, OpenJPEG, libpng, zlib, lcms, ICU, abseil...), todos permissivos.
-    "pypdfium2": "BSD-3-Clause OR Apache-2.0",
-}
 FORA = {"lince", "pip", "setuptools", "wheel"}
+EXCECOES = Path(__file__).with_name("excecoes-de-licenca.toml")
+
+
+def excecoes(caminho=EXCECOES) -> dict:
+    """Exceções declaradas, por nome do pacote em minúsculas: {nome: entrada}."""
+    with open(caminho, "rb") as f:
+        return {e["pacote"].lower(): e for e in tomllib.load(f).get("excecao", [])}
 
 
 def licenca(dist) -> str:
-    nome = dist.metadata["Name"].lower()
-    if nome in REVISADAS:
-        return REVISADAS[nome]
     if expr := dist.metadata.get("License-Expression"):
         return expr.strip()
     classes = [c.split("::")[-1].strip() for c in dist.metadata.get_all("Classifier") or [] if c.startswith("License")]
     spdx = list(dict.fromkeys(CLASSIFICADORES.get(c, c) for c in classes))
     if len(spdx) == 1:
         return spdx[0]
-    if spdx:  # vários classificadores nem sempre são licença dupla: exige revisão em REVISADAS
+    if spdx:  # vários classificadores nem sempre são licença dupla: exige exceção declarada
         return "ambígua: " + "; ".join(spdx)
     return (dist.metadata.get("License") or "desconhecida").splitlines()[0].strip()
 
@@ -58,7 +59,7 @@ def licenca(dist) -> str:
 def permitida(expr: str) -> bool:
     """SPDX sem parênteses (AND tem precedência): `A OR B` basta uma; `A AND B` exige todas.
 
-    Expressão com parênteses não é interpretada aqui: reprova e vai para REVISADAS depois de conferida.
+    Expressão com parênteses não é interpretada aqui: reprova e vai para as exceções declaradas depois de conferida.
     """
     if "(" in expr or ")" in expr:
         return False
@@ -73,8 +74,29 @@ def pacotes():
     for d in md.distributions():
         nome = d.metadata["Name"]
         if nome and nome.lower() not in FORA:
-            vistos[nome.lower()] = (nome, d.version, licenca(d), d.metadata.get("Home-page") or "")
+            vistos[nome.lower()] = (nome, d.version, licenca(d))
     return [vistos[k] for k in sorted(vistos)]
+
+
+def conferir(lista, declaradas) -> tuple[list, list]:
+    """Aplica as exceções declaradas. Devolve (pacotes com a licença final, problemas). A exceção só vale para a
+    versão declarada; exceção sem pacote instalado e licença declarada fora da lista também são problema."""
+    final, problemas = [], []
+    for n, v, lic in lista:
+        if (e := declaradas.get(n.lower())) is not None:
+            if e["versao"] != v:
+                problemas.append(f"{n} {v}: exceção declarada para a versão {e['versao']}; confira a licença desta")
+            elif not permitida(e["licenca"]):
+                problemas.append(f"{n} {v}: exceção declara '{e['licenca']}', fora da lista permitida")
+            else:
+                lic = f"{e['licenca']} (exceção declarada)"
+        elif not permitida(lic):
+            problemas.append(f"{n} {v}: licença '{lic}' fora da lista permitida")
+        final.append((n, v, lic))
+    instalados = {n.lower() for n, _, _ in lista}
+    problemas += [f"{e['pacote']}: exceção declarada sem o pacote instalado" for k, e in declaradas.items()
+                  if k not in instalados]  # fmt: skip
+    return final, problemas
 
 
 def main():
@@ -82,13 +104,12 @@ def main():
     ap.add_argument("--checar", action="store_true")
     ap.add_argument("--gerar")
     a = ap.parse_args()
-    lista = pacotes()
-    ruins = [(n, v, lic) for n, v, lic, _ in lista if not permitida(lic)]
+    lista, problemas = conferir(pacotes(), excecoes())
     if a.checar:
-        for n, v, lic in ruins:
-            print(f"::error::{n} {v}: licença '{lic}' fora da lista permitida")
-        print(f"{len(lista)} pacotes conferidos, {len(ruins)} fora da lista")
-        if ruins:
+        for p in problemas:
+            print(f"::error::{p}")
+        print(f"{len(lista)} pacotes conferidos, {len(problemas)} problema(s)")
+        if problemas:
             sys.exit(1)
     if a.gerar:
         linhas = [
@@ -101,7 +122,7 @@ def main():
             "| Pacote | Versão | Licença |",
             "| --- | --- | --- |",
         ]
-        linhas += [f"| {n} | {v} | {lic} |" for n, v, lic, _ in lista]
+        linhas += [f"| {n} | {v} | {lic} |" for n, v, lic in lista]
         with open(a.gerar, "w", encoding="utf-8") as f:
             f.write("\n".join(linhas) + "\n")
 
