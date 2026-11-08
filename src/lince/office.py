@@ -377,6 +377,22 @@ def planejar_office(path, pasta, ext=None):
         _complemento(imagens_ods, "imagens da planilha", ilegiveis)
     if ext in (".xlsx", ".docx"):
         _complemento(lambda: extras.extend(grafico_md(g) for g in graficos_ooxml(path)), "gráficos", ilegiveis)
+    if ext == ".xls":  # o gráfico do Excel 97-2003: tipo, título e séries; os valores já estão nas células
+
+        def graficos_xls():
+            import olefile
+
+            if not olefile.isOleFile(path):
+                return
+            with olefile.OleFileIO(path) as o:
+                for g in legados.graficos_xls(o, os.path.getsize(path)):
+                    linhas = [f"**Gráfico ({g['tipo'] or 'tipo não identificado'}): {g['titulo'] or 'sem título'}**"]
+                    if g["series"]:
+                        linhas.append("Séries: " + ", ".join(g["series"]) + ".")
+                    linhas.append("_Os valores estão nas células da planilha, acima._")
+                    extras.append("\n".join(linhas))
+
+        _complemento(graficos_xls, "gráficos", ilegiveis)
     if ext in ODF:  # o leitor do corpo não entrega o gráfico do LibreOffice: tipo, título e os dados que ele desenha
         _complemento(lambda: extras.extend(grafico_md(g) for g in graficos_odf(path, ilegiveis)), "gráficos", ilegiveis)
     if ext == ".pptx":
