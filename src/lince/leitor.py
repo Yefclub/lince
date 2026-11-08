@@ -116,6 +116,8 @@ class Leitor:
             plano = planejar_office(caminho, pasta, ext)
         plano["arquivo"] = os.path.basename(caminho)
         plano["meta_arquivo"] = metadados_arquivo(caminho, ext)
+        if plano.get("propriedades"):  # o HTML já tira as propriedades no mesmo parse do corpo
+            plano["meta_arquivo"]["propriedades"] = plano.pop("propriedades")
         if plano.get("ilegiveis"):
             plano["meta_arquivo"].setdefault("partes_ilegiveis", []).extend(plano["ilegiveis"])
         plano["tarefas_originais"] = list(plano.get("tarefas", []))
