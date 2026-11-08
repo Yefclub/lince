@@ -6,9 +6,11 @@ import io
 import time
 
 import pytest
+from lxml import etree
 from PIL import Image
 
 import lince
+from lince.pagina_html import _tirar_oculto
 
 
 def _png(cor, tamanho=(400, 200)):
@@ -520,3 +522,26 @@ def test_midia_fica_no_corpo_e_so_o_alternativo_sai(tmp_path):
     assert "Seu navegador não suporta." not in r.markdown and "Sem áudio." not in r.markdown
     assert "Diálogo mostrado pelo autor." in r.markdown
     assert "Seu navegador não suporta." in r.metadados["texto_oculto_removido"][0]["texto"]
+
+
+def test_alternativo_da_midia_na_ordem_e_todas_as_fontes_ficam(tmp_path):
+    p = tmp_path / "fontes.html"
+    p.write_text(
+        '<video><source src="https://x/a.webm"><source src="https://x/b.mp4"><track src="https://x/leg.vtt">'
+        'Seu navegador não suporta, <a href="https://x/b.mp4">baixe aqui</a>.</video>'
+        '<p>Depois.</p><audio style="visibility:hidden" src="https://x/oculto.mp3"></audio>',
+        encoding="utf-8",
+    )
+    r = lince.ler(p)
+    texto = r.metadados["texto_oculto_removido"][0]["texto"]
+    assert texto.index("Seu navegador") < texto.index("baixe aqui")  # na ordem do documento
+    assert "baixe aqui" not in r.markdown and "Depois." in r.markdown
+    assert "https://x/a.webm" in r.markdown and "oculto.mp3" not in r.markdown  # invisível sai como a imagem
+    # o libxml2 aninha um source dentro do outro; o conversor recebe todas as fontes e a faixa como filhas diretas
+    raiz = etree.fromstring(p.read_bytes(), etree.HTMLParser())
+    _tirar_oculto(raiz)
+    assert [(f.tag, f.get("src")) for f in raiz.find(".//video")] == [
+        ("source", "https://x/a.webm"),
+        ("source", "https://x/b.mp4"),
+        ("track", "https://x/leg.vtt"),
+    ]

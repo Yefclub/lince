@@ -1,16 +1,18 @@
 """HTML salvo (página, relatório exportado, e-mail em HTML): Markdown pelo html-to-markdown. Texto escondido sem
 ambiguidade (atributo hidden; display:none, opacity:0, visibility:hidden e fonte zero no estilo da própria tag ou nos
-atributos de apresentação do SVG) sai do corpo e vira alerta. O style é lido pelo tinycss2, com a cascata do CSS
-(última declaração válida, !important vence, valor inválido descartado) e herança de visibility e font-size.
+atributos de apresentação do SVG) sai do corpo e vira alerta, assim como o conteúdo que o navegador não desenha
+(<datalist>, <noembed>, <noframes>, <dialog> fechado), a não ser que o display do autor o mostre. O style é lido pelo
+tinycss2, com a cascata do CSS (última declaração válida, !important vence, valor inválido descartado) e herança de
+visibility e font-size.
 
 Limites (a página não é renderizada): cor do texto contra o fundo (branco sobre azul é visível, e a cor transparente
 também fica de fora), estilo de classe numa folha <style>, valor com função (calc, var, min, max, clamp), opacidade
 quase zero, layout (fora da tela, text-indent negativo, tamanho zero com overflow, clip, zoom), font-size sem unidade
-do modo quirks, popover fechado e rp/title no corpo (ficam no corpo), hidden="until-found" e dialog fechado (vão
-para o alerta, embora a pessoa possa abri-los), altura de linha em unidade de tela e oblique com ângulo no atalho
-font (recusados), HTML dentro de <foreignObject> tratado como SVG e conteúdo de
-<symbol>/<defs> desenhado por <use> (vai para o alerta), e técnicas que o Lince não avalia: content-visibility,
-transform:scale(0), filter e clip-path. Imagem
+do modo quirks, popover fechado e rp/title no corpo (ficam no corpo), hidden="until-found" e dialog fechado (vão para
+o alerta, embora a pessoa possa abri-los), altura de linha em unidade de tela e oblique com ângulo no atalho font
+(recusados), HTML dentro de <foreignObject> tratado como SVG e conteúdo de <symbol>/<defs> desenhado por <use> e o
+texto alternativo de <canvas>, <video> e <audio> (vai para o alerta, que guarda até 500 caracteres; a mídia fica no
+corpo), e técnicas que o Lince não avalia: content-visibility, transform:scale(0), filter e clip-path. Imagem
 embutida (data:) é lida pela IA; imagem externa nunca é baixada (o Lince não busca nada na rede por causa de um
 documento)."""
 
@@ -49,7 +51,7 @@ _PREFIXO_FONT = {"normal": "normal", "italic": "estilo", "oblique": "estilo", "s
                                   "expanded", "extra-expanded", "ultra-expanded"], "largura")}  # fmt: skip
 _GLOBAIS = _MANTEM | {"initial"}  # "default" é reservado, mas não é global: o navegador descarta a declaração
 _NAO_FAMILIA = _GLOBAIS | {"default"}
-# o navegador não desenha: conteúdo alternativo (canvas, video, audio), listas de sugestão e dialog fechado
+# o navegador não desenha: listas de sugestão, alternativos de plugin e frame (e o dialog fechado, à parte)
 _NAO_MOSTRA = {"datalist", "noembed", "noframes"}
 _COM_ALTERNATIVO = {"canvas", "video", "audio"}  # a mídia fica; o texto alternativo (para navegador antigo) não
 _DISPLAY = {"none", "block", "inline", "inline-block", "flex", "inline-flex", "grid", "inline-grid", "flow-root",
@@ -331,21 +333,20 @@ def _tirar_oculto(raiz) -> list:
         px = efetivas.get("font-size", px)
         if el is raiz:
             raiz_px = px
-        if not em_svg and el.tag in _COM_ALTERNATIVO:  # tira só o alternativo; a mídia e as faixas ficam
-            partes = [el.text] + [f.tail for f in el]
-            for f in list(el):
-                if isinstance(f.tag, str) and f.tag in ("source", "track"):
-                    # elemento vazio: o parser HTML4 do libxml2 põe o alternativo dentro dele
-                    partes.append(f.text_content())
-                    for neto in list(f):
-                        f.remove(neto)
-                    f.text = f.tail = None
-                else:
-                    partes.append(f.text_content() if isinstance(f.tag, str) else "")
-                    el.remove(f)  # o tail do removido já foi guardado acima
-            el.text = None
-            if conteudo := " ".join(" ".join(p for p in partes if p).split()):
+        if not em_svg and el.tag in _COM_ALTERNATIVO:
+            if invisivel:  # mídia invisível: sai como a imagem invisível
+                _esvaziar(el)
+                continue
+            # a mídia fica (atributos, todo <source> e <track>, em qualquer profundidade: o parser HTML4 do libxml2
+            # aninha um dentro do outro); o texto alternativo, na ordem do documento, vai para o alerta
+            if conteudo := " ".join(" ".join(el.itertext()).split()):
                 ocultos.append(("conteúdo que o navegador não mostra", conteudo))
+            faixas = [(f.tag, dict(f.attrib)) for f in el.iter("source", "track")]
+            for f in list(el):
+                el.remove(f)
+            el.text = None
+            for tag, atributos in faixas:
+                el.append(etree.Element(tag, atributos))
             continue
         if invisivel and el.tag == "img":  # imagem invisível não é lida (com fonte zero, a imagem aparece)
             _esvaziar(el)
