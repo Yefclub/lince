@@ -163,3 +163,11 @@ def test_bitmap_com_cabecalho_hostil_e_ignorado_sem_perder_os_outros():
     stream = _blip(0xF01F, 0x7A8, b"\x00", hostil) + _png_blip("red")
     achadas, corte = legados.imagens(_Ole(stream), len(stream))
     assert [m for m, _ in achadas] == ["image/png"] and corte is None
+
+
+def test_metafile_com_fluxo_cortado_nao_vira_imagem():
+    cab = b"\x00" * 32 + b"\x00\xfe"
+    inteiro = _blip(0xF01A, 0x3D4, cab, zlib.compress(b"EMF" * 5000))
+    cortado = _blip(0xF01A, 0x3D4, cab, zlib.compress(b"EMF" * 5000)[:-10])
+    assert [len(d) for _, d in legados._blips(inteiro, legados.Orcamento(10**6))] == [15000]
+    assert list(legados._blips(cortado, legados.Orcamento(10**6))) == []

@@ -203,7 +203,11 @@ def _inflar(dados, orcamento) -> bytes | None:
         partes.append(pedaco)
         if not (dados := d.unconsumed_tail):
             break
-    return b"".join(partes) + d.flush()
+    try:
+        partes.append(d.flush())  # o resto que o zlib guardou: no máximo uma cópia pendente
+    except zlib.error:
+        return None
+    return b"".join(partes) if d.eof else None  # fluxo cortado antes do fim não é metafile válido
 
 
 def _bmp_do_dib(dib: bytes) -> bytes | None:
