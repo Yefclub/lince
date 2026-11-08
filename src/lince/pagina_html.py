@@ -17,16 +17,16 @@ from lxml import html as lxml_html
 IMAGEM_MAX = 20 * 1024 * 1024  # bytes de uma imagem embutida; maior que isso fica marcada, sem leitura
 PROFUNDIDADE_MAX = 2048  # o libxml2 com huge_tree corta aí; o html-to-markdown recebe o mesmo teto
 _SEM_CONTEUDO = {"script", "style", "noscript", "template", "iframe", "object", "embed", "head"}
-_FIM = r"\s*(?:!\s*important\s*)?(?:;|$)"  # um \s* por trecho: dois seguidos tornariam o regex quadrático
-_ATRIBUTO = r"(?<![-\w])"  # a propriedade em si, não background-color, stroke-opacity, --color
-# escondem a subárvore inteira, sem volta: nenhum descendente desfaz display:none nem opacity:0
-_SEMPRE = re.compile(_ATRIBUTO + r"(?:display\s*:\s*none|opacity\s*:\s*0(?:\.0+)?)" + _FIM, re.I)
-# herdáveis: o estado (fonte zero, invisível) desce pela pilha; o descendente com valor próprio absoluto volta a
-# aparecer, e o relativo (em, %, inherit) continua herdando o zero (2em de zero é zero)
-_FONTE = re.compile(_ATRIBUTO + r"font-size\s*:\s*([^;!]*)", re.I)
-_FONTE_ZERO = re.compile(r"\s*(?:0(?:\.0+)?(?:px|pt|em|rem|%)?|0?\.\d+px|1px)\s*", re.I)
-_FONTE_RELATIVA = re.compile(r"\s*(?:[\d.]+\s*(?:em|%)|inherit|smaller|larger)\s*", re.I)
-_VISIBILIDADE = re.compile(_ATRIBUTO + r"visibility\s*:\s*([a-z-]+)", re.I)
+# Estilo da própria tag lido como declarações, a última vence (como no CSS); o atributo de apresentação do SVG
+# (display="none", font-size="0"...) vale como declaração anterior ao style. Sem renderizar a página, só isto conta.
+_PROPRIEDADES = ("display", "opacity", "visibility", "font-size", "font")
+_MANTEM = {"inherit", "unset", "revert", "revert-layer"}  # em propriedade herdada, é o valor do pai
+_FONTE_ZERO = re.compile(r"(?:0(?:\.0+)?(?:px|pt|em|rem|%)?|0?\.\d+px|1px)", re.I)
+_FONTE_RELATIVA = re.compile(r"(?:[\d.]+\s*(?:em|%)|smaller|larger)", re.I)
+_TAMANHO_NO_ATALHO = re.compile(r"(?<![\w.])(0|[\d.]+(?:px|pt|em|rem|%))(?=\s*/|\s|$)", re.I)  # font: 0/0 a
+# partes do SVG que nunca são desenhadas: o texto delas não aparece
+_SVG_NAO_DESENHA = {"defs", "symbol", "clippath", "mask", "pattern", "marker", "metadata", "desc", "lineargradient",
+                    "radialgradient", "filter"}  # fmt: skip
 _CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?\s*([\w.:-]+)""", re.I)
 _PROLOGO = re.compile(r"^\s*<\?xml[^>]*\?>", re.I)  # XHTML: o lxml recusa str com declaração de encoding
 # o que os navegadores fazem com o charset declarado (WHATWG Encoding): latin-1 e ASCII são windows-1252, e UTF-16
@@ -98,10 +98,11 @@ def planejar_html(path, pasta) -> dict:
         plano["ilegiveis"].append(f"html: aninhado além de {PROFUNDIDADE_MAX} níveis; o resto ficou de fora")
     plano["propriedades"] = _propriedades(raiz)
     ocultos = _tirar_oculto(raiz)
-    for svg in list(raiz.iter("svg")):  # o conversor descarta SVG inline: o texto dele (rótulos de gráfico) fica
+    # o conversor descarta SVG inline: o texto que ele desenha (rótulos de gráfico) fica, no lugar e na mesma linha
+    for svg in [s for s in raiz.iter("svg") if next(s.iterancestors("svg"), None) is None]:  # só o mais externo
         rotulos = " ".join(" ".join(svg.itertext()).split())
-        troca = etree.Element("p")
-        troca.text, troca.tail = rotulos, svg.tail
+        troca = etree.Element("span")
+        troca.text, troca.tail = f" {rotulos} " if rotulos else "", svg.tail
         svg.getparent().replace(svg, troca)
     prefixo = _prefixo_livre(texto)
     marcas = _imagens(raiz, pasta, plano["tarefas"], prefixo)
@@ -129,35 +130,59 @@ def planejar_html(path, pasta) -> dict:
     return plano
 
 
+def _declaracoes(el, em_svg) -> list:
+    """(propriedade, valor) na ordem em que valem: atributos de apresentação (só no SVG; no HTML o navegador os
+    ignora), depois o style."""
+    saida = [] if not em_svg else [(n, el.get(n).strip().lower()) for n in _PROPRIEDADES[:4] if el.get(n) is not None]
+    for parte in (el.get("style") or "").split(";"):
+        nome, _, valor = parte.partition(":")
+        nome = nome.strip().lower()
+        if nome in _PROPRIEDADES:
+            saida.append((nome, valor.lower().replace("!important", "").strip()))
+    return saida
+
+
 def _tirar_oculto(raiz) -> list:
-    """Tira o que não aparece (scripts, estilos, <noscript>…) e o texto escondido, antes de olhar as imagens: imagem
-    dentro de bloco oculto não é paga nem lida. Percurso com pilha, sem recursão, levando o estado herdado (fonte
-    zero, invisível): o texto de um nó escondido sai mesmo que um descendente volte a aparecer. O(1) por nó."""
-    ocultos, pilha = [], [(raiz, False, False)]  # (elemento, fonte zero herdada, invisível herdado)
+    """Tira o que não aparece (scripts, estilos, <noscript>, partes do SVG que não são desenhadas) e o texto
+    escondido, antes de olhar as imagens: imagem dentro de bloco oculto não é paga nem lida. Percurso com pilha, sem
+    recursão, levando o estado herdado (fonte zero, invisível): o texto de um nó escondido sai mesmo que um
+    descendente volte a aparecer. O(1) por nó, mais o tamanho do style."""
+    ocultos, pilha = [], [(raiz, False, False, False)]  # (elemento, fonte zero, invisível, dentro de SVG)
     while pilha:
-        el, zero, invisivel = pilha.pop()
+        el, zero, invisivel, em_svg = pilha.pop()
         if not isinstance(el.tag, str):
             continue
         if el.tag in _SEM_CONTEUDO:
             _esvaziar(el)
             continue
-        estilo = el.get("style") or ""
-        if el.get("hidden") is not None or _SEMPRE.search(estilo):  # sem volta: a subárvore inteira sai
+        tecnica = "atributo hidden" if el.get("hidden") is not None else None
+        em_svg = em_svg or el.tag == "svg"
+        tecnica = tecnica or ("parte do SVG que não é desenhada" if em_svg and el.tag in _SVG_NAO_DESENHA else None)
+        exibe, opaco = True, True
+        for nome, valor in _declaracoes(el, em_svg):
+            if nome == "display":
+                exibe = valor != "none"
+            elif nome == "opacity":
+                try:
+                    opaco = (float(valor[:-1]) / 100 if valor.endswith("%") else float(valor)) > 0
+                except ValueError:
+                    pass
+            elif nome == "visibility" and valor not in _MANTEM:
+                invisivel = valor in ("hidden", "collapse")
+            elif nome in ("font-size", "font"):
+                tamanho = (
+                    valor if nome == "font-size" else (m.group(1) if (m := _TAMANHO_NO_ATALHO.search(valor)) else "")
+                )
+                if _FONTE_ZERO.fullmatch(tamanho):
+                    zero = True
+                elif tamanho and tamanho not in _MANTEM and not _FONTE_RELATIVA.fullmatch(tamanho):
+                    zero = False  # tamanho próprio absoluto (px, pt, rem, medium…): volta a aparecer
+        tecnica = tecnica or (None if exibe and opaco else "estilo que esconde")
+        if tecnica:  # sem volta: nenhum descendente desfaz display:none, opacity:0 nem hidden
             if conteudo := " ".join(el.text_content().split()):
-                ocultos.append(("atributo hidden" if el.get("hidden") is not None else "estilo que esconde", conteudo))
+                ocultos.append((tecnica, conteudo))
             _esvaziar(el)
             continue
-        if m := _FONTE.search(estilo):
-            valor = m.group(1)
-            if _FONTE_ZERO.fullmatch(valor):
-                zero = True
-            elif not _FONTE_RELATIVA.fullmatch(valor):
-                zero = False  # tamanho próprio absoluto (px, pt, rem, medium…): volta a aparecer
-        if m := _VISIBILIDADE.search(estilo):
-            if m.group(1).lower() in ("hidden", "collapse"):
-                invisivel = True
-            elif m.group(1).lower() != "inherit":
-                invisivel = False
         if invisivel and el.tag == "img":  # imagem invisível não é lida (com fonte zero, a imagem aparece)
             _esvaziar(el)
             continue
@@ -167,7 +192,7 @@ def _tirar_oculto(raiz) -> list:
                 if (t := getattr(dono, campo)) and t.strip():
                     ocultos.append((tecnica, " ".join(t.split())))
                     setattr(dono, campo, None)
-        pilha.extend((f, zero, invisivel) for f in reversed(list(el)))
+        pilha.extend((f, zero, invisivel, em_svg) for f in reversed(list(el)))
     return ocultos
 
 
