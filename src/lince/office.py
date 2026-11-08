@@ -5,6 +5,7 @@ import io  # noqa: F401
 import json  # noqa: F401
 import os  # noqa: F401
 import re  # noqa: F401
+import secrets
 import zipfile  # noqa: F401
 from xml.etree import ElementTree as ET  # noqa: F401
 
@@ -183,13 +184,24 @@ def planejar_office(path, pasta, ext=None):
     ext = ext or os.path.splitext(path)[1].lower()
     # CSV e TSV não têm assinatura: o formato vai explícito (o anydoc detecta separador e codificação)
     doc = anydoc.to_document(open(path, "rb").read(), format="csv" if ext in (".csv", ".tsv") else None)
-    tarefas = []
+    tarefas, ilegiveis = [], []
+    svgs, sentinela = [], f"LINCE{secrets.token_hex(8)}S"  # SVGs desenhados juntos no fim, num lote só
 
     def ler_imagem(data, mime, onde):
-        tid = f"img{len(tarefas) + 1:02d}"
+        """A imagem vira tarefa da IA; a que não abre (EMF, WMF, formato quebrado) fica marcada no lugar e
+        registrada, nunca derruba o documento. SVG fica com uma marca provisória e é desenhado no fim."""
         from PIL import Image
 
-        Image.open(io.BytesIO(data)).convert("RGB").save(f"{pasta}/ia/{tid}.png")
+        tid = f"img{len(tarefas) + 1:02d}"
+        try:
+            Image.open(io.BytesIO(data)).convert("RGB").save(f"{pasta}/ia/{tid}.png")
+        except MemoryError:  # falta de memória não é imagem ruim: derruba o documento, como no resto da leitura
+            raise
+        except Exception:  # noqa: BLE001 — decodificador do Pillow com arquivo hostil levanta de tudo
+            if "svg" in (mime or "").lower():
+                svgs.append((data, onde))
+                return f"{sentinela}{len(svgs) - 1}X"
+            return _nao_lida(onde, mime, ilegiveis)
         tarefas.append({"id": tid, "modo": "imagem", "ancora": onde})
         return f"{{{{IA:{tid}}}}}"
 
@@ -202,7 +214,7 @@ def planejar_office(path, pasta, ext=None):
             seguranca.append(
                 {"tecnicas": sorted({m for m, _ in ocultos}), "texto": " ".join(t for _, t in ocultos)[:500]}
             )
-    extras, ilegiveis = [], []
+    extras = []
     if ext == ".xlsx":  # o anydoc não extrai imagem de planilha: openpyxl, com aba e célula
         from openpyxl import load_workbook
 
@@ -237,6 +249,8 @@ def planejar_office(path, pasta, ext=None):
             "gráficos",
             ilegiveis,
         )
+    if svgs:
+        md = re.sub(rf"{sentinela}(\d+)X", _desenhar_svgs(svgs, pasta, tarefas, ilegiveis), md)
     return {
         "tipo": "office",
         "md": md,
@@ -245,6 +259,43 @@ def planejar_office(path, pasta, ext=None):
         "texto_oculto": seguranca,
         "ilegiveis": ilegiveis,
     }
+
+
+_FORMATOS = {"image/x-emf": "EMF", "image/emf": "EMF", "image/x-wmf": "WMF", "image/wmf": "WMF",
+             "image/svg+xml": "SVG"}  # fmt: skip
+
+
+def _nao_lida(onde, mime, ilegiveis) -> str:
+    ilegiveis.append(f"{onde}: imagem {mime or 'sem tipo'} não lida")
+    return f"[{onde}: imagem {_FORMATOS.get((mime or '').lower(), mime or 'sem tipo')} não lida]"
+
+
+def _desenhar_svgs(svgs, pasta, tarefas, ilegiveis):
+    """Desenha os SVGs do documento num lote só (o teto de tempo é do documento) e até DESENHOS_MAX; devolve a
+    troca de cada marca provisória pela tarefa da IA ou pela marca de imagem não lida."""
+    from lxml import etree
+
+    from .desenho_svg import desenhar_lote
+    from .pagina_html import _SVG_XML, DESENHOS_MAX
+
+    lote, trocas = [], {}
+    for k, (data, onde) in enumerate(svgs):
+        try:
+            svg = etree.fromstring(data, _SVG_XML)
+        except etree.XMLSyntaxError:
+            svg = None
+        if svg is None or etree.QName(svg).localname != "svg" or len(lote) >= DESENHOS_MAX:
+            trocas[k] = _nao_lida(onde, "image/svg+xml", ilegiveis)
+            continue
+        lote.append((k, onde, f"img{len(tarefas) + len(lote) + 1:02d}", svg))
+    feitos = desenhar_lote([(svg, f"{pasta}/ia/{tid}.png") for _, _, tid, svg in lote])
+    for (k, onde, tid, _), feito in zip(lote, feitos, strict=True):
+        if feito == "lido":
+            tarefas.append({"id": tid, "modo": "imagem", "ancora": onde})
+            trocas[k] = f"{{{{IA:{tid}}}}}"
+        else:
+            trocas[k] = _nao_lida(onde, "image/svg+xml", ilegiveis)
+    return lambda m: trocas[int(m.group(1))]
 
 
 def _complemento(funcao, nome, ilegiveis):
