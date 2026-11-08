@@ -420,9 +420,19 @@ def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
     """O fim da leitura, igual com a IA do Lince ou com a de quem chama: pendência de resposta vazia, montagem do
     texto e dos metadados, estrutura."""
     if respostas and tamanho_da_saida(plano, respostas) > SAIDA_MAX:
-        # as leituras copiadas em cada lugar em que entram estourariam a memória: fica o texto nativo, com o motivo
-        cobertura.pendentes += [f"{tid}: resultado grande demais" for tid in respostas]
-        respostas = {}
+        # acima do teto de saída, entram as leituras que cabem, na ordem do plano; as outras ficam pendentes, com o
+        # motivo, e o texto nativo sai inteiro no lugar delas. A busca é binária: o tamanho só cresce com cada leitura
+        posicao = {t["id"]: k for k, t in enumerate(plano.get("tarefas", []))}
+        ordem = sorted(respostas, key=lambda tid: posicao.get(tid, len(posicao)))
+        cabem, sobra = 0, len(ordem)
+        while cabem + 1 < sobra:
+            meio = (cabem + sobra) // 2
+            if tamanho_da_saida(plano, {tid: respostas[tid] for tid in ordem[:meio]}) <= SAIDA_MAX:
+                cabem = meio
+            else:
+                sobra = meio
+        cobertura.pendentes += [f"{tid}: resultado grande demais" for tid in ordem[cabem:]]
+        respostas = {tid: respostas[tid] for tid in ordem[:cabem]}
     if conferir_vazias:  # resposta vazia não pode virar lacuna silenciosa no documento
         lidos = distribuir_lotes(plano, respostas)
         ja = {p.split(":", 1)[0] for p in cobertura.pendentes}
