@@ -95,3 +95,15 @@ def test_repeticao_invalida_nao_derruba_os_outros_graficos(tmp_path):
     ruim = _objeto(_cel() + _cel("Meta", "x"), [["Jan", "7"]], titulo="Ruim")
     graficos = office.graficos_odf(_ods(tmp_path, bom, ruim), [])
     assert [g["titulo"] for g in graficos] == ["Bom", "Ruim"] and graficos[1]["series"][0]["vals"] == ["7"]
+
+
+def test_texto_longo_em_celula_repetida_tem_teto(tmp_path):
+    longo = "x" * 200_000
+    linhas = "".join(f"<table:table-row>{_cel(f'C{n}')}{_cel(longo, 64)}</table:table-row>" for n in range(20))
+    objeto = _objeto(_cel() + _cel("S", 64), []).replace(
+        "<table:table-rows></table:table-rows>", f"<table:table-rows>{linhas}</table:table-rows>"
+    )
+    ilegiveis = []
+    [g] = office.graficos_odf(_ods(tmp_path, objeto), ilegiveis)
+    md = office.grafico_md(g)
+    assert len(md) < 20 * 64 * 1100 and any("caracteres, cortada" in x for x in ilegiveis)

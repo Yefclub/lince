@@ -100,9 +100,10 @@ _LINHAS_GRAFICO_MAX = 1000  # linhas da tabela de dados de um gráfico; o resto 
 _SERIES_MAX = 64  # séries (colunas) de um gráfico: o custo da tabela é séries × linhas
 
 
-def _celulas(linha, teto) -> tuple[list[str], bool]:
+def _celulas(linha, teto, cortes) -> tuple[list[str], bool]:
     """Texto das primeiras `teto` células de uma linha da tabela local (table:number-columns-repeated conta, e valor
-    inválido vale 1), e se a linha pedia mais células do que isso. Para no teto: o custo não passa dele."""
+    inválido vale 1), e se a linha pedia mais células do que isso. Para no teto: o custo não passa dele. Cada texto
+    fica em legados._TEXTO_MAX caracteres (rótulo e valor de gráfico são curtos); o corte entra em `cortes`."""
     out, pedidas = [], 0
     for c in linha.iterfind(f"{{{_TB}}}table-cell"):
         try:
@@ -111,6 +112,9 @@ def _celulas(linha, teto) -> tuple[list[str], bool]:
             vezes = 1
         pedidas += vezes
         texto = " ".join(" ".join(t for p in c.findall(f"{{{_TX}}}p") for t in p.itertext()).split())  # sem o svg:desc
+        if len(texto) > legados._TEXTO_MAX:
+            texto = texto[: legados._TEXTO_MAX] + "…"
+            cortes.add("texto")
         out += [texto] * min(vezes, teto - len(out))
         if pedidas > teto:
             return out, True
@@ -139,10 +143,15 @@ def graficos_odf(path, ilegiveis) -> list[dict]:
                 ilegiveis.append(
                     f"gráfico {titulo or nome}: mais de {_LINHAS_GRAFICO_MAX} linhas; o resto ficou de fora"
                 )
-            cabecalho, largo = _celulas(linhas[0], _SERIES_MAX + 1) if linhas else ([], False)
+            cortes = set()
+            cabecalho, largo = _celulas(linhas[0], _SERIES_MAX + 1, cortes) if linhas else ([], False)
             if largo:
                 ilegiveis.append(f"gráfico {titulo or nome}: mais de {_SERIES_MAX} séries; o resto ficou de fora")
-            dados = [_celulas(r, len(cabecalho))[0] for r in linhas[1 : _LINHAS_GRAFICO_MAX + 1]]
+            dados = [_celulas(r, len(cabecalho), cortes)[0] for r in linhas[1 : _LINHAS_GRAFICO_MAX + 1]]
+            if cortes:
+                ilegiveis.append(
+                    f"gráfico {titulo or nome}: célula com mais de {legados._TEXTO_MAX} caracteres, cortada"
+                )
             series = [
                 {"nome": cabecalho[k] or f"série {k}", "cats": [d[0] if d else "" for d in dados],
                  "vals": [d[k] if k < len(d) else "" for d in dados], "ref": None}
