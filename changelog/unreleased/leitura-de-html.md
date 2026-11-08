@@ -10,15 +10,15 @@ propriedades.
 #### As mesmas proteções do resto
 
 Texto que a pessoa não vê sai do corpo e gera alerta, como no Word e no PDF: marcado como oculto ou escondido pelo
-estilo da própria tag (`display:none`, `opacity:0`, `visibility:hidden` ou fonte zero). O estilo é lido com as regras
-do CSS, como o navegador: vale a última declaração válida, `!important` vence, e comentário ou escape no meio não
-enganam a leitura.
-Assim, uma instrução escondida numa página para enganar a IA é detectada. O que só a renderização da página
-decide fica de fora, para não apagar conteúdo visível: a cor do texto contra o fundo (branco sobre azul é visível) e
-o estilo definido por classe numa folha de estilos. O estilo de esconder vale para tudo o que vem dentro dele: só o trecho que volta a ter
-tamanho ou a ficar visível (como as colunas dos e-mails montados com fonte zero) continua no texto. Scripts, estilos, conteúdo de `<noscript>`, `<dialog>` fechado, `<datalist>` e o conteúdo alternativo de `<canvas>`,
-`<video>` e `<audio>` não viram
-texto, e a imagem dentro de um trecho oculto também não é lida.
+estilo da própria tag (`display:none`, `opacity:0`, `visibility:hidden` ou fonte zero). O estilo é lido com as
+regras do CSS, como o navegador: vale a última declaração válida, `!important` vence, e comentário ou escape no meio
+não enganam a leitura. Assim, uma instrução escondida numa página para enganar a IA é detectada. O que só a
+renderização da página decide fica de fora, para não apagar conteúdo visível: a cor do texto contra o fundo (branco
+sobre azul é visível) e o estilo definido por classe numa folha de estilos. O estilo de esconder vale para tudo o
+que vem dentro dele: só o trecho que volta a ter tamanho ou a ficar visível (como as colunas dos e-mails montados
+com fonte zero) continua no texto. Scripts, estilos, conteúdo de `<noscript>`, `<dialog>` fechado, `<datalist>` e o
+conteúdo alternativo de `<canvas>`, `<video>` e `<audio>` não viram texto, e a imagem dentro de um trecho oculto
+também não é lida.
 
 Página com aninhamento acima de 2048 níveis é lida até onde dá, e o corte fica registrado em `partes_ilegiveis`.
 Links e mídias com o arquivo embutido no endereço (`data:`) não despejam o conteúdo em base64 no texto.
