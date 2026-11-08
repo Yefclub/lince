@@ -91,3 +91,14 @@ def test_lote_de_recortes_vem_com_os_itens(tmp_path):
     resposta = json.dumps({str(it["n"]): f"recorte {it['n']}" for it in lotes[0].itens})
     r = lince.Leitor().concluir(plano, {lotes[0].id: resposta})
     assert "recorte 1" in r.markdown and "recorte 2" in r.markdown
+
+
+def test_resposta_da_ia_nao_e_varrida_de_novo_atras_de_marcas():
+    pagina = {
+        "i": 0, "rota": "regioes", "md": "Antes.\n\n{{TABELA:0}}\n\nDepois.", "tabelas": ["| nativa |"],
+        "formulas": ["FÓRMULA NATIVA ENORME"], "regioes": [{"tarefa": "t1", "substitui_tabela": 0, "depois_de": ""}],
+    }  # fmt: skip
+    estado = {"tipo": "pdf", "paginas": [pagina], "tarefas_originais": [{"id": "t1", "modo": "tabela"}]}
+    plano = lince.Plano([lince.TarefaVisual("t1", "tabela", b"", "", "", 0)], estado, [])
+    r = lince.Leitor().concluir(plano, {"t1": "| lida | {{FORMULA:0}} |"})
+    assert "{{FORMULA:0}}" in r.markdown and "FÓRMULA NATIVA" not in r.markdown

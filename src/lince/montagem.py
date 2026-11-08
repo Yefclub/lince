@@ -84,7 +84,13 @@ def montar(pasta, respostas):
 
     partes = []
     if plano["tipo"] == "office":
-        md = re.sub(r"\{\{IA:(\w+)\}\}", lambda m: "\n\n" + bloco_ia(m.group(1), "imagem") + "\n\n", plano["md"])
+        # só a marca que o Lince pôs (id de tarefa do plano) vira leitura; o texto do documento que imita uma fica
+        ids = {t["id"] for t in plano.get("tarefas_originais", [])} | set(plano.get("iguais", {}))
+        md = re.sub(
+            r"\{\{IA:(\w+)\}\}",
+            lambda m: "\n\n" + bloco_ia(m.group(1), "imagem") + "\n\n" if m.group(1) in ids else m[0],
+            plano["md"],
+        )
         partes.append(md)
         partes.extend(plano["extras"])
         corpo = "\n\n".join(partes)
@@ -104,30 +110,20 @@ def montar(pasta, respostas):
             for r in p["regioes"]
             if "substitui_tabela" in r and R.get(r["tarefa"], "").strip()
         }
-        md = re.sub(
-            r"\{\{TABELA:(\d+)\}\}",
-            lambda m: (
-                bloco_ia(trocadas[int(m.group(1))], "tabela")
-                if int(m.group(1)) in trocadas
-                else tabelas[int(m.group(1))]
-            ),
-            p["md"],
-        )
         formulas = p.get("formulas", [])
         f_lidas = {
             r["substitui_formula"]: r["tarefa"]
             for r in p["regioes"]
             if "substitui_formula" in r and R.get(r["tarefa"], "").strip()
         }
-        md = re.sub(
-            r"\{\{FORMULA:(\d+)\}\}",
-            lambda m: (
-                bloco_ia(f_lidas[int(m.group(1))], "fórmula")
-                if int(m.group(1)) in f_lidas
-                else formulas[int(m.group(1))]
-            ),
-            md,
-        )
+
+        def troca(m):  # numa passada só: o texto que entra (resposta, tabela) não é varrido de novo
+            k = int(m.group(2))
+            if m.group(1) == "TABELA":
+                return bloco_ia(trocadas[k], "tabela") if k in trocadas else tabelas[k] if k < len(tabelas) else m[0]
+            return bloco_ia(f_lidas[k], "fórmula") if k in f_lidas else formulas[k] if k < len(formulas) else m[0]
+
+        md = re.sub(r"\{\{(TABELA|FORMULA):(\d+)\}\}", troca, p["md"])
         blocos = [b for b in md.split("\n\n") if b.strip()]
         # tira do nativo o texto que pertence à figura (rótulos de eixo etc.)
         dentro = " ".join(

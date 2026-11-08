@@ -777,8 +777,10 @@ def test_plano_vencido_grande_ou_forjado_nao_monta(api, monkeypatch):
     torto = srv.selar(servidor, cliente, Plano([], {"tipo": "pdf", "paginas": [{"rota": "x"}]}, []))
     r = _montar(api, {"plano": torto, "respostas": {}})
     assert r.status_code == 422 and r.json()["type"] == "urn:lince:erro:plano-invalido"  # 422, nunca 500
-    repetido = srv.selar(servidor, cliente, Plano([], {"tipo": "office", "md": "{{IA:x}}" * 3}, []))
-    assert _montar(api, {"plano": repetido, "respostas": {"x": "y"}}).status_code == 422  # marca repetida
+    monkeypatch.setattr(srv, "SAIDA_MAX", 100_000)  # a mesma leitura copiada em mil lugares passa do teto de saída
+    copias = srv.selar(servidor, cliente, Plano([], {"tipo": "office", "md": "{{IA:x}}" * 1000}, []))
+    r = _montar(api, {"plano": copias, "respostas": {"x": "y" * 1000}})
+    assert r.status_code == 413 and r.json()["type"] == "urn:lince:erro:saida-grande"
     monkeypatch.setattr(srv, "PLANO_MAX", 10)
     s = enviar(api, ("r.docx", _docx_com_imagens()), {**A, **ESPERA}, modo="tarefas").json()
     assert s["itens"][0]["estado"] == "falhou" and "acima do teto" in s["itens"][0]["erro"]
@@ -825,3 +827,41 @@ def test_plano_monta_em_outra_replica_com_o_mesmo_segredo():
     plano = s["itens"][0]["resultado"]["plano"]
     assert _montar(outra, {"plano": plano, "respostas": {}}).status_code == 200
     assert _montar(sem, {"plano": plano, "respostas": {}}).status_code == 422
+
+
+def test_documento_com_marca_literal_no_texto_e_montado_com_o_texto_intacto(api):
+    import io
+
+    from docx import Document
+
+    d = Document()
+    d.add_paragraph("Modelo: {{IA:img01}} e {{IA:img01}} de novo, {{TABELA:itens}}.")
+    out = io.BytesIO()
+    d.save(out)
+    s = enviar(api, ("modelo.docx", out.getvalue()), {**A, **ESPERA}, modo="tarefas").json()
+    preparo = s["itens"][0]["resultado"]
+    r = _montar(api, {"plano": preparo["plano"], "respostas": {}})
+    assert (
+        r.status_code == 200
+        and r.json()["markdown"].count("{{IA:img01}}") == 2
+        and "{{TABELA:itens}}" in r.json()["markdown"]
+    )
+
+
+def test_lince_segredo_curto_recusa_a_subida_e_o_certo_chega_ao_servico(monkeypatch):
+    import sys
+
+    import uvicorn
+
+    import lince.servidor as srv
+
+    apps = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **k: apps.append(app))
+    monkeypatch.setattr(sys, "argv", ["lince-servidor"])
+    monkeypatch.setenv("LINCE_TOKENS", "token-a")
+    monkeypatch.setenv("LINCE_SEGREDO", "curto")
+    with pytest.raises(SystemExit):
+        srv.main()
+    monkeypatch.setenv("LINCE_SEGREDO", "x" * 40)
+    srv.main()
+    assert apps[0].state.servico.segredo_plano == b"x" * 40

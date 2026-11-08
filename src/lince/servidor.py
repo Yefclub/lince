@@ -344,7 +344,7 @@ def abrir(segredo: bytes, cliente: str, selado: str):
     from .tipos import Plano, TarefaVisual
 
     dados, _, assinatura = (selado or "").partition(".")
-    esperada = base64.urlsafe_b64encode(hmac.digest(segredo, dados.encode(), "sha256")).decode()
+    esperada = base64.urlsafe_b64encode(hmac.digest(segredo, dados.encode("utf-8", "replace"), "sha256")).decode()
     if not dados or not hmac.compare_digest(assinatura.encode("utf-8", "replace"), esperada.encode()):
         raise Problema(422, "plano-invalido", "Plano inválido", "Não foi assinado para este token, ou foi alterado.")
     try:
@@ -368,6 +368,7 @@ PLANO_TAREFAS_MAX = 20_000
 # (~1 s); um PDF de mil páginas com dez figuras por página de 5 KB usa 50 milhões
 PLANO_TRABALHO_MAX = 500_000_000
 RESPOSTAS_MAX = 64 * 1024 * 1024  # caracteres somados das respostas de uma montagem
+SAIDA_MAX = 256 * 1024 * 1024  # caracteres que a montagem escreve (a leitura em cada lugar em que entra)
 
 
 def _montar_pedido(segredo, cliente, corpo):
@@ -385,9 +386,39 @@ def _montar_pedido(segredo, cliente, corpo):
     plano = abrir(segredo, cliente, str(pedido.get("plano") or ""))
     try:
         _conferir_estado(plano.estado)
+        if _tamanho_da_saida(plano.estado, respostas) > SAIDA_MAX:
+            raise Problema(413, "saida-grande", "Resultado grande demais", f"Até {SAIDA_MAX // 2**20} M caracteres.")
         return Leitor().concluir(plano, respostas)
     except (KeyError, TypeError, ValueError, AttributeError, IndexError) as e:
         raise Problema(422, "plano-invalido", "Plano inválido", f"{type(e).__name__}: {str(e)[:200]}") from None
+
+
+def _tamanho_da_saida(e, respostas) -> int:
+    """Quanto texto a montagem vai escrever: cada marca vira a leitura (a mesma imagem repetida recebe a mesma
+    leitura em cada lugar) ou a tabela e a fórmula nativas. Conta antes de montar, para a saída ter teto como a
+    entrada tem: uma resposta grande copiada em mil lugares não estoura a memória do processo."""
+    from collections import Counter
+
+    lote_de = {tid: lid for lid, itens in (e.get("lotes") or {}).items() for _, tid in itens}
+
+    def leitura(tid):
+        tid = e.get("iguais", {}).get(tid, tid)
+        return len(respostas.get(lote_de.get(tid, tid), "")) + 64
+
+    total = len(e.get("md", "")) + sum(len(x) for x in e.get("extras", []))
+    marcas = Counter(re.findall(r"\{\{IA:(\w+)\}\}", e.get("md", "")))
+    total += sum(n * leitura(tid) for tid, n in marcas.items())
+    for p in e.get("paginas", []):
+        total += len(p.get("md", "")) + sum(leitura(r.get("tarefa", "")) for r in p.get("regioes", []))
+        tabelas, formulas = p.get("tabelas", []), p.get("formulas", [])
+        for tipo, k in re.findall(r"\{\{(TABELA|FORMULA):(\d+)\}\}", p.get("md", "")):
+            nativo = tabelas if tipo == "TABELA" else formulas
+            k = int(k)
+            total += max(
+                len(nativo[k]) if k < len(nativo) else 0,
+                max((leitura(r.get("tarefa", "")) for r in p.get("regioes", [])), default=0),
+            )
+    return total
 
 
 def _conferir_estado(e):
@@ -404,11 +435,7 @@ def _conferir_estado(e):
     lista(e.get("extras", []), str, PLANO_TAREFAS_MAX, "extras")
     if not isinstance(e.get("md", ""), str) or not isinstance(e.get("iguais", {}), dict):
         raise ValueError("md ou iguais")
-    if len(e.get("iguais", {})) > PLANO_TAREFAS_MAX:
-        raise ValueError("iguais")
-    marcas = re.findall(r"\{\{(?:IA|TABELA|FORMULA):\w+\}\}", e.get("md", "") + "".join(e.get("extras", [])))
-    if len(marcas) != len(set(marcas)):  # o plano que o Lince monta põe cada marca uma vez
-        raise ValueError("marca repetida")
+
     lotes = e.get("lotes") or {}
     if (
         not isinstance(lotes, dict)
@@ -423,9 +450,6 @@ def _conferir_estado(e):
         lista(p.get("regioes", []), dict, PLANO_TAREFAS_MAX, "regiões")
         lista(p.get("tabelas", []), str, PLANO_TAREFAS_MAX, "tabelas")
         lista(p.get("formulas", []), str, PLANO_TAREFAS_MAX, "fórmulas")
-        marcas = re.findall(r"\{\{(?:TABELA|FORMULA):\d+\}\}", p.get("md", ""))
-        if len(marcas) != len(set(marcas)):
-            raise ValueError("marca repetida na página")
         trabalho += len(p.get("regioes", [])) * (len(p.get("md", "")) + 1)
         if trabalho > PLANO_TRABALHO_MAX:
             raise ValueError("regiões e texto demais no documento")
