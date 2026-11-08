@@ -98,12 +98,20 @@ _TB = "urn:oasis:names:tc:opendocument:xmlns:table:1.0"
 _TX = "urn:oasis:names:tc:opendocument:xmlns:text:1.0"
 _LINHAS_GRAFICO_MAX = 1000  # linhas da tabela de dados de um gráfico; o resto fica de fora, registrado
 _SERIES_MAX = 64  # séries (colunas) de um gráfico: o custo da tabela é séries × linhas
+_CARACTERES_GRAFICOS_MAX = 8 * 1024 * 1024  # de todos os gráficos ODF do documento; 1.000 linhas × 64 séries de
+# rótulos curtos cabem com folga várias vezes
 
 
-def _celulas(linha, teto, cortes) -> tuple[list[str], bool]:
+class _SemSaldo(Exception):
+    """O orçamento de caracteres dos gráficos do documento acabou."""
+
+
+def _celulas(linha, teto, cortes, saldo) -> tuple[list[str], bool]:
     """Texto das primeiras `teto` células de uma linha da tabela local (table:number-columns-repeated conta, e valor
     inválido vale 1), e se a linha pedia mais células do que isso. Para no teto: o custo não passa dele. Cada texto
-    fica em legados._TEXTO_MAX caracteres (rótulo e valor de gráfico são curtos); o corte entra em `cortes`."""
+    fica em legados._TEXTO_MAX caracteres (rótulo e valor de gráfico são curtos); o corte entra em `cortes`. O texto
+    vezes as cópias sai de `saldo` ([caracteres]), comum a todos os gráficos do documento: a repetição não amplifica
+    a saída além dele, por mais objetos que o arquivo tenha."""
     out, pedidas = [], 0
     for c in linha.iterfind(f"{{{_TB}}}table-cell"):
         try:
@@ -115,7 +123,11 @@ def _celulas(linha, teto, cortes) -> tuple[list[str], bool]:
         if len(texto) > legados._TEXTO_MAX:
             texto = texto[: legados._TEXTO_MAX] + "…"
             cortes.add("texto")
-        out += [texto] * min(vezes, teto - len(out))
+        copias = min(vezes, teto - len(out))
+        saldo[0] -= (len(texto) + 3) * copias  # o " | " de cada célula na tabela do Markdown
+        if saldo[0] < 0:
+            raise _SemSaldo
+        out += [texto] * copias
         if pedidas > teto:
             return out, True
     return out, False
@@ -124,48 +136,53 @@ def _celulas(linha, teto, cortes) -> tuple[list[str], bool]:
 def graficos_odf(path, ilegiveis) -> list[dict]:
     """Gráfico do LibreOffice (.ods, .odp, .odt): cada objeto embutido com office:chart traz tipo, título e a tabela
     local com os dados que ele desenha. Mesmo formato de graficos_ooxml."""
-    out = []
+    out, saldo = [], [_CARACTERES_GRAFICOS_MAX]
     with zipfile.ZipFile(path) as z:
         for nome in sorted(n for n in z.namelist() if re.fullmatch(r"(?:[^/]+/)*Object \d+/content\.xml", n)):
-            raiz = xml_ou_nada(z.read(nome))
-            grafico = raiz.find(f".//{{{_CH}}}chart") if raiz is not None else None
-            if grafico is None:
-                continue
-            tipo = (grafico.get(f"{{{_CH}}}class") or "").rsplit(":", 1)[-1]
-            titulo = (
-                " ".join(" ".join(grafico.find(f"{{{_CH}}}title").itertext()).split())
-                if grafico.find(f"{{{_CH}}}title") is not None
-                else ""
-            )
-            tabela = grafico.find(f".//{{{_TB}}}table")
-            linhas = list(tabela.iter(f"{{{_TB}}}table-row")) if tabela is not None else []
-            if len(linhas) > _LINHAS_GRAFICO_MAX + 1:
-                ilegiveis.append(
-                    f"gráfico {titulo or nome}: mais de {_LINHAS_GRAFICO_MAX} linhas; o resto ficou de fora"
-                )
-            cortes = set()
-            cabecalho, largo = _celulas(linhas[0], _SERIES_MAX + 1, cortes) if linhas else ([], False)
-            if largo:
-                ilegiveis.append(f"gráfico {titulo or nome}: mais de {_SERIES_MAX} séries; o resto ficou de fora")
-            dados = [_celulas(r, len(cabecalho), cortes)[0] for r in linhas[1 : _LINHAS_GRAFICO_MAX + 1]]
-            if cortes:
-                ilegiveis.append(
-                    f"gráfico {titulo or nome}: célula com mais de {legados._TEXTO_MAX} caracteres, cortada"
-                )
-            series = [
-                {"nome": cabecalho[k] or f"série {k}", "cats": [d[0] if d else "" for d in dados],
-                 "vals": [d[k] if k < len(d) else "" for d in dados], "ref": None}
-                for k in range(1, len(cabecalho))
-            ]  # fmt: skip
-            out.append(
-                {
-                    "parte": nome,
-                    "tipo": _ODF_CHART.get(tipo, tipo or "desconhecido"),
-                    "titulo": titulo,
-                    "series": series,
-                }
-            )
+            try:
+                g = _grafico_odf(z, nome, ilegiveis, saldo)
+            except _SemSaldo:
+                ilegiveis.append(f"gráficos: mais de {_CARACTERES_GRAFICOS_MAX} caracteres; os demais ficaram de fora")
+                break
+            if g is not None:
+                out.append(g)
     return out
+
+
+def _grafico_odf(z, nome, ilegiveis, saldo) -> dict | None:
+    """Um objeto de gráfico do pacote ODF, ou None se não for gráfico ou estiver quebrado."""
+    raiz = xml_ou_nada(z.read(nome))
+    grafico = raiz.find(f".//{{{_CH}}}chart") if raiz is not None else None
+    if grafico is None:
+        return None
+    tipo = (grafico.get(f"{{{_CH}}}class") or "").rsplit(":", 1)[-1]
+    titulo = (
+        " ".join(" ".join(grafico.find(f"{{{_CH}}}title").itertext()).split())
+        if grafico.find(f"{{{_CH}}}title") is not None
+        else ""
+    )
+    tabela = grafico.find(f".//{{{_TB}}}table")
+    linhas = list(tabela.iter(f"{{{_TB}}}table-row")) if tabela is not None else []
+    if len(linhas) > _LINHAS_GRAFICO_MAX + 1:
+        ilegiveis.append(f"gráfico {titulo or nome}: mais de {_LINHAS_GRAFICO_MAX} linhas; o resto ficou de fora")
+    cortes = set()
+    cabecalho, largo = _celulas(linhas[0], _SERIES_MAX + 1, cortes, saldo) if linhas else ([], False)
+    if largo:
+        ilegiveis.append(f"gráfico {titulo or nome}: mais de {_SERIES_MAX} séries; o resto ficou de fora")
+    dados = [_celulas(r, len(cabecalho), cortes, saldo)[0] for r in linhas[1 : _LINHAS_GRAFICO_MAX + 1]]
+    if cortes:
+        ilegiveis.append(f"gráfico {titulo or nome}: célula com mais de {legados._TEXTO_MAX} caracteres, cortada")
+    series = [
+            {"nome": cabecalho[k] or f"série {k}", "cats": [d[0] if d else "" for d in dados],
+             "vals": [d[k] if k < len(d) else "" for d in dados], "ref": None}
+            for k in range(1, len(cabecalho))
+        ]  # fmt: skip
+    return {
+        "parte": nome,
+        "tipo": _ODF_CHART.get(tipo, tipo or "desconhecido"),
+        "titulo": titulo,
+        "series": series,
+    }
 
 
 def grafico_md(g):

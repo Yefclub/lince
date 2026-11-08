@@ -107,3 +107,16 @@ def test_texto_longo_em_celula_repetida_tem_teto(tmp_path):
     [g] = office.graficos_odf(_ods(tmp_path, objeto), ilegiveis)
     md = office.grafico_md(g)
     assert len(md) < 20 * 64 * 1100 and any("caracteres, cortada" in x for x in ilegiveis)
+
+
+def test_muitos_graficos_dividem_um_orcamento_unico(tmp_path, monkeypatch):
+    monkeypatch.setattr(office, "_CARACTERES_GRAFICOS_MAX", 300_000)
+    linhas = "".join(f"<table:table-row>{_cel(f'C{n}')}{_cel('y' * 1024, 64)}</table:table-row>" for n in range(4))
+    objeto = _objeto(_cel() + _cel("S", 64), []).replace(
+        "<table:table-rows></table:table-rows>", f"<table:table-rows>{linhas}</table:table-rows>"
+    )
+    ilegiveis = []
+    graficos = office.graficos_odf(_ods(tmp_path, *[objeto] * 50), ilegiveis)  # cada um custa ~265 mil caracteres
+    total = sum(len(office.grafico_md(g)) for g in graficos)
+    assert 0 < len(graficos) < 50 and total < 2 * 300_000
+    assert sum("os demais ficaram de fora" in x for x in ilegiveis) == 1
