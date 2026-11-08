@@ -111,3 +111,8 @@ def test_titulo_com_muitos_espacos_nao_prende_a_leitura():
     s = secoes("# x" + " " * 200_000 + "y\n# Fim   \r\n")["secoes"]
     assert time.monotonic() - inicio < 2  # o regex anterior era quadrático nessa linha
     assert s[0]["titulo"].startswith("x ") and s[0]["titulo"].endswith("y") and s[1]["titulo"] == "Fim"
+
+
+def test_titulo_que_comeca_com_espaco_unicode_continua_secao():
+    s = secoes("# \u3000はじめに\n# \u00a0Nota\n#   \r\n")["secoes"]  # espaço ideográfico, NBSP e linha vazia
+    assert [x["titulo"] for x in s] == ["\u3000はじめに", "\u00a0Nota"]

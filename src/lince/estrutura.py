@@ -13,7 +13,9 @@ from defusedxml.ElementTree import iterparse
 from .limites import xml_ou_nada
 
 SECOES_MAX = 2000  # documento com mais títulos que isso é índice de livro: as primeiras bastam para navegar
-_TITULO = re.compile(r"(#{1,6})[ \t]+(\S.*)")  # título ATX (linear: o fim é aparado fora do regex)
+# título ATX: o conteúdo perde só espaço e tab (espaço ideográfico ou NBSP no início fazem parte dele, como no
+# CommonMark); linear, porque o fim é aparado fora do regex
+_TITULO = re.compile(r"(#{1,6})[ \t]+([^ \t\r].*)")
 _CERCA = re.compile(r" {0,3}(`{3,}|~{3,})(.*?)\r?")
 _PAGINA = re.compile(r"<!-- página ([1-9]\d*) · \w+ -->\r?")  # exatamente o que a montagem do PDF escreve
 _PPTX = {".pptx", ".pptm", ".ppsx", ".ppsm"}
