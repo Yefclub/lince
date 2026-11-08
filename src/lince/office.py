@@ -141,6 +141,10 @@ def graficos_odf(path, ilegiveis) -> list[dict]:
         for nome in sorted(n for n in z.namelist() if re.fullmatch(r"(?:[^/]+/)*Object \d+/content\.xml", n)):
             try:
                 g = _grafico_odf(z, nome, ilegiveis, saldo)
+                if g is not None:  # o que vai para a leitura é a tabela pronta: ela paga o orçamento inteira
+                    saldo[0] -= len(grafico_md(g))
+                    if saldo[0] < 0:
+                        raise _SemSaldo
             except _SemSaldo:
                 ilegiveis.append(f"gráficos: mais de {_CARACTERES_GRAFICOS_MAX} caracteres; os demais ficaram de fora")
                 break

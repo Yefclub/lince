@@ -110,13 +110,24 @@ def test_texto_longo_em_celula_repetida_tem_teto(tmp_path):
 
 
 def test_muitos_graficos_dividem_um_orcamento_unico(tmp_path, monkeypatch):
-    monkeypatch.setattr(office, "_CARACTERES_GRAFICOS_MAX", 300_000)
+    monkeypatch.setattr(office, "_CARACTERES_GRAFICOS_MAX", 1_200_000)
     linhas = "".join(f"<table:table-row>{_cel(f'C{n}')}{_cel('y' * 1024, 64)}</table:table-row>" for n in range(4))
     objeto = _objeto(_cel() + _cel("S", 64), []).replace(
         "<table:table-rows></table:table-rows>", f"<table:table-rows>{linhas}</table:table-rows>"
     )
     ilegiveis = []
-    graficos = office.graficos_odf(_ods(tmp_path, *[objeto] * 50), ilegiveis)  # cada um custa ~265 mil caracteres
+    graficos = office.graficos_odf(
+        _ods(tmp_path, *[objeto] * 50), ilegiveis
+    )  # cada um custa ~265 mil nas células e outro tanto na tabela
     total = sum(len(office.grafico_md(g)) for g in graficos)
-    assert 0 < len(graficos) < 50 and total < 2 * 300_000
+    assert 0 < len(graficos) < 50 and total < 1_200_000
+    assert sum("os demais ficaram de fora" in x for x in ilegiveis) == 1
+
+
+def test_linhas_vazias_tambem_pagam_o_orcamento(tmp_path, monkeypatch):
+    monkeypatch.setattr(office, "_CARACTERES_GRAFICOS_MAX", 2_000_000)
+    vazio = _objeto(_cel() + _cel("S", 64), [[] for _ in range(1000)])  # a tabela de saída é cheia mesmo assim
+    ilegiveis = []
+    graficos = office.graficos_odf(_ods(tmp_path, *[vazio] * 40), ilegiveis)
+    assert 0 < len(graficos) < 40 and sum(len(office.grafico_md(g)) for g in graficos) <= 2_000_000
     assert sum("os demais ficaram de fora" in x for x in ilegiveis) == 1
