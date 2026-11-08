@@ -131,3 +131,15 @@ def test_linhas_vazias_tambem_pagam_o_orcamento(tmp_path, monkeypatch):
     graficos = office.graficos_odf(_ods(tmp_path, *[vazio] * 40), ilegiveis)
     assert 0 < len(graficos) < 40 and sum(len(office.grafico_md(g)) for g in graficos) <= 2_000_000
     assert sum("os demais ficaram de fora" in x for x in ilegiveis) == 1
+
+
+def test_imagem_da_planilha_do_libreoffice_e_lida_com_a_aba():
+    vistas = []
+    ia = lince.FuncaoLeitor(lambda img, instr: vistas.append(img) or "Retângulo azul.", "m")
+    r = lince.Leitor(ia=ia, agrupar=False).ler(REAIS / "lince_imagem_planilha.ods")
+    assert len(vistas) == 1 and "**Imagem (aba Painel):**" in r.markdown and "Retângulo azul." in r.markdown
+
+
+def test_previa_do_grafico_nao_e_lida_como_imagem():
+    ilegiveis = []
+    assert office._imagens_ods(REAIS / "lince_grafico.ods", ilegiveis) == [] and not ilegiveis

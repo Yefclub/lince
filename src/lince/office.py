@@ -364,6 +364,17 @@ def planejar_office(path, pasta, ext=None):
                     md += f"\n\n**Imagem ({onde}):**\n\n" + ler_imagem(im._data(), "image/png", onde)
 
         _complemento(imagens_planilha, "imagens da planilha", ilegiveis)
+    if ext == ".ods":  # o anydoc também não extrai imagem da planilha do LibreOffice: content.xml, com a aba
+
+        def imagens_ods():
+            nonlocal md
+            for onde, mime, dados in _imagens_ods(path, ilegiveis):
+                if (marca := hashlib.sha256(dados).digest()) in vistas or min(_tam(dados)) < 48:
+                    continue
+                vistas.add(marca)
+                md += f"\n\n**Imagem ({onde}):**\n\n" + ler_imagem(dados, mime, onde)
+
+        _complemento(imagens_ods, "imagens da planilha", ilegiveis)
     if ext in (".xlsx", ".docx"):
         _complemento(lambda: extras.extend(grafico_md(g) for g in graficos_ooxml(path)), "gráficos", ilegiveis)
     if ext in ODF:  # o leitor do corpo não entrega o gráfico do LibreOffice: tipo, título e os dados que ele desenha
@@ -446,6 +457,44 @@ def _imagens_das_bordas(path, ext, ilegiveis) -> list[tuple[str, bytes]]:
         if len(alvos) > legados.IMAGENS_MAX:
             ilegiveis.append(f"imagens do cabeçalho e do rodapé: mais de {legados.IMAGENS_MAX}; o resto ficou de fora")
         return [(_mime(a), z.read(a)) for a in alvos[: legados.IMAGENS_MAX]]
+
+
+_DRAW = "urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+
+
+def _imagens_ods(path, ilegiveis) -> list[tuple[str, str, bytes]]:
+    """(onde, MIME, bytes) das imagens das abas do .ods, na ordem do documento: draw:image dentro de draw:frame que
+    não é objeto embutido (o gráfico traz a prévia em ObjectReplacements e é lido à parte). content.xml é lido em
+    streaming, limpando cada elemento: a planilha pode ser enorme. Mesma imagem, uma vez; até legados.IMAGENS_MAX."""
+    from defusedxml.ElementTree import iterparse
+
+    achadas, alvos, aba, objeto = [], set(), "", 0
+    with zipfile.ZipFile(path) as z:
+        nomes = set(z.namelist())
+        if "content.xml" not in nomes:
+            return []
+        with z.open("content.xml") as arquivo:
+            for evento, el in iterparse(arquivo, events=("start", "end")):
+                if evento == "start":
+                    if el.tag == f"{{{_TB}}}table":
+                        aba = el.get(f"{{{_TB}}}name") or aba
+                    elif el.tag == f"{{{_DRAW}}}object" or el.tag == f"{{{_DRAW}}}object-ole":
+                        objeto += 1
+                    elif el.tag == f"{{{_DRAW}}}image" and not objeto:
+                        alvo = (el.get(_XLINK) or "").removeprefix("./")
+                        if alvo in nomes and alvo not in alvos:
+                            if len(alvos) >= legados.IMAGENS_MAX:
+                                ilegiveis.append(
+                                    f"imagens da planilha: mais de {legados.IMAGENS_MAX}; o resto ficou de fora"
+                                )
+                                break
+                            alvos.add(alvo)
+                            achadas.append((f"aba {aba}" if aba else "planilha", _mime(alvo), z.read(alvo)))
+                    continue
+                if el.tag == f"{{{_DRAW}}}frame":
+                    objeto = 0  # o frame acabou: a próxima imagem não é prévia de objeto
+                el.clear()
+    return achadas
 
 
 def _nao_lida(onde, mime, ilegiveis) -> str:
