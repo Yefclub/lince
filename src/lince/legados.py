@@ -7,6 +7,7 @@ trabalho (bytes percorridos, copiados e decodificados, textos guardados) sai de 
 stream, então nenhuma estrutura sobreposta ou repetida multiplica o custo."""
 
 import codecs
+import hashlib
 import itertools
 import re
 import struct
@@ -135,6 +136,95 @@ def xls(o, teto) -> dict:
                 for texto in _header_footer_2007(d):
                     orcamento.guardar(bordas, texto)
     saida["bordas"] = list(bordas)
+    return saida
+
+
+# ---------- Imagens dos binários (OfficeArt) ----------
+
+# BLIP do OfficeArt (o armazém de imagens do Word, do Excel e do PowerPoint 97-2003): tipo do registro -> (MIME,
+# instância com um UID, bytes de cabeçalho depois do UID). A instância seguinte indica um segundo UID.
+_BLIPS = {0xF01A: ("image/x-emf", 0x3D4, 34), 0xF01B: ("image/x-wmf", 0x216, 34), 0xF01C: ("image/pict", 0x542, 34),
+          0xF01D: ("image/jpeg", 0x46A, 1), 0xF02A: ("image/jpeg", 0x6E2, 1), 0xF01E: ("image/png", 0x6E0, 1),
+          0xF01F: ("image/bmp", 0x7A8, 1), 0xF029: ("image/tiff", 0x6E4, 1)}  # fmt: skip
+_MSODRAWINGGROUP, _CONTINUE = 0x00EB, 0x003C
+IMAGENS_MAX = 512  # imagens distintas por arquivo; acima disso é arquivo hostil ou repetição sem fim
+_METAFILE_MAX = 64 * 1024 * 1024  # EMF/WMF guardado comprimido: teto do descomprimido
+
+
+def _blips(b, orcamento):
+    """(MIME, bytes) de cada BLIP do OfficeArt achado em `b`. O cabeçalho do registro é conferido inteiro (versão 0,
+    instância do tipo, tamanho dentro do stream) antes de aceitar; metafile comprimido é descomprimido com teto."""
+    import zlib
+
+    i = 0
+    while (i := b.find(b"\xf0", i + 1)) >= 0:
+        k = i - 3
+        if k < 0 or k + 8 > len(b):
+            continue
+        vi, tipo, tam = struct.unpack_from("<HHI", b, k)
+        if tipo not in _BLIPS or vi & 0xF or k + 8 + tam > len(b):
+            continue
+        mime, inst, extra = _BLIPS[tipo]
+        if vi >> 4 not in (inst, inst + 1):
+            continue
+        cab = 16 * (2 if vi >> 4 == inst + 1 else 1) + extra
+        if cab > tam:
+            continue
+        orcamento.gastar(tam)
+        dados = b[k + 8 + cab : k + 8 + tam]
+        if extra == 34 and b[k + 8 + cab - 2] == 0:  # metafile com compressão DEFLATE
+            d = zlib.decompressobj()
+            try:
+                dados = d.decompress(dados, _METAFILE_MAX)
+            except zlib.error:
+                continue
+            if d.unconsumed_tail:
+                continue  # descomprime além do teto: bomba
+            orcamento.gastar(len(dados))
+        yield mime, (_bmp_do_dib(dados) if mime == "image/bmp" else dados)
+        i = k + 8 + tam - 1
+
+
+def _bmp_do_dib(dib: bytes) -> bytes:
+    """O OfficeArt guarda o bitmap sem o cabeçalho de arquivo BMP: o Pillow só abre com ele na frente."""
+    if len(dib) < 16:
+        return dib
+    tam_cab, bits = struct.unpack_from("<I", dib, 0)[0], struct.unpack_from("<H", dib, 14)[0]
+    cores = struct.unpack_from("<I", dib, 32)[0] if len(dib) >= 36 and tam_cab >= 36 else 0
+    paleta = 4 * (cores or (1 << bits if bits <= 8 else 0))
+    return b"BM" + struct.pack("<IHHI", 14 + len(dib), 0, 0, 14 + tam_cab + paleta) + dib
+
+
+def _desenhos_xls(b, orcamento) -> bytes:
+    """O armazém de imagens do Excel vem em MSODRAWINGGROUP, partido em CONTINUE a cada 8 KB: remonta os pedaços."""
+    partes, juntando = [], False
+    for tipo, d in _registros(b, 0, orcamento):
+        if tipo == _MSODRAWINGGROUP:
+            partes.append(d)
+            juntando = True
+        elif tipo == _CONTINUE and juntando:
+            partes.append(d)
+        else:
+            juntando = False
+    return b"".join(partes)
+
+
+def imagens(o, teto) -> list[tuple[str, bytes]]:
+    """Imagens distintas do .doc, .xls ou .ppt (armazém OfficeArt), na ordem em que estão gravadas. A posição no
+    documento não é recuperada: quem chama as põe juntas depois do texto."""
+    vistas, saida = set(), []
+    for caminho in o.listdir():
+        nome = "/".join(caminho)
+        b = ler_stream(o, nome, teto)
+        orcamento = Orcamento(len(b))
+        if nome in ("Workbook", "Book") and len(b) >= 8 and struct.unpack_from("<H", b, 0)[0] == _BOF:
+            b = _desenhos_xls(b, orcamento)
+        for mime, dados in _blips(b, orcamento):
+            if (marca := hashlib.sha256(dados).digest()) not in vistas and dados:
+                vistas.add(marca)
+                saida.append((mime, dados))
+                if len(saida) >= IMAGENS_MAX:
+                    return saida
     return saida
 
 
