@@ -24,9 +24,9 @@ jobs:
       - name: Lock em dia com o pyproject
         run: uv lock --check
       - name: Lint
-        run: uv run --frozen --only-group dev ruff check src tests scripts
+        run: uv run --frozen --only-group dev ruff check src tests scripts bench
       - name: Formatação
-        run: uv run --frozen --only-group dev ruff format --check src tests scripts
+        run: uv run --frozen --only-group dev ruff format --check src tests scripts bench
 
   contrato:
     # PR que quebra o contrato da API (remove rota, campo obrigatório novo, tipo trocado...) não passa;

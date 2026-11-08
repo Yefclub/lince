@@ -356,16 +356,37 @@ cada publicação; patch e minor entram sozinhos quando o CI passa.
 
 ## Estado
 
-Versão 0.1, em validação. Resultados medidos com o mesmo modelo de visão para os dois motores, testes no estilo
-olmOCR-Bench e documentos inéditos criados por um agente sem contexto:
+Em validação. A bancada `bench/medir.py` gera os próprios documentos (nada de arquivo de terceiro), lê com uma IA
+simulada e confere o que o Lince faz: texto nativo, roteamento, montagem, texto oculto e concorrência. Ela refaz a
+tabela abaixo em qualquer máquina, e a versão curta roda no CI (`tests/test_bench.py`):
 
-| Teste | Docling + IA | Lince |
+```bash
+uv run --extra emf python bench/medir.py
+```
+
+| Conferência | Resultado | |
+| --- | --- | --- |
+| Lote de faturas do mesmo modelo (PDF) | 12/12 faturas no texto, rodapé com a folha nos metadados (0.0 s) | ok |
+| PDF longo | 15000/15000 linhas de 300 páginas (1.6 s) | ok |
+| Currículos com injeção escondida (5 técnicas) | 5/5 removidas, 5/5 com alerta (0.1 s) | ok |
+| Apresentação com gráficos e logo repetido | 5/5 slides numerados, 5/5 gráficos no lugar, 6 leituras para 10 imagens (0.1 s) | ok |
+| Leitura em duas fases (IA de quem chama) | 6 tarefas, resultado igual ao da IA do Lince (0.1 s) | ok |
+| Planilha grande | 100000 linhas, perfil data/texto/texto/numero/numero, corte avisado no texto (1.8 s) | ok |
+| Concorrência | 42/42 documentos ao mesmo tempo, 0 erros (1.3 s) | ok |
+| Pico de memória do processo | 245 MB | ok |
+
+Medido num contêiner de 4 CPUs, Python 3.13; o tempo não inclui gerar os documentos.
+
+A qualidade da leitura pela IA depende do modelo e não entra nesta bancada. Na versão 0.1 ela foi medida uma vez,
+com o mesmo modelo de visão para os dois motores, em testes no estilo olmOCR-Bench e em documentos que não podem
+ser publicados, e a carga foi medida uma vez com a API. Por isso a medição abaixo não é refeita pela bancada:
+
+| Teste (medição única, v0.1) | Docling + IA | Lince |
 | --- | --- | --- |
 | Bateria pública (Falcon, ANP, arXiv, Office) | 84% | 92% |
 | Conjunto cego de documentos corporativos | 86% | 89% |
 | Escaneados com gabarito exato (média e pesada) | 78% | 85–86% |
 | Gráficos do ParseBench (pontos de dados) | 14% | 50–53% |
-| Currículos com injeção oculta | 4/5 removidas, sem alerta | 5/5 removidas, 6/6 alertas |
 | Carga com 16 usuários simultâneos | 10 GB RAM, 10/160 perdidos | 1,4 GB, 0/160 perdidos |
 | Carga com 200 usuários × 10 documentos | — | 2.000/2.000, 3,7 GB, 0 quedas |
 | Carga com 1.000 usuários simultâneos × 3 documentos | — | 3.000/3.000 processados, 0 perdidos, 3,4 GB, 0 quedas |
