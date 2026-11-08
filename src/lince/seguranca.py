@@ -823,14 +823,3 @@ def _oculto_na_forma(sh, solta, W, H, fundos, tema, mapa, Pt, parte, imagens) ->
             if certos and cor is not None and all(_iguais(cor, f) for f in fundos):
                 out.append(("cor igual ao fundo", run.text, run._r))
     return out
-
-
-def remover_ocultos(md, ocultos):
-    """Tira do corpo o texto oculto (juntando fragmentos seguidos) e devolve o que saiu."""
-    removidos = []
-    corrida = " ".join(t for _, t in ocultos).strip()
-    for alvo in [corrida] + [t.strip() for _, t in ocultos]:
-        if len(alvo) >= 6 and alvo in md:
-            md = md.replace(alvo, "")
-            removidos.append(alvo)
-    return md, removidos

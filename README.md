@@ -59,7 +59,9 @@ leitor = lince.Leitor(
 
 - Sem `ia`, o Lince devolve o texto nativo completo e marca o que ficou pendente.
 - `leitor.ler(arquivo, prazo=20)`: 20 s, a partir da chamada, para o documento (o chat lê com prazo; a base,
-  sem). A extração nativa conta no prazo; no PDF, a página que começa depois dele entra só com o texto (sem figuras,
+  sem). A extração nativa conta no prazo: o PDF é lido em faixas de 50 páginas, e as faixas que não começam a tempo
+  não são lidas (`páginas N–M: não lidas (prazo esgotado)` em `cobertura.pendentes`); a primeira sempre entra, para o
+  documento nunca sair vazio. Na faixa lida, a página que começa depois do prazo entra só com o texto (sem figuras,
   escaneado nem conferência de texto oculto, que vira alerta), registrada em `cobertura.pendentes`. Nenhuma leitura pela IA começa depois dele, e a
   que está em curso no `OpenAICompativel` é cortada, sem novas tentativas: o que não coube vira a pendência
   `prazo esgotado`, e o texto nativo sai completo. Nada fica rodando depois da entrega. Toda leitura concluída chega em
@@ -138,7 +140,8 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   memória até a entrega); as que passam ficam nas pendências do preparo com o motivo, e `-F max_tarefas=N` baixa o
   teto do documento (nunca sobe).
 - **Prazo**: com `prazo=20`, cada documento tem 20 s a partir do início da leitura dele (a espera na fila não
-  conta; a extração nativa conta, e no PDF a página que começa depois do prazo entra só com o texto); o que a IA não leu a tempo aparece em
+  conta; a extração nativa conta: no PDF, a faixa de páginas que não começa a tempo não é lida, e a página que começa
+  depois do prazo entra só com o texto); o que a IA não leu a tempo aparece em
   `cobertura.pendentes` como `prazo esgotado`.
 - **Fila justa**: os documentos são atendidos em rodízio entre tokens, então quem manda 500 não trava quem
   mandou 1. Até 16 documentos em leitura ao mesmo tempo por instância. As montagens (`POST /v1/montagens`) têm fila
