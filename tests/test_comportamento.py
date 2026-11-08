@@ -556,16 +556,19 @@ def test_leitura_copiada_alem_do_teto_de_saida_fica_pendente_e_o_texto_nativo_sa
     Image.new("RGB", (600, 300), "navy").save(tmp_path / "selo.png")
     d = Document()
     d.add_paragraph("Anexo do contrato de fornecimento.")
-    for k in range(20):  # o mesmo selo em vinte cláusulas: uma leitura, copiada em cada lugar
+    for k in range(500):  # o mesmo selo em quinhentas cláusulas: uma leitura, que entra uma vez
         d.add_paragraph(f"Cláusula {k + 1}.")
         d.add_picture(str(tmp_path / "selo.png"), width=Inches(1))
     d.save(tmp_path / "selos.docx")
     arq = tmp_path / "selos.docx"
     lidas = []
-    ia = lince.FuncaoLeitor(lambda img, i: lidas.append(1) or "Logo " + "z" * 5000, "m")
+    ia = lince.FuncaoLeitor(lambda img, i: lidas.append(1) or "Logo " + "z" * 50_000, "m")
     r = lince.Leitor(ia=ia, agrupar=False).ler(arq)
-    assert len(lidas) == 1 and r.markdown.count("Logo z") == 20  # abaixo do teto, cada lugar recebe a leitura
-    monkeypatch.setattr(leitor_mod, "SAIDA_MAX", 50_000)  # 20 cópias de 5 KB passam de 50 mil caracteres
+    assert len(lidas) == 1 and r.markdown.count("Logo z") == 1  # a leitura entra inteira na primeira posição
+    assert r.markdown.count("_(mesma imagem lida acima: ") == 499  # e as outras posições apontam para ela
+    sem_leitura = lince.ler(arq).markdown  # o mesmo documento sem IA: só o nativo e as marcas de pendência
+    assert len(r.markdown) - len(sem_leitura) < 50_000 + 500 * 80  # cada cópia custa uma linha, não a leitura
+    monkeypatch.setattr(leitor_mod, "SAIDA_MAX", 40_000)  # a leitura sozinha já passa do teto
     r = lince.Leitor(ia=ia, agrupar=False).ler(arq)
     assert "Logo z" not in r.markdown and "Anexo do contrato de fornecimento." in r.markdown
     assert any(p.endswith("resultado grande demais") for p in r.cobertura.pendentes)
@@ -588,5 +591,5 @@ def test_teto_de_saida_conta_a_leitura_em_lote_tambem_no_esforco_maximo(tmp_path
     assert r.markdown.count("Selo z") == 3 and r.cobertura.leituras_ia == 1  # uma chamada leu os três
     monkeypatch.setattr(leitor_mod, "SAIDA_MAX", 10_000)  # três leituras de 5 KB passam de 10 mil caracteres
     r = leitor.ler(tmp_path / "selos.pdf")
-    assert "Selo z" not in r.markdown and "Anexo com os selos de certificação." in r.markdown
-    assert any(p.endswith("resultado grande demais") for p in r.cobertura.pendentes)
+    assert r.markdown.count("Selo z") == 1 and "Anexo com os selos de certificação." in r.markdown  # a que cabe entra
+    assert len([p for p in r.cobertura.pendentes if p.endswith("resultado grande demais")]) == 2  # as outras, não

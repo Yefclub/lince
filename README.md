@@ -37,8 +37,10 @@ r.estrutura         # páginas, slides, abas (e quais são ocultas), seções co
 renderizado de novo em 2–3x a resolução e relido com a primeira leitura como contexto.
 
 **Metadados corporativos**: cabeçalho e rodapé corridos saem do corpo e vão para os metadados (versão,
-revisão, código, classificação), junto com marca d'água, propriedades do arquivo, comentários e alterações
-rastreadas do Word e abas ocultas do Excel.
+revisão, código, classificação). No PDF, sai a linha curta da borda da página em que só o número da página muda, o
+número sozinho (registrado como `#`) e a linha idêntica na borda de ao menos 80% das páginas ("Contrato 123/2026 -
+Confidencial"). Também vão para os metadados a marca d'água, as propriedades do arquivo, os comentários e as
+alterações rastreadas do Word e as abas ocultas do Excel.
 
 **Segurança**: texto que a IA leria e uma pessoa não vê (branco no branco, fonte minúscula, modo invisível,
 oculto do Word) sai do corpo e gera alerta; padrões de prompt injection em português e inglês geram alerta.
@@ -112,7 +114,7 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
 
 | Rota | O que faz |
 | --- | --- |
-| `POST /v1/sessoes` | Envia 1 a 50 arquivos (campo `arquivo` repetido), com `referencia`, `esforco` (`padrao` ou `max`) e `prazo` (1 a 3600 s por documento) opcionais. Responde `201` com a sessão e `Location`. Com `Prefer: wait=N` (até 300 s), espera terminar. |
+| `POST /v1/sessoes` | Envia 1 a 50 arquivos (campo `arquivo` repetido), com `referencia`, `esforco` (`padrao` ou `max`), `prazo` (1 a 3600 s por documento), `modo` (`leitura` ou `tarefas`) e `max_tarefas` (só no modo `tarefas`) opcionais. Responde `201` com a sessão e `Location`. Com `Prefer: wait=N` (até 300 s), espera terminar. |
 | `GET /v1/sessoes/{id}` | Estado da sessão e de cada documento; o que já terminou vem com `markdown`, `metadados`, `cobertura`, `alertas_injecao`, `uso` (tokens por leitura) e `estrutura`. Aceita `Prefer: wait=N`. |
 | `GET /v1/sessoes?referencia=…` | Sessões do token ainda não entregues, da mais nova para a mais antiga (resumo, sem o conteúdo lido). |
 | `DELETE /v1/sessoes/{id}` | Confirma o recebimento (ou cancela o que ainda não foi lido) e apaga a sessão na hora. |
@@ -129,16 +131,27 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   instrução, onde está, `chave` de cache e `tokens_estimados`) e um `plano` opaco, assinado pelo servidor para o token
   e válido por 24 h. Quem chama lê as imagens com o próprio modelo e manda `POST /v1/montagens`; nada fica guardado
   no servidor. Com várias réplicas, todas precisam do mesmo `LINCE_SEGREDO` (32+ caracteres aleatórios); sem ele, o
-  plano só monta na instância que o entregou.
+  plano só monta na instância que o entregou. O plano leva o identificador da chave que o selou: depois de um
+  reinício sem `LINCE_SEGREDO` (ou numa réplica com outro segredo), a montagem responde `422 plano-de-outra-chave`, e
+  a saída é refazer a fase 1; `422 plano-invalido` é só o plano alterado ou de outro token. Cada documento devolve
+  até 200 tarefas e cada sessão, 300 somando o lote (cada tarefa leva a imagem em base64 no resultado, que fica em
+  memória até a entrega); as que passam ficam nas pendências do preparo com o motivo, e `-F max_tarefas=N` baixa o
+  teto do documento (nunca sobe).
 - **Prazo**: com `prazo=20`, cada documento tem 20 s a partir do início da leitura dele (a espera na fila não
   conta; a extração nativa conta, e no PDF a página que começa depois do prazo entra só com o texto); o que a IA não leu a tempo aparece em
   `cobertura.pendentes` como `prazo esgotado`.
 - **Fila justa**: os documentos são atendidos em rodízio entre tokens, então quem manda 500 não trava quem
-  mandou 1. Até 16 documentos em leitura ao mesmo tempo por instância.
+  mandou 1. Até 16 documentos em leitura ao mesmo tempo por instância. As montagens (`POST /v1/montagens`) têm fila
+  justa própria, com até 2 ao mesmo tempo: não esperam atrás de leituras presas na IA nem tomam a vaga delas.
 - **Isolamento**: um token nunca vê sessão nem referência de outro. `LINCE_TOKENS` aceita vários tokens
   separados por vírgula, um por plataforma. Para uso local sem token: `lince-servidor --sem-autenticacao`.
 - **Limites**: 100 MB por envio (com `Content-Length`), 50 arquivos por sessão, 64 documentos pendentes e 256 MB
-  de resultado esperando entrega por token. Acima disso, `429` com `Retry-After`.
+  de resultado esperando entrega por token. Acima disso, `429` com `Retry-After`. A montagem aceita até 64 M
+  caracteres de respostas (acima, `413 envio-grande`) e escreve até 16 M caracteres de resultado, contando o texto
+  nativo: a leitura da mesma imagem repetida entra uma vez, e as outras posições levam só a referência. Acima desse
+  teto, entram as leituras que cabem e as outras ficam em `cobertura.pendentes` (`resultado grande demais`), com o
+  texto nativo no lugar, como na leitura com a IA do Lince. No `.xlsb` que só o leitor tolerante abre, a tabela de
+  strings compartilhadas tem teto de 1 milhão de strings e 64 MB de texto; acima disso, o arquivo é recusado.
 - **Escala**: as sessões ficam na memória da instância. Para várias réplicas, use `Prefer: wait` (resposta na
   mesma conexão) ou afinidade por id da sessão no balanceador.
 
@@ -334,10 +347,19 @@ O desenho de EMF e WMF (`lince[emf]`, metafile-render) é opcional: ele só tem 
 Windows, e ainda não instala no Python 3.15. Sem ele, a imagem EMF ou WMF fica marcada no texto e entra em
 `cobertura.pendentes` com o motivo; o resto do documento é lido igual.
 
-**Alpine (musl).** O `pdf-inspector` e o `html-to-markdown` não publicam wheel musllinux: em Alpine o `pip`
-compila os dois a partir do código-fonte e precisa de Rust (`apk add rust cargo`) e de um compilador C. O
-`lince[emf]` não instala em Alpine. Para rodar como serviço, a imagem de referência é a
-`ghcr.io/yefclub/lince` (Debian slim, Python 3.14, com o `lince[emf]`), chamada pela API HTTP.
+**Alpine (musl).** Quem roda em Alpine deve usar o Lince como serviço: a imagem de referência
+`ghcr.io/yefclub/lince` (Debian slim, Python 3.14, com o `lince[emf]`), chamada pela API HTTP, ao lado da aplicação.
+Instalar a biblioteca no próprio Alpine é possível, mas caro: o `pdf-inspector` e o `html-to-markdown` não publicam
+wheel musllinux, e o `pip` compila os dois a partir do código-fonte. O Rust do `apk` (`apk add rust cargo`) é antigo
+demais para o `html-to-markdown`; use o Rust estável do `rustup` com o `build-base` (compilador C e cabeçalhos). Na
+medição da issue #40, a compilação levou cerca de 16 min. O `lince[emf]` não instala em Alpine.
+
+```sh
+apk add build-base curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+. "$HOME/.cargo/env"
+pip install "lince @ git+https://github.com/Yefclub/lince"
+```
 
 Linha de comando:
 

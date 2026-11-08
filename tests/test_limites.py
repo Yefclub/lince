@@ -132,3 +132,33 @@ def test_pagina_gigante_nao_vira_imagem_gigante():
 
     assert escala(595, 842, 2.0) == 2.0  # A4 segue igual
     assert 14400 * escala(14400, 14400, 2.0) <= LADO_MAX_PX
+
+
+def _xlsb_com_strings(tmp_path, quantas, texto="ab"):
+    """Um .xlsb mínimo cuja tabela de strings compartilhadas tem `quantas` strings (BrtSSTItem, MS-XLSB 2.4.14)."""
+    import struct
+
+    item = b"\x00" + struct.pack("<I", len(texto)) + texto.encode("utf-16-le")
+    tamanho, n = b"", len(item)  # o tamanho do registro em grupos de 7 bits
+    while True:
+        tamanho += bytes([n & 0x7F | (0x80 if n > 0x7F else 0)])
+        n >>= 7
+        if not n:
+            break
+    p = tmp_path / "strings.xlsb"
+    with zipfile.ZipFile(p, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("xl/sharedStrings.bin", (b"\x13" + tamanho + item) * quantas)
+        z.writestr("xl/workbook.bin", b"")
+    return p
+
+
+def test_tabela_de_strings_do_xlsb_tem_teto_de_quantidade_e_de_texto(tmp_path, monkeypatch):
+    from lince import legados
+
+    monkeypatch.setattr(legados, "_XLSB_STRINGS_MAX", 1000)
+    assert legados.xlsb_tolerante(_xlsb_com_strings(tmp_path, 1000)) == ([], False)  # no teto, lê
+    with pytest.raises(DocumentoRecusado, match="tabela de strings do .xlsb acima do teto"):
+        legados.xlsb_tolerante(_xlsb_com_strings(tmp_path, 1001))
+    monkeypatch.setattr(legados, "_XLSB_STRINGS_BYTES_MAX", 10 * 1024)  # poucas strings, mas longas
+    with pytest.raises(DocumentoRecusado, match="MB de texto"):
+        legados.xlsb_tolerante(_xlsb_com_strings(tmp_path, 3, texto="x" * 2000))

@@ -139,5 +139,40 @@ def test_numero_impresso_deslocado_do_indice_ainda_e_cabecalho():
     corpo = "\n".join(f"Cláusula {k}: o texto de verdade do contrato de fornecimento de grãos." for k in range(8))
     # capa e sumário sem número: a página física 3 é a "1" impressa
     nativas = _paginas(*([f"Relatório anual — {n - 1}", corpo, str(n - 1)] for n in range(2, 7)))
-    assert _sem_cabecalho_corrido(nativas) == {"Relatório anual — #"}
+    assert _sem_cabecalho_corrido(nativas) == {"Relatório anual — #", "#"}  # o número sozinho também é registrado
     assert all(b[0] == "" and b[2] == "" for _, b in nativas)
+
+
+def test_cabecalho_fixo_sem_numero_vai_para_os_metadados(tmp_path):
+    p = tmp_path / "contrato.pdf"
+    c = canvas.Canvas(str(p), pagesize=A4)
+    for n in range(60):
+        c.setFont("Helvetica", 9)
+        c.drawString(60, 810, "Contrato 123/2026 - Confidencial")
+        c.setFont("Helvetica", 11)
+        for k in range(3):
+            c.drawString(
+                60, 770 - k * 18, f"Cláusula {n + 1}.{k + 1}: entrega de {10 * n + k} toneladas de soja no porto."
+            )
+        c.showPage()
+    c.save()
+    r = lince.ler(p)
+    assert "Contrato 123/2026" not in r.markdown and r.markdown.count("toneladas de soja") == 180
+    assert r.metadados["cabeçalho/rodapé"] == ["Contrato 123/2026 - Confidencial"]
+
+
+def test_numero_da_pagina_tirado_do_corpo_vai_para_os_metadados():
+    corpo = "\n".join(f"Cláusula {k}: o texto de verdade do contrato de fornecimento de grãos." for k in range(8))
+    nativas = _paginas(*([f"Cláusula {n}.0 em vigor.", corpo, str(n + 1)] for n in range(5)))
+    assert _sem_cabecalho_corrido(nativas) == {"#"} and all(b[2] == "" for _, b in nativas)
+    abreviado = _paginas(*([f"Cláusula {n}.0 em vigor.", corpo, f"Pág. {n + 1}"] for n in range(5)))
+    assert _sem_cabecalho_corrido(abreviado) == {"Pág. #"}  # a forma que a página usava, para quem lê os metadados
+
+
+def test_paginas_iguais_e_linha_que_muda_nao_sao_cabecalho_fixo():
+    corpo = "\n".join(f"Cláusula {k}: o texto de verdade do contrato de fornecimento de grãos." for k in range(8))
+    copias = _paginas(*([corpo] for _ in range(5)))  # páginas inteiras iguais: o igual entra no corpo, é conteúdo
+    assert _sem_cabecalho_corrido(copias) == set() and all(b[0] == corpo for _, b in copias)
+    carne = _paginas(*([f"Vencimento: 10/{n + 1:02d}/2026", f"Valor: R$ {100 + n},00", corpo] for n in range(12)))
+    assert _sem_cabecalho_corrido(carne) == set()  # o que muda não é fixo, e o igual que segue no corpo também não
+    assert all(b[0].startswith("Vencimento") and b[1].startswith("Valor") for _, b in carne)
