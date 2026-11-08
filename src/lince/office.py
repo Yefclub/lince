@@ -13,7 +13,7 @@ from xml.etree import ElementTree as ET  # noqa: F401
 from . import legados, perfil_tabular
 from .limites import xml_ou_nada
 from .metadados import BINARIOS_OLE, ERROS_DE_PARTE, ODF
-from .seguranca import remover_ocultos, texto_oculto_docx
+from .seguranca import NAO_CONFERIDO, XMLIlegivel, remover_ocultos, texto_oculto_docx, texto_oculto_pptx
 
 NS = {
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
@@ -406,8 +406,13 @@ def planejar_office(path, pasta, ext=None):
 
         _complemento(imagens_bordas, "imagens do cabeçalho e do rodapé", ilegiveis)
     seguranca = []
-    if ext == ".docx":
-        ocultos = texto_oculto_docx(path)
+    conferir = texto_oculto_docx if ext in (".docx", ".docm") else texto_oculto_pptx if ext in PPTX else None
+    if conferir:
+        try:
+            ocultos = conferir(path)
+        except XMLIlegivel:  # não conferido é suspeita, nunca "nada oculto": vira alerta
+            ocultos = []
+            seguranca.append({"tecnicas": ["não conferido"], "texto": "", "alerta": NAO_CONFERIDO})
         if ocultos:
             md, _ = remover_ocultos(md, ocultos)
             seguranca.append(
@@ -635,6 +640,7 @@ def _imagens_xlsx(path, ilegiveis) -> list[tuple[str, str, bytes]]:
     return achadas
 
 
+PPTX = {".pptx", ".pptm", ".ppsx", ".ppsm"}
 PLANILHAS = {".xlsx", ".xlsm", ".xlsb", ".xls", ".ods", ".csv", ".tsv"}  # as que ganham perfil tabular
 
 # Planilha grande, lida em fluxo (openpyxl read_only), com os mesmos tetos do conversor que o Orbital usava

@@ -28,6 +28,7 @@ def _metadados(pasta, plano, corpo, moveis):
     if plano.get("texto_oculto"):
         meta["texto_oculto_removido"] = plano["texto_oculto"]
     alertas = alertas_injecao(corpo) + [a for o in plano.get("texto_oculto", []) for a in alertas_injecao(o["texto"])]
+    alertas += [o["alerta"] for o in plano.get("texto_oculto", []) if o.get("alerta")]
     if alertas:
         meta["alertas_injecao"] = alertas
     with open(f"{pasta}/metadados.json", "w", encoding="utf-8") as f:
