@@ -1,6 +1,6 @@
 [project]
 name = "lince"
-version = "0.1.0"
+version = "0.1.1.dev20261108153916"
 description = "Leitor único de documentos: extração nativa + modelo de visão plugável, com cache, metadados e proteção contra prompt injection."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,10 +12,18 @@ dependencies = [
   "openpyxl>=3.1.5,<4",        # MIT — imagens e gráficos de XLSX
   "python-pptx>=1.0.2,<2",     # MIT — setas de fluxograma em PPTX
   "Pillow>=13",                # MIT-CMU — imagem
+  "defusedxml>=0.7",           # PSF — o openpyxl só lê XML com proteção se ele estiver instalado
+  "lxml>=6.1",                 # BSD-3 — edição cirúrgica de OOXML (documento como código)
+  "olefile>=0.47,<1",          # BSD-2 — cabeçalho, rodapé e macro dos binários do Office (DOC, XLS, PPT)
+  "html-to-markdown>=3.20,<4", # MIT — HTML para Markdown (núcleo em Rust, sem dependências)
+  "tinycss2>=1.4,<2",          # BSD-3 — style do HTML com a sintaxe e a cascata do CSS
+  "resvg-py>=0.5,<0.6",        # MIT (no LICENSE do pacote; o PyPI não traz o campo) — desenha o SVG
+  "metafile-render>=0.4.2,<0.5 ; python_full_version < '3.15'",  # MIT — desenha EMF e WMF (ainda sem o 3.15)
 ]
 
 [project.optional-dependencies]
-servidor = ["starlette>=1.10", "uvicorn>=0.54", "python-multipart>=0.0.32"]  # BSD-3 / BSD-3 / Apache-2.0
+servidor = ["starlette>=1.10", "uvicorn>=0.54", "python-multipart>=0.0.32", "redis>=8.1,<9"]  # BSD-3 / BSD-3 / Apache-2.0 / MIT
+redis = ["redis>=8.1,<9"]  # MIT — CacheRedis para quem usa o Lince como lib
 
 [dependency-groups]
 # só desenvolvimento e CI (não vão para a imagem); versões travadas no uv.lock e atualizadas pelo Dependabot

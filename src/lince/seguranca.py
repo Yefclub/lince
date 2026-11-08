@@ -8,6 +8,8 @@ import re  # noqa: F401
 import zipfile  # noqa: F401
 from xml.etree import ElementTree as ET  # noqa: F401
 
+from .limites import escala, xml_ou_nada
+
 PADROES_INJECAO = [
     r"ignor\w*\s+(all|todas?|as|the)?\s*(previous|prior|anteriores|acima)?\s*(instru\w+|regras|rules)",
     r"(system|sistema)\s*prompt|prompt\s+do\s+sistema",
@@ -39,7 +41,7 @@ def texto_oculto_pdf(page, itens, imgs, W, H):
     fonte < 2,5 pt, fora da página, ou cor de texto ≈ cor do fundo."""
     from PIL import Image  # noqa: F401
 
-    esc = 0.5
+    esc = escala(W, H, 0.5)
     fundo = page.render(scale=esc).to_pil().convert("RGB")
     ocultos = []
     for x in itens:
@@ -72,7 +74,10 @@ def texto_oculto_docx(path):
     with zipfile.ZipFile(path) as z:
         if "word/document.xml" not in z.namelist():
             return out
-        for r in ET.fromstring(z.read("word/document.xml")).iter(f"{W}r"):
+        raiz = xml_ou_nada(z.read("word/document.xml"))
+        if raiz is None:  # corpo malformado ou hostil: o anydoc recusa o documento de qualquer forma
+            return out
+        for r in raiz.iter(f"{W}r"):
             rpr = r.find(f"{W}rPr")
             if rpr is None:
                 continue

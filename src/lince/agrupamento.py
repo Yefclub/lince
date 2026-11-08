@@ -82,21 +82,40 @@ def agrupar(tarefas, pasta, max_itens=12):
     return novas, mapa
 
 
+def _json_do_lote(bruto: str) -> dict:
+    m = re.search(r"\{.*\}", bruto, flags=re.S)
+    try:
+        dados = json.loads(m.group(0)) if m else {}
+    except json.JSONDecodeError:
+        return {}
+    return dados if isinstance(dados, dict) else {}
+
+
+def resposta_aproveitavel(plano, tid, texto: str) -> bool:
+    """A resposta pode ir para o cache? Vazia, ou lote cujo JSON não deu nenhum item, não: senão a falha passageira
+    do provedor ficaria valendo por dias, e cada nova tentativa receberia a mesma pendência."""
+    itens = (plano.get("lotes") or {}).get(tid)
+    if itens is None:
+        return bool(texto.strip())
+    dados = _json_do_lote(texto)
+    return any(_valor_do_item(dados, n).strip() for n, _ in itens)
+
+
+def _valor_do_item(dados: dict, n) -> str:
+    """Texto do item n do lote, pelo mesmo critério na distribuição e no cache: null, false e 0 são vazio."""
+    v = dados.get(str(n), dados.get(n, ""))
+    if isinstance(v, (dict, list)):
+        v = json.dumps(v, ensure_ascii=False)
+    return str(v or "")
+
+
 def distribuir_lotes(plano, respostas):
     """Resposta JSON do lote → resposta de cada tarefa original."""
     R = dict(respostas)
     for lid, itens in (plano.get("lotes") or {}).items():
         if lid not in R:  # já distribuído (esforço máximo) ou leitura do lote falhou
             continue
-        bruto = R.pop(lid)
-        m = re.search(r"\{.*\}", bruto, flags=re.S)
-        try:
-            dados = json.loads(m.group(0)) if m else {}
-        except json.JSONDecodeError:
-            dados = {}
+        dados = _json_do_lote(R.pop(lid))
         for n, tid in itens:
-            v = dados.get(str(n), dados.get(n, ""))
-            if isinstance(v, (dict, list)):
-                v = json.dumps(v, ensure_ascii=False)
-            R[tid] = v or ""
+            R[tid] = _valor_do_item(dados, n)
     return R

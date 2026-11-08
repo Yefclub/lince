@@ -15,6 +15,11 @@ class Uso:
     tarefa: str = ""
 
 
+class PrazoEsgotado(Exception):
+    """A leitura pela IA não coube no prazo do documento. Provedor próprio pode levantar quando
+    `lince.prazo_restante()` acabar; o Lince registra a pendência `prazo esgotado`."""
+
+
 @dataclass
 class RespostaIA:
     texto: str
@@ -38,6 +43,8 @@ class Resultado:
     metadados: dict[str, Any]  # versão, rodapé, marca d'água, propriedades, alertas
     cobertura: Cobertura
     uso: list[Uso] = field(default_factory=list)
+    # páginas (PDF), slides, abas (nome e se é oculta), seções do Markdown com posição e início de cada página
+    estrutura: dict[str, Any] = field(default_factory=dict)
 
     @property
     def alertas_injecao(self) -> list[str]:

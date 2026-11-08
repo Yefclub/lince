@@ -1,5 +1,6 @@
 """API HTTP: cada resposta é conferida contra o contrato OpenAPI; os testes provam sessão, lote, referência,
-entrega única (nada fica guardado), idempotência, isolamento entre tokens, limites e a proteção do provedor."""
+entrega única (o documento não fica guardado), idempotência, isolamento entre tokens, limites e proteção do
+provedor."""
 
 import json
 import threading
@@ -210,6 +211,9 @@ def test_token_nao_ve_sessao_nem_referencia_de_outro(api, pdf):
     [
         ([("documento", b"x")], {}, {}, "extensao-ausente"),
         ([("a.pdf", b"x")], {"esforco": "turbo"}, {}, "esforco-invalido"),
+        ([("a.pdf", b"x")], {"prazo": "0"}, {}, "prazo-invalido"),
+        ([("a.pdf", b"x")], {"prazo": "3601"}, {}, "prazo-invalido"),
+        ([("a.pdf", b"x")], {"prazo": "1.5"}, {}, "prazo-invalido"),
         ([("a.pdf", b"x")], {"referencia": "nome com espaço"}, {}, "referencia-invalida"),
         ([("a.pdf", b"x")], {}, {"X-IA-URL": "http://x/v1"}, "provedor-incompleto"),
         ([("a.pdf", b"x")], {}, {"X-IA-URL": "file:///etc/passwd", "X-IA-Modelo": "m"}, "provedor-invalido"),
@@ -244,6 +248,26 @@ def test_envios_paralelos_nao_furam_o_teto_de_pendentes():
     assert s.reservar("outro")  # o teto é por token
 
 
+def test_planilhas_em_texto_sao_lidas_com_separador_e_codificacao_detectados(api):
+    csv = 'nome;valor;obs\nJoão;1,5;"a;b"\n'.encode("latin-1")
+    s = conforme(
+        enviar(api, [("dados.csv", csv), ("dados.tsv", b"a\tb\n1\t2\n")], {**A, **ESPERA}), "/v1/sessoes", "post"
+    )
+    s = s.json()
+    assert [i["estado"] for i in s["itens"]] == ["pronto", "pronto"]
+    assert "| João | 1,5 | a;b |" in s["itens"][0]["resultado"]["markdown"]
+    assert "| 1 | 2 |" in s["itens"][1]["resultado"]["markdown"]
+    perfil = s["itens"][0]["resultado"]["estrutura"]["perfil_tabular"]  # o contrato valida a resposta
+    assert perfil[0]["aba"] is None and [c["tipo"] for c in perfil[0]["colunas"]] == ["texto", "numero", "texto"]
+
+
+def test_formato_nao_suportado_recusa_o_lote_antes_de_entrar_na_fila(api, pdf):
+    r = conforme(enviar(api, [("bom.pdf", pdf), ("mensagem.eml", b"From: a@b\n\noi")], A), "/v1/sessoes", "post")
+    assert r.status_code == 415 and r.json()["type"] == "urn:lince:erro:formato-nao-suportado"
+    assert "mensagem.eml" in r.json()["detail"] and ".pdf" in r.json()["detail"]
+    assert api.app.state.servico.sessoes == {} and api.app.state.servico.vagas == {}
+
+
 def test_pedido_recusado_devolve_a_vaga(api, pdf):
     for _ in range(PENDENTES_POR_CLIENTE + 10):  # se a vaga vazasse, viria 429
         assert enviar(api, ("sem_extensao", pdf), A).status_code == 400
@@ -272,7 +296,7 @@ def test_fila_justa_nao_deixa_um_cliente_travar_o_outro():
 
 
 # ------------------------------------------------------------------ provedor de IA
-def _provedor(texto, status=200, local=None):
+def _provedor(texto, status=200, local=None, demora=0):
     """Provedor OpenAI-compatível falso que responde sempre o mesmo texto (ou um redirect)."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -285,6 +309,7 @@ def _provedor(texto, status=200, local=None):
         def do_POST(self):
             self.rfile.read(int(self.headers["Content-Length"]))
             type(self).chamadas += 1
+            threading.Event().wait(demora)
             if status != 200:
                 self.send_response(status)
                 self.send_header("Location", local or "/")
@@ -325,6 +350,50 @@ def test_redirect_do_provedor_nao_e_seguido(pdf_com_figura):
     destino.shutdown()
     assert chamado.chamadas == 0
     assert r.json()["itens"][0]["resultado"]["cobertura"]["pendentes"]
+
+
+def test_prazo_entrega_o_nativo_na_hora_e_marca_a_leitura_que_nao_coube(pdf_com_figura):
+    import time
+
+    srv, contador, url = _provedor("Gráfico: Lapa 3500.", demora=3)
+    api = TestClient(criar_app(["token-a"]))
+    inicio = time.monotonic()
+    r = enviar(api, ("g.pdf", pdf_com_figura), {**A, **ESPERA, "X-IA-URL": url, "X-IA-Modelo": "m"}, prazo="1")
+    gasto = time.monotonic() - inicio
+    srv.shutdown()
+    resultado = conforme(r, "/v1/sessoes", "post").json()["itens"][0]["resultado"]
+    assert gasto < 2.5  # não esperou os 3 s da IA
+    assert "Produção anual por unidade." in resultado["markdown"]  # o texto nativo saiu completo
+    assert any("prazo esgotado" in p for p in resultado["cobertura"]["pendentes"])
+
+
+def test_cache_do_servidor_vale_entre_envios(pdf_com_figura):
+    from lince import CacheMemoria
+
+    srv, contador, url = _provedor("Gráfico de barras: Lapa 3500.")
+    api = TestClient(criar_app(["token-a"], cache=CacheMemoria()))
+    cab = {**A, **ESPERA, "X-IA-URL": url, "X-IA-Modelo": "m"}
+    primeiro = enviar(api, ("g.pdf", pdf_com_figura), cab).json()["itens"][0]["resultado"]
+    segundo = enviar(api, ("g.pdf", pdf_com_figura), cab).json()["itens"][0]["resultado"]
+    srv.shutdown()
+    assert contador.chamadas == 1  # o segundo envio não paga a mesma imagem
+    assert not primeiro["uso"][0]["cache"] and segundo["uso"][0]["cache"]
+    assert "Lapa 3500" in segundo["markdown"]
+    assert segundo["estrutura"]["paginas"] == 1  # a estrutura vem junto na API (e o contrato a valida)
+
+
+def test_cache_do_servidor_e_separado_por_token(pdf_com_figura):
+    from lince import CacheMemoria
+
+    srv, contador, url = _provedor("Gráfico de barras: Lapa 3500.")
+    api = TestClient(criar_app(["token-a", "token-b"], cache=CacheMemoria()))
+    ia = {**ESPERA, "X-IA-URL": url, "X-IA-Modelo": "m"}
+    enviar(api, ("g.pdf", pdf_com_figura), {**A, **ia})
+    outro = enviar(api, ("g.pdf", pdf_com_figura), {**B, **ia}).json()["itens"][0]["resultado"]
+    de_novo = enviar(api, ("g.pdf", pdf_com_figura), {**A, **ia}).json()["itens"][0]["resultado"]
+    srv.shutdown()
+    # o token B não aproveita (nem descobre) a leitura do A; o A aproveita a própria
+    assert contador.chamadas == 2 and not outro["uso"][0]["cache"] and de_novo["uso"][0]["cache"]
 
 
 def test_retry_after_do_provedor_tem_teto():
@@ -479,3 +548,124 @@ def test_lista_mostra_so_o_que_ainda_nao_foi_entregue(api, pdf):
     concluida(api, b)
     api.get(f"/v1/sessoes/{a}", headers=A)
     assert [x["id"] for x in api.get("/v1/sessoes", headers=A).json()["sessoes"]] == [b]
+
+
+# ------------------------------------------------------------------ documento como código
+@pytest.fixture
+def deck():
+    from pptx import Presentation
+
+    prs = Presentation()
+    s = prs.slides.add_slide(prs.slide_layouts[0])
+    s.shapes.title.text = "Relatório trimestral"
+    buf = __import__("io").BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def test_leitura_com_codigo_traz_a_estrutura_editavel(api, deck, pdf):
+    r = enviar(api, [("d.pptx", deck), ("a.pdf", pdf)], {**A, **ESPERA}, codigo="sim")
+    itens = conforme(r, "/v1/sessoes", "post").json()["itens"]
+    cod = itens[0]["resultado"]["codigo"]
+    assert (
+        cod["formato"] == "pptx" and cod["slides"][0]["formas"][0]["paragrafos"][0]["texto"] == "Relatório trimestral"
+    )
+    assert itens[1]["resultado"]["codigo"] is None and "pptx" in itens[1]["resultado"]["codigo_motivo"]
+
+
+def _editar(api, cab, arquivo, pedido):
+    return api.post("/v1/edicoes", files=[("arquivo", arquivo)], data={"operacoes": json.dumps(pedido)}, headers=cab)
+
+
+def test_edicao_devolve_relatorio_e_o_arquivo_uma_vez(api, deck):
+    import io
+
+    from pptx import Presentation
+
+    cod = enviar(api, ("d.pptx", deck), {**A, **ESPERA}, codigo="sim").json()["itens"][0]["resultado"]["codigo"]
+    titulo = cod["slides"][0]["formas"][0]["id"]
+    pedido = {
+        "base_sha256": cod["sha256"],
+        "operacoes": [{"op": "texto", "alvo": titulo, "se_texto": "Relatório trimestral", "texto": "Q3 2026"}],
+    }
+    r = conforme(_editar(api, A, ("d.pptx", deck), pedido), "/v1/edicoes", "post")
+    assert r.status_code == 201 and r.json()["diff"]["partes_alteradas"] == ["/ppt/slides/slide1.xml"]
+    url = r.headers["location"]
+    assert api.get(url, headers=B).status_code == 404  # outro token não baixa
+    baixado = api.get(url, headers=A)
+    assert baixado.status_code == 200 and baixado.headers["x-request-id"]
+    assert Presentation(io.BytesIO(baixado.content)).slides[0].shapes.title.text == "Q3 2026"
+    assert api.get(url, headers=A).status_code == 200  # repetir dentro da janela
+    assert api.delete(url, headers=A).status_code == 204
+    assert api.get(url, headers=A).status_code == 404
+    assert api.app.state.servico.edicoes == {}  # o arquivo editado saiu da memória
+
+
+def test_edicao_em_conflito_diz_qual_operacao_e_nao_aplica(api, deck):
+    pedido = {"operacoes": [{"op": "texto", "alvo": "sld:256/sp:2", "se_texto": "outro texto", "texto": "x"}]}
+    r = conforme(_editar(api, A, ("d.pptx", deck), pedido), "/v1/edicoes", "post")
+    assert r.status_code == 409 and r.json()["type"] == "urn:lince:erro:conflito"
+    assert r.json()["operacao"] == 0 and r.json()["alvo"] == "sld:256/sp:2"
+    assert api.app.state.servico.edicoes == {}
+
+
+def test_edicao_de_formato_sem_suporte_e_pedido_malformado(api, pdf, deck):
+    r = conforme(_editar(api, A, ("a.pdf", pdf), {"operacoes": [{"op": "ordem", "slides": []}]}), "/v1/edicoes", "post")
+    assert r.status_code == 415
+    ruim = api.post("/v1/edicoes", files=[("arquivo", ("d.pptx", deck))], data={"operacoes": "{nao"}, headers=A)
+    assert conforme(ruim, "/v1/edicoes", "post").status_code == 400
+    assert conforme(_editar(api, {}, ("d.pptx", deck), {"operacoes": []}), "/v1/edicoes", "post").status_code == 401
+
+
+def test_operacao_malformada_vira_422_e_nao_500(api, deck):
+    pedido = {"operacoes": [{"op": "valor_grafico", "alvo": "sld:256/sp:2", "ponto": "a", "valor": "nan"}]}
+    r = conforme(_editar(api, A, ("d.pptx", deck), pedido), "/v1/edicoes", "post")
+    assert r.status_code == 422 and r.json()["operacao"] == 0
+
+
+def test_docx_lido_como_codigo_e_editado_com_alteracoes_controladas(api):
+    import io
+    import zipfile
+
+    from docx import Document
+
+    d = Document()
+    d.add_paragraph("Prazo de 30 dias.")
+    buf = io.BytesIO()
+    d.save(buf)
+    cod = enviar(api, ("c.docx", buf.getvalue()), {**A, **ESPERA}, codigo="sim").json()["itens"][0]["resultado"]
+    cod = cod["codigo"]
+    alvo = cod["blocos"][0]["id"]
+    pedido = {
+        "base_sha256": cod["sha256"],
+        "operacoes": [{"op": "substituir", "alvo": alvo, "buscar": "30", "trocar": "45"}],
+    }
+    r = conforme(_editar(api, A, ("c.docx", buf.getvalue()), pedido), "/v1/edicoes", "post")
+    assert r.status_code == 201 and r.json()["codigo"]["blocos"][0]["texto"] == "Prazo de 45 dias."
+    novo = api.get(r.headers["location"], headers=A).content
+    assert b"<w:ins " in zipfile.ZipFile(io.BytesIO(novo)).read("word/document.xml")
+    pendente = conforme(
+        _editar(api, A, ("c.docx", novo), {"operacoes": [{"op": "texto", "alvo": alvo, "texto": "x"}]}),
+        "/v1/edicoes",
+        "post",
+    )
+    assert pendente.status_code == 409 and pendente.json()["type"] == "urn:lince:erro:revisoes-pendentes"
+
+
+def test_xlsx_lido_como_codigo_e_editado(api):
+    import io
+
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    wb.active.title = "Fretes"
+    wb.active["A1"], wb.active["A2"] = 10, "=A1*2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    cod = enviar(api, ("p.xlsx", buf.getvalue()), {**A, **ESPERA}, codigo="sim").json()["itens"][0]["resultado"]
+    assert [c["id"] for c in cod["codigo"]["abas"][0]["celulas"]] == ["Fretes!A1", "Fretes!A2"]
+    pedido = {"base_sha256": cod["codigo"]["sha256"], "operacoes": [{"op": "celula", "alvo": "Fretes!A1", "valor": 15}]}
+    r = conforme(_editar(api, A, ("p.xlsx", buf.getvalue()), pedido), "/v1/edicoes", "post")
+    assert r.status_code == 201 and r.json()["codigo"]["abas"][0]["celulas"][0]["valor"] == 15
+    novo = openpyxl.load_workbook(io.BytesIO(api.get(r.headers["location"], headers=A).content))
+    assert novo["Fretes"]["A1"].value == 15 and novo["Fretes"]["A2"].value == "=A1*2"

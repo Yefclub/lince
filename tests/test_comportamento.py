@@ -82,6 +82,24 @@ def test_texto_oculto_do_word_sai_do_corpo(tmp_path):
     assert r.alertas_injecao
 
 
+def test_formato_vem_do_conteudo_quando_a_extensao_nao_diz(tmp_path, pdf_tres_paginas):
+    d = Document()
+    p = d.add_paragraph("Contrato de fornecimento de soja. ")
+    p.add_run(INJECAO).font.hidden = True
+    sem_extensao = tmp_path / "anexo"
+    d.save(sem_extensao)
+    r = lince.ler(sem_extensao)
+    assert "fornecimento de soja" in r.markdown
+    assert "IGNORE TODAS" not in r.markdown and r.alertas_injecao  # a proteção do .docx vale sem a extensão
+    pdf = tmp_path / "relatorio.bin"
+    pdf.write_bytes(open(pdf_tres_paginas, "rb").read())
+    assert lince.ler(pdf).cobertura.rotas == lince.ler(pdf_tres_paginas).cobertura.rotas != {}  # roteado como PDF
+    eml = tmp_path / "mensagem.eml"
+    eml.write_text("From: a@b\nSubject: oi\n\noi")
+    with pytest.raises(lince.FormatoNaoSuportado):
+        lince.ler(eml)
+
+
 def test_documento_sem_injecao_nao_gera_alerta(tmp_path):
     p = tmp_path / "limpo.pdf"
     _pdf(p, ["Relatório mensal de produção.\nA unidade processou 1.200 t/dia."])
@@ -279,3 +297,210 @@ def test_esforco_maximo_mantem_as_leituras_da_folha_agrupada(tmp_path):
     r = lince.Leitor(ia=lince.FuncaoLeitor(ia, "m"), esforco="max").ler(pdf)
     assert "Título lido 1" in r.markdown and "pendente" not in r.markdown
     assert r.cobertura.pendentes == []
+
+
+def _pdf_com_figura(tmp_path, texto="Texto nativo do relatório."):
+    from PIL import Image
+
+    Image.new("RGB", (800, 400), "navy").save(tmp_path / "f.png")
+    pdf = tmp_path / "f.pdf"
+    c = canvas.Canvas(str(pdf), pagesize=A4)
+    c.drawString(60, 780, texto)
+    c.drawImage(str(tmp_path / "f.png"), 60, 400, width=400, height=200)
+    c.save()
+    return pdf
+
+
+def test_prazo_corta_a_chamada_em_curso_e_nada_fica_rodando_depois(tmp_path):
+    import time
+
+    class Lento(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            threading.Event().wait(4)  # o provedor demora mais que o prazo
+            self.send_response(200)
+            self.end_headers()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Lento)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    custos = []
+    ia = lince.OpenAICompativel(f"http://127.0.0.1:{srv.server_port}/v1", "m")
+    leitor = lince.Leitor(ia=ia, ao_usar=custos.append, agrupar=False)
+    vivas = threading.active_count()
+    inicio = time.monotonic()
+    r = leitor.ler(_pdf_com_figura(tmp_path), prazo=1)
+    gasto = time.monotonic() - inicio
+    srv.shutdown()
+    assert gasto < 2.5  # cortou no prazo, sem as 6 tentativas de 120 s
+    assert "Texto nativo do relatório." in r.markdown
+    assert any(p.endswith("prazo esgotado") for p in r.cobertura.pendentes) and not r.uso and not custos
+    assert threading.active_count() <= vivas + 1  # nenhuma leitura ficou em segundo plano (+1: o servidor falso)
+
+
+def test_provedor_proprio_ve_o_tempo_que_sobra(tmp_path):
+    vistos = []
+
+    def ia(imagem, instrucao):
+        vistos.append(lince.prazo_restante())
+        return "lido"
+
+    pdf = _pdf_com_figura(tmp_path)
+    lince.Leitor(ia=lince.FuncaoLeitor(ia, "m"), agrupar=False).ler(pdf, prazo=30)
+    lince.Leitor(ia=lince.FuncaoLeitor(ia, "m"), agrupar=False).ler(pdf)
+    assert 0 < vistos[0] <= 30 and vistos[1] is None and lince.prazo_restante() is None
+
+
+def test_lote_cortado_pelo_prazo_nao_vira_resposta_vazia_nos_itens(tmp_path):
+    from PIL import Image
+
+    pdf = tmp_path / "titulos.pdf"
+    c = canvas.Canvas(str(pdf), pagesize=A4)
+    c.drawString(60, 800, "Relatório com títulos em imagem.")
+    for n in range(4):  # títulos pequenos em imagem: viram um lote numa chamada só
+        Image.new("RGB", (600, 80), (20 * n, 60, 160)).save(tmp_path / f"t{n}.png")
+        c.drawImage(str(tmp_path / f"t{n}.png"), 60, 700 - 120 * n, width=300, height=40)
+    c.save()
+
+    def ia(imagem, instrucao):
+        raise lince.PrazoEsgotado
+
+    r = lince.Leitor(ia=lince.FuncaoLeitor(ia, "m")).ler(pdf)
+    assert any(p.startswith("lote") and p.endswith("prazo esgotado") for p in r.cobertura.pendentes)
+    assert not any("resposta vazia" in p for p in r.cobertura.pendentes)
+
+
+def test_falha_do_ledger_continua_derrubando_a_leitura(tmp_path):
+    def ledger(uso):
+        raise RuntimeError("orçamento estourado")
+
+    leitor = lince.Leitor(ia=lince.FuncaoLeitor(lambda i, s: "lido", "m"), ao_usar=ledger, agrupar=False)
+    with pytest.raises(RuntimeError, match="orçamento estourado"):  # quem paga decide; o Lince não engole
+        leitor.ler(_pdf_com_figura(tmp_path), prazo=30)
+
+
+@pytest.mark.parametrize("prazo", [0, -1, float("inf"), float("nan")])
+def test_prazo_invalido_e_recusado(prazo, tmp_path):
+    (tmp_path / "a.txt").write_text("oi")
+    with pytest.raises(ValueError):
+        lince.Leitor().ler(tmp_path / "a.txt", prazo=prazo)
+
+
+def _provedor_que_trava(passos):
+    """Provedor que manda os cabeçalhos e depois `passos` (bytes a enviar ou segundos a esperar)."""
+    import time
+
+    class Provedor(BaseHTTPRequestHandler):
+        chegou = threading.Event()
+
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            type(self).chegou.set()
+            self.send_response(200)
+            self.send_header("Content-Length", "100000")
+            self.end_headers()
+            try:
+                for p in passos:
+                    if isinstance(p, bytes):
+                        self.wfile.write(p)
+                        self.wfile.flush()
+                    else:
+                        time.sleep(p)
+            except OSError:
+                pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Provedor)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, Provedor.chegou, lince.OpenAICompativel(f"http://127.0.0.1:{srv.server_port}/v1", "m")
+
+
+@pytest.mark.parametrize(
+    "passos",
+    [
+        [b" ", 0.2] * 200,  # aos poucos: cada byte chega antes do timeout do socket
+        [b" ", 1.4, b" ", 5],  # para no meio: um byte quase no fim do prazo e depois trava
+    ],
+    ids=["aos-poucos", "para-no-meio"],
+)
+def test_provedor_lento_no_corpo_nao_segura_o_prazo(tmp_path, passos):
+    import time
+
+    pdf = _pdf_com_figura(tmp_path)
+    srv, chegou, ia = _provedor_que_trava(passos)
+    leitor = lince.Leitor(ia=ia, agrupar=False)
+    inicio = time.monotonic()
+    r = leitor.ler(pdf, prazo=2)
+    gasto = time.monotonic() - inicio
+    srv.shutdown()
+    assert chegou.is_set()  # a leitura chegou ao provedor: o corte foi no corpo, não antes da chamada
+    assert gasto < 2.8 and any(p.endswith("prazo esgotado") for p in r.cobertura.pendentes)  # prazo de 2 s
+
+
+def test_releitura_ampliada_respeita_o_prazo_e_mantem_a_primeira_leitura(tmp_path):
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (900, 500), "white")
+    ImageDraw.Draw(img).text((40, 40), "Tabela de preços", fill="black")
+    img.save(tmp_path / "t.png")
+    pdf = tmp_path / "t.pdf"
+    c = canvas.Canvas(str(pdf), pagesize=A4)
+    c.drawString(60, 780, "Anexo com a tabela de preços em imagem.")
+    c.drawImage(str(tmp_path / "t.png"), 60, 400, width=450, height=250)
+    c.save()
+
+    def ia(imagem, instrucao):
+        if "SEGUNDA LEITURA" in instrucao:
+            raise lince.PrazoEsgotado  # o prazo venceu durante a releitura
+        return "Diesel S10: R$ [ilegível]"
+
+    r = lince.Leitor(ia=lince.FuncaoLeitor(ia, "m"), esforco="max", agrupar=False).ler(pdf, prazo=30)
+    assert "Diesel S10: R$ [ilegível]" in r.markdown  # a 1ª leitura fica valendo
+    assert r.cobertura.rotas["segunda_passada"] == 0 and not r.cobertura.pendentes
+
+    def lenta(imagem, instrucao):
+        assert "SEGUNDA LEITURA" not in instrucao  # com o prazo vencido, nem renderiza nem relê
+        while lince.prazo_restante() > 0:  # a 1ª leitura termina só depois do prazo, seja qual for a máquina
+            threading.Event().wait(0.05)
+        return "Diesel S10: R$ [ilegível]"
+
+    r = lince.Leitor(ia=lince.FuncaoLeitor(lenta, "m"), esforco="max", agrupar=False).ler(pdf, prazo=3)
+    assert "Diesel S10: R$ [ilegível]" in r.markdown and "segunda_passada" not in r.cobertura.rotas
+
+
+@pytest.mark.parametrize("chunked", [False, True], ids=["content-length", "chunked"])
+def test_leitura_que_da_certo_com_prazo_continua_dando_certo(tmp_path, chunked):
+    class Normal(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            out = json.dumps({"choices": [{"message": {"content": "Gráfico lido."}}], "usage": {"prompt_tokens": 9}})
+            out = out.encode()
+            self.send_response(200)
+            if chunked:
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                for parte in (out[:10], out[10:]):
+                    self.wfile.write(f"{len(parte):x}\r\n".encode() + parte + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+            else:
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Normal)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    custos = []
+    ia = lince.OpenAICompativel(f"http://127.0.0.1:{srv.server_port}/v1", "m")
+    r = lince.Leitor(ia=ia, ao_usar=custos.append, agrupar=False).ler(_pdf_com_figura(tmp_path), prazo=30)
+    srv.shutdown()
+    assert "Gráfico lido." in r.markdown and r.cobertura.leituras_ia == 1 and not r.cobertura.pendentes
+    assert [u.tokens_entrada for u in custos] == [9]

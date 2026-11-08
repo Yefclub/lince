@@ -1,0 +1,97 @@
+name: versao-dev
+
+# Todo merge em dev ganha uma versão de desenvolvimento carimbada pelo bot (próximo patch + .devTIMESTAMP, PEP 440)
+# e a imagem ghcr.io/<repo>:dev, para testar antes da release. O push sai pelo GitHub App do Lince, que dispara
+# workflows: o `if:` ignora commit de bot com prefixo chore(versao)/chore(release), e não há laço.
+on:
+  push:
+    branches: [dev]
+
+permissions: {}
+
+concurrency:
+  group: versao-dev # o push tenta de novo se a release ou um merge empurrar ao mesmo tempo
+  cancel-in-progress: false
+
+jobs:
+  versao:
+    if: github.repository == 'Yefclub/lince' && !(endsWith(github.event.head_commit.author.name, '[bot]') && (startsWith(github.event.head_commit.message, 'chore(versao)') || startsWith(github.event.head_commit.message, 'chore(release)')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: lince-bot # a chave do bot só existe neste environment, que só libera dev e main
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - id: bot
+        name: Token do bot do Lince (GitHub App com exceção nas regras de dev, main e tags)
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.LINCE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.LINCE_BOT_CHAVE }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.bot.outputs.token }} # o push sai como o bot, que passa pelas regras
+          ref: dev
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - id: versao
+        name: Carimba próximo patch depois da última release + .devTIMESTAMP e commita como bot
+        env:
+          BOT_NOME: ${{ steps.bot.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+        run: |
+          git config user.name "${BOT_NOME}[bot]"
+          bot_id=$(gh api "/users/${BOT_NOME}%5Bbot%5D" --jq .id)
+          git config user.email "${bot_id}+${BOT_NOME}[bot]@users.noreply.github.com"
+          # se a dev andou (merge ou release) enquanto isto rodava, recalcula e carimba de novo sobre a ponta nova
+          for tentativa in 1 2 3 4; do
+            git fetch -q --tags origin dev
+            ultima=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)
+            ultima=${ultima#v}
+            IFS=. read -r ma mi pa <<< "${ultima:-0.0.0}"
+            VERSAO="${ma}.${mi}.$((pa + 1)).dev$(date -u +%Y%m%d%H%M%S)"
+            echo "versao=$VERSAO" >> "$GITHUB_OUTPUT"
+            git checkout -q -B carimbo origin/dev
+            sed -i -E "0,/^version = \".*\"/s//version = \"${VERSAO}\"/" pyproject.toml
+            uv lock
+            git add pyproject.toml uv.lock
+            git commit -q -m "chore(versao): ${VERSAO}"
+            if saida=$(git push origin HEAD:dev 2>&1); then exit 0; fi
+            echo "$saida"
+            case "$saida" in
+              *"rule violations"*) echo "::error::as regras da dev recusaram o bot: confira a exceção do GitHub App no ruleset"; exit 1 ;;
+            esac
+            echo "Tentativa ${tentativa}: a dev andou, carimbando de novo"
+          done
+          echo "::error::não consegui publicar a versão na dev depois de 4 tentativas"
+          exit 1
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=dev
+            type=raw,value=${{ steps.versao.outputs.versao }}
+          labels: |
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.version=${{ steps.versao.outputs.versao }}
+      - name: Imagem de desenvolvimento
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -14,6 +14,8 @@ r.markdown          # corpo do documento
 r.metadados         # versão, rodapé, marca d'água, propriedades, comentários, alertas de injeção
 r.cobertura         # rotas por página, leituras pela IA, leituras do cache, pendências
 r.uso               # custo de cada leitura (para o seu ledger)
+r.estrutura         # páginas, slides, abas (e quais são ocultas), seções com a posição no Markdown (pontos de código)
+                    # e, nas planilhas e no CSV, o perfil de cada tabela: colunas com o tipo, amostra e linhas no texto
 ```
 
 ## O que ele faz
@@ -47,13 +49,20 @@ O conteúdo das imagens é tratado como dado, nunca como instrução.
 ```python
 leitor = lince.Leitor(
     ia=lince.OpenAICompativel(url, modelo, chave),   # ou FuncaoLeitor(sua_funcao), ou o seu objeto com .ler()
-    cache=lince.CacheDisco("/var/cache/lince"),      # ou o seu: obter(k) / guardar(k, texto)
+    cache=lince.CacheRedis(redis_da_plataforma),     # ou CacheDisco(pasta), ou o seu: obter(k) / guardar(k, texto)
     ao_usar=registrar_custo,                         # chamado a cada leitura com tokens e modelo
     max_leituras=200,                                # teto por documento; o resto vira pendência registrada
 )
 ```
 
 - Sem `ia`, o Lince devolve o texto nativo completo e marca o que ficou pendente.
+- `leitor.ler(arquivo, prazo=20)`: 20 s, a partir da chamada, para o documento (o chat lê com prazo; a base,
+  sem). A extração nativa conta no prazo, mas nunca é interrompida. Nenhuma leitura pela IA começa depois dele, e a
+  que está em curso no `OpenAICompativel` é cortada, sem novas tentativas: o que não coube vira a pendência
+  `prazo esgotado`, e o texto nativo sai completo. Nada fica rodando depois da entrega. Toda leitura concluída chega em
+  `ao_usar` e em `Resultado.uso`; a chamada cortada pode ser cobrada pelo provedor sem aparecer ali (ela já tinha sido
+  enviada). O corte vale também quando o provedor manda a resposta aos poucos ou para no meio dela; só a conexão, o
+  envio de uma imagem grande ou um DNS lento podem passar alguns segundos do prazo. Provedor próprio lê o tempo que sobra em `lince.prazo_restante()` e pode levantar `lince.PrazoEsgotado`.
 - 429 e 5xx do provedor são repetidos com espera exponencial e `Retry-After`.
 - Falha da IA nunca derruba o documento: a leitura nativa fica e a pendência é registrada.
 
@@ -65,7 +74,8 @@ Serviço para qualquer plataforma chamar, com contrato **OpenAPI 3.1** versionad
 Cada envio, de um documento ou de um lote, cria uma **sessão**. Quem chama marca a sessão com uma `referencia`
 própria, por exemplo `usuario:42`. Assim, um sistema com N usuários sabe de quem é cada resultado.
 
-**Nada fica guardado.** O arquivo é apagado assim que lido, e não há cache em disco. O resultado fica em memória só
+**O documento não fica guardado.** O arquivo é apagado assim que lido (a exceção é o cache opcional de transcrições,
+abaixo). O resultado fica em memória só
 até ser entregue: a primeira resposta com a sessão `concluida` (o próprio envio com `Prefer: wait`, ou um `GET`) é a
 entrega. Depois dela, a sessão fica 60 s para repetir o pedido caso a resposta tenha se perdido, e some; um
 `DELETE` confirma o recebimento e apaga na hora. Resultado que ninguém busca em 15 min é descartado.
@@ -84,8 +94,8 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
 
 | Rota | O que faz |
 | --- | --- |
-| `POST /v1/sessoes` | Envia 1 a 50 arquivos (campo `arquivo` repetido), com `referencia` e `esforco` (`padrao` ou `max`) opcionais. Responde `201` com a sessão e `Location`. Com `Prefer: wait=N` (até 300 s), espera terminar. |
-| `GET /v1/sessoes/{id}` | Estado da sessão e de cada documento; o que já terminou vem com `markdown`, `metadados`, `cobertura`, `alertas_injecao` e `uso` (tokens por leitura). Aceita `Prefer: wait=N`. |
+| `POST /v1/sessoes` | Envia 1 a 50 arquivos (campo `arquivo` repetido), com `referencia`, `esforco` (`padrao` ou `max`) e `prazo` (1 a 3600 s por documento) opcionais. Responde `201` com a sessão e `Location`. Com `Prefer: wait=N` (até 300 s), espera terminar. |
+| `GET /v1/sessoes/{id}` | Estado da sessão e de cada documento; o que já terminou vem com `markdown`, `metadados`, `cobertura`, `alertas_injecao`, `uso` (tokens por leitura) e `estrutura`. Aceita `Prefer: wait=N`. |
 | `GET /v1/sessoes?referencia=…` | Sessões do token ainda não entregues, da mais nova para a mais antiga (resumo, sem o conteúdo lido). |
 | `DELETE /v1/sessoes/{id}` | Confirma o recebimento (ou cancela o que ainda não foi lido) e apaga a sessão na hora. |
 | `GET /v1/openapi.json`, `GET /saude` | Contrato; serviço no ar e versões. |
@@ -96,6 +106,9 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   (`urn:lince:erro:<codigo>`) e `instance` igual ao `X-Request-Id`. O `X-Request-Id` enviado volta em toda
   resposta, o que facilita o rastreio entre os dois sistemas.
 - **Sem `X-IA-URL`**: só a extração nativa; o que precisava de IA aparece em `cobertura.pendentes`.
+- **Prazo**: com `prazo=20`, cada documento tem 20 s a partir do início da leitura dele (a espera na fila não
+  conta; a extração nativa conta, mas não é interrompida); o que a IA não leu a tempo aparece em
+  `cobertura.pendentes` como `prazo esgotado`.
 - **Fila justa**: os documentos são atendidos em rodízio entre tokens, então quem manda 500 não trava quem
   mandou 1. Até 16 documentos em leitura ao mesmo tempo por instância.
 - **Isolamento**: um token nunca vê sessão nem referência de outro. `LINCE_TOKENS` aceita vários tokens
@@ -104,6 +117,85 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   de resultado esperando entrega por token. Acima disso, `429` com `Retry-After`.
 - **Escala**: as sessões ficam na memória da instância. Para várias réplicas, use `Prefer: wait` (resposta na
   mesma conexão) ou afinidade por id da sessão no balanceador.
+
+## Documento como código (edição por IA)
+
+Para uma IA editar um documento sem estragar layout, mestres, animações e gráficos, ela precisa da estrutura com
+endereços estáveis. Com `codigo=sim` no envio, cada PPTX e DOCX traz `resultado.codigo`, com um id tirado do
+próprio arquivo para cada peça:
+
+- **PPTX:** slides, formas, parágrafos, células de tabela e séries de gráfico (`sld:258/sp:2/p:0`).
+- **DOCX:** parágrafos e tabelas (cada célula traz os ids dos parágrafos dela), estilos e comentários. O id do
+  parágrafo é o `w14:paraId` que o Word grava (`p:1A2B3C4D`); em arquivo sem ele, a posição no documento (`p:n12`),
+  e aí vale mandar `se_texto`.
+- **XLSX:** abas, células com valor, fórmula e data (`Fretes!B3`), mesclagens, tabelas e nomes definidos.
+
+`POST /v1/edicoes` recebe o arquivo e as operações, aplica tudo ou nada e devolve o relatório: o que mudou, o diff
+por parte, avisos (texto que pode transbordar) e o código novo. O arquivo editado sai em `GET /v1/edicoes/{id}/arquivo`.
+
+```bash
+curl -H "Authorization: Bearer $LINCE_TOKEN" -F arquivo=@deck.pptx \
+     -F 'operacoes={"base_sha256":"<codigo.sha256>","operacoes":[
+           {"op":"texto","alvo":"sld:258/sp:2/p:0","se_texto":"Título antigo","texto":"Título novo"},
+           {"op":"valor_grafico","alvo":"sld:260/sp:5/ser:0","ponto":2,"valor":12.5},
+           {"op":"ordem","slides":["sld:256","sld:259","sld:258","sld:260"]}]}' \
+     http://localhost:8000/v1/edicoes
+```
+
+Operações do PPTX:
+
+| Operação | O que faz |
+| --- | --- |
+| `texto` | Troca o texto de uma forma (uma linha por parágrafo) ou de um parágrafo, mantendo a formatação |
+| `substituir` | Busca e troca num slide ou numa forma, mesmo com o texto partido em vários trechos de formatação |
+| `notas` | Troca as notas do apresentador |
+| `celula_tabela` | Troca o texto de uma célula |
+| `valor_grafico` | Muda um ponto da série no gráfico e na planilha embutida dele |
+| `ordem`, `remover_slide` | Reordena ou tira slides |
+
+Operações do XLSX, escritas direto no XML da aba (o openpyxl perderia imagens e gráficos ao salvar):
+
+| Operação | O que faz |
+| --- | --- |
+| `celula` | Grava um valor (número, texto, booleano ou vazio) ou uma fórmula (`=SUM(B2:B5)`, em inglês) numa célula, mantendo o estilo |
+| `intervalo` | Grava uma matriz de valores a partir de uma célula; texto que começa com `=` é fórmula |
+| `renomear_aba` | Renomeia a aba e atualiza as referências a ela em fórmulas, nomes, validações e gráficos |
+
+Valor ou fórmula alterada faz o Excel recalcular tudo ao abrir, e por isso os resultados de fórmula no código novo
+ainda são os antigos. A fórmula é conferida antes de entrar: sintaxe, funções conhecidas (em inglês) e o prefixo que
+o Excel exige nas funções novas (`XLOOKUP` vira `_xlfn.XLOOKUP` no arquivo); matriz dinâmica (`FILTER`, `UNIQUE`…)
+é recusada. Também são recusadas com o motivo: célula dentro de mesclagem, de fórmula matricial, na origem de uma
+fórmula compartilhada, no cabeçalho ou na linha de totais de uma tabela, em tabela dinâmica, e aba protegida.
+A fórmula também precisa citar abas e nomes que existem; referência estruturada de tabela (`Tabela1[Coluna]`) ainda
+não é escrita: use o intervalo de células. Renomear recusa nome já usado por qualquer aba (inclusive de gráfico)
+e pasta com a estrutura protegida, e falha fechado: se a aba antiga continuar citada em algum lugar que a edição não
+atualiza (controle de formulário, VML), nada é aplicado e o erro diz onde. O pedido inteiro tem prazo de 60 s.
+
+Operações do DOCX, que por padrão entram como **alterações controladas**: quem abre no Word vê o que a IA propôs e
+aceita ou rejeita cada uma. `"revisao": false` aplica direto, e `"revisao": {"autor": "Ana"}` troca o autor (o
+padrão é `Lince`).
+
+| Operação | O que faz |
+| --- | --- |
+| `texto` | Troca o texto de um parágrafo, com a formatação do começo dele |
+| `substituir` | Busca e troca num parágrafo ou no documento todo (sem `alvo`); corta no caractere exato, então o resto do parágrafo mantém negrito, itálico e links |
+| `inserir_paragrafo_apos` | Parágrafo novo depois do alvo, com o formato dele ou com `estilo` |
+| `remover_paragrafo` | Tira o parágrafo |
+| `estilo_paragrafo` | Aplica um estilo do documento, pelo id ou pelo nome |
+| `comentar` | Comentário no parágrafo, com `autor` |
+
+No DOCX, um parágrafo recebe uma operação de texto por pedido, e o que já tem alteração controlada pendente no
+arquivo (inclusive de formatação) é recusado até alguém aceitar ou rejeitar no Word. Imagem, campo (inclusive o
+sumário), nota, equação, quebra de página, caixa de texto e controle de conteúdo no meio do parágrafo nunca são
+apagados: `texto` recusa, e `substituir` só troca o trecho que não passa por eles (dentro de um controle de
+conteúdo, troca). Para nenhum pedido prender o serviço, a edição de DOCX tem teto: parágrafo com mais de 200 mil caracteres ou 50 mil
+elementos XML é recusado, e o pedido inteiro que passa de 60 s não aplica nada.
+
+- **Nada se perde:** só as partes tocadas são reescritas; o resto do arquivo (mídia, mestres, partes que o Lince
+  não conhece) sai idêntico em bytes. No deck real de uma empresa, com 16 slides, gráficos com planilha embutida e
+  tabela, 5 edições alteraram 6 das 97 partes, e a renderização antes e depois mostrou o layout intacto.
+- **Concorrência:** `se_texto` e `base_sha256` recusam a edição (409) se o documento mudou desde a leitura.
+- **Formatos:** PPTX e PPTM; DOCX e DOCM; XLSX e XLSM.
 
 ## Deploy
 
@@ -125,10 +217,85 @@ services:
 
 Coloque atrás de um proxy reverso com TLS e timeout de leitura acima de 300 s.
 
+### Antivírus (opcional)
+
+Com `LINCE_CLAMAV=host:porta`, todo arquivo recebido passa pelo [ClamAV](https://www.clamav.net/) antes de ser
+lido ou editado. Arquivo infectado recusa o envio inteiro (`422 arquivo-infectado`, com o nome da assinatura); antivírus fora
+do ar recusa com `503` em vez de ler sem varrer. Sem a variável, nada muda. O ClamAV roda como serviço à parte: o
+Lince só fala o protocolo do `clamd` pela rede. As variáveis estão em [`.env.example`](.env.example).
+
+```yaml
+services:
+  lince:
+    image: ghcr.io/yefclub/lince:0.1
+    env_file: .env            # LINCE_TOKENS e LINCE_CLAMAV=clamav:3310
+    depends_on: [clamav]
+    ports: ["8000:8000"]
+    read_only: true
+    tmpfs: [/tmp]
+  clamav:
+    image: clamav/clamav:stable  # baixa e atualiza as assinaturas sozinho
+    volumes: [clamav-db:/var/lib/clamav]
+volumes:
+  clamav-db:
+```
+
+No `clamd.conf`, `StreamMaxLength` precisa ser pelo menos `100M`, que é o teto de envio do Lince.
+
+### Cache das leituras da IA (opcional)
+
+Com `LINCE_REDIS=redis://host:6379/0`, a transcrição que a IA fez de cada recorte ou página fica no Redis por
+`LINCE_CACHE_DIAS` dias (padrão 30). A mesma imagem, com a mesma instrução e o mesmo modelo, não é paga de novo, nem
+em outro envio nem em outra versão do Lince. Fica a transcrição em texto puro, sob o hash da imagem; numa página
+escaneada, ela é o texto da página. O arquivo nunca é guardado. Resposta vazia ou lote que a IA devolveu quebrado não
+entram no cache: a próxima tentativa lê de novo.
+
+O cache é **separado por token**: um cliente não descobre o que outro leu nem recebe resposta gravada por outro.
+Sem a variável, não há cache. Com o Redis fora do ar, o Lince lê normalmente pela IA e só volta a tentar o Redis 30 s
+depois de uma falha.
+
+**Redis:** use uma instância (ou um banco) com teto de memória e descarte das chaves antigas, por exemplo
+`maxmemory 2gb` e `maxmemory-policy allkeys-lru`. Não divida a memória com um Redis de filas que exige `noeviction`
+(BullMQ, Sidekiq e afins): as transcrições acumulam, e quando a memória acaba quem cai são as filas. As chaves levam o
+prefixo `lince:leitura:`.
+
+Na biblioteca, passe o cliente síncrono que a plataforma já tem, com `socket_timeout` definido (sem ele, um Redis
+travado prende a leitura): `lince.Leitor(ia=..., cache=lince.CacheRedis(cliente))` (instale com
+`pip install "lince[redis]"`), ou qualquer objeto com `obter(chave)` e `guardar(chave, texto)`.
+
 ## Formatos
 
-PDF (nativo, escaneado, misto), DOCX, DOC, PPTX, PPT, XLSX, XLS, ODT, ODS, ODP, RTF, EPUB, CSV, imagens
-(PNG, JPG, WEBP, TIFF, BMP, GIF) e texto (TXT, MD, JSON, YAML, XML, TeX).
+O formato vem da extensão do nome do arquivo. Qualquer outra extensão é recusada pela API com `415
+formato-nao-suportado`, antes do upload entrar na fila. Na biblioteca e na linha de comando, um arquivo com
+extensão fora da lista (ou sem extensão) é lido pelo conteúdo quando traz o marcador do formato; sem marcador, a
+leitura falha com `lince.FormatoNaoSuportado`.
+
+| Tipo | Extensões | Leitura |
+| --- | --- | --- |
+| PDF | `.pdf` | Nativo, escaneado ou misto, roteado por página |
+| Word e texto rico | `.docx` `.docm` `.doc` `.odt` `.rtf` `.epub` | Texto, tabelas e imagens; texto oculto do `.docx` vai para os alertas |
+| Apresentação | `.pptx` `.pptm` `.ppsx` `.ppsm` `.ppt` `.pps` `.pot` `.odp` | Slides, notas, tabelas e gráficos com os dados |
+| Planilha | `.xlsx` `.xlsm` `.xlsb` `.xls` `.ods` `.csv` `.tsv` | Abas como tabelas; CSV e TSV com separador e codificação detectados |
+| Imagem | `.png` `.jpg` `.jpeg` `.webp` `.tif` `.tiff` `.bmp` `.gif` | Pelo modelo de visão |
+| Página da web | `.html` `.htm` | Títulos, listas, tabelas e links; imagem embutida (`data:`) e desenho SVG lidos pela IA, imagem externa nunca baixada; texto escondido pela própria tag vai para os alertas |
+| Desenho vetorial | `.svg` | Desenhado (resvg) e lido pela IA; o texto do desenho fica no corpo e título e descrição vão para as propriedades. Referência a arquivo local ou endereço externo nunca entra no desenho |
+| Texto | `.txt` `.md` `.json` `.yaml` `.yml` `.xml` `.tex` | Como está |
+
+Documento como código e edição: `.pptx` e `.pptm` (`.ppsx` só na leitura do código).
+
+Cabeçalho e rodapé de `.docx`, `.docm`, `.doc`, `.rtf`, `.xlsx`, `.xlsm`, `.xls`, `.ppt`, `.pps`, `.pot`, `.odt`, `.ods` e `.odp`
+saem do corpo e ficam nos metadados, em `cabeçalho/rodapé`, com número de página e data legíveis
+(`Página [página] de [páginas]`). Abas ocultas do `.xlsx` e do `.xls` ficam em `abas_ocultas`. Arquivo com macro
+ganha `macros: true`: VBA no Office (OOXML, inclusive `.xlsb`, e `.doc`, `.xls`, `.ppt`, `.pps` e `.pot`), macro do Excel 4.0
+(`.xlsx`, `.xlsm`, `.xlsb` e `.xls`) e macro do LibreOffice. A macro nunca é executada.
+
+Cada extensão da tabela é testada no CI com um arquivo real em `tests/fixtures/reais/`: os de Word, Excel,
+PowerPoint, OpenDocument, RTF, EPUB, PDF, HTML, SVG, CSV e imagem vêm dos conjuntos de teste públicos do Apache POI e do
+Apache Tika, gravados pelos próprios programas; `.pps`, `.pot`, `.htm`, `.jpeg` e `.tiff` são cópias com outra extensão, e os de
+texto foram escritos à mão. Limite conhecido: `.xlsb` gravado fora da especificação falha na leitura com erro claro
+do documento (um de 23 arquivos reais testados; nenhum outro leitor livre testado o abre).
+
+E-mail (`.eml`, `.msg`) e arquivos compactados (`.zip`) ainda não são aceitos.
 
 ## Instalação
 
@@ -147,7 +314,8 @@ lince relatorio.pdf --url https://openrouter.ai/api/v1 --modelo seu/modelo --cha
 
 Todas com licença permissiva: [anydoc](https://github.com/firecrawl/anydoc) (MIT),
 [pdf-inspector](https://github.com/firecrawl/pdf-inspector) (MIT), [pypdfium2](https://github.com/pypdfium2-team/pypdfium2)
-(Apache-2.0/BSD-3), openpyxl (MIT), python-pptx (MIT), Pillow (MIT-CMU); na API, Starlette e Uvicorn (BSD-3) e
+(Apache-2.0/BSD-3), openpyxl (MIT), python-pptx (MIT), Pillow (MIT-CMU), lxml (BSD-3), defusedxml (PSF),
+[olefile](https://github.com/decalage2/olefile) (BSD-2), [html-to-markdown](https://github.com/xberg-io/html-to-markdown) (MIT), tinycss2 (BSD-3); na API, Starlette e Uvicorn (BSD-3) e
 python-multipart (Apache-2.0). Nada de GPL/AGPL. O CI e o build da imagem reprovam qualquer dependência fora
 dessa lista, e a imagem leva `THIRD_PARTY_NOTICES.md` gerado do que foi instalado.
 
