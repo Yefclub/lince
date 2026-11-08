@@ -12,6 +12,8 @@ from .agrupamento import distribuir_lotes
 from .seguranca import alertas_injecao
 from .texto import NUM_PAGINA, sem_repeticao
 
+SAIDA_MAX = 256 * 1024 * 1024  # caracteres que a montagem escreve (a leitura em cada lugar em que entra)
+
 
 def _metadados(pasta, plano, corpo, moveis):
     """Tira do corpo as marcas [[tipo: …]] da IA e grava metadados.json (com o nativo do arquivo)."""
@@ -263,3 +265,37 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
             partes = blocos[k].split("\n")
             blocos[k] = "\n".join(ln for j, ln in enumerate(partes) if (i, k, j) not in tirar)
     return {c for _, c in tirar.values() if c}
+
+
+def tamanho_da_saida(e, respostas) -> int:
+    """Quanto texto a montagem vai escrever: cada marca vira a leitura (a mesma imagem repetida recebe a mesma
+    leitura em cada lugar) ou a tabela e a fórmula nativas. Conta antes de montar, para a saída ter teto como a
+    entrada tem: uma resposta grande copiada em mil lugares não estoura a memória do processo."""
+    if e.get("tipo") == "imagem":  # a imagem solta sai como as leituras das faixas, uma depois da outra
+        return sum(len(respostas.get(t["id"], "")) + 2 for t in e.get("tarefas", []))
+    from collections import Counter
+
+    lote_de = {tid: lid for lid, itens in (e.get("lotes") or {}).items() for _, tid in itens}
+
+    def leitura(tid):
+        tid = e.get("iguais", {}).get(tid, tid)
+        # a maior entre a do item (já dividida, no esforço máximo e na releitura) e a do lote: a chave de um não
+        # esconde o outro, inclusive nas respostas de quem chama, antes do filtro por id
+        return max(len(respostas.get(tid, "")), len(respostas.get(lote_de.get(tid), ""))) + 64
+
+    total = len(e.get("md", "")) + sum(len(x) for x in e.get("extras", []))
+    marcas = Counter(re.findall(r"\{\{IA:(\w+)\}\}", e.get("md", "")))
+    total += sum(n * leitura(tid) for tid, n in marcas.items())
+    for p in e.get("paginas", []):
+        total += len(p.get("md", "")) + sum(leitura(r.get("tarefa", "")) for r in p.get("regioes", []))
+        if p.get("rota") == "pagina":  # página escaneada: cada metade lida entra inteira
+            total += sum(leitura(t) for t in (p.get("tarefas") or [p.get("tarefa", "")]))
+        tabelas, formulas = p.get("tabelas", []), p.get("formulas", [])
+        for tipo, k in re.findall(r"\{\{(TABELA|FORMULA):(\d+)\}\}", p.get("md", "")):
+            nativo = tabelas if tipo == "TABELA" else formulas
+            k = int(k)
+            total += max(
+                len(nativo[k]) if k < len(nativo) else 0,
+                max((leitura(r.get("tarefa", "")) for r in p.get("regioes", [])), default=0),
+            )
+    return total
