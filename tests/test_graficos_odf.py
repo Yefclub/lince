@@ -1,5 +1,6 @@
 """Gráfico do LibreOffice (.ods, .odp, .odt): tipo, título e os dados que ele desenha entram na leitura."""
 
+import time
 import zipfile
 from pathlib import Path
 
@@ -38,3 +39,59 @@ def test_objeto_de_grafico_quebrado_nao_derruba_a_leitura(tmp_path):
             zo.writestr(info, dados)
     md = lince.ler(p).markdown
     assert "| Norte | 120 |" in md and "**Gráfico" not in md  # a tabela da planilha fica; o gráfico ilegível sai
+
+
+_NS = (
+    'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+    'xmlns:chart="urn:oasis:names:tc:opendocument:xmlns:chart:1.0" '
+    'xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" '
+    'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"'
+)
+
+
+def _cel(texto="", repete=None):
+    attr = f' table:number-columns-repeated="{repete}"' if repete is not None else ""
+    return f"<table:table-cell{attr}><text:p>{texto}</text:p></table:table-cell>"
+
+
+def _objeto(cabecalho, linhas, classe="chart:line", titulo="Mensal"):
+    corpo = "".join(f"<table:table-row>{''.join(_cel(c) for c in linha)}</table:table-row>" for linha in linhas)
+    return (
+        f'<office:document-content {_NS}><office:body><office:chart><chart:chart chart:class="{classe}">'
+        f"<chart:title><text:p>{titulo}</text:p></chart:title><table:table>"
+        f"<table:table-header-rows><table:table-row>{cabecalho}</table:table-row></table:table-header-rows>"
+        f"<table:table-rows>{corpo}</table:table-rows></table:table></chart:chart></office:chart></office:body>"
+        "</office:document-content>"
+    )
+
+
+def _ods(tmp_path, *objetos):
+    p = tmp_path / "graficos.ods"
+    with zipfile.ZipFile(p, "w") as z:
+        for n, conteudo in enumerate(objetos, 1):
+            z.writestr(f"Object {n}/content.xml", conteudo)
+    return p
+
+
+def test_varias_series_com_cabecalho_em_header_rows(tmp_path):
+    objeto = _objeto(_cel() + _cel("Meta") + _cel("Real"), [["Jan", "100", "90"], ["Fev", "110", "120"]])
+    [g] = office.graficos_odf(_ods(tmp_path, objeto), [])
+    md = office.grafico_md(g)
+    assert "**Gráfico (linhas): Mensal**" in md and "| Categoria | Meta | Real |" in md
+    assert "| Jan | 100 | 90 |" in md and "| Fev | 110 | 120 |" in md
+
+
+def test_cabecalho_largo_e_repetido_tem_teto(tmp_path):
+    hostil = _objeto(_cel() + _cel("S", 64) * 10_000, [[] for _ in range(1000)])
+    ilegiveis = []
+    inicio = time.monotonic()
+    [g] = office.graficos_odf(_ods(tmp_path, hostil), ilegiveis)
+    assert time.monotonic() - inicio < 5
+    assert len(g["series"]) == office._SERIES_MAX and any("mais de 64 séries" in x for x in ilegiveis)
+
+
+def test_repeticao_invalida_nao_derruba_os_outros_graficos(tmp_path):
+    bom = _objeto(_cel() + _cel("Meta"), [["Jan", "100"]], titulo="Bom")
+    ruim = _objeto(_cel() + _cel("Meta", "x"), [["Jan", "7"]], titulo="Ruim")
+    graficos = office.graficos_odf(_ods(tmp_path, bom, ruim), [])
+    assert [g["titulo"] for g in graficos] == ["Bom", "Ruim"] and graficos[1]["series"][0]["vals"] == ["7"]

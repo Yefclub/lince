@@ -97,15 +97,24 @@ _CH = "urn:oasis:names:tc:opendocument:xmlns:chart:1.0"
 _TB = "urn:oasis:names:tc:opendocument:xmlns:table:1.0"
 _TX = "urn:oasis:names:tc:opendocument:xmlns:text:1.0"
 _LINHAS_GRAFICO_MAX = 1000  # linhas da tabela de dados de um gráfico; o resto fica de fora, registrado
+_SERIES_MAX = 64  # séries (colunas) de um gráfico: o custo da tabela é séries × linhas
 
 
-def _celulas(linha) -> list[str]:
-    """Texto das células de uma linha da tabela local, com table:number-columns-repeated limitado."""
-    out = []
-    for c in linha.findall(f"{{{_TB}}}table-cell"):
+def _celulas(linha, teto) -> tuple[list[str], bool]:
+    """Texto das primeiras `teto` células de uma linha da tabela local (table:number-columns-repeated conta, e valor
+    inválido vale 1), e se a linha pedia mais células do que isso. Para no teto: o custo não passa dele."""
+    out, pedidas = [], 0
+    for c in linha.iterfind(f"{{{_TB}}}table-cell"):
+        try:
+            vezes = max(1, int(c.get(f"{{{_TB}}}number-columns-repeated", "1")))
+        except ValueError:
+            vezes = 1
+        pedidas += vezes
         texto = " ".join(" ".join(t for p in c.findall(f"{{{_TX}}}p") for t in p.itertext()).split())  # sem o svg:desc
-        out += [texto] * min(int(c.get(f"{{{_TB}}}number-columns-repeated", "1") or 1), 64)
-    return out
+        out += [texto] * min(vezes, teto - len(out))
+        if pedidas > teto:
+            return out, True
+    return out, False
 
 
 def graficos_odf(path, ilegiveis) -> list[dict]:
@@ -130,11 +139,10 @@ def graficos_odf(path, ilegiveis) -> list[dict]:
                 ilegiveis.append(
                     f"gráfico {titulo or nome}: mais de {_LINHAS_GRAFICO_MAX} linhas; o resto ficou de fora"
                 )
-            cabecalho, dados = (
-                (_celulas(linhas[0]), [_celulas(r) for r in linhas[1 : _LINHAS_GRAFICO_MAX + 1]])
-                if linhas
-                else ([], [])
-            )
+            cabecalho, largo = _celulas(linhas[0], _SERIES_MAX + 1) if linhas else ([], False)
+            if largo:
+                ilegiveis.append(f"gráfico {titulo or nome}: mais de {_SERIES_MAX} séries; o resto ficou de fora")
+            dados = [_celulas(r, len(cabecalho))[0] for r in linhas[1 : _LINHAS_GRAFICO_MAX + 1]]
             series = [
                 {"nome": cabecalho[k] or f"série {k}", "cats": [d[0] if d else "" for d in dados],
                  "vals": [d[k] if k < len(d) else "" for d in dados], "ref": None}
