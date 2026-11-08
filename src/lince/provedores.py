@@ -32,6 +32,13 @@ class _SemRedirecionar(urllib.request.HTTPRedirectHandler):
 
 _ABRIDOR = urllib.request.build_opener(_SemRedirecionar)
 ESPERA_MAX_PROVEDOR = 60  # Retry-After acima disso não prende a thread: o provedor é escolhido por quem chama
+# a leitura de um recorte ou página tem alguns KB; acima disso o provedor está com defeito ou é hostil, e o corpo não
+# pode crescer a memória do processo, que atende todos os tokens
+RESPOSTA_MAX = 8 * 1024 * 1024
+
+
+class RespostaGrande(Exception):
+    """Corpo da resposta do provedor acima de RESPOSTA_MAX: a leitura fica pendente e o texto nativo segue."""
 
 
 def _retry_after(valor: str | None) -> float:
@@ -127,10 +134,11 @@ class OpenAICompativel:
 
 
 def _ler_corpo(r, timeout) -> bytes:
-    """Corpo da resposta em blocos. Com prazo, antes de cada bloco o socket espera só o que sobra dele: o provedor que
-    manda aos poucos ou para no meio não segura a leitura (o timeout do socket vale por operação, não para o corpo)."""
+    """Corpo da resposta em blocos, até RESPOSTA_MAX. Com prazo, antes de cada bloco o socket espera só o que sobra
+    dele: o provedor que manda aos poucos ou para no meio não segura a leitura (o timeout do socket vale por operação,
+    não para o corpo)."""
     sock = getattr(getattr(getattr(r, "fp", None), "raw", None), "_sock", None)  # sem ele, fica o timeout inicial
-    partes = []
+    partes, lido = [], 0
     while True:
         if (restante := prazo_restante()) is not None:
             if restante <= 0:
@@ -143,6 +151,8 @@ def _ler_corpo(r, timeout) -> bytes:
         if not (bloco := r.read1(64 * 1024)):
             return b"".join(partes)
         partes.append(bloco)
+        if (lido := lido + len(bloco)) > RESPOSTA_MAX:
+            raise RespostaGrande(f"resposta do provedor passou de {RESPOSTA_MAX // 2**20} MB")
 
 
 def _esperar(segundos, erro, sorteio=True):
