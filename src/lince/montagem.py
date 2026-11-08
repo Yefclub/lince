@@ -50,6 +50,9 @@ def acabamento(txt: str) -> str:
 def montar(pasta, respostas):
     plano = json.load(open(f"{pasta}/plano.json", encoding="utf-8"))
     R = {k: sem_repeticao(v) for k, v in distribuir_lotes(plano, respostas).items()}
+    for repetida, leitora in plano.get("iguais", {}).items():  # a mesma imagem em outro lugar: a mesma leitura
+        if leitora in R:
+            R[repetida] = R[leitora]
 
     def bloco_ia(tid, rotulo):
         txt = R.get(tid, "").strip()

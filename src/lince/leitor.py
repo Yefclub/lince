@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import time
 import zipfile
@@ -130,6 +131,7 @@ class Leitor:
                 if p["aba"] is None and len(visiveis) == 1:
                     p["aba"] = visiveis[0]
             estrutura["perfil_tabular"] = perfis
+        plano["iguais"] = _deduplicar(plano, pasta)  # a mesma imagem (logo em todo slide) é lida uma vez
         plano["tarefas_originais"] = list(plano.get("tarefas", []))
         if self.agrupar and plano["tipo"] in ("pdf", "office"):
             plano["tarefas"], plano["lotes"] = agrupar(plano["tarefas"], pasta)
@@ -419,7 +421,67 @@ def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
     else:
         md = montar(pasta, respostas)
         meta = json.loads(Path(f"{pasta}/metadados.json").read_text(encoding="utf-8"))
-    return _com_estrutura(Resultado(md, meta, cobertura, usos), plano)
+    r = _com_estrutura(Resultado(md, meta, cobertura, usos), plano)
+    if imagens := _imagens(plano, distribuir_lotes(plano, respostas)):
+        r.estrutura["imagens"] = imagens
+    return r
+
+
+def _deduplicar(plano, pasta) -> dict[str, str]:
+    """Tira das tarefas a repetição exata (mesma imagem, mesmo tipo de leitura) e devolve {repetida: a que lê}; a
+    montagem põe a mesma leitura em cada lugar. Guarda em `posicoes` onde cada uma estava, para a estrutura."""
+    import hashlib
+
+    vistas, iguais, unicas = {}, {}, []
+    plano["posicoes"] = [
+        {k: t[k] for k in ("id", "modo", "pagina", "caixa") if t.get(k) is not None}
+        | ({"onde": t.get("ancora", "")} if plano["tipo"] != "pdf" else {})
+        for t in plano.get("tarefas", [])
+    ]
+    for t in plano.get("tarefas", []):
+        h = hashlib.sha256(t["modo"].encode() + Path(f"{pasta}/ia/{t['id']}.png").read_bytes()).digest()
+        if h in vistas:
+            iguais[t["id"]] = vistas[h]
+        else:
+            vistas[h] = t["id"]
+            unicas.append(t)
+    plano["tarefas"] = unicas
+    return iguais
+
+
+def _imagens(plano, lidos) -> list[dict]:
+    """Onde está cada leitura visual (página e caixa no PDF; slide e lugar no Office e no HTML), qual tarefa a leu e
+    se ela foi lida. Página escaneada inteira fica de fora: ela já está em `paginas` e nas rotas da cobertura."""
+    iguais = plano.get("iguais", {})
+    posicoes = {p["id"]: p for p in plano.get("posicoes", [])}
+    out = []
+
+    def item(tid, extra=None):
+        p = posicoes.get(tid, {"id": tid})
+        if p.get("modo") == "pagina":
+            return
+        leitor = iguais.get(tid, tid)
+        out.append(
+            {"tarefa": tid, "tipo": p.get("modo", "imagem"), "lida_por": leitor,
+             "lida": bool(str(lidos.get(leitor, "")).strip())}
+            | ({"pagina": p["pagina"] + 1} if isinstance(p.get("pagina"), int) else {})
+            | ({"caixa": p["caixa"]} if p.get("caixa") else {})
+            | ({"onde": p["onde"]} if p.get("onde") else {})
+            | (extra or {})
+        )  # fmt: skip
+
+    if plano["tipo"] == "pdf":
+        for p in plano.get("posicoes", []):
+            item(p["id"])
+        return out
+    slide = None
+    for k, pedaco in enumerate([plano.get("md", "")] + list(plano.get("extras", []))):
+        for m in re.finditer(r"<!-- slide (\d+) -->|\{\{IA:(\w+)\}\}", pedaco):
+            if m.group(1):
+                slide = int(m.group(1))
+            else:
+                item(m.group(2), {"slide": slide} if slide is not None and k == 0 else None)
+    return out
 
 
 def _com_estrutura(r: Resultado, plano) -> Resultado:

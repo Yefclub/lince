@@ -10,6 +10,8 @@ import secrets
 import zipfile
 from xml.etree import ElementTree as ET  # noqa: F401
 
+from lxml import etree
+
 from . import legados, perfil_tabular
 from .limites import xml_ou_nada
 from .metadados import BINARIOS_OLE, ERROS_DE_PARTE, ODF
@@ -338,11 +340,14 @@ def planejar_office(path, pasta, ext=None):
     # CSV e TSV não têm assinatura: o formato vai explícito (o anydoc detecta separador e codificação)
     grande = ext in (".xlsx", ".xlsm") and _celulas_declaradas(path) > _CELULAS_ANYDOC_MAX
     # planilha grande não passa pelo anydoc, que monta o documento inteiro na memória (1,2 GB para 100 mil linhas)
-    doc = (
-        None
-        if grande
-        else anydoc.to_document(open(path, "rb").read(), format="csv" if ext in (".csv", ".tsv") else None)
-    )
+    marca = f"LINCE{secrets.token_hex(8)}D"  # início de cada slide, trocado por <!-- slide N --> depois da leitura
+    if grande:
+        doc = None
+    else:
+        dados = open(path, "rb").read()
+        if ext in PPTX:
+            dados = _com_marcas_de_slide(dados, marca)
+        doc = anydoc.to_document(dados, format="csv" if ext in (".csv", ".tsv") else None)
     tarefas, ilegiveis, pendentes = [], [], []  # pendentes: o que entra em cobertura.pendentes, com o motivo
     svgs, sentinela = [], f"LINCE{secrets.token_hex(8)}S"  # desenhos vetoriais, juntos no fim, num lote só
     vistas = set()  # imagens já lidas (sha256): o armazém dos binários não as repete
@@ -371,6 +376,7 @@ def planejar_office(path, pasta, ext=None):
     else:
         md = serializar(doc, ler_imagem)[0]
         perfis = _perfis(doc) if ext in PLANILHAS else []
+        md = re.sub(rf"(?m)^{marca}(\d+)X$", r"<!-- slide \1 -->", md)
     if ext in BINARIOS_OLE:  # o leitor do corpo quase não entrega as imagens do .doc, .xls e .ppt: o armazém, sim
 
         def imagens_legado():
@@ -461,26 +467,35 @@ def planejar_office(path, pasta, ext=None):
         _complemento(graficos_xls, "gráficos", ilegiveis)
     if ext in ODF:  # o leitor do corpo não entrega o gráfico do LibreOffice: tipo, título e os dados que ele desenha
         _complemento(lambda: extras.extend(grafico_md(g) for g in graficos_odf(path, ilegiveis)), "gráficos", ilegiveis)
-    if ext == ".pptx":
+    if ext in PPTX:
+        por_slide = {}  # n -> o que entra no fim do slide (ou logo depois da tabela do gráfico)
 
         def diagramas():
             for n, arestas in fluxos_pptx(path).items():
-                extras.append(
-                    f"**Diagrama do slide {n}:**\n\n"
-                    + mermaid_do_fluxo(arestas)
-                    + "\n\n"
-                    + "\n".join(f"- {a}" for a in arestas)
+                por_slide.setdefault(n, []).append(
+                    (
+                        None,
+                        f"**Diagrama do slide {n}:**\n\n"
+                        + mermaid_do_fluxo(arestas)
+                        + "\n\n"
+                        + "\n".join(f"- {a}" for a in arestas),
+                    )
                 )
 
         _complemento(diagramas, "diagramas de formas", ilegiveis)
-        # gráfico do pptx: anydoc já entrega os dados; acrescenta tipo e título
-        _complemento(
-            lambda: extras.extend(
-                f"_(gráfico de {g['tipo']} acima: {g['titulo'] or 'sem título'})_" for g in graficos_ooxml(path)
-            ),
-            "gráficos",
-            ilegiveis,
-        )
+
+        def graficos():  # o leitor do corpo já entrega os dados; o tipo e o título entram logo depois da tabela
+            slide_do_grafico = _slides_dos_graficos(path)
+            for g in graficos_ooxml(path):
+                nota = f"_(gráfico de {g['tipo']} acima: {g['titulo'] or 'sem título'})_"
+                n = slide_do_grafico.get(g["parte"])
+                if n is None:
+                    extras.append(nota)
+                else:
+                    por_slide.setdefault(n, []).append(([se["nome"] for se in g["series"]], nota))
+
+        _complemento(graficos, "gráficos", ilegiveis)
+        md = _nos_slides(md, por_slide, extras)
     if svgs:
         md = re.sub(rf"{sentinela}(\d+)X", _desenhar_svgs(svgs, pasta, tarefas, ilegiveis, pendentes), md)
     return {
@@ -802,6 +817,95 @@ def _perfis(doc) -> list[dict]:
             perfis.append(aba.montar())
             nome = None
     return perfis
+
+
+_P = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+
+
+def _slides_pptx(z, nomes) -> list[str]:
+    """As partes dos slides na ordem da apresentação (sldIdLst), como o PowerPoint numera."""
+    from .seguranca import XMLIlegivel, _xml
+
+    try:
+        raiz = _xml(z.read("ppt/presentation.xml"))
+    except (KeyError, XMLIlegivel):
+        return []
+    rels = _alvos(z, "ppt/presentation.xml", nomes)
+    lista = raiz.find(f"{_P}sldIdLst")
+    return [rels[s.get(f"{_REL}id")] for s in (lista if lista is not None else []) if s.get(f"{_REL}id") in rels]
+
+
+def _com_marcas_de_slide(dados: bytes, marca: str) -> bytes:
+    """Cópia do pacote com uma caixa de texto invisível ("<marca>N X", tamanho 1, no canto) no começo de cada slide:
+    o leitor do corpo a escreve antes do resto do slide, e ela vira <!-- slide N -->. Slide que não abre fica sem
+    marca (o texto dele segue com o slide anterior); pacote que não abre segue sem marca nenhuma."""
+    from .seguranca import XMLIlegivel, _xml
+
+    try:
+        zi = zipfile.ZipFile(io.BytesIO(dados))
+    except zipfile.BadZipFile:
+        return dados
+    with zi:
+        nomes = set(zi.namelist())
+        ordem = {parte: n for n, parte in enumerate(_slides_pptx(zi, nomes), 1)}
+        saida = io.BytesIO()
+        with zipfile.ZipFile(saida, "w", zipfile.ZIP_DEFLATED) as zo:
+            for info in zi.infolist():
+                conteudo = zi.read(info)
+                if info.filename in ordem:
+                    try:
+                        raiz = _xml(conteudo)
+                        arvore = raiz.find(f"{_P}cSld/{_P}spTree")
+                        if arvore is not None:
+                            arvore.insert(min(2, len(arvore)), _caixa_marca(f"{marca}{ordem[info.filename]}X"))
+                            conteudo = etree.tostring(raiz, xml_declaration=True, encoding="UTF-8", standalone=True)
+                    except XMLIlegivel:
+                        pass
+                zo.writestr(info, conteudo)
+    return saida.getvalue()
+
+
+def _caixa_marca(texto):
+    p, a = _P[1:-1], "http://schemas.openxmlformats.org/drawingml/2006/main"
+    return etree.fromstring(
+        f'<p:sp xmlns:p="{p}" xmlns:a="{a}"><p:nvSpPr><p:cNvPr id="2147483646" name="lince"/><p:cNvSpPr '
+        f'txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1" cy="1"/></a:xfrm>'
+        f"</p:spPr><p:txBody><a:bodyPr/><a:p><a:r><a:t>{texto}</a:t></a:r></a:p></p:txBody></p:sp>"
+    )
+
+
+def _slides_dos_graficos(path) -> dict[str, int]:
+    """Parte do gráfico -> número do slide em que ele está."""
+    with zipfile.ZipFile(path) as z:
+        nomes = set(z.namelist())
+        return {
+            alvo: n
+            for n, parte in enumerate(_slides_pptx(z, nomes), 1)
+            for alvo in _alvos(z, parte, nomes).values()
+            if "/charts/" in alvo
+        }
+
+
+def _nos_slides(md, por_slide, extras) -> str:
+    """Põe cada item no slide dele: o que tem séries logo depois da primeira tabela do slide com essas séries no
+    cabeçalho (a tabela do gráfico), o resto no fim do slide. Sem a marca do slide, vai para o fim do documento."""
+    partes = re.split(r"(?m)^(<!-- slide \d+ -->)$", md)
+    inicio = {int(re.search(r"\d+", partes[k]).group()): k + 1 for k in range(1, len(partes), 2)}
+    for n, itens in por_slide.items():
+        if n not in inicio:
+            extras.extend(texto for _, texto in itens)
+            continue
+        k = inicio[n]
+        for series, texto in itens:
+            tabelas = list(re.finditer(r"(?m)^\|(.*)\|\n\|(?: --- \|)+\n(?:\|.*\|\n?)*", partes[k]))
+            alvo = next(
+                (t for t in tabelas if series and all(f" {nome} " in f" {t.group(1)} " for nome in series)), None
+            )
+            if alvo is None:
+                partes[k] = partes[k].rstrip("\n") + "\n\n" + texto.replace(" acima:", " neste slide:") + "\n\n"
+            else:
+                partes[k] = partes[k][: alvo.end()].rstrip("\n") + "\n\n" + texto + "\n\n" + partes[k][alvo.end() :]
+    return "".join(partes)
 
 
 def _nao_lida(onde, mime, ilegiveis) -> str:

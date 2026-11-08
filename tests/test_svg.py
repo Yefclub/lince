@@ -162,7 +162,8 @@ def test_desenho_que_prende_o_resvg_e_cortado_e_o_texto_fica(tmp_path, monkeypat
 
 def test_pagina_com_milhares_de_svgs_tem_teto_de_desenhos(tmp_path):
     p = tmp_path / "icones.html"
-    p.write_text('<svg width="48" height="48"><rect width="48" height="48"/></svg>' * 3000, encoding="utf-8")
+    icones = (f'<svg width="48" height="48"><rect width="48" height="48" fill="#{k:06x}"/></svg>' for k in range(3000))
+    p.write_text("".join(icones), encoding="utf-8")  # cada um diferente: a mesma imagem é lida uma vez só
     inicio = time.monotonic()
     r = lince.ler(p)
     assert time.monotonic() - inicio < 20
