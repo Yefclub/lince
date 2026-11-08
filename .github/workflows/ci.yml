@@ -24,9 +24,9 @@ jobs:
       - name: Lock em dia com o pyproject
         run: uv lock --check
       - name: Lint
-        run: uv run --frozen --only-group dev ruff check src tests scripts
+        run: uv run --frozen --only-group dev ruff check src tests scripts bench
       - name: Formatação
-        run: uv run --frozen --only-group dev ruff format --check src tests scripts
+        run: uv run --frozen --only-group dev ruff format --check src tests scripts bench
 
   contrato:
     # PR que quebra o contrato da API (remove rota, campo obrigatório novo, tipo trocado...) não passa;
@@ -96,7 +96,7 @@ jobs:
       - name: Fonte da folha de recortes
         run: sudo apt-get install -y --no-install-recommends fonts-dejavu-core
       - name: Testes
-        run: uv run --frozen --extra servidor pytest -q
+        run: uv run --frozen --extra servidor --extra emf pytest -q
 
   licencas:
     runs-on: ubuntu-latest
@@ -107,7 +107,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: Só dependências de produção
-        run: uv sync --frozen --no-dev --extra servidor --no-editable
+        run: uv sync --frozen --no-dev --extra servidor --extra emf --no-editable
       - name: Licenças permissivas
         run: .venv/bin/python -I scripts/licencas.py --checar
 

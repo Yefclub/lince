@@ -11,11 +11,15 @@ from xml.etree import ElementTree as ET  # noqa: F401
 
 import pypdfium2.raw as c  # noqa: F401
 
+from ._prazo import prazo_restante
 from .limites import escala
 from .seguranca import remover_ocultos, texto_oculto_pdf
 from .texto import densidade_matematica, desifenizar, limpar_tabelas, lixo
 
 PROMPT_VERSAO = "leitura-ia-v1"
+# Teto da análise visual (desenho da página, figuras, texto oculto) por documento: medido em ~15 ms por página de
+# texto, 2000 páginas cabem em ~30 s. Acima dele, e depois do prazo do documento, a página entra só com o texto.
+PAGINAS_ANALISE_MAX = 2000
 
 
 def texto_pdfium(page):
@@ -66,17 +70,34 @@ def regioes_vetoriais(page, W, H, c):
 
 
 def planejar_pdf(path, pasta):
-    import pdf_inspector
+    """Chamar com a trava da PDFium. O documento é fechado aqui dentro, mesmo com exceção: o finalizador dele (e o
+    das páginas) não pode rodar fora da trava, em paralelo com outro PDF."""
     import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument(path)
+    try:
+        return _planejar_pdf(path, pasta, doc)
+    finally:
+        doc.close()
+
+
+def _planejar_pdf(path, pasta, doc):
+    import pdf_inspector
 
     res = pdf_inspector.extract_pages_markdown(path)
     ocr = {p - 1 for p in res.pages_needing_ocr}
     posicoes = pdf_inspector.extract_text_with_positions(path)
-    doc = pdfium.PdfDocument(path)
     paginas, tarefas = [], []
     cache = {}
     seguranca = []
+    so_texto = {}  # página -> motivo de ela ter entrado só com o texto (teto ou prazo)
     for i, pg in enumerate(res.pages):
+        if i >= PAGINAS_ANALISE_MAX or ((resta := prazo_restante()) is not None and resta <= 0):
+            so_texto[i] = f"teto de {PAGINAS_ANALISE_MAX} páginas" if i >= PAGINAS_ANALISE_MAX else "prazo esgotado"
+            md, tabelas = limpar_tabelas(desifenizar(pg.markdown))
+            paginas.append({"i": i, "rota": "nativa", "densidade_mat": 0, "origem_texto": "pdf-inspector", "md": md,
+                            "tabelas": [tb["md"] for tb in tabelas], "formulas": [], "regioes": []})  # fmt: skip
+            continue
         page = doc[i]
         W, H = page.get_size()
         md = pg.markdown
@@ -345,7 +366,15 @@ def planejar_pdf(path, pasta):
                     }
                 )
         paginas.append(info)
-    return {"tipo": "pdf", "paginas": paginas, "tarefas": tarefas, "texto_oculto": seguranca}
+    pendentes = []
+    for motivo in dict.fromkeys(so_texto.values()):
+        ns = [i + 1 for i, m in so_texto.items() if m == motivo]
+        faixa = f"página {ns[0]}" if len(ns) == 1 else f"páginas {ns[0]}–{ns[-1]}"
+        pendentes.append(f"{faixa}: só o texto, sem figuras nem páginas escaneadas lidas ({motivo})")
+        seguranca.append(  # o texto oculto dessas páginas não foi conferido: suspeita, nunca "nada oculto"
+            {"tecnicas": ["não conferido"], "texto": "", "alerta": f"texto oculto não conferido: {faixa} ({motivo})"}
+        )
+    return {"tipo": "pdf", "paginas": paginas, "tarefas": tarefas, "texto_oculto": seguranca, "pendentes": pendentes}
 
 
 def _sobrepoe(a, b):

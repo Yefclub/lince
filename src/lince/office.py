@@ -10,10 +10,12 @@ import secrets
 import zipfile
 from xml.etree import ElementTree as ET  # noqa: F401
 
+from lxml import etree
+
 from . import legados, perfil_tabular
 from .limites import xml_ou_nada
 from .metadados import BINARIOS_OLE, ERROS_DE_PARTE, ODF
-from .seguranca import remover_ocultos, texto_oculto_docx
+from .seguranca import NAO_CONFERIDO, XMLIlegivel, _xml, remover_ocultos, texto_oculto_docx, texto_oculto_pptx
 
 NS = {
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
@@ -338,12 +340,26 @@ def planejar_office(path, pasta, ext=None):
     # CSV e TSV não têm assinatura: o formato vai explícito (o anydoc detecta separador e codificação)
     grande = ext in (".xlsx", ".xlsm") and _celulas_declaradas(path) > _CELULAS_ANYDOC_MAX
     # planilha grande não passa pelo anydoc, que monta o documento inteiro na memória (1,2 GB para 100 mil linhas)
-    doc = (
-        None
-        if grande
-        else anydoc.to_document(open(path, "rb").read(), format="csv" if ext in (".csv", ".tsv") else None)
-    )
-    tarefas, ilegiveis = [], []
+    marca = f"LINCE{secrets.token_hex(8)}D"  # início de cada slide, trocado por <!-- slide N --> depois da leitura
+    if grande:
+        doc = None
+    else:
+        dados = open(path, "rb").read()
+        if ext in PPTX:
+            dados = _com_marcas_de_slide(dados, marca)
+        try:
+            doc = anydoc.to_document(dados, format="csv" if ext in (".csv", ".tsv") else None)
+        except anydoc.ConvertError as recusa:
+            if ext != ".xlsb":
+                raise
+            doc = None  # .xlsb fora da especificação (gravadores antigos): lido registro a registro
+            try:
+                md_xlsb = _xlsb_tolerante(path, ilegiveis_xlsb := [])
+            except MemoryError:
+                raise
+            except Exception:  # noqa: BLE001 — o leitor tolerante também não abre: vale o erro do leitor do corpo
+                raise recusa from None
+    tarefas, ilegiveis, pendentes = [], [], []  # pendentes: o que entra em cobertura.pendentes, com o motivo
     svgs, sentinela = [], f"LINCE{secrets.token_hex(8)}S"  # desenhos vetoriais, juntos no fim, num lote só
     vistas = set()  # imagens já lidas (sha256): o armazém dos binários não as repete
 
@@ -368,9 +384,14 @@ def planejar_office(path, pasta, ext=None):
 
     if grande:
         md, perfis = _xlsx_em_fluxo(path, ilegiveis)
+    elif doc is None:
+        (md, perfis), ilegiveis[:0] = md_xlsb, ilegiveis_xlsb
     else:
         md = serializar(doc, ler_imagem)[0]
         perfis = _perfis(doc) if ext in PLANILHAS else []
+        if ext in PPTX:  # o texto do slide que imita a marca não vira marca: só a do Lince numera os slides
+            md = re.sub(r"(?m)^(<!-- slide \d+ -->)$", r"\\\1", md)
+            md = re.sub(rf"(?m)^{marca}(\d+)X$", r"<!-- slide \1 -->", md)
     if ext in BINARIOS_OLE:  # o leitor do corpo quase não entrega as imagens do .doc, .xls e .ppt: o armazém, sim
 
         def imagens_legado():
@@ -406,8 +427,15 @@ def planejar_office(path, pasta, ext=None):
 
         _complemento(imagens_bordas, "imagens do cabeçalho e do rodapé", ilegiveis)
     seguranca = []
-    if ext == ".docx":
-        ocultos = texto_oculto_docx(path)
+    conferir = texto_oculto_docx if ext in (".docx", ".docm") else texto_oculto_pptx if ext in PPTX else None
+    if conferir:
+        try:
+            ocultos = conferir(path)
+        except MemoryError:
+            raise
+        except Exception:  # noqa: BLE001 — XML hostil, parte cifrada ou CRC errado: não conferido é suspeita, vira alerta
+            ocultos = []
+            seguranca.append({"tecnicas": ["não conferido"], "texto": "", "alerta": NAO_CONFERIDO})
         if ocultos:
             md, _ = remover_ocultos(md, ocultos)
             seguranca.append(
@@ -456,28 +484,37 @@ def planejar_office(path, pasta, ext=None):
         _complemento(graficos_xls, "gráficos", ilegiveis)
     if ext in ODF:  # o leitor do corpo não entrega o gráfico do LibreOffice: tipo, título e os dados que ele desenha
         _complemento(lambda: extras.extend(grafico_md(g) for g in graficos_odf(path, ilegiveis)), "gráficos", ilegiveis)
-    if ext == ".pptx":
+    if ext in PPTX:
+        por_slide = {}  # n -> o que entra no fim do slide (ou logo depois da tabela do gráfico)
 
         def diagramas():
             for n, arestas in fluxos_pptx(path).items():
-                extras.append(
-                    f"**Diagrama do slide {n}:**\n\n"
-                    + mermaid_do_fluxo(arestas)
-                    + "\n\n"
-                    + "\n".join(f"- {a}" for a in arestas)
+                por_slide.setdefault(n, []).append(
+                    (
+                        None,
+                        f"**Diagrama do slide {n}:**\n\n"
+                        + mermaid_do_fluxo(arestas)
+                        + "\n\n"
+                        + "\n".join(f"- {a}" for a in arestas),
+                    )
                 )
 
         _complemento(diagramas, "diagramas de formas", ilegiveis)
-        # gráfico do pptx: anydoc já entrega os dados; acrescenta tipo e título
-        _complemento(
-            lambda: extras.extend(
-                f"_(gráfico de {g['tipo']} acima: {g['titulo'] or 'sem título'})_" for g in graficos_ooxml(path)
-            ),
-            "gráficos",
-            ilegiveis,
-        )
+
+        def graficos():  # o leitor do corpo já entrega os dados; o tipo e o título entram logo depois da tabela
+            slide_do_grafico = _slides_dos_graficos(path)
+            for g in graficos_ooxml(path):
+                nota = f"_(gráfico de {g['tipo']} acima: {g['titulo'] or 'sem título'})_"
+                n = slide_do_grafico.get(g["parte"])
+                if n is None:
+                    extras.append(nota)
+                else:
+                    por_slide.setdefault(n, []).append(([se["nome"] for se in g["series"]], nota))
+
+        _complemento(graficos, "gráficos", ilegiveis)
+        md = _nos_slides(md, por_slide, extras)
     if svgs:
-        md = re.sub(rf"{sentinela}(\d+)X", _desenhar_svgs(svgs, pasta, tarefas, ilegiveis), md)
+        md = re.sub(rf"{sentinela}(\d+)X", _desenhar_svgs(svgs, pasta, tarefas, ilegiveis, pendentes), md)
     return {
         "tipo": "office",
         "md": md,
@@ -486,6 +523,8 @@ def planejar_office(path, pasta, ext=None):
         "texto_oculto": seguranca,
         "ilegiveis": ilegiveis,
         "perfil_tabular": perfis,
+        "pendentes": pendentes,
+        "slides": ext in PPTX,  # só a apresentação tem <!-- slide N --> com a posição na estrutura
     }
 
 
@@ -635,6 +674,7 @@ def _imagens_xlsx(path, ilegiveis) -> list[tuple[str, str, bytes]]:
     return achadas
 
 
+PPTX = {".pptx", ".pptm", ".ppsx", ".ppsm"}
 PLANILHAS = {".xlsx", ".xlsm", ".xlsb", ".xls", ".ods", ".csv", ".tsv"}  # as que ganham perfil tabular
 
 # Planilha grande, lida em fluxo (openpyxl read_only), com os mesmos tetos do conversor que o Orbital usava
@@ -763,6 +803,35 @@ def _xlsx_em_fluxo(path, ilegiveis) -> tuple[str, list[dict]]:
     return "\n\n".join(partes), perfis
 
 
+def _xlsb_tolerante(path, ilegiveis) -> tuple[str, list[dict]]:
+    """Corpo do .xlsb que o leitor do corpo recusa, escrito como o das outras planilhas: célula pelo `_celula`,
+    colunas vazias à esquerda fora, linha vazia entre linhas com dado mantida, aba única sem título."""
+    abas, cortado = legados.xlsb_tolerante(path)
+    ilegiveis.append("corpo do .xlsb lido registro a registro: o arquivo não segue a especificação")
+    if cortado:
+        ilegiveis.append(f"células além de {legados._XLSB_CELULAS_MAX}: o resto ficou de fora")
+    partes, perfis = [], []
+    for nome, linhas in abas:
+        cheias = {r: {c: t for c, v in cel.items() if (t := _celula(v))} for r, cel in linhas.items()}
+        cheias = {r: cel for r, cel in cheias.items() if cel}
+        if not cheias:
+            continue
+        inicio = min(min(cel) for cel in cheias.values())
+        largura = max(max(cel) for cel in cheias.values()) + 1 - inicio
+        corpo = [
+            [cheias.get(r, {}).get(inicio + c, "") for c in range(largura)] for r in range(min(cheias), max(cheias) + 1)
+        ]
+        tabela = ["| " + " | ".join(corpo[0]) + " |", "|" + " --- |" * largura]
+        tabela += ["| " + " | ".join(lin) + " |" for lin in corpo[1:]]
+        partes.append((nome, "\n".join(tabela)))
+        aba = perfil_tabular.Aba(nome)
+        for lin in corpo:
+            aba.linha([c.replace("\\|", "|") for c in lin])
+        perfis.append(aba.montar(cortado))
+    md = "\n\n".join((f"## {n}\n\n" if len(partes) > 1 else "") + t for n, t in partes)
+    return md, perfis
+
+
 def _texto_simples(blocos) -> str:
     """Texto de uma célula do documento do anydoc, sem marcação: o mesmo que a tabela do Markdown mostra (os
     parágrafos juntos por espaço, as pontas aparadas, os espaços de dentro mantidos)."""
@@ -797,6 +866,98 @@ def _perfis(doc) -> list[dict]:
     return perfis
 
 
+_P = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+
+
+def _slides_pptx(z, nomes) -> list[str]:
+    """As partes dos slides na ordem da apresentação (sldIdLst), como o PowerPoint numera."""
+
+    try:
+        raiz = _xml(z.read("ppt/presentation.xml"))
+    except (KeyError, XMLIlegivel):
+        return []
+    rels = _alvos(z, "ppt/presentation.xml", nomes)
+    lista = raiz.find(f"{_P}sldIdLst")
+    return [rels[s.get(f"{_REL}id")] for s in (lista if lista is not None else []) if s.get(f"{_REL}id") in rels]
+
+
+def _com_marcas_de_slide(dados: bytes, marca: str) -> bytes:
+    """Cópia do pacote com uma caixa de texto invisível ("<marca>N X", tamanho 1, no canto) no começo de cada slide:
+    o leitor do corpo a escreve antes do resto do slide, e ela vira <!-- slide N -->. Slide que não abre fica sem
+    marca (o texto dele segue com o slide anterior); pacote que não abre segue sem marca nenhuma."""
+    try:
+        return _marcar(dados, marca)
+    except MemoryError:
+        raise
+    except Exception:  # noqa: BLE001 — pacote que não dá para copiar (CRC, parte cifrada): segue sem marca
+        return dados
+
+
+def _marcar(dados, marca):
+
+    with zipfile.ZipFile(io.BytesIO(dados)) as zi:
+        nomes = set(zi.namelist())
+        ordem = {parte: n for n, parte in enumerate(_slides_pptx(zi, nomes), 1)}
+        saida = io.BytesIO()
+        with zipfile.ZipFile(saida, "w", zipfile.ZIP_DEFLATED) as zo:
+            for info in zi.infolist():
+                conteudo = zi.read(info)
+                if info.filename in ordem:
+                    try:
+                        raiz = _xml(conteudo)
+                        arvore = raiz.find(f"{_P}cSld/{_P}spTree")
+                        if arvore is not None:
+                            arvore.insert(min(2, len(arvore)), _caixa_marca(f"{marca}{ordem[info.filename]}X"))
+                            conteudo = etree.tostring(raiz, xml_declaration=True, encoding="UTF-8", standalone=True)
+                    except XMLIlegivel:
+                        pass
+                zo.writestr(info, conteudo)
+    return saida.getvalue()
+
+
+def _caixa_marca(texto):
+    p, a = _P[1:-1], "http://schemas.openxmlformats.org/drawingml/2006/main"
+    return etree.fromstring(
+        f'<p:sp xmlns:p="{p}" xmlns:a="{a}"><p:nvSpPr><p:cNvPr id="2147483646" name="lince"/><p:cNvSpPr '
+        f'txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1" cy="1"/></a:xfrm>'
+        f"</p:spPr><p:txBody><a:bodyPr/><a:p><a:r><a:t>{texto}</a:t></a:r></a:p></p:txBody></p:sp>"
+    )
+
+
+def _slides_dos_graficos(path) -> dict[str, int]:
+    """Parte do gráfico -> número do slide em que ele está."""
+    with zipfile.ZipFile(path) as z:
+        nomes = set(z.namelist())
+        return {
+            alvo: n
+            for n, parte in enumerate(_slides_pptx(z, nomes), 1)
+            for alvo in _alvos(z, parte, nomes).values()
+            if "/charts/" in alvo
+        }
+
+
+def _nos_slides(md, por_slide, extras) -> str:
+    """Põe cada item no slide dele: o que tem séries logo depois da primeira tabela do slide com essas séries no
+    cabeçalho (a tabela do gráfico), o resto no fim do slide. Sem a marca do slide, vai para o fim do documento."""
+    partes = re.split(r"(?m)^(<!-- slide \d+ -->)$", md)
+    inicio = {int(re.search(r"\d+", partes[k]).group()): k + 1 for k in range(1, len(partes), 2)}
+    for n, itens in por_slide.items():
+        if n not in inicio:
+            extras.extend(texto for _, texto in itens)
+            continue
+        k = inicio[n]
+        for series, texto in itens:
+            tabelas = list(re.finditer(r"(?m)^\|(.*)\|\n\|(?: --- \|)+\n(?:\|.*\|\n?)*", partes[k]))
+            alvo = next(
+                (t for t in tabelas if series and all(f" {nome} " in f" {t.group(1)} " for nome in series)), None
+            )
+            if alvo is None:
+                partes[k] = partes[k].rstrip("\n") + "\n\n" + texto.replace(" acima:", " neste slide:") + "\n\n"
+            else:
+                partes[k] = partes[k][: alvo.end()].rstrip("\n") + "\n\n" + texto + "\n\n" + partes[k][alvo.end() :]
+    return "".join(partes)
+
+
 def _nao_lida(onde, mime, ilegiveis) -> str:
     ilegiveis.append(f"{onde}: imagem {mime or 'sem tipo'} não lida")
     return f"[{onde}: imagem {_FORMATOS.get((mime or '').lower(), mime or 'sem tipo')} não lida]"
@@ -817,7 +978,7 @@ def _metafile(data, mime) -> str | None:
     return (mime or "").lower() if (mime or "").lower() in _METAFILES else None
 
 
-def _desenhar_svgs(svgs, pasta, tarefas, ilegiveis):
+def _desenhar_svgs(svgs, pasta, tarefas, ilegiveis, pendentes):
     """Desenha os SVG, EMF e WMF do documento num lote só (o teto de tempo é do documento) e até DESENHOS_MAX;
     devolve a troca de cada marca provisória pela tarefa da IA ou pela marca de imagem não lida."""
     from lxml import etree
@@ -848,6 +1009,9 @@ def _desenhar_svgs(svgs, pasta, tarefas, ilegiveis):
             trocas[k] = f"{{{{IA:{tid}}}}}"
         else:
             trocas[k] = _nao_lida(onde, mime, ilegiveis)
+            if feito.startswith("sem "):  # falta o desenhista: dá para resolver instalando, fica pendente
+                extra = ' (instale "lince[emf]")' if feito == "sem metafile-render" else ""
+                pendentes.append(f"{onde}: {_FORMATOS.get(mime, mime)} não desenhado, {feito}{extra}")
     return lambda m: trocas[int(m.group(1))]
 
 

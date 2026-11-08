@@ -517,14 +517,13 @@ wheels = [
 
 [[package]]
 name = "lince"
-version = "0.2.0"
+version = "0.2.1.dev20261108205611"
 source = { editable = "." }
 dependencies = [
     { name = "defusedxml" },
     { name = "firecrawl-anydoc" },
     { name = "html-to-markdown" },
     { name = "lxml" },
-    { name = "metafile-render", marker = "python_full_version < '3.15'" },
     { name = "olefile" },
     { name = "openpyxl" },
     { name = "pdf-inspector" },
@@ -536,6 +535,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+emf = [
+    { name = "metafile-render", marker = "python_full_version < '3.15'" },
+]
 redis = [
     { name = "redis" },
 ]
@@ -564,7 +566,7 @@ requires-dist = [
     { name = "firecrawl-anydoc", specifier = "==0.2.4" },
     { name = "html-to-markdown", specifier = ">=3.20,<4" },
     { name = "lxml", specifier = ">=6.1" },
-    { name = "metafile-render", marker = "python_full_version < '3.15'", specifier = ">=0.4.2,<0.5" },
+    { name = "metafile-render", marker = "python_full_version < '3.15' and extra == 'emf'", specifier = ">=0.4.2,<0.5" },
     { name = "olefile", specifier = ">=0.47,<1" },
     { name = "openpyxl", specifier = ">=3.1.5,<4" },
     { name = "pdf-inspector", specifier = "==1.25.2" },
@@ -579,7 +581,7 @@ requires-dist = [
     { name = "tinycss2", specifier = ">=1.4,<2" },
     { name = "uvicorn", marker = "extra == 'servidor'", specifier = ">=0.54" },
 ]
-provides-extras = ["servidor", "redis"]
+provides-extras = ["servidor", "redis", "emf"]
 
 [package.metadata.requires-dev]
 dev = [

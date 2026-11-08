@@ -10,10 +10,10 @@ ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
 WORKDIR /app
 COPY pyproject.toml uv.lock README.md LICENSE ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --extra servidor --no-install-project
+    uv sync --frozen --no-dev --extra servidor --extra emf --no-install-project
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --extra servidor --no-editable
+    uv sync --frozen --no-dev --extra servidor --extra emf --no-editable
 # A imagem não sai com dependência de licença fora da lista; os créditos são gerados do que foi instalado.
 COPY scripts/licencas.py scripts/excecoes-de-licenca.toml ./
 RUN .venv/bin/python -I licencas.py --checar && .venv/bin/python -I licencas.py --gerar THIRD_PARTY_NOTICES.md

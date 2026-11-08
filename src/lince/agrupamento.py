@@ -83,9 +83,9 @@ def agrupar(tarefas, pasta, max_itens=12):
 
 
 def _json_do_lote(bruto: str) -> dict:
-    m = re.search(r"\{.*\}", bruto, flags=re.S)
+    i, j = bruto.find("{"), bruto.rfind("}")  # do primeiro { ao último }: linear, como o regex guloso fazia
     try:
-        dados = json.loads(m.group(0)) if m else {}
+        dados = json.loads(bruto[i : j + 1]) if 0 <= i < j else {}
     except json.JSONDecodeError:
         return {}
     return dados if isinstance(dados, dict) else {}

@@ -669,3 +669,204 @@ def test_xlsx_lido_como_codigo_e_editado(api):
     assert r.status_code == 201 and r.json()["codigo"]["abas"][0]["celulas"][0]["valor"] == 15
     novo = openpyxl.load_workbook(io.BytesIO(api.get(r.headers["location"], headers=A).content))
     assert novo["Fretes"]["A1"].value == 15 and novo["Fretes"]["A2"].value == "=A1*2"
+
+
+# ------------------------------------------------------------------ modo tarefas (a IA é de quem chama)
+def _docx_com_imagens():
+    import io
+
+    from docx import Document
+    from docx.shared import Inches
+    from PIL import Image, ImageDraw
+
+    d = Document()
+    d.add_paragraph("Relatório de moagem.")
+    for cor in ("navy", "darkgreen"):
+        im = Image.new("RGB", (600, 300), "white")
+        ImageDraw.Draw(im).rectangle([50, 50, 400, 250], fill=cor)
+        b = io.BytesIO()
+        im.save(b, "PNG")
+        d.add_picture(io.BytesIO(b.getvalue()), width=Inches(3))
+    out = io.BytesIO()
+    d.save(out)
+    return out.getvalue()
+
+
+def _montar(api, corpo, cab=A):
+    return conforme(api.post("/v1/montagens", json=corpo, headers=cab), "/v1/montagens", "post")
+
+
+def test_modo_tarefas_devolve_o_que_ler_e_monta_com_as_respostas(api, tmp_path):
+    import base64
+
+    import lince
+
+    docx = _docx_com_imagens()
+    s = conforme(enviar(api, ("r.docx", docx), {**A, **ESPERA}, modo="tarefas"), "/v1/sessoes", "post").json()
+    preparo = s["itens"][0]["resultado"]
+    assert [t["onde"] for t in preparo["tarefas"]] == ["imagem 1", "imagem 2"]
+    assert all(base64.b64decode(t["imagem"]).startswith(b"\x89PNG") for t in preparo["tarefas"])
+    respostas = {t["id"]: f"Figura {k}." for k, t in enumerate(preparo["tarefas"], 1)}
+    r = _montar(api, {"plano": preparo["plano"], "respostas": respostas}).json()
+    (tmp_path / "r.docx").write_bytes(docx)
+    ordem = iter(["Figura 1.", "Figura 2."])
+    direto = lince.Leitor(ia=lince.FuncaoLeitor(lambda img, instr: next(ordem), "m"), concorrencia=1).ler(
+        tmp_path / "r.docx"
+    )
+    assert r["markdown"] == direto.markdown and r["cobertura"]["pendentes"] == [] and r["uso"] == []
+
+
+def test_plano_alterado_ou_de_outro_token_nao_monta(api):
+    s = enviar(api, ("r.docx", _docx_com_imagens()), {**A, **ESPERA}, modo="tarefas").json()
+    plano = s["itens"][0]["resultado"]["plano"]
+    dados, _, assinatura = plano.partition(".")
+    alterado = dados[:-4] + ("AAAA" if dados[-4:] != "AAAA" else "BBBB") + "." + assinatura
+    for corpo, cab in (({"plano": alterado, "respostas": {}}, A), ({"plano": plano, "respostas": {}}, B)):
+        r = _montar(api, corpo, cab)
+        assert r.status_code == 422 and r.json()["type"] == "urn:lince:erro:plano-invalido"
+    assert _montar(api, {"plano": plano}).status_code == 400  # sem respostas
+
+
+def test_modo_tarefas_nao_aceita_provedor(api, pdf):
+    cab = {**A, "X-IA-URL": "https://exemplo.invalid/v1", "X-IA-Modelo": "m"}
+    r = conforme(enviar(api, ("a.pdf", pdf), cab, modo="tarefas"), "/v1/sessoes", "post")
+    assert r.status_code == 400 and r.json()["type"] == "urn:lince:erro:modo-invalido"
+
+
+def _pdf_com_desenho():
+    import io
+
+    c_buf = io.BytesIO()
+    c = canvas.Canvas(c_buf, pagesize=A4)
+    c.drawString(60, 780, "Moagem anual por unidade, em mil toneladas.")
+    for k, h in enumerate((120, 200, 80)):  # gráfico de barras vetorial
+        c.rect(100 + 60 * k, 400, 40, h, fill=1)
+    c.save()
+    return c_buf.getvalue()
+
+
+def test_modo_tarefas_com_pdf_segue_o_contrato_e_respeita_o_prazo(api, monkeypatch):
+    import lince.pdf
+
+    s = conforme(enviar(api, ("g.pdf", _pdf_com_desenho()), {**A, **ESPERA}, modo="tarefas"), "/v1/sessoes", "post")
+    preparo = s.json()["itens"][0]["resultado"]
+    assert preparo["tarefas"] and {t["tipo"] for t in preparo["tarefas"]} <= {"desenho", "imagem", "lote"}
+    monkeypatch.setattr(lince.pdf, "PAGINAS_ANALISE_MAX", 0)  # o teto (como o prazo) vem nas pendências do preparo
+    s = enviar(api, ("g.pdf", _pdf_com_desenho()), {**A, **ESPERA}, modo="tarefas").json()
+    assert any("teto de 0 páginas" in p for p in s["itens"][0]["resultado"]["pendentes"])
+
+
+def test_plano_vencido_grande_ou_forjado_nao_monta(api, monkeypatch):
+    import hashlib
+
+    import lince.servidor as srv
+    from lince.tipos import Plano
+
+    s = enviar(api, ("r.docx", _docx_com_imagens()), {**A, **ESPERA}, modo="tarefas").json()
+    plano = s["itens"][0]["resultado"]["plano"]
+    monkeypatch.setattr(srv, "PLANO_VALIDADE", -1)
+    r = _montar(api, {"plano": plano, "respostas": {}})
+    assert r.status_code == 422 and r.json()["type"] == "urn:lince:erro:plano-expirado"
+    monkeypatch.undo()
+    cliente = hashlib.sha256(b"token-a").hexdigest()[:16]
+    do_token = hashlib.sha256(b"lince-plano\0token-a").digest()  # quem tem o token não conhece a chave do servidor
+    forjado = srv.selar(do_token, cliente, Plano([], {"tipo": "office", "md": "a"}, []))
+    r = _montar(api, {"plano": forjado, "respostas": {}})
+    assert r.status_code == 422 and r.json()["type"] == "urn:lince:erro:plano-invalido"
+    servidor = api.app.state.servico.segredo(cliente)  # rede: mesmo assinado pelo servidor, forma errada é 422
+    torto = srv.selar(servidor, cliente, Plano([], {"tipo": "pdf", "paginas": [{"rota": "x"}]}, []))
+    r = _montar(api, {"plano": torto, "respostas": {}})
+    assert r.status_code == 422 and r.json()["type"] == "urn:lince:erro:plano-invalido"  # 422, nunca 500
+    monkeypatch.setattr(srv, "SAIDA_MAX", 100_000)  # a mesma leitura copiada em mil lugares passa do teto de saída
+    copias = srv.selar(servidor, cliente, Plano([], {"tipo": "office", "md": "{{IA:x}}" * 1000}, []))
+    r = _montar(api, {"plano": copias, "respostas": {"x": "y" * 1000}})
+    assert r.status_code == 413 and r.json()["type"] == "urn:lince:erro:saida-grande"
+    paginas = [{"i": k, "rota": "pagina", "md": "", "tarefas": [f"p{k:03d}"], "regioes": []} for k in range(200)]
+    escaneado = {"tipo": "pdf", "paginas": paginas, "iguais": {f"p{k:03d}": "p000" for k in range(1, 200)}}
+    plano = srv.selar(servidor, cliente, Plano([], escaneado, []))
+    assert _montar(api, {"plano": plano, "respostas": {"p000": "z" * 1000}}).status_code == 413  # cada página conta
+    monkeypatch.setattr(srv, "PLANO_MAX", 10)
+    s = enviar(api, ("r.docx", _docx_com_imagens()), {**A, **ESPERA}, modo="tarefas").json()
+    assert s["itens"][0]["estado"] == "falhou" and "acima do teto" in s["itens"][0]["erro"]
+
+
+def test_montagem_tem_teto_de_trabalho_no_documento_e_nas_respostas(api, monkeypatch):
+    import hashlib
+
+    import lince.servidor as srv
+    from lince.tipos import Plano
+
+    cliente = hashlib.sha256(b"token-a").hexdigest()[:16]
+    segredo = api.app.state.servico.segredo(cliente)  # o teto vale como rede, mesmo para plano do servidor
+    pagina = {"rota": "regioes", "md": "x" * 5000, "regioes": [{"tarefa": "x"}] * 50}  # um bloco só, grande
+    estado = {"tipo": "pdf", "paginas": [{**pagina, "i": k} for k in range(100)]}  # cada página cabe; o todo, não
+    monkeypatch.setattr(srv, "PLANO_TRABALHO_MAX", 2_000_000)
+    r = _montar(api, {"plano": srv.selar(segredo, cliente, Plano([], estado, [])), "respostas": {}})
+    assert r.status_code == 422 and "no documento" in r.json()["detail"]
+    monkeypatch.setattr(srv, "RESPOSTAS_MAX", 10)
+    plano = srv.selar(segredo, cliente, Plano([], {"tipo": "office", "md": "a"}, []))
+    assert _montar(api, {"plano": plano, "respostas": {"t": "x" * 11}}).status_code == 413
+
+
+def test_texto_hostil_nao_custa_quadratico_na_montagem():
+    import time
+
+    from lince.agrupamento import _json_do_lote
+    from lince.montagem import acabamento
+
+    inicio = time.monotonic()
+    acabamento("```x\n" * 200_000)  # cercas que nunca fecham
+    _json_do_lote("{" * 2_000_000)  # chaves que nunca fecham
+    assert time.monotonic() - inicio < 3
+    assert acabamento("início\n```\ncod--x\n```\n\n\n\nfim--a") == "início\n```\ncod--x\n```\n\nfim—a"
+
+
+def test_plano_monta_em_outra_replica_com_o_mesmo_segredo():
+    from starlette.testclient import TestClient as Cliente
+
+    segredo = b"s" * 32
+    uma, outra = (Cliente(criar_app(["token-a"], segredo=segredo)) for _ in range(2))
+    sem = Cliente(criar_app(["token-a"]))  # sem LINCE_SEGREDO: aleatório por processo
+    s = enviar(uma, ("r.docx", _docx_com_imagens()), {**A, **ESPERA}, modo="tarefas").json()
+    plano = s["itens"][0]["resultado"]["plano"]
+    assert _montar(outra, {"plano": plano, "respostas": {}}).status_code == 200
+    assert _montar(sem, {"plano": plano, "respostas": {}}).status_code == 422
+
+
+def test_documento_com_marca_literal_no_texto_e_montado_com_o_texto_intacto(api):
+    import io
+
+    from docx import Document
+
+    d = Document()
+    d.add_paragraph("Modelo: {{IA:img01}} e {{IA:img01}} de novo, {{TABELA:itens}}.")
+    out = io.BytesIO()
+    d.save(out)
+    s = enviar(api, ("modelo.docx", out.getvalue()), {**A, **ESPERA}, modo="tarefas").json()
+    preparo = s["itens"][0]["resultado"]
+    r = _montar(api, {"plano": preparo["plano"], "respostas": {}})
+    assert (
+        r.status_code == 200
+        and r.json()["markdown"].count("{{IA:img01}}") == 2
+        and "{{TABELA:itens}}" in r.json()["markdown"]
+    )
+    assert not r.json()["estrutura"].get("imagens")  # nem imagem fantasma na estrutura
+
+
+def test_lince_segredo_curto_recusa_a_subida_e_o_certo_chega_ao_servico(monkeypatch):
+    import sys
+
+    import uvicorn
+
+    import lince.servidor as srv
+
+    apps = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **k: apps.append(app))
+    monkeypatch.setattr(sys, "argv", ["lince-servidor"])
+    monkeypatch.setenv("LINCE_TOKENS", "token-a")
+    monkeypatch.setenv("LINCE_SEGREDO", "curto")
+    with pytest.raises(SystemExit):
+        srv.main()
+    monkeypatch.setenv("LINCE_SEGREDO", "x" * 40)
+    srv.main()
+    assert apps[0].state.servico.segredo_plano == b"x" * 40

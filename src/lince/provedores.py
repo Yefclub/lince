@@ -102,9 +102,16 @@ class OpenAICompativel:
                 with _ABRIDOR.open(urllib.request.Request(self.url, corpo, cab), timeout=timeout) as r:
                     d = json.loads(_ler_corpo(r, timeout))
                 u = d.get("usage") or {}
+                custo = u.get("cost")  # OpenRouter manda o custo da chamada; OpenAI e outros, não
+                custo = float(custo) if isinstance(custo, int | float) and not isinstance(custo, bool) else None
                 return RespostaIA(
                     d["choices"][0]["message"]["content"] or "",
-                    Uso(d.get("model", self.modelo), u.get("prompt_tokens", 0), u.get("completion_tokens", 0)),
+                    Uso(
+                        d.get("model", self.modelo),
+                        u.get("prompt_tokens", 0),
+                        u.get("completion_tokens", 0),
+                        custo_usd=custo,
+                    ),
                 )
             except urllib.error.HTTPError as e:
                 if e.code != 429 and e.code < 500 or k == self.tentativas - 1:
