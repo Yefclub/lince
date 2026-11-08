@@ -653,3 +653,123 @@ def rtf(dados: bytes, ler_rtf) -> tuple[list[str], bool]:
             return saida, False  # grupos aninhados ou prólogo enorme de propósito: custo proporcional ao arquivo
         saida += ler_rtf(prologo + corpo + b"}")
     return saida, True
+
+
+# ---------------------------------------------------------------------------------------------------- XLSB tolerante
+_XLSB_CELULAS_MAX = 500_000  # o mesmo teto de células do documento da leitura em fluxo do .xlsx
+
+
+def _registros_xlsb(b: bytes):
+    """(tipo, dados) de cada registro BIFF12 (MS-XLSB 2.1.4): tipo e tamanho em inteiros de 7 bits. Registro que
+    passa do fim é cortado no fim, sem levantar."""
+    i = 0
+    while i < len(b):
+        tipo = b[i]
+        i += 1
+        if tipo & 0x80 and i < len(b):
+            tipo = (tipo & 0x7F) | ((b[i] & 0x7F) << 7)
+            i += 1
+        tam = desloc = 0
+        for _ in range(4):
+            if i >= len(b):
+                return
+            c = b[i]
+            i += 1
+            tam |= (c & 0x7F) << desloc
+            desloc += 7
+            if not c & 0x80:
+                break
+        yield tipo, b[i : i + tam]
+        i += tam
+
+
+def _texto_largo(d, j):
+    """XLWideString (contagem de 4 bytes + UTF-16) em d[j:], e onde termina."""
+    if j + 4 > len(d):
+        return "", len(d)
+    n = struct.unpack_from("<I", d, j)[0]
+    if n == 0xFFFFFFFF:
+        return "", j + 4
+    return d[j + 4 : j + 4 + 2 * n].decode("utf-16-le", "replace"), j + 4 + 2 * n
+
+
+def _rk(v):
+    """RkNumber (MS-XLSB 2.5.122)."""
+    x = struct.unpack("<d", struct.pack("<Q", (v & 0xFFFFFFFC) << 32))[0] if not v & 2 else (v >> 2) - (
+        (v >> 31 & 1) << 30
+    )  # fmt: skip
+    return x / 100 if v & 1 else x
+
+
+def xlsb_tolerante(path) -> tuple[list[tuple[str, list[list[str]]]], bool]:
+    """Abas visíveis do .xlsb e as linhas de cada uma, lidas registro a registro, para quando o leitor do corpo
+    recusa o arquivo: linha (BrtRowHdr), células de valor e de fórmula com o resultado guardado, e as strings
+    compartilhadas. Devolve também se o teto de células cortou algo."""
+    import posixpath
+    import re
+    import zipfile
+
+    from lxml import etree
+
+    with zipfile.ZipFile(path) as z:
+        nomes = set(z.namelist())
+        sst = []
+        if "xl/sharedStrings.bin" in nomes:
+            for tipo, d in _registros_xlsb(z.read("xl/sharedStrings.bin")):
+                if tipo == 0x13 and len(d) >= 5:  # BrtSSTItem: flags (1 byte) + XLWideString
+                    sst.append(_texto_largo(d, 1)[0])
+        rels = {}
+        if "xl/_rels/workbook.bin.rels" in nomes:
+            raiz = etree.fromstring(z.read("xl/_rels/workbook.bin.rels"), etree.XMLParser(resolve_entities=False))
+            for r in raiz:
+                rels[r.get("Id")] = posixpath.normpath(posixpath.join("xl", r.get("Target") or ""))
+        abas = []
+        for tipo, d in _registros_xlsb(z.read("xl/workbook.bin")):
+            if tipo == 0x9C and len(d) >= 12:  # BrtBundleSh: estado, id, relação e nome
+                # a relação vem em d[8:]; há gravador que põe 4 bytes a mais antes dela (o anydoc recusa esse)
+                for j in (8, 12):
+                    rid, k = _texto_largo(d, j)
+                    if rid in rels:
+                        break
+                nome, _ = _texto_largo(d, k)
+                if not struct.unpack_from("<I", d, 0)[0] & 3:
+                    abas.append((nome, rels.get(rid)))
+        saida, total, cortado = [], 0, False
+        for nome, parte in abas:
+            if parte not in nomes or not re.search(r"\.bin$", parte):
+                continue
+            linhas, linha = {}, None
+            for tipo, d in _registros_xlsb(z.read(parte)):
+                if tipo == 0x00 and len(d) >= 4:  # BrtRowHdr
+                    linha = linhas.setdefault(struct.unpack_from("<I", d, 0)[0], {})
+                    continue
+                if linha is None or not 1 <= tipo <= 11 or len(d) < 8:
+                    continue
+                if total >= _XLSB_CELULAS_MAX:
+                    cortado = True
+                    break
+                col, v = struct.unpack_from("<I", d, 0)[0], d[8:]
+                if tipo in (2,) and len(v) >= 4:
+                    valor = _rk(struct.unpack_from("<I", v, 0)[0])
+                elif tipo in (5, 9) and len(v) >= 8:
+                    valor = struct.unpack_from("<d", v, 0)[0]
+                elif tipo in (4, 10) and v:
+                    valor = "TRUE" if v[0] else "FALSE"
+                elif tipo == 7 and len(v) >= 4:
+                    k = struct.unpack_from("<I", v, 0)[0]
+                    valor = sst[k] if k < len(sst) else ""
+                elif tipo in (6, 8):
+                    valor = _texto_largo(v, 0)[0]
+                else:
+                    continue
+                if isinstance(valor, float) and valor.is_integer():
+                    valor = int(valor)
+                linha[col] = " ".join(str(valor).split())
+                total += 1
+            if linhas:
+                largura = max((max(c) + 1 for c in linhas.values() if c), default=0)
+                tabela = [[linhas[r].get(c, "") for c in range(largura)] for r in sorted(linhas) if linhas[r]]
+                saida.append((nome, tabela))
+            if cortado:
+                break
+    return saida, cortado

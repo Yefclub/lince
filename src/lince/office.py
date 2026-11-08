@@ -347,7 +347,12 @@ def planejar_office(path, pasta, ext=None):
         dados = open(path, "rb").read()
         if ext in PPTX:
             dados = _com_marcas_de_slide(dados, marca)
-        doc = anydoc.to_document(dados, format="csv" if ext in (".csv", ".tsv") else None)
+        try:
+            doc = anydoc.to_document(dados, format="csv" if ext in (".csv", ".tsv") else None)
+        except anydoc.ConvertError:
+            if ext != ".xlsb":
+                raise
+            doc = None  # .xlsb fora da especificação (gravadores antigos): lido registro a registro, abaixo
     tarefas, ilegiveis, pendentes = [], [], []  # pendentes: o que entra em cobertura.pendentes, com o motivo
     svgs, sentinela = [], f"LINCE{secrets.token_hex(8)}S"  # desenhos vetoriais, juntos no fim, num lote só
     vistas = set()  # imagens já lidas (sha256): o armazém dos binários não as repete
@@ -373,6 +378,8 @@ def planejar_office(path, pasta, ext=None):
 
     if grande:
         md, perfis = _xlsx_em_fluxo(path, ilegiveis)
+    elif doc is None:
+        md, perfis = _xlsb_tolerante(path, ilegiveis)
     else:
         md = serializar(doc, ler_imagem)[0]
         perfis = _perfis(doc) if ext in PLANILHAS else []
@@ -782,6 +789,26 @@ def _xlsx_em_fluxo(path, ilegiveis) -> tuple[str, list[dict]]:
             partes.append(texto)
     finally:
         wb.close()
+    return "\n\n".join(partes), perfis
+
+
+def _xlsb_tolerante(path, ilegiveis) -> tuple[str, list[dict]]:
+    """Corpo do .xlsb que o leitor do corpo recusa, em tabela Markdown como o resto (uma aba sem título)."""
+    abas, cortado = legados.xlsb_tolerante(path)
+    ilegiveis.append("corpo do .xlsb lido registro a registro: o arquivo não segue a especificação")
+    if cortado:
+        ilegiveis.append(f"células além de {legados._XLSB_CELULAS_MAX}: o resto ficou de fora")
+    partes, perfis = [], []
+    for nome, linhas in abas:
+        largura = max(len(lin) for lin in linhas)
+        corpo = [[c.replace("|", "\\|") for c in lin + [""] * (largura - len(lin))] for lin in linhas]
+        tabela = ["| " + " | ".join(corpo[0]) + " |", "|" + " --- |" * largura]
+        tabela += ["| " + " | ".join(lin) + " |" for lin in corpo[1:]]
+        partes.append((f"## {nome}\n\n" if len(abas) > 1 else "") + "\n".join(tabela))
+        aba = perfil_tabular.Aba(nome)
+        for lin in linhas:
+            aba.linha(lin)
+        perfis.append(aba.montar())
     return "\n\n".join(partes), perfis
 
 

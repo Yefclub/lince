@@ -248,11 +248,25 @@ def test_cabecalho_do_excel_sem_codigos_e_word_com_tab(tmp_path):
     assert lince.ler(tmp_path / "t.docx").metadados["cabeçalho/rodapé"] == ["Confidencial Versão 3"]
 
 
-def test_xlsb_que_o_leitor_nao_entende_falha_com_erro_claro():
+def test_xlsb_fora_da_especificacao_e_lido_registro_a_registro():
+    r = lince.ler(REAIS / "testEXCEL.xlsb")  # Excel 2007 Beta 2: fora da especificação, o anydoc recusa
+    assert "example spreadsheet created with Microsoft Excel 2007" in r.markdown
+    assert any("registro a registro" in x for x in r.metadados["partes_ilegiveis"])  # o caminho fica registrado
+
+
+def test_xlsb_recusado_pelo_leitor_do_corpo_sai_igual_pelo_tolerante(monkeypatch):
     import anydoc
 
-    with pytest.raises(anydoc.ConvertError):  # erro do documento, nunca resultado vazio ou parcial calado
-        lince.ler(REAIS / "testEXCEL.xlsb")
+    normal = lince.ler(REAIS / "poi_sample.xlsb")
+
+    def recusa(*a, **k):
+        raise anydoc.MalformedError("simulado")
+
+    monkeypatch.setattr(anydoc, "to_document", recusa)
+    tolerante = lince.ler(REAIS / "poi_sample.xlsb")
+    assert "| Lorem | 111 |" in tolerante.markdown and "## rich test" in tolerante.markdown
+    linhas = lambda md: {ln for ln in md.splitlines() if ln.startswith("| ") and "---" not in ln}  # noqa: E731
+    assert linhas(tolerante.markdown) >= {ln for ln in linhas(normal.markdown) if "Lorem" in ln or "ipsum" in ln}
 
 
 def test_acabamento_limpa_o_texto_e_preserva_bloco_de_codigo():

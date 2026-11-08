@@ -314,8 +314,9 @@ ganha `macros: true`: VBA no Office (OOXML, inclusive `.xlsb`, e `.doc`, `.xls`,
 Cada extensão da tabela é testada no CI com um arquivo real em `tests/fixtures/reais/`: os de Word, Excel,
 PowerPoint, OpenDocument, RTF, EPUB, PDF, HTML, SVG, CSV e imagem vêm dos conjuntos de teste públicos do Apache POI e do
 Apache Tika, gravados pelos próprios programas; `.pps`, `.pot`, `.htm`, `.jpeg` e `.tiff` são cópias com outra extensão, e os de
-texto foram escritos à mão. Limite conhecido: `.xlsb` gravado fora da especificação falha na leitura com erro claro
-do documento (um de 23 arquivos reais testados; nenhum outro leitor livre testado o abre).
+texto foram escritos à mão. O `.xlsb` gravado fora da especificação (como o do Excel 2007 Beta 2), que o leitor do
+corpo recusa, é lido registro a registro: valores, fórmulas com o resultado guardado e strings compartilhadas, e o
+caminho fica registrado em `partes_ilegiveis`.
 
 E-mail (`.eml`, `.msg`) e arquivos compactados (`.zip`) ainda não são aceitos.
 
