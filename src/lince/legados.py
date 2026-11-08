@@ -275,6 +275,79 @@ def imagens(o, teto) -> tuple[list[tuple[str, bytes]], str | None]:
     return saida, None
 
 
+# ---------- Gráficos do Excel 97-2003 ----------
+
+_CHART_BOF, _TEXT, _SERIESTEXT, _OBJECTLINK, _SERIES, _BEGIN, _END = (
+    0x0020,
+    0x1025,
+    0x100D,
+    0x1027,
+    0x1003,
+    0x1033,
+    0x1034,
+)
+_TIPOS_XLS = {0x1017: "barras", 0x1018: "linhas", 0x1019: "pizza", 0x101A: "área", 0x101B: "dispersão",
+              0x103E: "radar", 0x103F: "superfície", 0x1040: "radar"}  # fmt: skip
+GRAFICOS_XLS_MAX = 256  # gráficos por arquivo; um painel real tem dezenas
+_SERIES_XLS_MAX = 64
+
+
+def graficos_xls(o, teto) -> tuple[list[dict], str | None]:
+    """Tipo, título e nomes das séries de cada gráfico do .xls (subfluxo BIFF de gráfico, embutido na aba ou em
+    folha própria), e o motivo do corte se a leitura parou antes do fim. Os valores ficam nas células da planilha,
+    que o corpo já lê. Andando registro a registro com o orçamento do stream; cada SERIESTEXT é classificado pelo
+    bloco em que está (BEGIN/END depois de SERIES ou TEXT), e o do TEXT ligado ao gráfico (OBJECTLINK com
+    wLinkObj = 1) é o título; o texto de outro TEXT (título de eixo, rótulo de dado) não vaza para ele. Um gráfico
+    dentro do gráfico (BOF aninhado) é pulado."""
+    b = ler_stream(o, "Workbook" if o.exists("Workbook") else "Book", teto)
+    if len(b) < 8 or struct.unpack_from("<H", b, 0)[0] != _BOF or struct.unpack_from("<H", b, 4)[0] != 0x0600:
+        return [], None  # só BIFF8: o Excel 5/95 grava gráfico de outro jeito
+    saida, atual, profundidade, blocos, anterior, pendente = [], None, 0, [], None, None
+    for tipo, d in _registros(b, 0, Orcamento(len(b))):
+        if tipo == _FILEPASS:
+            return saida, None  # protegida por senha: o resto é cifrado
+        if tipo == _BOF:
+            if atual is not None:
+                profundidade += 1
+            elif len(d) >= 4 and struct.unpack_from("<H", d, 2)[0] == _CHART_BOF:
+                if len(saida) >= GRAFICOS_XLS_MAX:
+                    return saida, f"mais de {GRAFICOS_XLS_MAX} gráficos; o resto ficou de fora"
+                atual, profundidade, blocos, pendente = {"tipo": "", "titulo": "", "series": []}, 0, [], None
+        elif atual is None:
+            pass
+        elif tipo == _EOF:
+            if profundidade:
+                profundidade -= 1
+                continue
+            saida.append(atual)
+            atual = None
+        elif profundidade:
+            continue  # registros do gráfico de dentro: não são deste
+        elif tipo == _BEGIN:
+            if len(blocos) >= _ANINHAMENTO_MAX:
+                return saida, "gráfico com blocos aninhados demais; o resto ficou de fora"
+            blocos.append(anterior)
+        elif tipo == _END:
+            if blocos:
+                blocos.pop()
+        elif tipo == _TEXT:
+            pendente = None  # cada TEXT tem o seu texto
+        elif tipo in _TIPOS_XLS and not atual["tipo"]:
+            atual["tipo"] = _TIPOS_XLS[tipo]
+        elif tipo == _SERIESTEXT and len(d) >= 4:
+            texto = _texto_xls(d, 2, None, 1)[0].strip()
+            if blocos and blocos[-1] == _SERIES and len(atual["series"]) < _SERIES_XLS_MAX:
+                atual["series"].append(texto)
+            elif blocos and blocos[-1] == _TEXT:
+                pendente = texto
+        elif tipo == _OBJECTLINK and len(d) >= 2:
+            if struct.unpack_from("<H", d, 0)[0] == 1 and pendente:
+                atual["titulo"] = pendente
+            pendente = None
+        anterior = tipo
+    return saida, None
+
+
 # ---------- PowerPoint 97-2003 ----------
 
 _CONTEINER, _VBA_INFO, _VBA_INFO_ATOM, _CABECALHOS_RODAPES, _CSTRING = 0xF, 0x03FF, 0x0400, 0x0FD9, 0x0FBA

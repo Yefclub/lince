@@ -15,6 +15,7 @@ e `NOTICE-Apache-Tika.txt`). Arquivos tirados dos conjuntos de teste públicos d
 | `poi_vector_image.doc` | apache/poi `test-data/document/vector_image.doc` |
 | `poi_SimpleWithImages.xls` | apache/poi `test-data/spreadsheet/SimpleWithImages.xls` |
 | `poi_pictures.ppt` | apache/poi `test-data/slideshow/pictures.ppt` |
+| `poi_WithTwoCharts.xls` | apache/poi `test-data/spreadsheet/WithTwoCharts.xls` |
 | `poi_SampleShow.pptx`, `poi_SampleShow.ppt`, `poi_SimpleMacro.pptm`, `poi_SimpleMacro.ppt`, `poi_headers_footers.ppt`, `poi_slide_master.ppt` | apache/poi `test-data/slideshow/` (mesmo nome, sem o prefixo `poi_`) |
 | `test*.*` (PDF, Word, Excel, PowerPoint, ODF, RTF, EPUB, HTML, SVG, CSV, imagens) | apache/tika, pastas `test-documents/` dos módulos de parser, mesmo nome |
 
@@ -60,3 +61,6 @@ modelo padrão do python-pptx foi trocado por "Autor teste".
 
 `lince_imagem_planilha.ods`: planilha com dados fictícios (Pedidos 42) e uma imagem sintética (retângulo azul),
 montada com openpyxl e convertida pelo LibreOffice. Sem dado de pessoa ou empresa.
+
+`lince_grafico.xls`: a mesma planilha de `lince_grafico.ods` (dados fictícios e gráfico "Vendas por região"),
+convertida para Excel 97-2003 pelo LibreOffice.
