@@ -26,6 +26,7 @@ PERMITIDAS = {
     "0BSD",
     "Zlib",
     "Unlicense",
+    "BSL-1.0",  # Boost: permissiva, sem copyleft (a biblioteca Clipper, dentro do pyclipper)
 }
 CLASSIFICADORES = {
     "MIT License": "MIT",

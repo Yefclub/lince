@@ -24,3 +24,11 @@ motivo = "o PyPI não traz o campo de licença"
 evidencia = """resvg_py-0.5.0.dist-info/licenses/LICENSE (texto MIT, Copyright 2024 baseplate-admin); o binário \
 embute o resvg e as crates dele (usvg, tiny-skia, rustybuzz, ttf-parser, fontdb, roxmltree), MIT, Apache-2.0 ou \
 BSD-3-Clause"""
+
+[[excecao]]
+pacote = "pyclipper"
+versao = "1.4.0"
+licenca = "MIT AND BSL-1.0"
+motivo = "os classificadores dizem só 'OSI Approved' e 'MIT', e a biblioteca Clipper embutida é BSL-1.0"
+evidencia = """pyclipper-1.4.0.dist-info/licenses/LICENSE (texto MIT, Copyright 2015 Gregor Ratajc, Lukas Treyer, \
+Maxime Chalton); o METADATA declara a biblioteca Clipper embutida sob a Boost Software License 1.0"""
