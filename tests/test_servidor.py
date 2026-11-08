@@ -768,11 +768,17 @@ def test_plano_vencido_grande_ou_forjado_nao_monta(api, monkeypatch):
     r = _montar(api, {"plano": plano, "respostas": {}})
     assert r.status_code == 422 and r.json()["type"] == "urn:lince:erro:plano-expirado"
     monkeypatch.undo()
-    segredo = hashlib.sha256(b"lince-plano\0token-a").digest()  # quem tem o token assina o que quiser
     cliente = hashlib.sha256(b"token-a").hexdigest()[:16]
-    forjado = srv.selar(segredo, cliente, Plano([], {"tipo": "pdf", "paginas": [{"rota": "x"}]}, []))
+    do_token = hashlib.sha256(b"lince-plano\0token-a").digest()  # quem tem o token não conhece a chave do servidor
+    forjado = srv.selar(do_token, cliente, Plano([], {"tipo": "office", "md": "a"}, []))
     r = _montar(api, {"plano": forjado, "respostas": {}})
+    assert r.status_code == 422 and r.json()["type"] == "urn:lince:erro:plano-invalido"
+    servidor = api.app.state.servico.segredo(cliente)  # rede: mesmo assinado pelo servidor, forma errada é 422
+    torto = srv.selar(servidor, cliente, Plano([], {"tipo": "pdf", "paginas": [{"rota": "x"}]}, []))
+    r = _montar(api, {"plano": torto, "respostas": {}})
     assert r.status_code == 422 and r.json()["type"] == "urn:lince:erro:plano-invalido"  # 422, nunca 500
+    repetido = srv.selar(servidor, cliente, Plano([], {"tipo": "office", "md": "{{IA:x}}" * 3}, []))
+    assert _montar(api, {"plano": repetido, "respostas": {"x": "y"}}).status_code == 422  # marca repetida
     monkeypatch.setattr(srv, "PLANO_MAX", 10)
     s = enviar(api, ("r.docx", _docx_com_imagens()), {**A, **ESPERA}, modo="tarefas").json()
     assert s["itens"][0]["estado"] == "falhou" and "acima do teto" in s["itens"][0]["erro"]
@@ -784,8 +790,8 @@ def test_montagem_tem_teto_de_trabalho_no_documento_e_nas_respostas(api, monkeyp
     import lince.servidor as srv
     from lince.tipos import Plano
 
-    segredo = hashlib.sha256(b"lince-plano\0token-a").digest()
     cliente = hashlib.sha256(b"token-a").hexdigest()[:16]
+    segredo = api.app.state.servico.segredo(cliente)  # o teto vale como rede, mesmo para plano do servidor
     pagina = {"rota": "regioes", "md": "x" * 5000, "regioes": [{"tarefa": "x"}] * 50}  # um bloco só, grande
     estado = {"tipo": "pdf", "paginas": [{**pagina, "i": k} for k in range(100)]}  # cada página cabe; o todo, não
     monkeypatch.setattr(srv, "PLANO_TRABALHO_MAX", 2_000_000)
@@ -807,3 +813,15 @@ def test_texto_hostil_nao_custa_quadratico_na_montagem():
     _json_do_lote("{" * 2_000_000)  # chaves que nunca fecham
     assert time.monotonic() - inicio < 3
     assert acabamento("início\n```\ncod--x\n```\n\n\n\nfim--a") == "início\n```\ncod--x\n```\n\nfim—a"
+
+
+def test_plano_monta_em_outra_replica_com_o_mesmo_segredo():
+    from starlette.testclient import TestClient as Cliente
+
+    segredo = b"s" * 32
+    uma, outra = (Cliente(criar_app(["token-a"], segredo=segredo)) for _ in range(2))
+    sem = Cliente(criar_app(["token-a"]))  # sem LINCE_SEGREDO: aleatório por processo
+    s = enviar(uma, ("r.docx", _docx_com_imagens()), {**A, **ESPERA}, modo="tarefas").json()
+    plano = s["itens"][0]["resultado"]["plano"]
+    assert _montar(outra, {"plano": plano, "respostas": {}}).status_code == 200
+    assert _montar(sem, {"plano": plano, "respostas": {}}).status_code == 422

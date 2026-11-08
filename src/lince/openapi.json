@@ -1620,7 +1620,7 @@
           },
           "plano": {
             "type": "string",
-            "description": "O texto e o estado do documento, compactados e assinados com uma chave derivada do token: só o mesmo token monta, em até 24 h, e ninguém o altera no caminho. Opaco: mande de volta como veio. Plano acima de 64 MB descompactados faz o documento falhar já nesta fase."
+            "description": "O texto e o estado do documento, compactados e assinados com uma chave que só o servidor conhece: só o mesmo token monta, em até 24 h, e ninguém o altera nem o forja. Opaco: mande de volta como veio. Com várias réplicas, todas precisam do mesmo LINCE_SEGREDO; sem ele, o plano só monta na instância que o entregou. Plano acima de 64 MB descompactados faz o documento falhar já nesta fase."
           },
           "codigo": {
             "description": "Presente com `codigo=sim`. Nulo se o formato não tem código.",

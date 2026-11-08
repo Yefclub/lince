@@ -126,8 +126,10 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   resposta, o que facilita o rastreio entre os dois sistemas.
 - **Sem `X-IA-URL`**: só a extração nativa; o que precisava de IA aparece em `cobertura.pendentes`.
 - **Modo `tarefas`** (`-F modo=tarefas`): o Lince não chama IA. Cada documento volta com `tarefas` (imagem em base64,
-  instrução, onde está, `chave` de cache e `tokens_estimados`) e um `plano` opaco, assinado para o token e válido por
-  24 h. Quem chama lê as imagens com o próprio modelo e manda `POST /v1/montagens`; nada fica guardado no servidor.
+  instrução, onde está, `chave` de cache e `tokens_estimados`) e um `plano` opaco, assinado pelo servidor para o token
+  e válido por 24 h. Quem chama lê as imagens com o próprio modelo e manda `POST /v1/montagens`; nada fica guardado
+  no servidor. Com várias réplicas, todas precisam do mesmo `LINCE_SEGREDO` (32+ caracteres aleatórios); sem ele, o
+  plano só monta na instância que o entregou.
 - **Prazo**: com `prazo=20`, cada documento tem 20 s a partir do início da leitura dele (a espera na fila não
   conta; a extração nativa conta, e no PDF a página que começa depois do prazo entra só com o texto); o que a IA não leu a tempo aparece em
   `cobertura.pendentes` como `prazo esgotado`.

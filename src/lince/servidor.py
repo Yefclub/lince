@@ -164,7 +164,8 @@ class Servico:
         self.retidos: dict[str, int] = {}  # bytes de resultado em memória por cliente (sessões em curso e concluídas)
         self.trava = threading.Lock()
         self.fila = Fila(self._ler, DOCS_SIMULTANEOS)
-        self.segredo_aberto = os.urandom(32)  # sem tokens: o plano só vale nesta instância
+        # segredo que assina o plano do modo tarefas: só o servidor conhece (LINCE_SEGREDO para várias réplicas)
+        self.segredo_plano = os.urandom(32)
 
     # ---------------------------------------------------------------- identidade e limites
     def cliente(self, request: Request) -> str:
@@ -178,12 +179,10 @@ class Servico:
                 return hashlib.sha256(dado).hexdigest()[:16]
         raise Problema(401, "nao-autorizado", "Token ausente ou inválido", cabecalhos={"WWW-Authenticate": "Bearer"})
 
-    def segredo(self, request: Request) -> bytes:
-        """Chave que sela o plano do modo tarefas: derivada do token, vale em qualquer instância que o aceite."""
-        if not self.tokens:
-            return self.segredo_aberto
-        m = re.match(r"Bearer\s+(.+)", request.headers.get("authorization", ""))
-        return hashlib.sha256(b"lince-plano\0" + m.group(1).strip().encode()).digest()
+    def segredo(self, cliente: str) -> bytes:
+        """Chave que sela o plano do modo tarefas para um cliente, derivada do segredo do servidor: quem chama não a
+        conhece, então não assina plano nenhum; só monta o que o servidor entregou a ele."""
+        return hmac.digest(self.segredo_plano, b"lince-plano\0" + cliente.encode(), "sha256")
 
     def reservar(self, cliente, n=1) -> bool:
         """Conferir e ocupar as vagas numa só operação: envios paralelos não furam o teto."""
@@ -321,9 +320,9 @@ class Servico:
 
 # -------------------------------------------------------------------- plano do modo tarefas
 def selar(segredo: bytes, cliente: str, plano) -> str:
-    """O plano (texto e estado do documento, sem as imagens) compactado e assinado com uma chave derivada do token:
-    a montagem não guarda nada no servidor, só o mesmo token monta, dentro de PLANO_VALIDADE, e ninguém altera o
-    plano no caminho. Quem tem o token pode assinar um estado próprio: por isso a montagem o confere como entrada."""
+    """O plano (texto e estado do documento, sem as imagens) compactado e assinado com a chave do servidor para o
+    cliente: a montagem não guarda nada no servidor, só o mesmo token monta, dentro de PLANO_VALIDADE, e ninguém (nem
+    o próprio cliente) altera ou forja o plano. A forma e os tetos ainda são conferidos, como rede."""
     import base64
     import zlib
 
@@ -372,9 +371,8 @@ RESPOSTAS_MAX = 64 * 1024 * 1024  # caracteres somados das respostas de uma mont
 
 
 def _montar_pedido(segredo, cliente, corpo):
-    """O corpo de POST /v1/montagens até o resultado. O plano é entrada de quem tem o token (a assinatura só prova
-    que é dele e que não mudou no caminho): a forma e os tetos são conferidos antes da montagem, e o que ela não
-    entende vira 422, nunca erro interno."""
+    """O corpo de POST /v1/montagens até o resultado. O plano foi assinado pelo servidor; a forma e os tetos ainda são
+    conferidos antes da montagem, como rede, e o que ela não entende vira 422, nunca erro interno."""
     try:
         pedido = json.loads(corpo)
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -406,6 +404,11 @@ def _conferir_estado(e):
     lista(e.get("extras", []), str, PLANO_TAREFAS_MAX, "extras")
     if not isinstance(e.get("md", ""), str) or not isinstance(e.get("iguais", {}), dict):
         raise ValueError("md ou iguais")
+    if len(e.get("iguais", {})) > PLANO_TAREFAS_MAX:
+        raise ValueError("iguais")
+    marcas = re.findall(r"\{\{(?:IA|TABELA|FORMULA):\w+\}\}", e.get("md", "") + "".join(e.get("extras", [])))
+    if len(marcas) != len(set(marcas)):  # o plano que o Lince monta põe cada marca uma vez
+        raise ValueError("marca repetida")
     lotes = e.get("lotes") or {}
     if (
         not isinstance(lotes, dict)
@@ -420,6 +423,9 @@ def _conferir_estado(e):
         lista(p.get("regioes", []), dict, PLANO_TAREFAS_MAX, "regiões")
         lista(p.get("tabelas", []), str, PLANO_TAREFAS_MAX, "tabelas")
         lista(p.get("formulas", []), str, PLANO_TAREFAS_MAX, "fórmulas")
+        marcas = re.findall(r"\{\{(?:TABELA|FORMULA):\d+\}\}", p.get("md", ""))
+        if len(marcas) != len(set(marcas)):
+            raise ValueError("marca repetida na página")
         trabalho += len(p.get("regioes", [])) * (len(p.get("md", "")) + 1)
         if trabalho > PLANO_TRABALHO_MAX:
             raise ValueError("regiões e texto demais no documento")
@@ -537,9 +543,13 @@ class _Envelope:
 
 
 # -------------------------------------------------------------------- rotas
-def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=None) -> Starlette:
+def criar_app(
+    tokens: list[str], clamav: tuple[str, int] | None = None, cache=None, segredo: bytes | None = None
+) -> Starlette:
     s = Servico(tokens)
     s.clamav, s.cache = clamav, cache
+    if segredo:  # o mesmo em todas as réplicas: o plano de uma monta em qualquer outra
+        s.segredo_plano = segredo
 
     async def saude(request):
         return JSONResponse({"status": "ok", "versao": VERSAO, "contrato": CONTRATO["info"]["version"]})
@@ -626,7 +636,7 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=No
                     )
             sessao = await _receber(
                 s, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=pedir_codigo == "sim", prazo=prazo,
-                modo=modo, segredo=s.segredo(request),
+                modo=modo, segredo=s.segredo(cliente),
             )  # fmt: skip
         finally:
             if form is not None:
@@ -809,7 +819,7 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=No
             raise _limite_pendentes()
         try:
             corpo = await request.body()
-            segredo = s.segredo(request)
+            segredo = s.segredo(cliente)
             # leitura do JSON, abertura do plano e montagem fora do laço de eventos: os outros clientes seguem
             r = await asyncio.to_thread(_montar_pedido, segredo, cliente, corpo)
         finally:
@@ -974,9 +984,13 @@ def main():
         cache = cache_do_ambiente(os.environ)
     except ValueError as e:
         raise SystemExit(str(e)) from None
+    segredo = os.environ.get("LINCE_SEGREDO", "")
+    if segredo and len(segredo) < 32:
+        raise SystemExit("LINCE_SEGREDO precisa de pelo menos 32 caracteres aleatórios.")
     import uvicorn
 
-    uvicorn.run(criar_app(tokens, clamav, cache), host=a.host, port=a.porta, proxy_headers=True, log_level="info")
+    app = criar_app(tokens, clamav, cache, segredo.encode() or None)
+    uvicorn.run(app, host=a.host, port=a.porta, proxy_headers=True, log_level="info")
 
 
 def cache_do_ambiente(env) -> CacheRedis | None:

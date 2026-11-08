@@ -27,7 +27,9 @@ Correções e melhorias para usar o Lince como leitor de documentos de uma aplic
 
 `Leitor.preparar` devolve o texto extraído e cada imagem que a IA precisa ler (com a instrução, onde ela está, a
 chave de cache e os tokens estimados); `Leitor.concluir` monta o mesmo resultado com as respostas. Na API, `modo=tarefas`
-no envio e `POST /v1/montagens`. Quando o Lince chama a IA, `uso` traz o custo em dólar que o provedor informa.
+no envio e `POST /v1/montagens`, com o plano assinado por um segredo que só o servidor conhece; com várias
+réplicas, todas recebem o mesmo `LINCE_SEGREDO`. Quando o Lince chama a IA, `uso` traz o custo em dólar que o
+provedor informa.
 
 #### Posição e repetição
 
