@@ -515,7 +515,7 @@ wheels = [
 
 [[package]]
 name = "lince"
-version = "0.1.1.dev20261108061334"
+version = "0.1.1.dev20261108063843"
 source = { editable = "." }
 dependencies = [
     { name = "defusedxml" },
