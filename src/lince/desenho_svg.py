@@ -25,6 +25,8 @@ LADO_MIN_PX = 800  # desenho pequeno é ampliado até aqui (4x o tamanho declara
 FILHO = Path(__file__).with_name("_desenhar.py")
 SEGUNDOS_MAX = 30  # teto do lote de desenhos de um documento: filtro hostil prende o resvg por minutos
 SVG_NS, XLINK_NS = "http://www.w3.org/2000/svg", "http://www.w3.org/1999/xlink"
+# só imagem raster embutida: um data: com SVG (ou sem tipo) traria texto que a limpeza do oculto não vê
+_RASTER = re.compile(r"data:image/(png|jpe?g|gif|webp)[;,]", re.I)
 _MEDIDA = re.compile(r"^\s*([0-9]*\.?[0-9]+(?:e[+-]?\d+)?)\s*([a-z]*)\s*$", re.I)
 _UNIDADES = {
     "": 1.0,
@@ -105,13 +107,16 @@ def tamanho(svg) -> tuple[float, float] | None:
 def _preparar(svg) -> tuple[str, dict] | None:
     """O SVG pronto para o resvg e o lado do desenho, ou None se não há o que desenhar (proporção absurda)."""
     svg = copy.deepcopy(svg)
-    for el in svg.iter():
+    for el in list(svg.iter()):
         if not isinstance(el.tag, str):
+            continue
+        if etree.QName(el).localname == "tref":  # desenharia o texto de qualquer elemento, até o CSS do <style>
+            el.getparent().remove(el)
             continue
         for nome in [n for n in el.attrib if etree.QName(n).localname == "href"]:
             valor = el.get(nome).strip()
-            if not (valor.startswith("#") or valor.lower().startswith("data:")):
-                del el.attrib[nome]  # arquivo local ou endereço externo: nunca entra no desenho
+            if not (valor.startswith("#") or _RASTER.match(valor)):
+                del el.attrib[nome]  # arquivo local, endereço externo ou SVG embutido: nunca entra no desenho
     w, h = tamanho(svg) or (LADO_PX, LADO_PX)
     maior = min(LADO_PX, max(LADO_MIN_PX, 4 * max(w, h)))  # ícone não vira imagem de 1600 px
     if min(w, h) * maior / max(w, h) < 1:  # proporção absurda: o outro lado sumiria

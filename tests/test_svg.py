@@ -290,12 +290,18 @@ def test_desenho_so_mostra_texto_que_ficou_no_corpo(tmp_path):
         '<use href="#s" font-size="0.5"/></svg>',
         "f.svg": f'<svg xmlns="http://www.w3.org/2000/svg" width="300" height="150"><style>text{{display:inline'
         f' !important}}</style>{azul}<text y="80" font-size="40" style="display:none">{oculto}</text></svg>',
+        "h.svg": '<svg xmlns="http://www.w3.org/2000/svg" xmlns:x="http://www.w3.org/1999/xlink" width="300"'
+        f' height="150"><style id="s">/* {oculto} */</style>{azul}'
+        '<text x="5" y="80" font-size="30"><tref x:href="#s"/></text></svg>',
     }
     for nome, conteudo in casos.items():
         p = tmp_path / nome
         p.write_text(conteudo, encoding="utf-8")
         r, vistas = _ler_vendo(p)
-        assert oculto not in r.markdown and r.alertas_injecao, nome
+        assert oculto not in r.markdown and (r.alertas_injecao or nome in ("g.html", "h.svg")), (
+            nome
+        )  # g, h: só no desenho
+        assert len(vistas) == 1, nome
         for img in vistas:  # o desenho sai, só com a caixa azul: nenhum traço de letra
             assert (37, 97, 193) in (cores := {c for _, c in _imagem(img).getcolors(1 << 24)}), nome
             assert all(min(c) > 30 or c == (37, 97, 193) or c[2] > 150 for c in cores), nome
@@ -311,3 +317,28 @@ def test_camada_oculta_do_svg_nao_impede_o_desenho(tmp_path):
     )
     r, vistas = _ler_vendo(p)
     assert len(vistas) == 1 and "rascunho" not in r.markdown
+
+
+def test_estilo_dentro_de_defs_vale_no_desenho_e_nao_vira_alerta(tmp_path):
+    p = tmp_path / "illustrator.svg"
+    p.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="150"><defs><style>.cls-1{fill:#2561c1;}</style>'
+        '</defs><rect class="cls-1" width="300" height="150"/></svg>',
+        encoding="utf-8",
+    )
+    r, vistas = _ler_vendo(p)
+    assert (37, 97, 193) in {c for _, c in _imagem(vistas[0]).getcolors(1 << 24)}
+    assert "texto_oculto_removido" not in r.metadados and not r.alertas_injecao
+
+
+def test_so_imagem_raster_embutida_entra_no_desenho():
+    foto = base64.b64encode(_png("red")).decode()
+    svg = etree.fromstring(
+        '<svg xmlns="http://www.w3.org/2000/svg" xmlns:x="http://www.w3.org/1999/xlink" width="300" height="150">'
+        f'<image id="png" href="data:image/png;base64,{foto}"/>'
+        '<image id="svg" x:href="data:image/svg+xml;base64,PHN2Zz4="/>'
+        '<image id="texto" href="data:,ola"/><use id="interno" href="#png"/></svg>'
+    )
+    pronto = etree.fromstring(desenho_svg._preparar(svg)[0])
+    com_href = {el.get("id") for el in pronto.iter() if any(etree.QName(n).localname == "href" for n in el.attrib)}
+    assert com_href == {"png", "interno"}  # SVG dentro do SVG não passaria pela limpeza do oculto

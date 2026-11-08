@@ -355,12 +355,16 @@ def _tirar_oculto(raiz, svgs=None) -> list:
             tecnica = "conteúdo que o navegador não mostra"  # o display do autor vence, como no hidden
         elif em_svg and el.tag in _SVG_NAO_DESENHA:
             if el.tag not in ("desc", "metadata"):  # referenciável (use, fill, marker): a estrutura fica, o texto sai
-                if conteudo := " ".join(el.text_content().split()):
-                    ocultos.append(("parte do SVG que não é desenhada", conteudo))
+                partes = []  # o CSS de um <style> aqui dentro fica para o desenho e não é texto escondido
                 for f in el.iter():
-                    f.text = None
-                    if f is not el:
+                    if isinstance(f.tag, str) and f.tag != "style" and f.text:
+                        partes.append(f.text)
+                        f.text = None
+                    if f is not el and f.tail:
+                        partes.append(f.tail)
                         f.tail = None
+                if conteudo := " ".join(" ".join(partes).split()):
+                    ocultos.append(("parte do SVG que não é desenhada", conteudo))
                 continue
             tecnica = "parte do SVG que não é desenhada"
         elif efetivas.get("display") == "none" or efetivas.get("opacity", 1.0) <= 0:
