@@ -36,15 +36,39 @@ def _metadados(pasta, plano, corpo, moveis):
     return corpo.strip() + "\n"
 
 
+_CERCA_ABRE = re.compile(r"(?:```|~~~)")
+_CERCA_FECHA = re.compile(r"(?:```|~~~)[ \t]*")
+
+
 def acabamento(txt: str) -> str:
     """Limpeza final do corpo: travessão, parágrafo vazio solto e linhas em branco demais; blocos de código
-    (``` ou ~~~) ficam como estão."""
-    pedacos = re.split(r"(?ms)(^(?:```|~~~).*?^(?:```|~~~)[ \t]*$)", txt)
-    for k in range(0, len(pedacos), 2):
-        t = re.sub(r"(?<=\w)--(?=\w)", "—", pedacos[k])  # travessão datilografado
-        t = re.sub(r"(?m)^[ \t]*\\[ \t]*$", "", t)  # parágrafo vazio vira "\" no Markdown: some
-        pedacos[k] = re.sub(r"\n{3,}", "\n\n", t)
-    return "".join(pedacos)
+    (``` ou ~~~ até a próxima linha que só fecha cerca) ficam como estão, e cerca que não fecha é texto comum.
+    Linear no tamanho do texto, por mais cercas abertas que ele tenha."""
+    linhas = txt.split("\n")
+    inicio, pos = [], 0  # posição de cada linha no texto
+    for ln in linhas:
+        inicio.append(pos)
+        pos += len(ln) + 1
+    fechos = [k for k, ln in enumerate(linhas) if _CERCA_FECHA.fullmatch(ln)]
+    saida, de, k, f = [], 0, 0, 0
+    while k < len(linhas):
+        if _CERCA_ABRE.match(linhas[k]):
+            while f < len(fechos) and fechos[f] <= k:
+                f += 1
+            if f < len(fechos):  # bloco de código: da abertura ao fim da linha do fecho, intacto
+                fim = inicio[fechos[f]] + len(linhas[fechos[f]])
+                saida += [_limpar(txt[de : inicio[k]]), txt[inicio[k] : fim]]
+                de, k = fim, fechos[f] + 1
+                continue
+        k += 1
+    saida.append(_limpar(txt[de:]))
+    return "".join(saida)
+
+
+def _limpar(t: str) -> str:
+    t = re.sub(r"(?<=\w)--(?=\w)", "—", t)  # travessão datilografado
+    t = re.sub(r"(?m)^[ \t]*\\[ \t]*$", "", t)  # parágrafo vazio vira "\" no Markdown: some
+    return re.sub(r"\n{3,}", "\n\n", t)
 
 
 def montar(pasta, respostas):

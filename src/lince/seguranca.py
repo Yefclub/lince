@@ -205,6 +205,8 @@ def _fundo_do_run(run, fundo_par, pagina):
         return fundo_par
     el = run.getparent()
     while el is not None:
+        if el.tag == f"{_W}txbxContent":  # caixa de texto: o fundo é o da forma (DrawingML ou VML), que pode pintar
+            return _INCERTO
         if el.tag == f"{_W}tc":
             tc = el.find(f"{_W}tcPr/{_W}shd")
             if (cor := _fundo_do_sombreamento(tc)) is not None:
@@ -236,6 +238,10 @@ def texto_oculto_docx(path):
         tema = _esquema(_xml(z.read(tema))) if tema else {}
     fundo = raiz.find(f"{_W}background")
     pagina = (_rgb(fundo.get(f"{_W}color")) if fundo is not None else None) or (255, 255, 255)
+    _WP = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
+    atras_do_texto = any(a.get("behindDoc") in ("1", "true") for a in raiz.iter(f"{_WP}anchor"))
+    if (fundo is not None and len(fundo)) or atras_do_texto:  # fundo de imagem ou figura atrás do texto: incerto
+        pagina = _INCERTO
     for par in raiz.iter(f"{_W}p"):
         ppr = par.find(f"{_W}pPr")
         fundo_par = estilos.sombreamento_paragrafo(ppr)
@@ -335,9 +341,15 @@ def texto_oculto_pptx(path):
                     if bgref is not None and int(bgref.get("idx") or 0) in (0, 1001):
                         fundo = _cor_drawingml(next(iter(bgref), None), tema, mapa) or _INCERTO
                 break
-            for sh in slide.shapes:  # o teste de fora do slide só vale para a forma solta (no grupo, a posição é dele)
-                for forma, solta in [(sh, True)] + [(f, False) for f in _dentro_do_grupo(sh)]:
-                    out += _oculto_na_forma(forma, solta, W, H, fundo, tema, mapa, Pt)
+            desenhadas = []  # caixas das formas já desenhadas que podem pintar o que vem por cima
+            for sh in slide.shapes:  # na ordem de desenho: o que vem antes fica atrás
+                caixa = (sh.left or 0, sh.top or 0, (sh.left or 0) + (sh.width or 0), (sh.top or 0) + (sh.height or 0))
+                atras = fundo if not any(_sobrepoe(caixa, d) for d in desenhadas) else _INCERTO
+                out += _oculto_na_forma(sh, True, W, H, atras, tema, mapa, Pt)
+                for f in _dentro_do_grupo(sh):  # no grupo, posição e camadas são do grupo: só o preenchimento certo
+                    out += _oculto_na_forma(f, False, W, H, _INCERTO, tema, mapa, Pt)
+                if _pode_pintar(sh, tema, mapa):
+                    desenhadas.append(caixa)
         return out
     except XMLIlegivel:
         raise
@@ -345,6 +357,21 @@ def texto_oculto_pptx(path):
         raise
     except Exception as e:  # noqa: BLE001 — o python-pptx levanta de tudo com pacote hostil: não conferido
         raise XMLIlegivel(f"{type(e).__name__}: {str(e)[:200]}") from None
+
+
+def _sobrepoe(a, b) -> bool:
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def _pode_pintar(sh, tema, mapa) -> bool:
+    """A forma pode cobrir o fundo do que vem por cima: imagem, gráfico, tabela, grupo, ou forma com preenchimento
+    próprio ou do estilo do tema. Só a caixa sem preenchimento nenhum é transparente."""
+    if sh.shape_type in (6, 13) or sh._element.tag in (f"{_P}pic", f"{_P}graphicFrame", f"{_P}grpSp"):
+        return True
+    if _preenchimento(sh._element.find(f"{_P}spPr"), tema, mapa) is not None:
+        return True
+    ref = sh._element.find(f"{_P}style/{_A}fillRef")
+    return ref is not None and bool(int(ref.get("idx") or 0))
 
 
 def _dentro_do_grupo(sh):

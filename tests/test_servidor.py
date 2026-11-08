@@ -776,3 +776,34 @@ def test_plano_vencido_grande_ou_forjado_nao_monta(api, monkeypatch):
     monkeypatch.setattr(srv, "PLANO_MAX", 10)
     s = enviar(api, ("r.docx", _docx_com_imagens()), {**A, **ESPERA}, modo="tarefas").json()
     assert s["itens"][0]["estado"] == "falhou" and "acima do teto" in s["itens"][0]["erro"]
+
+
+def test_montagem_tem_teto_de_trabalho_no_documento_e_nas_respostas(api, monkeypatch):
+    import hashlib
+
+    import lince.servidor as srv
+    from lince.tipos import Plano
+
+    segredo = hashlib.sha256(b"lince-plano\0token-a").digest()
+    cliente = hashlib.sha256(b"token-a").hexdigest()[:16]
+    pagina = {"rota": "regioes", "md": "\n\n".join(["bloco"] * 50), "regioes": [{"tarefa": "x"}] * 50}
+    estado = {"tipo": "pdf", "paginas": [{**pagina, "i": k} for k in range(100)]}  # cada página cabe; o todo, não
+    monkeypatch.setattr(srv, "PLANO_TRABALHO_MAX", 200_000)
+    r = _montar(api, {"plano": srv.selar(segredo, cliente, Plano([], estado, [])), "respostas": {}})
+    assert r.status_code == 422 and "no documento" in r.json()["detail"]
+    monkeypatch.setattr(srv, "RESPOSTAS_MAX", 10)
+    plano = srv.selar(segredo, cliente, Plano([], {"tipo": "office", "md": "a"}, []))
+    assert _montar(api, {"plano": plano, "respostas": {"t": "x" * 11}}).status_code == 413
+
+
+def test_texto_hostil_nao_custa_quadratico_na_montagem():
+    import time
+
+    from lince.agrupamento import _json_do_lote
+    from lince.montagem import acabamento
+
+    inicio = time.monotonic()
+    acabamento("```x\n" * 200_000)  # cercas que nunca fecham
+    _json_do_lote("{" * 2_000_000)  # chaves que nunca fecham
+    assert time.monotonic() - inicio < 3
+    assert acabamento("início\n```\ncod--x\n```\n\n\n\nfim--a") == "início\n```\ncod--x\n```\n\nfim—a"

@@ -700,3 +700,14 @@ def test_xlsb_que_nenhum_leitor_abre_falha_com_o_erro_do_leitor_do_corpo(tmp_pat
         z.writestr("[Content_Types].xml", "<Types/>")
     with pytest.raises(anydoc.ConvertError):
         lince.ler(p)
+
+
+def test_xlsb_tolerante_conta_o_intervalo_de_linhas_no_teto(tmp_path, monkeypatch):
+    from lince import legados, office
+
+    monkeypatch.setattr(legados, "_XLSB_CELULAS_MAX", 1000)
+    longe = _xlsb(tmp_path, [(0, 0, 1.0), (4_000_000_000, 0, 2.0), (900_000, 0, 3.0)])  # linha fora do Excel e longe
+    abas, cortado = legados.xlsb_tolerante(longe)
+    assert cortado and all(max(linhas) < legados._XLSB_LINHAS_MAX for _, linhas in abas)
+    md, _ = office._xlsb_tolerante(longe, [])
+    assert md.count("\n") < 2000  # nada de um milhão de linhas vazias entre os dados

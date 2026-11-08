@@ -6,6 +6,7 @@ import io
 import sys
 import threading
 import time
+from pathlib import Path
 
 from lxml import etree
 from PIL import Image
@@ -345,8 +346,9 @@ def test_sem_fonte_no_sistema_o_texto_do_svg_ainda_e_desenhado(tmp_path):
 
     vazio = tmp_path / "sem-fontes"
     vazio.mkdir()
-    fontes = _desenhar.opcoes_de_fonte(diretorios=[str(vazio)])
-    assert fontes["font_files"] and fontes["sans_serif_family"] == "Aileron"
+    fontes = _desenhar.opcoes_de_fonte(diretorios=[str(vazio)], pasta=str(tmp_path))
+    assert fontes["sans_serif_family"] == "Aileron"
+    assert [Path(f).parent for f in fontes["font_files"]] == [tmp_path]  # na pasta do documento, apagada com ela
     svg = (
         '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="80">'
         '<text x="10" y="50" font-size="40">Moagem</text></svg>'

@@ -365,7 +365,8 @@ def abrir(segredo: bytes, cliente: str, selado: str):
 
 PLANO_PAGINAS_MAX = 100_000
 PLANO_TAREFAS_MAX = 20_000
-PLANO_TRABALHO_MAX = 2_000_000  # por página: regiões x blocos, o que a montagem compara uma com a outra
+PLANO_TRABALHO_MAX = 20_000_000  # no documento: regiões x blocos de cada página, o que a montagem compara
+RESPOSTAS_MAX = 64 * 1024 * 1024  # caracteres somados das respostas de uma montagem
 
 
 def _montar_pedido(segredo, cliente, corpo):
@@ -379,6 +380,8 @@ def _montar_pedido(segredo, cliente, corpo):
     respostas = pedido.get("respostas") if isinstance(pedido, dict) else None
     if not isinstance(respostas, dict) or not all(isinstance(v, str) for v in respostas.values()):
         raise Problema(400, "montagem-invalida", 'Envie {"plano": ..., "respostas": {id: texto}}')
+    if len(respostas) > PLANO_TAREFAS_MAX or sum(len(v) for v in respostas.values()) > RESPOSTAS_MAX:
+        raise Problema(413, "envio-grande", "Respostas grandes demais", f"Até {RESPOSTAS_MAX // 2**20} M caracteres.")
     plano = abrir(segredo, cliente, str(pedido.get("plano") or ""))
     try:
         _conferir_estado(plano.estado)
@@ -408,14 +411,16 @@ def _conferir_estado(e):
     ):
         raise ValueError("lotes")
     lista(e.get("paginas", []), dict, PLANO_PAGINAS_MAX, "paginas")
+    trabalho = 0
     for p in e.get("paginas", []):
         if not isinstance(p.get("md", ""), str) or p.get("rota") not in ("nativa", "regioes", "pagina"):
             raise ValueError("página")
         lista(p.get("regioes", []), dict, PLANO_TAREFAS_MAX, "regiões")
         lista(p.get("tabelas", []), str, PLANO_TAREFAS_MAX, "tabelas")
         lista(p.get("formulas", []), str, PLANO_TAREFAS_MAX, "fórmulas")
-        if len(p.get("regioes", [])) * (p.get("md", "").count("\n\n") + 1) > PLANO_TRABALHO_MAX:
-            raise ValueError("página com regiões e blocos demais")
+        trabalho += len(p.get("regioes", [])) * (p.get("md", "").count("\n\n") + 1)
+        if trabalho > PLANO_TRABALHO_MAX:
+            raise ValueError("regiões e blocos demais no documento")
 
 
 def _resultado_api(r) -> dict:

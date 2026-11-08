@@ -289,3 +289,49 @@ def test_cadeia_de_estilos_enorme_nao_custa_quadratico(tmp_path):
     inicio = time.monotonic()
     seguranca.texto_oculto_docx(p)
     assert time.monotonic() - inicio < 5
+
+
+def _docx_com_xml(tmp_path, trecho, nome="camada.docx"):
+    d = Document()
+    d.add_paragraph("Texto visível do contrato de fornecimento.")
+    ns = (
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:v="urn:schemas-microsoft-com:vml" '
+        'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"'
+    )
+    d.element.body.insert(0, etree.fromstring(f"<w:p {ns}>{trecho}</w:p>"))
+    p = tmp_path / nome
+    d.save(p)
+    return p
+
+
+def test_texto_branco_em_caixa_de_texto_ou_sobre_figura_atras_do_texto_e_visivel(tmp_path):
+    branco = '<w:r><w:rPr><w:color w:val="FFFFFF"/></w:rPr><w:t>Título branco da capa</w:t></w:r>'
+    caixa = (
+        '<w:r><w:pict><v:shape fillcolor="#1F3864" filled="t"><v:textbox><w:txbxContent><w:p>'
+        f"{branco}</w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r>"
+    )
+    assert seguranca.texto_oculto_docx(_docx_com_xml(tmp_path, caixa)) == []
+    atras = f'<w:r><w:drawing><wp:anchor behindDoc="1"/></w:drawing></w:r>{branco}'  # foto atrás do texto
+    assert seguranca.texto_oculto_docx(_docx_com_xml(tmp_path, atras, "atras.docx")) == []
+
+
+def test_pptx_titulo_branco_sobre_foto_ou_faixa_escura_fica(tmp_path):
+    import io as _io
+
+    from PIL import Image as _Image
+
+    prs = Presentation()
+    s = prs.slides.add_slide(prs.slide_layouts[6])
+    foto = _io.BytesIO()
+    _Image.new("RGB", (400, 200), "black").save(foto, "PNG")
+    s.shapes.add_picture(foto, Inches(0), Inches(0), Inches(10), Inches(4))  # a foto da capa, atrás do título
+    run = s.shapes.add_textbox(Inches(1), Inches(1), Inches(6), Inches(1)).text_frame.paragraphs[0].add_run()
+    run.text, run.font.color.rgb = "Título branco sobre a foto", PRGB(0xFF, 0xFF, 0xFF)
+    faixa = s.shapes.add_shape(1, Inches(0), Inches(5), Inches(10), Inches(1))  # faixa preenchida pelo tema
+    run = s.shapes.add_textbox(Inches(1), Inches(5.2), Inches(6), Inches(0.5)).text_frame.paragraphs[0].add_run()
+    run.text, run.font.color.rgb = "Rodapé branco na faixa", PRGB(0xFF, 0xFF, 0xFF)
+    assert faixa is not None
+    p = tmp_path / "capa.pptx"
+    prs.save(p)
+    assert _visivel(p, "Título branco sobre a foto", "Rodapé branco na faixa")

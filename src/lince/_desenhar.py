@@ -22,11 +22,12 @@ _DIRETORIOS_DE_FONTE = ("/usr/share/fonts", "/usr/local/share/fonts", "/System/L
                         "C:/Windows/Fonts", "~/.fonts", "~/.local/share/fonts")  # fmt: skip
 
 
-def opcoes_de_fonte(diretorios=_DIRETORIOS_DE_FONTE) -> dict:
+def opcoes_de_fonte(diretorios=_DIRETORIOS_DE_FONTE, pasta=None) -> dict:
     """Sem fonte nenhuma no sistema (container mínimo, Alpine), o resvg não desenha texto: o rótulo do diagrama some
     do desenho. Aí entra a fonte que o Pillow traz embutida (Aileron, domínio público; só ASCII, então acento sai
-    sem glifo) como padrão de todas as famílias. O texto do SVG continua no corpo de qualquer forma. Qualquer falha
-    aqui devolve {}: o desenho sai como sairia sem a reserva, nunca pior."""
+    sem glifo) como padrão de todas as famílias. O texto do SVG continua no corpo de qualquer forma. O arquivo da
+    fonte vai para `pasta` (a do documento, apagada no fim da leitura, mesmo que o filho seja morto pelo teto de
+    tempo). Qualquer falha aqui devolve {}: o desenho sai como sairia sem a reserva, nunca pior."""
 
     try:
         for d in diretorios:
@@ -43,7 +44,7 @@ def opcoes_de_fonte(diretorios=_DIRETORIOS_DE_FONTE) -> dict:
         embutida = re.search(r'b"""(.*?)"""', inspect.getsource(ImageFont.load_default), re.S)
         if embutida is None:
             return {}
-        fd, caminho = tempfile.mkstemp(prefix="lince-fonte-", suffix=".ttf")  # nome único, criado só por nós
+        fd, caminho = tempfile.mkstemp(prefix="lince-fonte-", suffix=".ttf", dir=pasta)  # nome único, só nosso
         with os.fdopen(fd, "wb") as f:
             f.write(base64.b64decode(embutida.group(1)))
     except Exception:  # noqa: BLE001 — sem a reserva, o desenho sai sem texto, como antes
@@ -85,7 +86,7 @@ def main():
         for i, (tipo, conteudo, lado, destino) in enumerate(json.load(sys.stdin)):
             try:
                 if tipo == "svg" and fontes is None:
-                    fontes = opcoes_de_fonte()
+                    fontes = opcoes_de_fonte(pasta=os.path.dirname(destino) or None)
                 im = Image.open(io.BytesIO(_png(tipo, conteudo, lado, fontes)))
                 fundo = Image.new("RGBA", im.size, "#ffffff")  # transparência vira branco, como no SVG
                 im = Image.alpha_composite(fundo, im.convert("RGBA")).convert("RGB")

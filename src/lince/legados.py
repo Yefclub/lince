@@ -658,6 +658,7 @@ def rtf(dados: bytes, ler_rtf) -> tuple[list[str], bool]:
 # ---------------------------------------------------------------------------------------------------- XLSB tolerante
 _XLSB_CELULAS_MAX = 500_000  # o mesmo teto de células do documento da leitura em fluxo do .xlsx
 _XLSB_COLUNAS_MAX = 16_384  # a última coluna do Excel (XFD): coluna maior que isso é arquivo hostil
+_XLSB_LINHAS_MAX = 1_048_576  # a última linha do Excel
 
 
 def _registros_xlsb(b: bytes):
@@ -739,10 +740,12 @@ def xlsb_tolerante(path) -> tuple[list[tuple[str, dict[int, dict[int, object]]]]
         for nome, parte in abas:
             if parte not in nomes:
                 continue
-            linhas, linha, largura = {}, None, 0
+            linhas, linha, largura, r = {}, None, 0, 0
+            primeira, ultima = _XLSB_LINHAS_MAX, -1
             for tipo, d in _registros_xlsb(z.read(parte)):
                 if tipo == 0x00 and len(d) >= 4:  # BrtRowHdr
-                    linha = linhas.setdefault(struct.unpack_from("<I", d, 0)[0], {})
+                    r = struct.unpack_from("<I", d, 0)[0]
+                    linha = linhas.setdefault(r, {}) if r < _XLSB_LINHAS_MAX else None
                     continue
                 if linha is None or not 1 <= tipo <= 11 or len(d) < 8:
                     continue
@@ -763,13 +766,15 @@ def xlsb_tolerante(path) -> tuple[list[tuple[str, dict[int, dict[int, object]]]]
                 else:
                     continue
                 nova = max(largura, col + 1)
-                if total + nova * (len(linhas) or 1) > _XLSB_CELULAS_MAX:  # o retângulo que a tabela ocuparia
+                primeira, ultima = min(primeira, r), max(ultima, r)
+                # a tabela vai da primeira à última linha com dado e da coluna 0 à mais larga: é isso que o teto conta
+                if total + nova * (ultima - primeira + 1) > _XLSB_CELULAS_MAX:
                     cortado = True
                     break
                 linha[col], largura = valor, nova
             if any(linhas.values()):
                 saida.append((nome, linhas))
-                total += largura * len(linhas)
+                total += largura * (ultima - primeira + 1)
             if cortado:
                 break
     return saida, cortado
