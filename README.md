@@ -37,10 +37,12 @@ r.estrutura         # páginas, slides, abas (e quais são ocultas), seções co
 renderizado de novo em 2–3x a resolução e relido com a primeira leitura como contexto.
 
 **Metadados corporativos**: cabeçalho e rodapé corridos saem do corpo e vão para os metadados (versão,
-revisão, código, classificação). No PDF, sai a linha curta da borda da página em que só o número da página muda, o
-número sozinho (registrado como `#`) e a linha idêntica na borda de ao menos 80% das páginas ("Contrato 123/2026 -
-Confidencial"). Também vão para os metadados a marca d'água, as propriedades do arquivo, os comentários e as
-alterações rastreadas do Word e as abas ocultas do Excel.
+revisão, código, classificação). No PDF, sai a linha curta da borda da página em que só o número da página muda,
+rotulado como página ("Página 3 de 12", "fls. 3"), o número sozinho (registrado como `#`, também em "3 de 12") e a
+linha idêntica na borda de ao menos 80% das páginas ("Contrato 123/2026 - Confidencial"). O número sem rótulo no meio
+de outras palavras fica no texto: no carnê com uma parcela por página, "Parcela 3 de 12" é conteúdo. Também vão para
+os metadados a marca d'água, as propriedades do arquivo, os comentários e as alterações rastreadas do Word e as abas
+ocultas do Excel.
 
 **Segurança**: texto que a IA leria e uma pessoa não vê (branco no branco, fonte minúscula, modo invisível,
 oculto do Word) sai do corpo e gera alerta; padrões de prompt injection em português e inglês geram alerta.
@@ -355,10 +357,11 @@ Windows, e ainda não instala no Python 3.15. Sem ele, a imagem EMF ou WMF fica 
 Instalar a biblioteca no próprio Alpine é possível, mas caro: o `pdf-inspector` e o `html-to-markdown` não publicam
 wheel musllinux, e o `pip` compila os dois a partir do código-fonte. O Rust do `apk` (`apk add rust cargo`) é antigo
 demais para o `html-to-markdown`; use o Rust estável do `rustup` com o `build-base` (compilador C e cabeçalhos). Na
-medição da issue #40, a compilação levou cerca de 16 min. O `lince[emf]` não instala em Alpine.
+medição da issue #40, a compilação levou cerca de 16 min. O `lince[emf]` não instala em Alpine. A instalação direto do
+GitHub precisa do `git`, que a imagem `python:*-alpine` não traz.
 
 ```sh
-apk add build-base curl
+apk add build-base curl git
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 . "$HOME/.cargo/env"
 pip install "lince @ git+https://github.com/Yefclub/lince"

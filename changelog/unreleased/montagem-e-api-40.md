@@ -24,11 +24,14 @@ documento.
 
 **Cabeçalho fixo no PDF.** Uma linha curta idêntica na borda de ao menos 80% das páginas, como
 "Contrato 123/2026 - Confidencial", sai do corpo e vai para `metadados["cabeçalho/rodapé"]`. O número de página
-tirado do corpo também passa a ser registrado ali. Faturas do mesmo modelo, linhas numeradas e páginas inteiras
-iguais continuam no texto.
+tirado do corpo também passa a ser registrado ali. Um número só conta como o da página quando a linha diz isso
+("Página 3 de 12", "fls. 3") ou é só ele ("3 de 12"): no carnê com uma parcela por página, "Parcela 3 de 12" fica no
+texto, e "Cliente: Transportadora 3 Ltda" na terceira fatura também. Faturas do mesmo modelo, linhas numeradas e
+páginas inteiras iguais continuam no texto; das faturas, só a linha de marca idêntica em todas pode ir para os
+metadados, como cabeçalho fixo.
 
 **Planilha `.xlsb` hostil.** No `.xlsb` que só o leitor tolerante abre, a tabela de strings compartilhadas tem teto
 de 1 milhão de strings e 64 MB de texto. Acima disso, o arquivo é recusado antes de ocupar memória.
 
-**Alpine.** O README traz a receita que funciona (Rust estável pelo `rustup` com `build-base`, cerca de 16 min de
-compilação) e recomenda usar a imagem Debian do Lince como serviço.
+**Alpine.** O README traz a receita que funciona (Rust estável pelo `rustup` com `build-base`, e o `git` para
+instalar do GitHub; cerca de 16 min de compilação) e recomenda usar a imagem Debian do Lince como serviço.

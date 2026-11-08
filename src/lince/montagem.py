@@ -195,6 +195,9 @@ FIXA_MIN = 0.8  # linha idêntica na borda de ao menos esta fração das página
 
 
 DESLOCAMENTO_MAX = 50  # número impresso = índice da página + d (capa e páginas iniciais sem número): |d| até isto
+# o rótulo logo antes do número que diz que ele é o da página, e a linha que é só o número ("3 de 12", "3/12")
+_ROTULO_PAGINA = re.compile(r"(?<![^\W\d_])(p[aá]gina|p[aá]g|page|pg|p|folha|fls|fl)\.?:?\s*$", flags=re.I)
+_SO_O_NUMERO = re.compile(r"\W*#(\s*(de|of|/)\s*\d{1,4})?\W*", flags=re.I)
 _ROMANOS = [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
             (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")]  # fmt: skip
 
@@ -213,13 +216,15 @@ def _numero(token) -> int | None:
 def _sem_cabecalho_corrido(nativas) -> set[str]:
     """Tira das páginas nativas (índice, blocos) o cabeçalho/rodapé corrido e devolve o que saiu, para os metadados.
     Só sai a linha curta, na borda da página, igual em quase todas as páginas, em que só o número da própria página
-    varia ("Página 3 de 12", "Relatório anual — 3"), com um deslocamento constante entre o número impresso e o índice
-    da página (a capa sem número desloca todos); a linha só com o número da página, na primeira ou na última posição,
-    também sai, com o mesmo deslocamento em quase todas as páginas, e vai para os metadados como a linha com o número
-    trocado por #. A linha curta idêntica na borda de FIXA_MIN das páginas, sem número de página, é cabeçalho fixo e
-    sai também, se couber em FRACAO_MAX junto com o resto (senão só ela fica). Valor, data e número de documento que
-    mudam entre páginas não casam, a página escaneada e o texto lido pela IA não passam por aqui, título (linha com #)
-    nunca sai e, se o que sairia passa de FRACAO_MAX do texto nativo do documento, nada sai."""
+    varia, rotulado como página ("Página 3 de 12", "Relatório anual — fls. 3") ou sozinho ("3 de 12"), com um
+    deslocamento constante entre o número impresso e o índice da página (a capa sem número desloca todos); o número sem
+    rótulo no meio de outras palavras ("Parcela 3 de 12" num carnê) é conteúdo. A linha só com o número da página, na
+    primeira ou na última posição, também sai, com o mesmo deslocamento em quase todas as páginas, e vai para os
+    metadados como a linha com o número trocado por #. A linha curta idêntica na borda de FIXA_MIN das páginas, sem
+    número de página, é cabeçalho fixo e sai também, se couber em FRACAO_MAX junto com o resto (senão só ela fica).
+    Valor, data e número de documento que mudam entre páginas não casam, a página escaneada e o texto lido pela IA não
+    passam por aqui, título (linha com #) nunca sai e, se o que sairia passa de FRACAO_MAX do texto nativo do
+    documento, nada sai."""
     from collections import Counter
 
     def linhas(blocos):
@@ -240,7 +245,10 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
         for m in re.finditer(r"(?<![\w.,/])(\d{1,4}|[ivxlcdm]{1,8})(?![\w.,/])", t, flags=re.I):
             v = _numero(m.group())
             forma = t[: m.start()] + "#" + t[m.end() :]
-            if v is not None and abs(v - pagina) <= DESLOCAMENTO_MAX and re.search(r"[^\W\d]", forma):
+            # o número só é o da página se a linha diz que é ("Página 3", "fls. 3") ou se a linha é só ele ("3 de 12");
+            # "Parcela 3 de 12" num carnê de uma parcela por página é conteúdo
+            pagina_dita = _ROTULO_PAGINA.search(t[: m.start()]) or _SO_O_NUMERO.fullmatch(forma)
+            if v is not None and abs(v - pagina) <= DESLOCAMENTO_MAX and pagina_dita and re.search(r"[^\W\d]", forma):
                 out.add((forma, v - pagina))  # só número (sem palavra) é o caso de so_numero
         return out
 
