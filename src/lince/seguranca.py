@@ -63,8 +63,8 @@ def texto_oculto_pdf(page, itens, imgs, W, H):
     ocultos = []
     for x in itens:
         motivo = None
-        sobre_imagem = any(b[0] - 2 <= x.x <= b[2] + 2 and b[1] - 2 <= x.y <= b[3] + 2 for b in imgs)
-        if x.render_mode == 3 and not sobre_imagem:
+        # só o invisível olha as imagens: comparar cada item com cada imagem prende a trava numa página hostil
+        if x.render_mode == 3 and not any(b[0] - 2 <= x.x <= b[2] + 2 and b[1] - 2 <= x.y <= b[3] + 2 for b in imgs):
             motivo = "invisível"
         elif 0 < x.font_size < 2.5:
             motivo = "fonte minúscula"

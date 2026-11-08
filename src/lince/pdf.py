@@ -4,6 +4,7 @@ import ctypes
 import hashlib  # noqa: F401
 import io
 import json  # noqa: F401
+import math
 import os  # noqa: F401
 import re  # noqa: F401
 import time
@@ -17,7 +18,7 @@ import pypdfium2.raw as c  # noqa: F401
 from ._prazo import prazo_restante
 from ._trava import PDFIUM
 from .limites import escala
-from .seguranca import texto_oculto_pdf
+from .seguranca import NAO_CONFERIDO, texto_oculto_pdf
 from .texto import densidade_matematica, desifenizar, limpar_tabelas, lixo
 
 PROMPT_VERSAO = "leitura-ia-v1"
@@ -41,6 +42,14 @@ VEZ_S = 0.5
 # texto corrido (medido: 0,8 s para as 650 páginas lidas em 3 s). Uma faixa nova só começa se o que resta do prazo
 # cobre essa parte; a proporção vale em máquina lenta ou rápida, porque as duas etapas são CPU em Python.
 RESERVA_MONTAGEM = 0.3
+# Teto do trabalho para tirar o texto oculto de uma página pela posição, contado em células da grade visitadas e em
+# comparações entre um item oculto e um objeto de texto (~2 µs cada, com a trava): 100 mil cabem em ~0,2 s. A grade
+# compara cada item só com os objetos cujo centro cai na caixa dele: 10 mil itens ocultos espalhados numa página
+# custam ~40 mil. O teto segura a página hostil, com milhares de itens sobrepostos no mesmo lugar (antes, ~60 s na
+# trava). Acima dele, a página não é copiada: fica com o texto como está, e o oculto, com o alerta e a pendência.
+OCULTOS_COMPARACOES_MAX = 100_000
+# Lado da célula da grade dos objetos de texto, em pontos: menos que uma linha de texto corrido.
+CELULA = 8
 
 
 def texto_pdfium(page):
@@ -64,8 +73,6 @@ def regioes_vetoriais(page, W, H, c):
             continue
         caixas.append([l, b, r, t])
     # Fundo de linha de tabela tem a mesma largura em todas as linhas; barras de gráfico variam.
-    from collections import defaultdict
-
     por_inicio = defaultdict(list)
     for f in faixas:
         por_inicio[round(f[0] / 4)].append(f)
@@ -94,67 +101,106 @@ def planejar_pdf(path, pasta):
     """Lê o PDF em faixas de páginas, com o prazo conferido entre elas e os tetos valendo antes da leitura.
 
     A PDFium só é usada com a trava, tomada por pouco tempo e solta entre as vezes (`VEZ_S`): um PDF que chega
-    durante a leitura de um grande entra na próxima vez. O documento é aberto e fechado em cada vez, dentro da trava,
-    mesmo com exceção: o finalizador dele (e o das páginas) não pode rodar fora dela, em paralelo com outro PDF. O
-    pdf_inspector não usa a PDFium e roda fora da trava."""
+    durante a leitura de um grande entra na próxima vez. O documento é aberto uma vez só, na vez que lê a contagem de
+    páginas e as propriedades (abrir um PDF com a tabela de referências danificada a reconstrói, e isso não pode se
+    repetir a cada vez), e fechado dentro da trava, mesmo com exceção: o finalizador dele (e o das páginas) não pode
+    rodar fora dela, em paralelo com outro PDF. O pdf_inspector não usa a PDFium e roda fora da trava."""
     inicio = time.monotonic()
-    with PDFIUM:
-        doc = pdfium.PdfDocument(path)
-        try:
-            total = len(doc)
-        finally:
-            doc.close()
-    lidas = min(total, PAGINAS_TEXTO_MAX)
-    paginas, tarefas, cache, seguranca = [], [], {}, []
-    so_texto = {}  # página -> motivo de ela ter entrado só com o texto (teto ou prazo)
-    nao_lidas = {}  # página -> motivo de ela não ter sido lida (prazo ou teto)
-    for a in range(0, lidas, FAIXA):
-        # a primeira faixa sempre entra: o documento nunca sai sem texto por causa do prazo
-        if a and (resta := prazo_restante()) is not None and resta <= RESERVA_MONTAGEM * (time.monotonic() - inicio):
-            nao_lidas |= {i: "prazo esgotado" for i in range(a, lidas)}
-            break
-        fila = range(a, min(a + FAIXA, lidas))
-        md_de, ocr, itens_de = _extrair(path, fila, total)
-        k = 0
-        while k < len(fila):
-            if motivo := _so_texto(fila[k]):
-                so_texto[fila[k]] = motivo
-                md, tabelas = limpar_tabelas(desifenizar(md_de.get(fila[k], "")))
-                paginas.append({"i": fila[k], "rota": "nativa", "densidade_mat": 0, "origem_texto": "pdf-inspector",
-                                "md": md, "tabelas": [tb["md"] for tb in tabelas], "formulas": [],
-                                "regioes": []})  # fmt: skip
-                k += 1
-                continue
-            with PDFIUM:
-                doc = pdfium.PdfDocument(path)
-                try:
+    doc = None
+    try:
+        with PDFIUM:
+            doc = pdfium.PdfDocument(path)
+            total = len(doc)  # o /Count declarado: a PDFium confia nele, mesmo quando não bate com as páginas
+            propriedades = _propriedades(doc)
+        lidas = min(total, PAGINAS_TEXTO_MAX)
+        paginas, tarefas, cache, seguranca, pendentes = [], [], {}, [], []
+        so_texto, nao_lidas = [], []  # [início, fim, motivo]: páginas só com o texto e páginas não lidas
+        encontradas, parada = 0, None  # páginas que o pdf_inspector achou; a primeira que a PDFium não abre
+        for a in range(0, lidas, FAIXA):
+            # a primeira faixa sempre entra: o documento nunca sai sem texto por causa do prazo
+            resta = prazo_restante()
+            if a and resta is not None and resta <= RESERVA_MONTAGEM * (time.monotonic() - inicio):
+                _marcar(nao_lidas, a, lidas, "prazo esgotado")
+                break
+            faixa = range(a, min(a + FAIXA, lidas))
+            md_de, ocr, itens_de, abertas = _extrair(doc, path, faixa, total)
+            encontradas = max(encontradas, max(md_de, default=-1) + 1)
+            fila = faixa[:abertas]
+            if abertas < len(faixa):
+                parada = faixa[abertas]
+            k = 0
+            while k < len(fila):
+                if motivo := _so_texto(fila[k]):
+                    _marcar(so_texto, fila[k], fila[k] + 1, motivo)
+                    md, tabelas = limpar_tabelas(desifenizar(md_de.get(fila[k], "")))
+                    paginas.append({"i": fila[k], "rota": "nativa", "densidade_mat": 0, "origem_texto": "pdf-inspector",
+                                    "md": md, "tabelas": [tb["md"] for tb in tabelas], "formulas": [],
+                                    "regioes": []})  # fmt: skip
+                    k += 1
+                    continue
+                with PDFIUM:
                     fim = time.monotonic() + VEZ_S
                     while True:  # a vez acaba no tempo, no fim da faixa ou na página que entra só com o texto
                         i = fila[k]
-                        paginas.append(_pagina(doc, i, md_de.get(i, ""), i in ocr, itens_de.get(i, []), pasta,
-                                               tarefas, cache, seguranca))  # fmt: skip
+                        info = _pagina(doc, i, md_de.get(i, ""), i in ocr, itens_de.get(i, []), pasta, tarefas, cache,
+                                       seguranca, pendentes)  # fmt: skip
+                        if info is None:  # a página não abre: a leitura para nela
+                            parada, fila = i, fila[:k]
+                            break
+                        paginas.append(info)
                         k += 1
                         if k == len(fila) or time.monotonic() >= fim or _so_texto(fila[k]):
                             break
-                finally:
-                    doc.close()
-    nao_lidas |= {i: f"teto de {PAGINAS_TEXTO_MAX} páginas de texto" for i in range(lidas, total)}
-    pendentes = []
+                    if k == len(fila) and (parada is not None or faixa[-1] + 1 == lidas):
+                        doc.close()  # na última vez: um PDF curto pega a trava só duas vezes
+                        doc = None
+            if parada is not None:
+                _marcar(nao_lidas, parada, total, f"a página {parada + 1} não abre")
+                break
+        if parada is None:
+            _marcar(nao_lidas, lidas, total, f"teto de {PAGINAS_TEXTO_MAX} páginas de texto")
+        # O /Count menor que as páginas do arquivo: a PDFium não abre as de fora da contagem, que o pdf_inspector achou.
+        _marcar(nao_lidas, total, encontradas, "fora da contagem de páginas do PDF")
+    finally:
+        if doc is not None:
+            with PDFIUM:
+                doc.close()
     for faixa, motivo in _faixas(so_texto):
         pendentes.append(f"{faixa}: só o texto, sem figuras nem páginas escaneadas lidas ({motivo})")
         seguranca.append(  # o texto oculto dessas páginas não foi conferido: suspeita, nunca "nada oculto"
-            {"tecnicas": ["não conferido"], "texto": "", "alerta": f"texto oculto não conferido: {faixa} ({motivo})"}
+            {"tecnicas": ["não conferido"], "texto": "", "alerta": f"{NAO_CONFERIDO}: {faixa} ({motivo})"}
         )
     pendentes += [f"{faixa}: não lidas ({motivo})" for faixa, motivo in _faixas(nao_lidas)]
-    return {"tipo": "pdf", "paginas": paginas, "paginas_total": total, "tarefas": tarefas, "texto_oculto": seguranca,
-            "pendentes": pendentes}  # fmt: skip
+    plano = {"tipo": "pdf", "paginas": paginas, "paginas_total": max(total, encontradas), "tarefas": tarefas,
+             "texto_oculto": seguranca, "pendentes": pendentes}  # fmt: skip
+    if propriedades:
+        plano["propriedades"] = propriedades
+    return plano
 
 
-def _faixas(motivos):
-    """(faixa de páginas, motivo) de {página: motivo}, na ordem em que os motivos apareceram."""
-    for motivo in dict.fromkeys(motivos.values()):
-        ns = [i + 1 for i, m in motivos.items() if m == motivo]
-        yield (f"página {ns[0]}" if len(ns) == 1 else f"páginas {ns[0]}–{ns[-1]}"), motivo
+def _propriedades(doc):
+    """Propriedades do PDF (título, autor, produtor), sem as vazias. Chamar com a trava."""
+    try:
+        return {k: v for k, v in doc.get_metadata_dict().items() if v}
+    except Exception:  # noqa: BLE001 — PDF sem propriedades legíveis: segue sem elas
+        return {}
+
+
+def _marcar(intervalos, a, b, motivo):
+    """Junta as páginas [a, b) com o motivo aos intervalos [início, fim, motivo], emendando no último quando seguem
+    dele com o mesmo motivo. Guarda intervalos, não páginas: um /Count de um milhão não vira um milhão de entradas."""
+    if a >= b:
+        return
+    if intervalos and intervalos[-1][1] == a and intervalos[-1][2] == motivo:
+        intervalos[-1][1] = b
+    else:
+        intervalos.append([a, b, motivo])
+
+
+def _faixas(intervalos):
+    """(faixa de páginas, motivo) de cada intervalo [início, fim, motivo]."""
+    for a, b, motivo in intervalos:
+        yield (f"página {a + 1}" if b - a == 1 else f"páginas {a + 1}–{b}"), motivo
 
 
 def _vencido():
@@ -168,29 +214,49 @@ def _so_texto(i):
     return "prazo esgotado" if _vencido() else None
 
 
-def _extrair(path, fila, total):
+def _extrair(doc, path, faixa, total):
     """Texto das páginas da faixa pelo pdf_inspector: markdown, páginas para OCR e itens com posição, por página do
-    documento. Documento de até uma faixa é lido direto do arquivo; o maior vai em cópias de uma faixa cada."""
+    documento, e quantas páginas da faixa abrem (o /Count declarado pode passar das páginas que o arquivo tem).
+    Documento de até uma faixa é lido direto do arquivo; o maior vai em cópias de uma faixa cada."""
     import pdf_inspector
 
     if total <= FAIXA:
         res = pdf_inspector.extract_pages_markdown(path)
         posicoes = pdf_inspector.extract_text_with_positions(path)
+        abertas = len(faixa)  # a página que não abre para a leitura em _pagina
     else:
         with PDFIUM:
-            doc = pdfium.PdfDocument(path)
-            try:
-                dados = _copia(doc, fila)
-            finally:
-                doc.close()
+            dados, abertas = _copia_da_faixa(doc, faixa)
+        if not abertas:
+            return {}, set(), {}, 0
         res = pdf_inspector.extract_pages_markdown_bytes(dados)
         posicoes = pdf_inspector.extract_text_with_positions_bytes(dados)
-    a = fila[0]
+    a = faixa[0]
     itens_de = defaultdict(list)
     for t in posicoes:
         if t.text.strip():
             itens_de[a + t.page - 1].append(t)
-    return {a + pg.page: pg.markdown for pg in res.pages}, {a + p - 1 for p in res.pages_needing_ocr}, itens_de
+    return {a + pg.page: pg.markdown for pg in res.pages}, {a + p - 1 for p in res.pages_needing_ocr}, itens_de, abertas
+
+
+def _copia_da_faixa(doc, faixa):
+    """Bytes da cópia das páginas da faixa e quantas entraram: até a anterior à primeira que não abre, quando o /Count
+    declarado passa das páginas que o arquivo tem. Chamar com a trava."""
+    try:
+        return _copia(doc, faixa), len(faixa)
+    except pdfium.PdfiumError:
+        abertas = next((k for k, i in enumerate(faixa) if not _abre(doc, i)), None)
+        if abertas is None:  # todas abrem: a cópia falhou por outro motivo
+            raise
+        return (_copia(doc, faixa[:abertas]) if abertas else b""), abertas
+
+
+def _abre(doc, i):
+    try:
+        doc[i].close()
+    except pdfium.PdfiumError:
+        return False
+    return True
 
 
 def _copia(doc, paginas, editar=None):
@@ -208,69 +274,118 @@ def _copia(doc, paginas, editar=None):
         novo.close()
 
 
-def _sem_ocultos(doc, i, ocultos):
-    """Markdown (pdf_inspector) e texto (PDFium) da página `i` tirados de uma cópia dela sem os objetos de texto dos
-    itens ocultos, e os itens que não deram com nenhum objeto. Chamar com a trava; o documento original não muda.
+def _alvos_ocultos(page, ocultos):
+    """Índices, na página, dos objetos de texto dos itens ocultos, e os itens que não saem pela posição: sem objeto de
+    texto que coincida, ou com um dentro de uma forma (Form XObject). A PDFium não regrava o conteúdo da forma, e a
+    mesma forma pode estar desenhada também num lugar visível. Chamar com a trava.
 
-    O oculto sai por posição, na origem: um texto visível igual a um oculto continua inteiro no corpo."""
+    Cada item só é comparado com os objetos cujo centro cai na caixa dele (quem cobre metade de um objeto cobre o
+    centro dele), achados numa grade. Acima de `OCULTOS_COMPARACOES_MAX`, nenhum item sai pela posição."""
+    l0, b0 = _origem_visivel(page)
+    grade = defaultdict(list)
+    for o in _objetos_de_texto(page):
+        l, b, r, t = o[2]
+        cx, cy = (l + max(r, l + 0.01)) / 2, (b + max(t, b + 0.01)) / 2
+        if math.isfinite(cx) and math.isfinite(cy):
+            grade[int(cx // CELULA), int(cy // CELULA)].append(o)
+    alvos, sobrou, custo = set(), [], 0
+    for x in ocultos:
+        l, b, r, t = _caixa_do_item(x, l0, b0)
+        n = ((r - l) / CELULA + 2) * ((t - b) / CELULA + 2)  # células na caixa; inf ou nan num item hostil
+        if n <= len(grade):
+            celulas = [(cx, cy) for cx in range(int(l // CELULA), int(r // CELULA) + 1)
+                       for cy in range(int(b // CELULA), int(t // CELULA) + 1)]  # fmt: skip
+        else:  # caixa maior que a grade: percorre as células ocupadas
+            celulas = [k for k in grade if k[0] * CELULA <= r and (k[0] + 1) * CELULA >= l
+                       and k[1] * CELULA <= t and (k[1] + 1) * CELULA >= b]  # fmt: skip
+        perto = [grade[cel] for cel in celulas if cel in grade]
+        custo += (len(celulas) if n <= len(grade) else len(grade)) + sum(map(len, perto))
+        if custo > OCULTOS_COMPARACOES_MAX:
+            return set(), list(ocultos)
+        achou = [o for objs in perto for o in objs if _coincide(o, x, l0, b0)]
+        if achou and all(k is not None for _raw, k, _caixa in achou):
+            alvos |= {k for _raw, k, _caixa in achou}
+        else:
+            sobrou.append(x)
+    return alvos, sobrou
+
+
+def _sem_ocultos(doc, i, alvos, n):
+    """Markdown (pdf_inspector) e texto (PDFium) da página `i` tirados de uma cópia dela sem os objetos de texto
+    `alvos` (índices na página de `n` objetos), ou None se a cópia não tem os mesmos objetos. Chamar com a trava; o
+    documento original não muda. O oculto sai por posição, na origem: um texto visível igual a ele fica inteiro."""
     import pdf_inspector
 
-    sobrou, texto = [], []
+    texto = []
 
     def editar(novo):
         page = novo[0]
-        l0, b0 = _origem_visivel(page)
-        textos = list(_objetos_de_texto(page))
-        alvos = {}
-        for x in ocultos:
-            achou = [o for o in textos if _coincide(o, x, l0, b0)]
-            if not achou:
-                sobrou.append(x)
-            alvos |= {ctypes.cast(o[0], ctypes.c_void_p).value: o for o in achou}
-        for raw, dono, _caixa in alvos.values():
-            ok = c.FPDFFormObj_RemoveObject(dono, raw) if dono else c.FPDFPage_RemoveObject(page.raw, raw)
-            if ok:
+        if c.FPDFPage_CountObjects(page.raw) != n:
+            return
+        for raw in [c.FPDFPage_GetObject(page.raw, k) for k in sorted(alvos)]:  # antes: remover muda os índices
+            if c.FPDFPage_RemoveObject(page.raw, raw):
                 c.FPDFPageObj_Destroy(raw)
         page.gen_content()
         texto.append(texto_pdfium(page))
 
     dados = _copia(doc, [i], editar)
+    if not texto:
+        return None
     res = pdf_inspector.extract_pages_markdown_bytes(dados)  # uma página: rápido, dentro da trava mesmo
-    return (res.pages[0].markdown if res.pages else ""), texto[0], sobrou
+    return (res.pages[0].markdown if res.pages else ""), texto[0]
+
+
+def _caixa_visivel(page):
+    """A caixa visível da página, como o pdf_inspector mede as posições: CropBox ∩ MediaBox, ou a MediaBox quando a
+    CropBox não a sobrepõe (ela é ignorada). Devolve a caixa e se a CropBox valeu."""
+    ml, mb, mr, mt = page.get_mediabox()
+    cl, cb, cr, ct = page.get_cropbox()
+    l, b, r, t = max(ml, cl), max(mb, cb), min(mr, cr), min(mt, ct)
+    return ((l, b, r, t), True) if l < r and b < t else ((ml, mb, mr, mt), False)
 
 
 def _origem_visivel(page):
-    """Canto inferior esquerdo da caixa visível (CropBox ∩ MediaBox), a origem das posições do pdf_inspector."""
-    ml, mb, _, _ = page.get_mediabox()
-    cl, cb, _, _ = page.get_cropbox()
-    return max(ml, cl), max(mb, cb)
+    """Canto inferior esquerdo da caixa visível, a origem das posições do pdf_inspector."""
+    (l, b, _r, _t), _ = _caixa_visivel(page)
+    return l, b
 
 
 def _objetos_de_texto(page):
-    """Gera (raw, forma que o contém ou None, caixa na página) de cada objeto de texto, inclusive dentro de formas."""
+    """Gera (raw, índice na página ou None dentro de uma forma, caixa na página) de cada objeto de texto, inclusive os
+    de dentro das formas."""
 
-    def walk(dono, raws, m):
+    def walk(raws, m):
         for raw in raws:
             tipo = c.FPDFPageObj_GetType(raw)
-            box = _bounds(raw)
             if tipo == c.FPDF_PAGEOBJ_TEXT:
-                yield raw, dono, (_transform(box, m) if m else box)
+                yield raw, None, _transform(_bounds(raw), m)
             elif tipo == c.FPDF_PAGEOBJ_FORM:
-                mm = _compose(_matrix(raw), m) if m else _matrix(raw)
-                n = c.FPDFFormObj_CountObjects(raw)
-                yield from walk(raw, [c.FPDFFormObj_GetObject(raw, k) for k in range(n)], mm)
+                yield from walk(_filhos(raw), _compose(_matrix(raw), m))
 
-    n = c.FPDFPage_CountObjects(page.raw)
-    yield from walk(None, [c.FPDFPage_GetObject(page.raw, k) for k in range(n)], None)
+    for k in range(c.FPDFPage_CountObjects(page.raw)):
+        raw = c.FPDFPage_GetObject(page.raw, k)
+        tipo = c.FPDFPageObj_GetType(raw)
+        if tipo == c.FPDF_PAGEOBJ_TEXT:
+            yield raw, k, _bounds(raw)
+        elif tipo == c.FPDF_PAGEOBJ_FORM:
+            yield from walk(_filhos(raw), _matrix(raw))
+
+
+def _filhos(forma):
+    return [c.FPDFFormObj_GetObject(forma, k) for k in range(c.FPDFFormObj_CountObjects(forma))]
+
+
+def _caixa_do_item(x, l0, b0):
+    """Caixa do item do pdf_inspector na página, com folga para a diferença entre as medidas dele e as da PDFium."""
+    folga = 1 + 0.25 * x.height
+    return l0 + x.x - folga, b0 + x.y - folga, l0 + x.x + x.width + folga, b0 + x.y + x.height + folga
 
 
 def _coincide(obj, x, l0, b0):
     """O objeto de texto é parte do item: cai quase todo na caixa dele e não tem outra cor nem outro modo de pintura
     (um texto visível desenhado no mesmo lugar fica)."""
-    raw, _dono, (l, b, r, t) = obj
-    folga = 1 + 0.25 * x.height
-    item = [l0 + x.x - folga, b0 + x.y - folga, l0 + x.x + x.width + folga, b0 + x.y + x.height + folga]
-    if _sobrepoe([l, b, max(r, l + 0.01), max(t, b + 0.01)], item) < 0.5:
+    raw, _k, (l, b, r, t) = obj
+    if _sobrepoe([l, b, max(r, l + 0.01), max(t, b + 0.01)], _caixa_do_item(x, l0, b0)) < 0.5:
         return False
     if (c.FPDFTextObj_GetTextRenderMode(raw) == 3) != (x.render_mode == 3):
         return False
@@ -280,9 +395,16 @@ def _coincide(obj, x, l0, b0):
     return True
 
 
-def _pagina(doc, i, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca):
-    """Roteamento de uma página: texto, regiões visuais, tabela duvidosa, fórmula e texto oculto. Chamar com a trava."""
-    page = doc[i]
+def _pagina(doc, i, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca, pendentes):
+    """Roteamento de uma página: texto, regiões visuais, tabela duvidosa, fórmula e texto oculto, ou None se a página
+    não abre (o /Count declarado passa das páginas do arquivo). Chamar com a trava."""
+    try:
+        page = doc[i]
+    except pdfium.PdfiumError:
+        return None
+    caixa, cropbox_valeu = _caixa_visivel(page)
+    if not cropbox_valeu:  # a PDFium daria tamanho zero à página: vale a MediaBox, como no pdf_inspector (em memória)
+        page.set_cropbox(*caixa)
     W, H = page.get_size()
     # Imagens vizinhas viram um grupo: texto fatiado em imagens ("Version 8 –
     # March 2025" da capa da Falcon são 6 fatias) e logotipo pequeno contam.
@@ -292,8 +414,12 @@ def _pagina(doc, i, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca):
     vistos = re.sub(r"\s+", " ", " ".join(x.text for x in itens_pg)).lower()
     sobrou = []
     if ocultos:
-        md, alt_limpo, sobrou = _sem_ocultos(doc, i, [x for _, x in ocultos])
-        alt = alt_limpo if eh_ocr else ""
+        alvos, sobrou = _alvos_ocultos(page, [x for _, x in ocultos])
+        if alvos and (limpo := _sem_ocultos(doc, i, alvos, c.FPDFPage_CountObjects(page.raw))):
+            md, alt_limpo = limpo
+            alt = alt_limpo if eh_ocr else ""
+        elif alvos:  # a cópia não tem os mesmos objetos: nenhum item sai
+            sobrou = [x for _, x in ocultos]
         ids = {id(x) for _, x in ocultos}
         itens_pg = [x for x in itens_pg if id(x) not in ids]
     origem_texto = "pdf-inspector"
@@ -331,18 +457,21 @@ def _pagina(doc, i, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca):
             if len(ln) >= 20 and ln.lower() not in vistos and ln.lower()[:20] not in vistos:
                 registro.append(("não renderizado (invisível)", ln))
     if registro:
-        # Item oculto sem objeto de texto que o tire da cópia, ou texto não renderizado que o extrator pôs no corpo:
-        # o corpo pode ter o oculto, e quem chama precisa saber.
+        # Item oculto que não saiu da cópia (sem objeto de texto, dentro de forma, acima do teto), ou texto não
+        # renderizado que o extrator pôs no corpo: o corpo pode ter o oculto, e quem chama precisa saber.
         corpo = re.sub(r"\s+", " ", md).lower()
         ficou = sobrou or any(m == "não renderizado (invisível)" and t.lower() in corpo for m, t in registro)
+        alerta = f"texto oculto que pode ter ficado no corpo: página {i + 1}"
         seguranca.append(
             {
                 "pagina": i + 1,
                 "tecnicas": sorted({m for m, _ in registro}),
                 "texto": " ".join(t for _, t in registro)[:500],
             }
-            | ({"alerta": f"texto oculto que pode ter ficado no corpo: página {i + 1}"} if ficou else {})
+            | ({"alerta": alerta} if ficou else {})
         )
+        if ficou:
+            pendentes.append(alerta)
     # Tabela nativa duvidosa: recorte da tabela vai para a IA (com o nativo como âncora).
     for k, tb in enumerate(tabelas):
         if not tb["complexa"]:

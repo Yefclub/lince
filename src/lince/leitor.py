@@ -103,7 +103,7 @@ class Leitor:
     def _planejar(self, caminho, pasta):
         os.makedirs(f"{pasta}/ia", exist_ok=True)
         ext = _extensao_lida(caminho)
-        if ext == ".pdf":  # toma a trava da PDFium por faixa: Office, HTML, texto e outros PDFs seguem em paralelo
+        if ext == ".pdf":  # a trava da PDFium vai em vezes curtas: Office, HTML, texto e outros PDFs seguem em paralelo
             plano = planejar_pdf(caminho, pasta)
         elif ext in IMAGEM:
             plano = _plano_imagem(caminho, pasta)
@@ -119,7 +119,7 @@ class Leitor:
             plano = planejar_office(caminho, pasta, ext)
         plano["arquivo"] = os.path.basename(caminho)
         plano["meta_arquivo"] = metadados_arquivo(caminho, ext)
-        if plano.get("propriedades"):  # HTML e SVG já tiram as propriedades no mesmo parse do corpo
+        if plano.get("propriedades"):  # HTML, SVG e PDF já tiram as propriedades na leitura do corpo
             plano["meta_arquivo"]["propriedades"] = plano.pop("propriedades")
         if plano.get("ilegiveis"):
             plano["meta_arquivo"].setdefault("partes_ilegiveis", []).extend(plano["ilegiveis"])

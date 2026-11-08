@@ -21,25 +21,10 @@ from .seguranca import bordas_sem_oculto
 
 def metadados_arquivo(path, ext=None):
     """Metadados que a empresa precisa e que não estão no corpo: propriedades do arquivo,
-    comentários e alterações rastreadas (DOCX), abas ocultas (XLSX), info do PDF. `ext` é o formato já decidido."""
+    comentários e alterações rastreadas (DOCX), abas ocultas (XLSX). `ext` é o formato já decidido. As propriedades do
+    PDF saem do plano (`planejar_pdf`), lidas na mesma vez da PDFium que abre o documento."""
     meta = {}
     ext = ext or os.path.splitext(path)[1].lower()
-    if ext == ".pdf":
-        import pypdfium2 as pdfium
-
-        from ._trava import PDFIUM
-
-        try:
-            with PDFIUM:
-                doc = pdfium.PdfDocument(path)
-                try:
-                    info = doc.get_metadata_dict()
-                finally:
-                    doc.close()
-            meta["propriedades"] = {k: v for k, v in info.items() if v}
-        except Exception:  # noqa: BLE001, S110 — PDF sem propriedades legíveis: segue sem elas
-            pass
-        return meta
     if ext in ODF:
         meta = _metadados_odf(path, meta, ext)
         if estrutura := estrutura_arquivo(path, ext):

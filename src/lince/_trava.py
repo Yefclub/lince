@@ -12,9 +12,9 @@ from collections import deque
 class TravaJusta:
     """Trava reentrante que atende por ordem de chegada.
 
-    Um PDF grande toma a trava por faixa de páginas e a solta entre as faixas. Com `threading.Lock`, quem solta pode
-    pegá-la de volta na hora, antes de quem está esperando acordar, e um PDF de uma página espera o grande inteiro.
-    Aqui a trava passa direto para o primeiro da fila: quem solta e pede de novo vai para o fim dela."""
+    Um PDF grande toma a trava em vezes curtas (`VEZ_S` em pdf.py) e a solta entre elas. Com `threading.Lock`, quem
+    solta pode pegá-la de volta na hora, antes de quem está esperando acordar, e um PDF de uma página espera o grande
+    inteiro. Aqui a trava passa direto para o primeiro da fila: quem solta e pede de novo vai para o fim dela."""
 
     def __init__(self):
         self._estado = threading.Lock()
@@ -35,7 +35,15 @@ class TravaJusta:
                 return False
             vez = (eu, threading.Event())
             self._fila.append(vez)
-        vez[1].wait(None if timeout is None or timeout < 0 else timeout)
+        try:
+            vez[1].wait(None if timeout is None or timeout < 0 else timeout)
+        except BaseException:  # interrompida na espera (KeyboardInterrupt, alarme): nunca deixa a trava presa
+            with self._estado:
+                if self._dono == eu:  # a vez chegou junto com a interrupção: passa para o próximo
+                    self._passar()
+                else:
+                    self._fila.remove(vez)
+            raise
         with self._estado:
             if self._dono == eu:  # recebeu a trava, mesmo que no limite do timeout
                 return True
@@ -47,14 +55,17 @@ class TravaJusta:
             if self._dono != threading.get_ident():
                 raise RuntimeError("a trava da PDFium não é desta thread")
             self._nivel -= 1
-            if self._nivel:
-                return
-            if self._fila:
-                self._dono, vez = self._fila.popleft()
-                self._nivel = 1
-                vez.set()
-            else:
-                self._dono = None
+            if not self._nivel:
+                self._passar()
+
+    def _passar(self):
+        """Dá a trava ao primeiro da fila, ou a deixa livre. Chamar com `_estado`."""
+        if self._fila:
+            self._dono, vez = self._fila.popleft()
+            self._nivel = 1
+            vez.set()
+        else:
+            self._dono, self._nivel = None, 0
 
     def __enter__(self):
         self.acquire()
