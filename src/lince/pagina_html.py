@@ -3,10 +3,12 @@ ambiguidade (atributo hidden; display:none, opacity:0, visibility:hidden e fonte
 atributos de apresentação do SVG) sai do corpo e vira alerta. O style é lido pelo tinycss2, com a cascata do CSS
 (última declaração válida, !important vence, valor inválido descartado) e herança de visibility e font-size.
 
-Limites (a página não é renderizada): cor do texto contra o fundo (branco sobre azul é visível), estilo de classe numa
-folha <style>, calc(), font-size sem unidade do modo quirks, <foreignObject> tratado como SVG e conteúdo de
+Limites (a página não é renderizada): cor do texto contra o fundo (branco sobre azul é visível, e a cor transparente
+também fica de fora), estilo de classe numa folha <style>, valor com função (calc, var, min, max, clamp), opacidade
+quase zero, layout (fora da tela, text-indent negativo, tamanho zero com overflow, clip, zoom), font-size sem unidade
+do modo quirks, <foreignObject> tratado como SVG e conteúdo de
 <symbol>/<defs> desenhado por <use> (vai para o alerta), e técnicas que o Lince não avalia: content-visibility,
-transform:scale(0), filter, clip-path e hidden num elemento do SVG. Imagem
+transform:scale(0), filter e clip-path. Imagem
 embutida (data:) é lida pela IA; imagem externa nunca é baixada (o Lince não busca nada na rede por causa de um
 documento)."""
 
@@ -39,10 +41,14 @@ _TELA_PX = 10  # 1vw numa tela de 1000px: só importa saber que não é zero
 _TAMANHOS = {"xx-small": 9, "x-small": 10, "small": 13, "medium": 16, "large": 18, "x-large": 24, "xx-large": 32,
              "xxx-large": 48}  # fmt: skip
 _FONTES_DO_SISTEMA = {"caption", "icon", "menu", "message-box", "small-caption", "status-bar"}
-_PREFIXO_FONT = {"normal", "italic", "oblique", "small-caps", "bold", "bolder", "lighter", "ultra-condensed",
-                 "extra-condensed", "condensed", "semi-condensed", "semi-expanded", "expanded", "extra-expanded",
-                 "ultra-expanded"}  # fmt: skip
-_GLOBAIS = _MANTEM | {"initial", "default"}
+_PREFIXO_FONT = {"normal": "normal", "italic": "estilo", "oblique": "estilo", "small-caps": "variante",
+                 "bold": "peso", "bolder": "peso", "lighter": "peso",
+                 **dict.fromkeys(["ultra-condensed", "extra-condensed", "condensed", "semi-condensed", "semi-expanded",
+                                  "expanded", "extra-expanded", "ultra-expanded"], "largura")}  # fmt: skip
+_GLOBAIS = _MANTEM | {"initial"}  # "default" é reservado, mas não é global: o navegador descarta a declaração
+_NAO_FAMILIA = _GLOBAIS | {"default"}
+# o navegador não desenha: conteúdo alternativo (canvas, video, audio), listas de sugestão e dialog fechado
+_NAO_MOSTRA = {"datalist", "noembed", "noframes", "canvas", "video", "audio"}
 _DISPLAY = {"none", "block", "inline", "inline-block", "flex", "inline-flex", "grid", "inline-grid", "flow-root",
             "table", "inline-table", "table-row", "table-cell", "table-column", "table-row-group", "table-column-group",
             "table-header-group", "table-footer-group", "table-caption", "list-item", "contents", "run-in", "ruby",
@@ -166,6 +172,8 @@ def _classificar(nome, tokens, pai_px, raiz_px, atributo_svg=False):
         unico.lower_value if unico is not None and unico.type == "ident" and unico.lower_value in _GLOBAIS else None
     )
     if nome == "display":  # uma palavra só: combinações de duas palavras raras inline ficam como inválidas
+        if global_ in ("revert", "revert-layer"):
+            return "revert"  # volta à folha do navegador, onde [hidden] é display:none
         if global_:
             return "outro"  # o valor do pai ou o inicial (inline): o pai está à mostra
         ok = unico is not None and unico.type == "ident" and unico.lower_value in _DISPLAY
@@ -221,9 +229,9 @@ def _px_do_atalho(tokens, pai_px, raiz_px):
     if len(tokens) == 1 and tokens[0].type == "ident" and tokens[0].lower_value in _FONTES_DO_SISTEMA:
         return 13.0
     k, vistos = 0, set()
-    while k < len(tokens) and k < 4:  # prefixo: palavras da lista fechada ou peso de 1 a 1000, sem repetir
+    while k < len(tokens) and k < 4:  # prefixo: estilo, variante, peso e largura, cada um no máximo uma vez
         t = tokens[k]
-        chave = t.lower_value if t.type == "ident" and t.lower_value in _PREFIXO_FONT else None
+        chave = _PREFIXO_FONT.get(t.lower_value) if t.type == "ident" else None
         if chave is None and t.type == "number" and 1 <= t.value <= 1000:
             chave = "peso"
         if chave is None or (chave in vistos and chave != "normal"):
@@ -235,10 +243,14 @@ def _px_do_atalho(tokens, pai_px, raiz_px):
     resto = tokens[k + 1 :]
     if resto and resto[0].type == "literal" and resto[0].value == "/":
         altura = resto[1] if len(resto) > 1 else None
-        valida = altura is not None and (
-            altura.type in ("number", "percentage")
-            or (altura.type == "dimension" and altura.lower_unit in _PX | _DO_PAI | _DA_RAIZ)
-            or (altura.type == "ident" and altura.lower_value == "normal")
+        valida = (
+            altura is not None
+            and (altura.type not in ("number", "percentage", "dimension") or altura.value >= 0)
+            and (
+                altura.type in ("number", "percentage")
+                or (altura.type == "dimension" and altura.lower_unit in _PX | _DO_PAI | _DA_RAIZ)
+                or (altura.type == "ident" and altura.lower_value == "normal")
+            )
         )
         if not valida:
             return None
@@ -252,7 +264,7 @@ def _px_do_atalho(tokens, pai_px, raiz_px):
             atual.append(r)
     for item in itens:
         so_string = len(item) == 1 and item[0].type == "string"
-        so_idents = item and all(x.type == "ident" and x.lower_value not in _GLOBAIS for x in item)
+        so_idents = item and all(x.type == "ident" and x.lower_value not in _NAO_FAMILIA for x in item)
         if not (so_string or so_idents):
             return None
     return tamanho
@@ -294,8 +306,10 @@ def _tirar_oculto(raiz) -> list:
         em_svg = em_svg or el.tag == "svg"
         efetivas = _efetivas(el, em_svg, px, raiz_px)
         tecnica = None
-        if el.get("hidden") is not None and efetivas.get("display") != "outro":  # display do autor vence o hidden
-            tecnica = "atributo hidden"
+        if el.get("hidden") is not None and not em_svg and efetivas.get("display") != "outro":
+            tecnica = "atributo hidden"  # display do autor vence o hidden; revert volta a ele; no SVG não vale
+        elif not em_svg and (el.tag in _NAO_MOSTRA or (el.tag == "dialog" and el.get("open") is None)):
+            tecnica = "conteúdo que o navegador não mostra"
         elif em_svg and el.tag in _SVG_NAO_DESENHA:
             tecnica = "parte do SVG que não é desenhada"
         elif efetivas.get("display") == "none" or efetivas.get("opacity", 1.0) <= 0:
