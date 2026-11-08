@@ -90,6 +90,67 @@ def graficos_ooxml(path):
     return out
 
 
+_ODF_CHART = {"bar": "barras", "line": "linhas", "circle": "pizza", "ring": "rosca", "area": "área",
+              "scatter": "dispersão", "radar": "radar", "filled-radar": "radar", "bubble": "bolhas",
+              "stock": "ações", "gantt": "Gantt"}  # fmt: skip
+_CH = "urn:oasis:names:tc:opendocument:xmlns:chart:1.0"
+_TB = "urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+_TX = "urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+_LINHAS_GRAFICO_MAX = 1000  # linhas da tabela de dados de um gráfico; o resto fica de fora, registrado
+
+
+def _celulas(linha) -> list[str]:
+    """Texto das células de uma linha da tabela local, com table:number-columns-repeated limitado."""
+    out = []
+    for c in linha.findall(f"{{{_TB}}}table-cell"):
+        texto = " ".join(" ".join(t for p in c.findall(f"{{{_TX}}}p") for t in p.itertext()).split())  # sem o svg:desc
+        out += [texto] * min(int(c.get(f"{{{_TB}}}number-columns-repeated", "1") or 1), 64)
+    return out
+
+
+def graficos_odf(path, ilegiveis) -> list[dict]:
+    """Gráfico do LibreOffice (.ods, .odp, .odt): cada objeto embutido com office:chart traz tipo, título e a tabela
+    local com os dados que ele desenha. Mesmo formato de graficos_ooxml."""
+    out = []
+    with zipfile.ZipFile(path) as z:
+        for nome in sorted(n for n in z.namelist() if re.fullmatch(r"(?:[^/]+/)*Object \d+/content\.xml", n)):
+            raiz = xml_ou_nada(z.read(nome))
+            grafico = raiz.find(f".//{{{_CH}}}chart") if raiz is not None else None
+            if grafico is None:
+                continue
+            tipo = (grafico.get(f"{{{_CH}}}class") or "").rsplit(":", 1)[-1]
+            titulo = (
+                " ".join(" ".join(grafico.find(f"{{{_CH}}}title").itertext()).split())
+                if grafico.find(f"{{{_CH}}}title") is not None
+                else ""
+            )
+            tabela = grafico.find(f".//{{{_TB}}}table")
+            linhas = list(tabela.iter(f"{{{_TB}}}table-row")) if tabela is not None else []
+            if len(linhas) > _LINHAS_GRAFICO_MAX + 1:
+                ilegiveis.append(
+                    f"gráfico {titulo or nome}: mais de {_LINHAS_GRAFICO_MAX} linhas; o resto ficou de fora"
+                )
+            cabecalho, dados = (
+                (_celulas(linhas[0]), [_celulas(r) for r in linhas[1 : _LINHAS_GRAFICO_MAX + 1]])
+                if linhas
+                else ([], [])
+            )
+            series = [
+                {"nome": cabecalho[k] or f"série {k}", "cats": [d[0] if d else "" for d in dados],
+                 "vals": [d[k] if k < len(d) else "" for d in dados], "ref": None}
+                for k in range(1, len(cabecalho))
+            ]  # fmt: skip
+            out.append(
+                {
+                    "parte": nome,
+                    "tipo": _ODF_CHART.get(tipo, tipo or "desconhecido"),
+                    "titulo": titulo,
+                    "series": series,
+                }
+            )
+    return out
+
+
 def grafico_md(g):
     linhas = [f"**Gráfico ({g['tipo']}): {g['titulo'] or 'sem título'}**"]
     ss = g["series"]
@@ -267,6 +328,8 @@ def planejar_office(path, pasta, ext=None):
         _complemento(imagens_planilha, "imagens da planilha", ilegiveis)
     if ext in (".xlsx", ".docx"):
         _complemento(lambda: extras.extend(grafico_md(g) for g in graficos_ooxml(path)), "gráficos", ilegiveis)
+    if ext in ODF:  # o leitor do corpo não entrega o gráfico do LibreOffice: tipo, título e os dados que ele desenha
+        _complemento(lambda: extras.extend(grafico_md(g) for g in graficos_odf(path, ilegiveis)), "gráficos", ilegiveis)
     if ext == ".pptx":
 
         def diagramas():
