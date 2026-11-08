@@ -491,6 +491,46 @@ def _fim_do_grupo(s: bytes, i: int) -> int:
     return -1 if prof else i
 
 
+_PICT = re.compile(rb"\{\\pict(?![a-z])")
+_TIPO_PICT = re.compile(rb"\\(pngblip|jpegblip|emfblip|wmetafile|dibitmap)(?![a-z])")
+_MIME_PICT = {b"pngblip": "image/png", b"jpegblip": "image/jpeg", b"emfblip": "image/x-emf",
+              b"wmetafile": "image/x-wmf", b"dibitmap": "image/bmp"}  # fmt: skip
+_SUBGRUPO = re.compile(rb"\{[^{}]*\}")  # {\*\blipuid ...} e afins dentro do \pict
+_PALAVRA = re.compile(rb"\\[a-z]+-?\d* ?")
+
+
+def imagens_rtf(dados: bytes) -> tuple[list[tuple[str, bytes]], bool]:
+    """Imagens (\\pict em hexadecimal) dos grupos \\header e \\footer, com os mesmos tetos de rtf(). Devolve também se
+    todos os grupos foram lidos. O bitmap cru (\\dibitmap) ganha o cabeçalho de arquivo BMP."""
+    vistos, saida, percorridos = set(), [], 0
+    for m in _GRUPO_BORDA.finditer(dados):
+        fim = _fim_do_grupo(dados, m.end())
+        if fim < 0:
+            return saida, False
+        percorridos += fim - m.end()
+        if percorridos > _RELEITURA_MAX * len(dados):
+            return saida, False
+        corpo = dados[m.end() : fim - 1]
+        if corpo in vistos:
+            continue
+        vistos.add(corpo)
+        if len(vistos) > _GRUPOS_MAX:
+            return saida, False
+        for p in _PICT.finditer(corpo):
+            if (fim_p := _fim_do_grupo(corpo, p.end())) < 0 or not (tipo := _TIPO_PICT.search(corpo, p.end(), fim_p)):
+                continue
+            hexa = re.sub(rb"\s", b"", _PALAVRA.sub(b"", _SUBGRUPO.sub(b"", corpo[p.end() : fim_p - 1])))
+            try:  # só hexadecimal: \\bin (binário cru) e conteúdo quebrado ficam de fora
+                imagem = bytes.fromhex(hexa.decode("ascii"))
+            except ValueError:
+                continue
+            if tipo.group(1) == b"dibitmap" and (imagem := _bmp_do_dib(imagem)) is None:
+                continue
+            if imagem:
+                saida.append((_MIME_PICT[tipo.group(1)], imagem))
+    return saida, True
+
+
 def rtf(dados: bytes, ler_rtf) -> tuple[list[str], bool]:
     """Texto dos grupos \\header e \\footer (e variantes l, r, f). Cada grupo vira um RTF mínimo com o prólogo e a
     tabela de fontes do original e é lido pelo mesmo leitor do corpo (`ler_rtf`), que já resolve página de código

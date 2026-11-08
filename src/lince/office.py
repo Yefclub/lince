@@ -4,14 +4,14 @@ import hashlib
 import io  # noqa: F401
 import json  # noqa: F401
 import os  # noqa: F401
-import re  # noqa: F401
+import re
 import secrets
-import zipfile  # noqa: F401
+import zipfile
 from xml.etree import ElementTree as ET  # noqa: F401
 
 from . import legados
 from .limites import xml_ou_nada
-from .metadados import BINARIOS_OLE
+from .metadados import BINARIOS_OLE, ODF
 from .seguranca import remover_ocultos, texto_oculto_docx
 
 NS = {
@@ -228,6 +228,19 @@ def planejar_office(path, pasta, ext=None):
                 md += "\n\n".join(ler_imagem(d, m, f"imagem do documento {n}") for n, (m, d) in enumerate(novas, 1))
 
         _complemento(imagens_legado, "imagens do documento", ilegiveis)
+    if ext in (".docx", ".docm", ".rtf") or ext in ODF:  # o leitor do corpo não entrega a imagem do cabeçalho
+
+        def imagens_bordas():
+            nonlocal md
+            achadas = _imagens_das_bordas(path, ext, ilegiveis)
+            novas = [(m, d) for m, d in achadas if hashlib.sha256(d).digest() not in vistas and min(_tam(d)) >= 48]
+            if novas:
+                md += "\n\n**Imagens do cabeçalho e do rodapé:**\n\n"
+                md += "\n\n".join(
+                    ler_imagem(d, m, f"imagem do cabeçalho/rodapé {n}") for n, (m, d) in enumerate(novas, 1)
+                )
+
+        _complemento(imagens_bordas, "imagens do cabeçalho e do rodapé", ilegiveis)
     seguranca = []
     if ext == ".docx":
         ocultos = texto_oculto_docx(path)
@@ -285,6 +298,46 @@ def planejar_office(path, pasta, ext=None):
 
 _FORMATOS = {"image/x-emf": "EMF", "image/emf": "EMF", "image/x-wmf": "WMF", "image/wmf": "WMF",
              "image/svg+xml": "SVG"}  # fmt: skip
+
+
+_MIDIA = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "bmp": "image/bmp",
+          "tif": "image/tiff", "tiff": "image/tiff", "emf": "image/x-emf", "wmf": "image/x-wmf",
+          "svg": "image/svg+xml"}  # fmt: skip
+_ODF_BORDAS = {"header", "footer", "header-left", "footer-left", "header-first", "footer-first"}
+_XLINK = "{http://www.w3.org/1999/xlink}href"
+
+
+def _mime(nome) -> str:
+    return _MIDIA.get(nome.rsplit(".", 1)[-1].lower(), "image/png")
+
+
+def _imagens_das_bordas(path, ext, ilegiveis) -> list[tuple[str, bytes]]:
+    """Imagens do cabeçalho e do rodapé, que o leitor do corpo não entrega: no Word, as relações de imagem das
+    partes header*/footer*; no ODF, as draw:image dentro do cabeçalho e do rodapé das páginas mestras (styles.xml);
+    no RTF, o \\pict dos grupos \\header e \\footer. O zip já foi conferido pelos limites antes da leitura."""
+    if ext == ".rtf":
+        achadas, completo = legados.imagens_rtf(open(path, "rb").read())
+        if not completo:
+            ilegiveis.append("imagens do cabeçalho e do rodapé (parcial)")
+        return achadas
+    achadas = []
+    with zipfile.ZipFile(path) as z:
+        nomes = set(z.namelist())
+        if ext in ODF:
+            raiz = xml_ou_nada(z.read("styles.xml")) if "styles.xml" in nomes else None
+            for borda in raiz.iter() if raiz is not None else ():
+                if borda.tag.rsplit("}", 1)[-1] in _ODF_BORDAS:
+                    for im in borda.iter():
+                        if im.tag.rsplit("}", 1)[-1] == "image" and (alvo := im.get(_XLINK)) in nomes:
+                            achadas.append((_mime(alvo), z.read(alvo)))
+            return achadas
+        for parte in sorted(n for n in nomes if re.fullmatch(r"word/_rels/(header|footer)\d*\.xml\.rels", n)):
+            rels = xml_ou_nada(z.read(parte))
+            for r in rels if rels is not None else ():
+                alvo = "word/" + (r.get("Target") or "").lstrip("/").removeprefix("word/")
+                if (r.get("Type") or "").endswith("/image") and r.get("TargetMode") != "External" and alvo in nomes:
+                    achadas.append((_mime(alvo), z.read(alvo)))
+    return achadas
 
 
 def _nao_lida(onde, mime, ilegiveis) -> str:
