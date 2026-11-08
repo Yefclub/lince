@@ -57,3 +57,6 @@ no corpo, montado com python-docx e convertido pelo LibreOffice. Sem dado de pes
 `lince_grafico.ods` e `lince_grafico.odp`: planilha e apresentação com um gráfico de barras e um de pizza sobre
 dados fictícios (Norte 120, Sul 80), montadas com openpyxl e python-pptx e convertidas pelo LibreOffice. O autor do
 modelo padrão do python-pptx foi trocado por "Autor teste".
+
+`lince_imagem_planilha.ods`: planilha com dados fictícios (Pedidos 42) e uma imagem sintética (retângulo azul),
+montada com openpyxl e convertida pelo LibreOffice. Sem dado de pessoa ou empresa.

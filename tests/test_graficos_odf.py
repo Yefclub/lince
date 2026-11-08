@@ -5,7 +5,7 @@ import zipfile
 from pathlib import Path
 
 import lince
-from lince import office
+from lince import legados, office
 
 REAIS = Path(__file__).parent / "fixtures" / "reais"
 
@@ -131,3 +131,48 @@ def test_linhas_vazias_tambem_pagam_o_orcamento(tmp_path, monkeypatch):
     graficos = office.graficos_odf(_ods(tmp_path, *[vazio] * 40), ilegiveis)
     assert 0 < len(graficos) < 40 and sum(len(office.grafico_md(g)) for g in graficos) <= 2_000_000
     assert sum("os demais ficaram de fora" in x for x in ilegiveis) == 1
+
+
+def test_imagem_da_planilha_do_libreoffice_e_lida_com_a_aba():
+    vistas = []
+    ia = lince.FuncaoLeitor(lambda img, instr: vistas.append(img) or "Retângulo azul.", "m")
+    r = lince.Leitor(ia=ia, agrupar=False).ler(REAIS / "lince_imagem_planilha.ods")
+    assert len(vistas) == 1 and "**Imagem (aba Painel):**" in r.markdown and "Retângulo azul." in r.markdown
+
+
+def test_previa_do_grafico_nao_e_lida_como_imagem():
+    ilegiveis = []
+    assert office._imagens_ods(REAIS / "lince_grafico.ods", ilegiveis) == [] and not ilegiveis
+
+
+def _ods_com_imagens(tmp_path, quadros):
+    corpo = "".join(
+        "<draw:frame>" + "".join(f'<draw:image xlink:href="Pictures/{n}"/>' for n in nomes) + "</draw:frame>"
+        for nomes in quadros
+    )
+    p = tmp_path / "imagens.ods"
+    with zipfile.ZipFile(p, "w") as z:
+        z.writestr(
+            "content.xml",
+            '<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+            'xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" '
+            'xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" '
+            'xmlns:xlink="http://www.w3.org/1999/xlink"><office:body><office:spreadsheet>'
+            f'<table:table table:name="Painel">{corpo}</table:table></office:spreadsheet></office:body>'
+            "</office:document-content>",
+        )
+        for nome in {n for nomes in quadros for n in nomes}:
+            z.writestr(f"Pictures/{nome}", nome.encode())
+    return p
+
+
+def test_frame_com_svg_e_png_de_reserva_e_uma_imagem_so(tmp_path):
+    achadas = office._imagens_ods(_ods_com_imagens(tmp_path, [["logo.svg", "logo.png"]]), [])
+    assert [(onde, mime) for onde, mime, _ in achadas] == [("aba Painel", "image/svg+xml")]
+
+
+def test_teto_de_imagens_da_planilha_fica_registrado(tmp_path, monkeypatch):
+    monkeypatch.setattr(legados, "IMAGENS_MAX", 2)
+    ilegiveis = []
+    achadas = office._imagens_ods(_ods_com_imagens(tmp_path, [["a.png"], ["b.png"], ["c.png"], ["d.png"]]), ilegiveis)
+    assert len(achadas) == 2 and ilegiveis == ["imagens da planilha: mais de 2; o resto ficou de fora"]
