@@ -13,8 +13,9 @@ o alerta, embora a pessoa possa abri-los), altura de linha em unidade de tela e 
 (recusados), HTML dentro de <foreignObject> tratado como SVG e conteúdo de <symbol>/<defs> desenhado por <use> e o
 texto alternativo de <canvas>, <video> e <audio> (vai para o alerta, que guarda até 500 caracteres; a mídia fica no
 corpo), e técnicas que o Lince não avalia: content-visibility, transform:scale(0), filter e clip-path. Imagem
-embutida (data:) e desenho SVG (pelo resvg; ícone abaixo de 48 px não) são lidos pela IA; imagem externa nunca é
-baixada (o Lince não busca nada na rede por causa de um documento)."""
+embutida (data:) e desenho SVG (pelo resvg; ícone abaixo de 48 px não, nem o SVG cujo texto o Lince considera
+escondido: ancestral invisível ou fonte de até 1 px) são lidos pela IA; imagem externa nunca é baixada (o Lince não
+busca nada na rede por causa de um documento)."""
 
 import base64
 import binascii
@@ -143,12 +144,13 @@ def planejar_html(path, pasta) -> dict:
     prefixo = _prefixo_livre(texto)
     visiveis = set(raiz.iter("svg"))  # SVG dentro de trecho oculto saiu da árvore: não é desenhado
     externos = [s for s in externos if s in visiveis]
-    for svg in externos:  # a cópia leva o que o SVG herda do HTML; o próprio style dele continua valendo
+    for svg in externos:  # o desenho só sai quando o Lince considera o texto do SVG visível
         invisivel, px = herdado.get(svg, (False, 16.0))
-        if invisivel:
-            copias[svg] = None  # o navegador não desenha nada: como a imagem invisível, não é lido
-        else:
-            copias[svg].set("font-size", f"{px:g}px")  # fonte zero herdada esconde o texto do desenho
+        if invisivel or px <= FONTE_INVISIVEL_PX:
+            copias[svg] = None  # escondido ou de fonte zero: o desenho mostraria o que o corpo tirou
+        else:  # a fonte que o Lince calculou (herança e style) manda no desenho, sem outra resolução
+            estilo = (copias[svg].get("style") or "").rstrip().rstrip(";")
+            copias[svg].set("style", f"{estilo};font-size:{px:g}px !important".lstrip(";"))
     # ícone (abaixo de 48 px) não vai para a IA; acima do teto, o desenho fica só no texto
     grandes = [s for s in externos if copias[s] is not None and (lado := tamanho(copias[s])) and min(lado) >= 48]
     if len(grandes) > DESENHOS_MAX:
