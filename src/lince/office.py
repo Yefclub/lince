@@ -15,7 +15,7 @@ from lxml import etree
 from . import legados, perfil_tabular
 from .limites import xml_ou_nada
 from .metadados import BINARIOS_OLE, ERROS_DE_PARTE, ODF
-from .seguranca import NAO_CONFERIDO, XMLIlegivel, _xml, remover_ocultos, texto_oculto_docx, texto_oculto_pptx
+from .seguranca import NAO_CONFERIDO, XMLIlegivel, _xml, limpar_docx, limpar_pptx
 
 NS = {
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
@@ -341,10 +341,15 @@ def planejar_office(path, pasta, ext=None):
     grande = ext in (".xlsx", ".xlsm") and _celulas_declaradas(path) > _CELULAS_ANYDOC_MAX
     # planilha grande não passa pelo anydoc, que monta o documento inteiro na memória (1,2 GB para 100 mil linhas)
     marca = f"LINCE{secrets.token_hex(8)}D"  # início de cada slide, trocado por <!-- slide N --> depois da leitura
+    limpeza = None  # o texto oculto sai do próprio XML, antes da conversão: nunca por busca no Markdown montado
     if grande:
         doc = None
     else:
         dados = open(path, "rb").read()
+        if ext in (".docx", ".docm"):
+            dados = (limpeza := limpar_docx(dados)).dados
+        elif ext in PPTX:
+            dados = (limpeza := limpar_pptx(dados)).dados
         if ext in PPTX:
             dados = _com_marcas_de_slide(dados, marca)
         try:
@@ -427,17 +432,11 @@ def planejar_office(path, pasta, ext=None):
 
         _complemento(imagens_bordas, "imagens do cabeçalho e do rodapé", ilegiveis)
     seguranca = []
-    conferir = texto_oculto_docx if ext in (".docx", ".docm") else texto_oculto_pptx if ext in PPTX else None
-    if conferir:
-        try:
-            ocultos = conferir(path)
-        except MemoryError:
-            raise
-        except Exception:  # noqa: BLE001 — XML hostil, parte cifrada ou CRC errado: não conferido é suspeita, vira alerta
-            ocultos = []
-            seguranca.append({"tecnicas": ["não conferido"], "texto": "", "alerta": NAO_CONFERIDO})
-        if ocultos:
-            md, _ = remover_ocultos(md, ocultos)
+    if limpeza is not None:
+        for falha in limpeza.falhas:  # parte que não pôde ser conferida: suspeita, com a parte e o motivo à vista
+            pendentes.append(f"{NAO_CONFERIDO}: {falha}")
+            seguranca.append({"tecnicas": ["não conferido"], "texto": "", "alerta": f"{NAO_CONFERIDO}: {falha}"})
+        if ocultos := limpeza.ocultos:
             seguranca.append(
                 {"tecnicas": sorted({m for m, _ in ocultos}), "texto": " ".join(t for _, t in ocultos)[:500]}
             )
@@ -488,7 +487,7 @@ def planejar_office(path, pasta, ext=None):
         por_slide = {}  # n -> o que entra no fim do slide (ou logo depois da tabela do gráfico)
 
         def diagramas():
-            for n, arestas in fluxos_pptx(path).items():
+            for n, arestas in fluxos_pptx(io.BytesIO(limpeza.dados)).items():  # o rótulo oculto não vira aresta
                 por_slide.setdefault(n, []).append(
                     (
                         None,

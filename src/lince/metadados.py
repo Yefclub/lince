@@ -16,6 +16,7 @@ from xml.etree import ElementTree as ET  # noqa: F401
 from . import legados
 from .estrutura import estrutura_arquivo
 from .limites import xml_ou_nada
+from .seguranca import bordas_sem_oculto
 
 
 def metadados_arquivo(path, ext=None):
@@ -71,9 +72,11 @@ def metadados_arquivo(path, ext=None):
     with zipfile.ZipFile(path) as z:
         nomes = set(z.namelist())
         ilegiveis = []
+        # o texto oculto do cabeçalho, do rodapé e dos comentários sai daqui como sai do corpo
+        sem_oculto = bordas_sem_oculto(z) if ext in (".docx", ".docm") else {}
 
         def ler(parte):
-            return _ler_parte(z, parte, ilegiveis)
+            return sem_oculto[parte] if parte in sem_oculto else _ler_parte(z, parte, ilegiveis)
 
         def arvore(parte):
             dados = ler(parte)

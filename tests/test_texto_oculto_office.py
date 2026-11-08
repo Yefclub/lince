@@ -54,7 +54,8 @@ def test_xml_que_nao_pode_ser_conferido_vira_alerta(tmp_path, monkeypatch):
 
     monkeypatch.setattr(seguranca, "_xml", falha)
     r = lince.ler(_docx(tmp_path, lambda d: d.add_paragraph("Mais texto.")))
-    assert seguranca.NAO_CONFERIDO in r.alertas_injecao
+    falha = f"{seguranca.NAO_CONFERIDO}: word/document.xml (hostil)"  # a parte e o motivo, no alerta e na cobertura
+    assert falha in r.alertas_injecao and falha in r.cobertura.pendentes
 
 
 def test_oculto_pelo_estilo(tmp_path):
@@ -287,7 +288,7 @@ def test_cadeia_de_estilos_enorme_nao_custa_quadratico(tmp_path):
     p = tmp_path / "cadeia.docx"
     d.save(p)
     inicio = time.monotonic()
-    seguranca.texto_oculto_docx(p)
+    seguranca.limpar_docx(p.read_bytes())
     assert time.monotonic() - inicio < 5
 
 
@@ -311,9 +312,9 @@ def test_texto_branco_em_caixa_de_texto_ou_sobre_figura_atras_do_texto_e_visivel
         '<w:r><w:pict><v:shape fillcolor="#1F3864" filled="t"><v:textbox><w:txbxContent><w:p>'
         f"{branco}</w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r>"
     )
-    assert seguranca.texto_oculto_docx(_docx_com_xml(tmp_path, caixa)) == []
+    assert seguranca.limpar_docx(_docx_com_xml(tmp_path, caixa).read_bytes()).ocultos == []
     atras = f'<w:r><w:drawing><wp:anchor behindDoc="1"/></w:drawing></w:r>{branco}'  # foto atrás do texto
-    assert seguranca.texto_oculto_docx(_docx_com_xml(tmp_path, atras, "atras.docx")) == []
+    assert seguranca.limpar_docx(_docx_com_xml(tmp_path, atras, "atras.docx").read_bytes()).ocultos == []
 
 
 def test_pptx_titulo_branco_sobre_foto_ou_faixa_escura_fica(tmp_path):
@@ -369,4 +370,4 @@ def test_papel_timbrado_atras_do_texto_no_cabecalho_deixa_o_fundo_incerto(tmp_pa
     desenho.append(etree.fromstring(f'<wp:anchor {ns} behindDoc="1"/>'))
     p = tmp_path / "timbrado.docx"
     d.save(p)
-    assert seguranca.texto_oculto_docx(p) == []
+    assert seguranca.limpar_docx(p.read_bytes()).ocultos == []
