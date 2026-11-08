@@ -110,7 +110,7 @@ def test_emf_no_powerpoint_nao_derruba_a_apresentacao(tmp_path):
     assert "Fluxo da moagem" in r.markdown and "EMF não lida]" in r.markdown and not vistas
 
 
-def test_svgs_do_documento_tem_teto_de_tempo_e_de_quantidade(tmp_path, monkeypatch):
+def test_svgs_do_documento_tem_teto_de_tempo(tmp_path, monkeypatch):
     monkeypatch.setattr(desenho_svg, "SEGUNDOS_MAX", 2)
     hostil = (
         b'<svg xmlns="http://www.w3.org/2000/svg" width="300" height="150"><filter id="t"><feTurbulence'
@@ -120,5 +120,8 @@ def test_svgs_do_documento_tem_teto_de_tempo_e_de_quantidade(tmp_path, monkeypat
     r, _ = _ler(_docx_com(tmp_path, "svg", "image/svg+xml", hostil, imagens=4))
     assert time.monotonic() - inicio < 6  # um teto para o documento, não um por imagem
     assert r.markdown.count("SVG não lida]") == 4
+
+
+def test_svgs_do_documento_tem_teto_de_quantidade(tmp_path):
     r, vistas = _ler(_docx_com(tmp_path, "svg", "image/svg+xml", SVG_AZUL, imagens=DESENHOS_MAX + 3))
     assert len(vistas) == DESENHOS_MAX and r.markdown.count("SVG não lida]") == 3
