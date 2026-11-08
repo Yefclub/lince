@@ -4,6 +4,7 @@ import hashlib
 import io  # noqa: F401
 import json  # noqa: F401
 import os  # noqa: F401
+import posixpath
 import re
 import secrets
 import zipfile
@@ -34,29 +35,75 @@ TIPOS_GRAFICO = {
 }
 
 
+_CELULAS_SEM_CACHE_MAX = 100_000  # intervalo de série sem cache lido da planilha; um gráfico real tem centenas
+_UNIAO_SEM_CACHE_MAX = 1_000_000  # retângulo que cobre os intervalos de uma aba, lido de uma vez
+# onde cada campo da série aponta para a planilha quando o gráfico não guarda os valores
+_CAMPOS_SEM_CACHE = (
+    ("nome", ("c:tx/c:strRef",)),
+    ("cats", ("c:cat/c:strRef", "c:cat/c:numRef")),
+    ("vals", ("c:val/c:numRef",)),
+)
+
+
+def _intervalo(el, nomes_das_abas):
+    """(aba, col1, lin1, col2, lin2) da referência c:f de um gráfico sem cache, ou None: fora do padrão, aba que não
+    existe, coluna ou linha inteira, ou acima de _CELULAS_SEM_CACHE_MAX células."""
+    from openpyxl.utils import range_boundaries
+
+    f = el.find("c:f", NS) if el is not None else None
+    m = re.match(r"^'?(.+?)'?!(.+)$", (f.text or "") if f is not None else "")
+    if not m or m.group(1) not in nomes_das_abas:
+        return None
+    try:
+        c1, l1, c2, l2 = range_boundaries(m.group(2).replace("$", ""))
+    except ValueError:
+        return None
+    if None in (c1, l1, c2, l2) or (c2 - c1 + 1) * (l2 - l1 + 1) > _CELULAS_SEM_CACHE_MAX:
+        return None
+    return m.group(1), c1, l1, c2, l2
+
+
+def _valores_sem_cache(path, refs) -> dict:
+    """Valores de cada intervalo em `refs`, lidos da planilha em modo somente leitura (carregar a planilha inteira
+    custaria minutos e gigabytes numa base grande). Cada aba é percorrida uma vez, no retângulo que cobre todos os
+    intervalos dela; se ele passar de _UNIAO_SEM_CACHE_MAX, cada intervalo é lido à parte."""
+    from openpyxl import load_workbook
+
+    out, por_aba = {}, {}
+    for r in refs:
+        por_aba.setdefault(r[0], set()).add(r)
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        for aba, rs in por_aba.items():
+            c1, l1 = min(r[1] for r in rs), min(r[2] for r in rs)
+            c2, l2 = max(r[3] for r in rs), max(r[4] for r in rs)
+            if (c2 - c1 + 1) * (l2 - l1 + 1) <= _UNIAO_SEM_CACHE_MAX:
+                grade = list(wb[aba].iter_rows(min_row=l1, max_row=l2, min_col=c1, max_col=c2, values_only=True))
+                for r in rs:
+                    out[r] = [v for linha in grade[r[2] - l1 : r[4] - l1 + 1] for v in linha[r[1] - c1 : r[3] - c1 + 1]]
+            else:
+                for r in rs:
+                    linhas = wb[aba].iter_rows(min_row=r[2], max_row=r[4], min_col=r[1], max_col=r[3], values_only=True)
+                    out[r] = [v for linha in linhas for v in linha]
+    finally:
+        wb.close()
+    return out
+
+
 def graficos_ooxml(path):
-    """Gráfico nativo do Office: tipo, título, séries e valores do cache — dado exato."""
-    out = []
-    wb = None
-    if path.lower().endswith(".xlsx"):
-        from openpyxl import load_workbook
-
-        wb = load_workbook(path, data_only=True)
-
-    def resolver(el):
-        """Sem cache no gráfico: lê o intervalo referenciado direto da planilha."""
-        f = el.find("c:f", NS) if el is not None else None
-        if f is None or wb is None:
-            return []
-        m = re.match(r"^'?(.+?)'?!(.+)$", f.text or "")
-        if not m or m.group(1) not in wb.sheetnames:
-            return []
-        cel = wb[m.group(1)][m.group(2).replace("$", "")]
-        if not isinstance(cel, tuple):
-            return [cel.value]
-        return [c.value for linha in cel for c in (linha if isinstance(linha, tuple) else (linha,))]
-
+    """Gráfico nativo do Office: tipo, título, séries e valores do cache — dado exato. Sem cache (gráfico gravado
+    por biblioteca), os valores vêm do intervalo na planilha, lidos depois de todos os gráficos, uma vez por aba."""
+    out, pendentes = [], []  # (série, campo, intervalo) a completar com os valores da planilha
+    planilha = path.lower().endswith((".xlsx", ".xlsm"))
     with zipfile.ZipFile(path) as z:
+        abas = set()
+        if planilha and "xl/workbook.xml" in z.namelist():
+            livro = xml_ou_nada(z.read("xl/workbook.xml"))
+            abas = (
+                {a.get("name") for a in livro.iter() if a.tag.rsplit("}", 1)[-1] == "sheet"}
+                if livro is not None
+                else set()
+            )
         for nome in sorted(n for n in z.namelist() if re.search(r"/charts/chart\d+\.xml$", n)):
             root = xml_ou_nada(z.read(nome))
             if root is None or root.find(".//c:plotArea", NS) is None:
@@ -69,24 +116,29 @@ def graficos_ooxml(path):
                     continue
                 series = []
                 for ser in tipo_el.findall("c:ser", NS):
-                    nome_s = " ".join(v.text or "" for v in ser.findall("c:tx//c:v", NS))
-                    if not nome_s:
-                        nome_s = " ".join(str(v) for v in resolver(ser.find("c:tx/c:strRef", NS))) or "série"
-                    cats = [v.text for v in ser.findall("c:cat//c:pt/c:v", NS)]
-                    if not cats:
-                        cats = [
-                            str(v)
-                            for v in resolver(ser.find("c:cat/c:strRef", NS))
-                            or resolver(ser.find("c:cat/c:numRef", NS))
-                        ]
-                    vals = [v.text for v in ser.findall("c:val//c:pt/c:v", NS)]
-                    if not vals:
-                        vals = [str(v) for v in resolver(ser.find("c:val/c:numRef", NS))]
                     ref = ser.find("c:val//c:f", NS)
-                    series.append(
-                        {"nome": nome_s, "cats": cats, "vals": vals, "ref": ref.text if ref is not None else None}
-                    )
+                    s = {
+                        "nome": " ".join(v.text or "" for v in ser.findall("c:tx//c:v", NS)),
+                        "cats": [v.text for v in ser.findall("c:cat//c:pt/c:v", NS)],
+                        "vals": [v.text for v in ser.findall("c:val//c:pt/c:v", NS)],
+                        "ref": ref.text if ref is not None else None,
+                    }
+                    for campo, caminhos in _CAMPOS_SEM_CACHE:
+                        if not s[campo] and planilha:
+                            for caminho in caminhos:
+                                if r := _intervalo(ser.find(caminho, NS), abas):
+                                    pendentes.append((s, campo, r))
+                                    break
+                    series.append(s)
                 out.append({"parte": nome, "tipo": TIPOS_GRAFICO[tag], "titulo": titulo, "series": series})
+    if pendentes:
+        valores = _valores_sem_cache(path, {r for _, _, r in pendentes})
+        for s, campo, r in pendentes:
+            lidos = [str(v) for v in valores.get(r, [])]
+            s[campo] = " ".join(lidos) if campo == "nome" else lidos
+    for g in out:
+        for s in g["series"]:
+            s["nome"] = s["nome"] or "série"
     return out
 
 
@@ -352,16 +404,12 @@ def planejar_office(path, pasta, ext=None):
                 {"tecnicas": sorted({m for m, _ in ocultos}), "texto": " ".join(t for _, t in ocultos)[:500]}
             )
     extras = []
-    if ext == ".xlsx":  # o anydoc não extrai imagem de planilha: openpyxl, com aba e célula
-        from openpyxl import load_workbook
+    if ext in (".xlsx", ".xlsm"):  # o anydoc não extrai imagem de planilha: as partes de desenho, com aba e célula
 
         def imagens_planilha():
             nonlocal md
-            for ws in load_workbook(path).worksheets:
-                for im in getattr(ws, "_images", []):
-                    a = im.anchor._from
-                    onde = f"aba {ws.title}, célula {chr(65 + a.col) if a.col < 26 else a.col}{a.row + 1}"
-                    md += f"\n\n**Imagem ({onde}):**\n\n" + ler_imagem(im._data(), "image/png", onde)
+            for onde, mime, dados in _imagens_xlsx(path, ilegiveis):
+                md += f"\n\n**Imagem ({onde}):**\n\n" + ler_imagem(dados, mime, onde)
 
         _complemento(imagens_planilha, "imagens da planilha", ilegiveis)
     if ext == ".ods":  # o anydoc também não extrai imagem da planilha do LibreOffice: content.xml, com a aba
@@ -375,7 +423,7 @@ def planejar_office(path, pasta, ext=None):
                 md += f"\n\n**Imagem ({onde}):**\n\n" + ler_imagem(dados, mime, onde)
 
         _complemento(imagens_ods, "imagens da planilha", ilegiveis)
-    if ext in (".xlsx", ".docx"):
+    if ext in (".xlsx", ".xlsm", ".docx"):
         _complemento(lambda: extras.extend(grafico_md(g) for g in graficos_ooxml(path)), "gráficos", ilegiveis)
     if ext == ".xls":  # o gráfico do Excel 97-2003: tipo, título e séries; os valores já estão nas células
 
@@ -515,6 +563,64 @@ def _imagens_ods(path, ilegiveis) -> list[tuple[str, str, bytes]]:
                 if el.tag == f"{{{_DRAW}}}frame":
                     objeto, imagem_no_frame = 0, False  # o frame acabou: a próxima imagem é outra
                 el.clear()
+    return achadas
+
+
+_XDR = "{http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing}"
+_REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_PKG = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+_A_BLIP = "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
+
+
+def _alvos(z, parte, nomes) -> dict:
+    """Id -> parte do zip das relações de `parte` (alvo relativo à pasta dela, ou absoluto a partir da raiz)."""
+    pasta, arquivo = posixpath.split(parte)
+    rels = posixpath.join(pasta, "_rels", arquivo + ".rels")
+    raiz = xml_ou_nada(z.read(rels)) if rels in nomes else None
+    out = {}
+    for r in raiz.iter(f"{_PKG}Relationship") if raiz is not None else ():
+        alvo = r.get("Target") or ""
+        if r.get("TargetMode") != "External":
+            out[r.get("Id")] = (
+                alvo.lstrip("/") if alvo.startswith("/") else posixpath.normpath(posixpath.join(pasta, alvo))
+            )
+    return out
+
+
+def _imagens_xlsx(path, ilegiveis) -> list[tuple[str, str, bytes]]:
+    """(onde, MIME, bytes) das imagens das abas do .xlsx, na ordem das abas e das âncoras, lidas direto das partes de
+    desenho do pacote (workbook -> aba -> drawing -> mídia), sem carregar as células: a planilha pode ter milhões.
+    A âncora dá a célula do canto da imagem. Mesma mídia, uma vez; até legados.IMAGENS_MAX."""
+    from openpyxl.utils import get_column_letter
+
+    achadas, vistos = [], set()
+    with zipfile.ZipFile(path) as z:
+        nomes = set(z.namelist())
+        livro = xml_ou_nada(z.read("xl/workbook.xml")) if "xl/workbook.xml" in nomes else None
+        if livro is None:
+            return []
+        abas = _alvos(z, "xl/workbook.xml", nomes)
+        for aba in livro.iter():
+            if aba.tag.rsplit("}", 1)[-1] != "sheet" or (parte := abas.get(aba.get(f"{_REL}id"))) not in nomes:
+                continue
+            for desenho in (d for d in _alvos(z, parte, nomes).values() if "/drawings/" in d and d in nomes):
+                raiz, midias = xml_ou_nada(z.read(desenho)), _alvos(z, desenho, nomes)
+                for ancora in list(raiz) if raiz is not None else ():
+                    blip = ancora.find(f".//{_A_BLIP}")
+                    alvo = midias.get(blip.get(f"{_REL}embed")) if blip is not None else None
+                    if alvo not in nomes or alvo in vistos:
+                        continue
+                    if len(vistos) >= legados.IMAGENS_MAX:
+                        ilegiveis.append(f"imagens da planilha: mais de {legados.IMAGENS_MAX}; o resto ficou de fora")
+                        return achadas
+                    vistos.add(alvo)
+                    canto = ancora.find(f"{_XDR}from")
+                    try:
+                        col, lin = int(canto.findtext(f"{_XDR}col")), int(canto.findtext(f"{_XDR}row"))
+                        celula = f", célula {get_column_letter(col + 1)}{lin + 1}"
+                    except (AttributeError, TypeError, ValueError):
+                        celula = ""  # âncora absoluta: sem célula
+                    achadas.append((f"aba {aba.get('name')}{celula}", _mime(alvo), z.read(alvo)))
     return achadas
 
 
