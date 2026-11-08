@@ -15,6 +15,7 @@ r.metadados         # versão, rodapé, marca d'água, propriedades, comentário
 r.cobertura         # rotas por página, leituras pela IA, leituras do cache, pendências
 r.uso               # custo de cada leitura (para o seu ledger)
 r.estrutura         # páginas, slides, abas (e quais são ocultas), seções com a posição no Markdown (pontos de código)
+                    # e, nas planilhas e no CSV, o perfil de cada tabela: colunas com o tipo, amostra e linhas no texto
 ```
 
 ## O que ele faz

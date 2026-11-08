@@ -1,4 +1,4 @@
-"""Estrutura do documento para quem navega ou indexa: páginas, slides, abas e seções do Markdown.
+"""Estrutura do documento para quem navega ou indexa: páginas, slides, abas, nomes definidos e seções do Markdown.
 
 Os números vêm do próprio arquivo, não do Markdown: slide sem título e aba vazia também contam. Estrutura é auxílio:
 arquivo fora do padrão fica sem ela, nunca derruba a leitura. Posições (`inicio`) são em pontos de código Unicode,
@@ -12,6 +12,7 @@ from defusedxml.ElementTree import iterparse
 
 from .limites import xml_ou_nada
 
+NOMES_DEFINIDOS_MAX = 32
 SECOES_MAX = 2000  # documento com mais títulos que isso é índice de livro: as primeiras bastam para navegar
 # título ATX: o conteúdo perde só espaço e tab (espaço ideográfico ou NBSP no início fazem parte dele, como no
 # CommonMark); linear, porque o fim é aparado fora do regex
@@ -90,7 +91,23 @@ def _abas_xlsx(dados) -> dict:
         for s in raiz.iter()
         if s.tag.endswith("}sheet")
     ]
-    return {"abas": abas} if abas else {}
+    # intervalos com nome do usuário, por onde a IA consulta a planilha: os reservados do Excel (_xlnm.Print_Area,
+    # _FilterDatabase) e os ocultos ficam de fora, e o nome com escopo de aba entra uma vez
+    nomes = list(
+        dict.fromkeys(
+            n.get("name", "")[:120]
+            for n in raiz.iter()
+            if n.tag.endswith("}definedName")
+            and not n.get("name", "").startswith("_xlnm.")
+            and n.get("hidden") not in ("1", "true")
+        )
+    )
+    saida = {"abas": abas} if abas else {}
+    if nomes:
+        saida["nomes_definidos"] = nomes[:NOMES_DEFINIDOS_MAX]
+        if len(nomes) > NOMES_DEFINIDOS_MAX:
+            saida["nomes_definidos_cortados"] = True
+    return saida
 
 
 def _abas_xlsb(b: bytes) -> dict:

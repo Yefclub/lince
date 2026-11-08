@@ -250,10 +250,15 @@ def test_envios_paralelos_nao_furam_o_teto_de_pendentes():
 
 def test_planilhas_em_texto_sao_lidas_com_separador_e_codificacao_detectados(api):
     csv = 'nome;valor;obs\nJoão;1,5;"a;b"\n'.encode("latin-1")
-    s = enviar(api, [("dados.csv", csv), ("dados.tsv", b"a\tb\n1\t2\n")], {**A, **ESPERA}).json()
+    s = conforme(
+        enviar(api, [("dados.csv", csv), ("dados.tsv", b"a\tb\n1\t2\n")], {**A, **ESPERA}), "/v1/sessoes", "post"
+    )
+    s = s.json()
     assert [i["estado"] for i in s["itens"]] == ["pronto", "pronto"]
     assert "| João | 1,5 | a;b |" in s["itens"][0]["resultado"]["markdown"]
     assert "| 1 | 2 |" in s["itens"][1]["resultado"]["markdown"]
+    perfil = s["itens"][0]["resultado"]["estrutura"]["perfil_tabular"]  # o contrato valida a resposta
+    assert perfil[0]["aba"] is None and [c["tipo"] for c in perfil[0]["colunas"]] == ["texto", "numero", "texto"]
 
 
 def test_formato_nao_suportado_recusa_o_lote_antes_de_entrar_na_fila(api, pdf):

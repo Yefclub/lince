@@ -10,7 +10,7 @@ import secrets
 import zipfile
 from xml.etree import ElementTree as ET  # noqa: F401
 
-from . import legados
+from . import legados, perfil_tabular
 from .limites import xml_ou_nada
 from .metadados import BINARIOS_OLE, ERROS_DE_PARTE, ODF
 from .seguranca import remover_ocultos, texto_oculto_docx
@@ -366,7 +366,11 @@ def planejar_office(path, pasta, ext=None):
         tarefas.append({"id": tid, "modo": "imagem", "ancora": onde})
         return f"{{{{IA:{tid}}}}}"
 
-    md = _xlsx_em_fluxo(path, ilegiveis) if grande else serializar(doc, ler_imagem)[0]
+    if grande:
+        md, perfis = _xlsx_em_fluxo(path, ilegiveis)
+    else:
+        md = serializar(doc, ler_imagem)[0]
+        perfis = _perfis(doc) if ext in PLANILHAS else []
     if ext in BINARIOS_OLE:  # o leitor do corpo quase não entrega as imagens do .doc, .xls e .ppt: o armazém, sim
 
         def imagens_legado():
@@ -481,6 +485,7 @@ def planejar_office(path, pasta, ext=None):
         "tarefas": tarefas,
         "texto_oculto": seguranca,
         "ilegiveis": ilegiveis,
+        "perfil_tabular": perfis,
     }
 
 
@@ -630,6 +635,8 @@ def _imagens_xlsx(path, ilegiveis) -> list[tuple[str, str, bytes]]:
     return achadas
 
 
+PLANILHAS = {".xlsx", ".xlsm", ".xlsb", ".xls", ".ods", ".csv", ".tsv"}  # as que ganham perfil tabular
+
 # Planilha grande, lida em fluxo (openpyxl read_only), com os mesmos tetos do conversor que o Orbital usava
 _CELULAS_ANYDOC_MAX = 200_000  # células declaradas acima das quais a planilha não passa pelo anydoc
 LINHAS_POR_ABA_MAX = 5_000
@@ -665,8 +672,8 @@ def _celulas_declaradas(path) -> int:
 
 
 def _celula(v) -> str:
-    """O valor como o leitor do corpo escreve: data ISO, número inteiro sem .0, booleano TRUE/FALSE, texto aparado,
-    | escapado, no máximo CARACTERES_POR_CELULA_MAX caracteres."""
+    """O valor como o leitor do corpo escreve: data ISO, número inteiro sem .0, booleano TRUE/FALSE, texto aparado
+    (os espaços de dentro ficam), | escapado, no máximo CARACTERES_POR_CELULA_MAX caracteres."""
     import datetime
 
     if v is None:
@@ -677,21 +684,21 @@ def _celula(v) -> str:
         v = int(v)
     if isinstance(v, datetime.datetime) and v.time() == datetime.time(0):
         v = v.date()
-    texto = " ".join(str(v).split())
+    texto = re.sub(r"\r\n|[\r\n]", " ", str(v)).strip()  # como o leitor do corpo: cada quebra vira um espaço
     if len(texto) > CARACTERES_POR_CELULA_MAX:
         texto = f"{texto[:CARACTERES_POR_CELULA_MAX]}…[+{len(texto) - CARACTERES_POR_CELULA_MAX} caracteres]"
     return texto.replace("|", "\\|")
 
 
-def _xlsx_em_fluxo(path, ilegiveis) -> str:
+def _xlsx_em_fluxo(path, ilegiveis) -> tuple[str, list[dict]]:
     """Corpo da planilha grande, aba por aba (as ocultas e as vazias ficam de fora, como no leitor do corpo), em
     tabela Markdown, lida em fluxo. Acima dos tetos, o resto da aba (ou as abas seguintes) não entra, e o aviso fica
     no próprio texto e em `ilegiveis`: quem lê nunca toma o recorte pelo todo. Os tetos contam as células que saem
     no texto (a tabela é retangular) e as que só foram varridas: a <dimension> do arquivo não é confiável, nem para
-    mais nem para menos."""
+    mais nem para menos. Devolve também o perfil de cada aba, das mesmas linhas da tabela."""
     from openpyxl import load_workbook
 
-    partes, total, varridas, esgotado = [], 0, 0, None
+    partes, perfis, total, varridas, esgotado = [], [], 0, 0, None
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
         visiveis = [ws for ws in wb.worksheets if ws.sheet_state == "visible"]
@@ -701,6 +708,7 @@ def _xlsx_em_fluxo(path, ilegiveis) -> str:
                 aviso = f"aba {ws.title}: {esgotado} atingido antes dela"
                 partes.append(f"{titulo}[TRUNCADO: {aviso}; ela não está nesta leitura.]")
                 ilegiveis.append(aviso)
+                perfis.append(perfil_tabular.Aba(ws.title).montar(cortada=True))
                 continue
             ws.reset_dimensions()  # lê as linhas que existem, não as que a <dimension> declara
             linhas, largura, cortada, vazias, inicio = [], 0, False, 0, None
@@ -729,15 +737,21 @@ def _xlsx_em_fluxo(path, ilegiveis) -> str:
                     aviso = f"aba {ws.title}: {esgotado} atingido antes dela"
                     partes.append(f"{titulo}[TRUNCADO: {aviso}; ela não está nesta leitura.]")
                     ilegiveis.append(aviso)
+                    perfis.append(perfil_tabular.Aba(ws.title).montar(cortada=True))
                 continue
             corpo = [
                 (linha + [""] * (largura - len(linha)))[inicio:] for linha in linhas
             ]  # colunas à esquerda vazias saem
             tabela = ["| " + " | ".join(corpo[0]) + " |", "|" + " --- |" * (largura - inicio)]
             tabela += ["| " + " | ".join(linha) + " |" for linha in corpo[1:]]
+            aba = perfil_tabular.Aba(ws.title)
+            for linha in corpo:
+                aba.linha([c.replace("\\|", "|") for c in linha])
+            perfis.append(aba.montar(cortada))
             texto = titulo + "\n".join(tabela)
             if cortada:
-                aviso = f"aba {ws.title} entregue com {len(linhas) - 1} linhas de dados por limite de extração"
+                com_dado = sum(1 for linha in linhas[1:] if any(linha))  # o mesmo número do perfil
+                aviso = f"aba {ws.title} entregue com {com_dado} linhas de dados por limite de extração"
                 texto += (
                     f"\n\n[TRUNCADO: {aviso}. O restante NÃO está nesta leitura; não afirme nada sobre ele. Para a"
                     " análise completa, use o arquivo original.]"
@@ -746,7 +760,41 @@ def _xlsx_em_fluxo(path, ilegiveis) -> str:
             partes.append(texto)
     finally:
         wb.close()
-    return "\n\n".join(partes)
+    return "\n\n".join(partes), perfis
+
+
+def _texto_simples(blocos) -> str:
+    """Texto de uma célula do documento do anydoc, sem marcação: o mesmo que a tabela do Markdown mostra (os
+    parágrafos juntos por espaço, as pontas aparadas, os espaços de dentro mantidos)."""
+
+    def inl(xs):
+        out = []
+        for x in xs or []:
+            if x.kind == "text":
+                out.append(x.text or "")
+            elif x.kind == "link":
+                out.append(inl(x.content))
+            elif x.kind == "line_break":
+                out.append(" ")
+        return "".join(out)
+
+    return "\n\n".join(t for t in (inl(b.content) for b in blocos or []) if t.strip()).replace("\n", " ").strip()
+
+
+def _perfis(doc) -> list[dict]:
+    """Perfil de cada tabela da planilha lida pelo anydoc, com o nome da aba pelo título que a precede (planilha de
+    aba única e CSV vêm sem título: o nome fica None)."""
+    perfis, nome = [], None
+    for b in doc.blocks:
+        if b.kind == "heading":  # o título da aba traz o nome exato, espaços inclusive
+            nome = "".join(x.text or "" for x in b.content or [] if x.kind == "text")
+        elif b.kind == "table":
+            aba = perfil_tabular.Aba(nome)
+            for linha in b.table.grid:
+                aba.linha([_texto_simples(s.cell.blocks) if s.kind == "origin" and s.cell else "" for s in linha])
+            perfis.append(aba.montar())
+            nome = None
+    return perfis
 
 
 def _nao_lida(onde, mime, ilegiveis) -> str:

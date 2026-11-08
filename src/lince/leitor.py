@@ -123,6 +123,13 @@ class Leitor:
             plano["meta_arquivo"]["propriedades"] = plano.pop("propriedades")
         if plano.get("ilegiveis"):
             plano["meta_arquivo"].setdefault("partes_ilegiveis", []).extend(plano["ilegiveis"])
+        if perfis := plano.pop("perfil_tabular", None):
+            estrutura = plano["meta_arquivo"].setdefault("estrutura", {})
+            visiveis = [a["nome"] for a in estrutura.get("abas", []) if not a["oculta"]]
+            for p in perfis:  # aba única sai sem título no texto: o nome vem da estrutura do arquivo
+                if p["aba"] is None and len(visiveis) == 1:
+                    p["aba"] = visiveis[0]
+            estrutura["perfil_tabular"] = perfis
         plano["tarefas_originais"] = list(plano.get("tarefas", []))
         if self.agrupar and plano["tipo"] in ("pdf", "office"):
             plano["tarefas"], plano["lotes"] = agrupar(plano["tarefas"], pasta)

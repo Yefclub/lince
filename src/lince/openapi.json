@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Lince",
-    "version": "1.7.0",
+    "version": "1.8.0",
     "summary": "Leitor único de documentos para bases de conhecimento e IA.",
     "description": "Cada envio (um documento ou um lote) cria uma **sessão**. Quem chama marca a sessão com uma `referencia` própria (o id do usuário ou do processo no sistema de origem) e recupera os resultados pela sessão ou pela referência.\n\nO documento não é guardado: o arquivo é apagado assim que lido. Só se o servidor tiver cache ligado, a transcrição que a IA fez de cada recorte ou página fica no Redis por alguns dias, separada por token, para não ser paga de novo. O resultado fica em memória só até ser **entregue**: a primeira resposta que traz a sessão `concluida` (o `POST` com `Prefer: wait` ou um `GET`) é a entrega. Depois dela, a sessão fica 60 s para o cliente repetir o pedido se a resposta se perdeu, e então some; `DELETE` confirma o recebimento e apaga na hora. Resultado não buscado é descartado 15 min depois de concluída. `expira_em` sempre diz até quando a sessão existe. Cada token pode ter até 256 MB de resultado esperando entrega; acima disso, novos envios recebem 429 até buscar o que é dele.\n\nO modelo de visão é de quem chama, informado em cada envio (`X-IA-URL`, `X-IA-Modelo`, `X-IA-Chave`); a chave não é guardada nem registrada.\n\nErros seguem a RFC 9457 (`application/problem+json`). Toda resposta traz `X-Request-Id`.\n\n**Documento como código.** Com `codigo=sim`, cada documento de formato editável (PPTX, DOCX, XLSX) traz também `resultado.codigo`: a estrutura do documento com ids estáveis tirados do próprio arquivo (slide, forma, parágrafo, célula, série de gráfico). Com esses ids, `POST /v1/edicoes` aplica operações nomeadas e devolve o arquivo novo, alterando só as partes tocadas; o resto do pacote sai idêntico em bytes.\n\n**Antivírus.** Se o serviço estiver configurado com ClamAV, todo arquivo é varrido antes de ser lido ou editado: arquivo infectado recusa o envio inteiro ou a edição (422 `arquivo-infectado`) e antivírus fora do ar recusa com 503 `antivirus-indisponivel` (nunca lê sem varrer).",
     "license": {
@@ -971,7 +971,7 @@
             "description": "Por que `codigo` é nulo."
           },
           "estrutura": {
-            "description": "Para navegar e indexar. `paginas` (PDF), `slides` (apresentações) e `abas` (planilhas, na ordem, com as ocultas marcadas) vêm do próprio arquivo, não do Markdown. `secoes` são os títulos do Markdown (fora de bloco de código) com o nível e a posição; `inicio_das_paginas` (só PDF) diz onde cada página começa no Markdown. Posições (`inicio`) são em pontos de código Unicode, não em unidades UTF-16: em JavaScript, conte por `Array.from(markdown)`. Acima de 2000 títulos, a lista para e `secoes_cortadas` vem `true`.",
+            "description": "Para navegar e indexar. `paginas` (PDF), `slides` (apresentações) e `abas` (planilhas, na ordem, com as ocultas marcadas) vêm do próprio arquivo, não do Markdown. `secoes` são os títulos do Markdown (fora de bloco de código) com o nível e a posição; `inicio_das_paginas` (só PDF) diz onde cada página começa no Markdown. Posições (`inicio`) são em pontos de código Unicode, não em unidades UTF-16: em JavaScript, conte por `Array.from(markdown)`. Acima de 2000 títulos, a lista para e `secoes_cortadas` vem `true`. `nomes_definidos` (`.xlsx` e `.xlsm`) são os intervalos com nome do usuário, sem os reservados do Excel nem os ocultos; acima de 32, a lista para e `nomes_definidos_cortados` vem `true`. `perfil_tabular` (planilhas e CSV) traz, por tabela, o que a IA precisa para decidir como consultar os dados sem ler tudo: o cabeçalho, cada coluna com o tipo dominante (`numero`, `data`, `booleano`, `texto` ou `vazio`), até 5 linhas de amostra e `linhas_extraidas` (linhas com dado que estão no Markdown). Montado das mesmas linhas da tabela do texto: nunca diz mais do que ele tem. `extracao_cortada` marca a aba que um teto cortou no texto; `colunas_cortadas`, a que tem mais de 64 colunas. Os tipos saem das primeiras 5.000 linhas com dado (`linhas_observadas`); o valor do cabeçalho e da amostra vai até 120 caracteres.",
             "type": "object",
             "required": [
               "secoes"
@@ -1047,6 +1047,97 @@
                 }
               },
               "secoes_cortadas": {
+                "type": "boolean"
+              },
+              "nomes_definidos": {
+                "type": "array",
+                "maxItems": 32,
+                "items": {
+                  "type": "string"
+                }
+              },
+              "perfil_tabular": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "aba",
+                    "linhas_extraidas",
+                    "cabecalho",
+                    "colunas",
+                    "amostra",
+                    "linhas_observadas"
+                  ],
+                  "properties": {
+                    "aba": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "Nome da aba, como em `abas`; `null` quando o arquivo não dá o nome (CSV, ou planilha sem a lista de abas)."
+                    },
+                    "linhas_extraidas": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "cabecalho": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "colunas": {
+                      "type": "array",
+                      "maxItems": 64,
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "nome",
+                          "tipo"
+                        ],
+                        "properties": {
+                          "nome": {
+                            "type": "string",
+                            "description": "O do cabeçalho, ou `coluna N` quando ele está vazio."
+                          },
+                          "tipo": {
+                            "type": "string",
+                            "enum": [
+                              "numero",
+                              "data",
+                              "booleano",
+                              "texto",
+                              "vazio"
+                            ]
+                          }
+                        }
+                      }
+                    },
+                    "amostra": {
+                      "type": "array",
+                      "maxItems": 5,
+                      "items": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "linhas_observadas": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 5000
+                    },
+                    "extracao_cortada": {
+                      "type": "boolean"
+                    },
+                    "colunas_cortadas": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              },
+              "nomes_definidos_cortados": {
                 "type": "boolean"
               }
             }
