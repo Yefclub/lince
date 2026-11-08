@@ -6,7 +6,9 @@ atributos de apresentação do SVG) sai do corpo e vira alerta. O style é lido 
 Limites (a página não é renderizada): cor do texto contra o fundo (branco sobre azul é visível, e a cor transparente
 também fica de fora), estilo de classe numa folha <style>, valor com função (calc, var, min, max, clamp), opacidade
 quase zero, layout (fora da tela, text-indent negativo, tamanho zero com overflow, clip, zoom), font-size sem unidade
-do modo quirks, <foreignObject> tratado como SVG e conteúdo de
+do modo quirks, popover fechado e rp/title no corpo (ficam no corpo), hidden="until-found" e dialog fechado (vão
+para o alerta, embora a pessoa possa abri-los), altura de linha em unidade de tela e oblique com ângulo no atalho
+font (recusados), HTML dentro de <foreignObject> tratado como SVG e conteúdo de
 <symbol>/<defs> desenhado por <use> (vai para o alerta), e técnicas que o Lince não avalia: content-visibility,
 transform:scale(0), filter e clip-path. Imagem
 embutida (data:) é lida pela IA; imagem externa nunca é baixada (o Lince não busca nada na rede por causa de um
@@ -48,7 +50,8 @@ _PREFIXO_FONT = {"normal": "normal", "italic": "estilo", "oblique": "estilo", "s
 _GLOBAIS = _MANTEM | {"initial"}  # "default" é reservado, mas não é global: o navegador descarta a declaração
 _NAO_FAMILIA = _GLOBAIS | {"default"}
 # o navegador não desenha: conteúdo alternativo (canvas, video, audio), listas de sugestão e dialog fechado
-_NAO_MOSTRA = {"datalist", "noembed", "noframes", "canvas", "video", "audio"}
+_NAO_MOSTRA = {"datalist", "noembed", "noframes"}
+_COM_ALTERNATIVO = {"canvas", "video", "audio"}  # a mídia fica; o texto alternativo (para navegador antigo) não
 _DISPLAY = {"none", "block", "inline", "inline-block", "flex", "inline-flex", "grid", "inline-grid", "flow-root",
             "table", "inline-table", "table-row", "table-cell", "table-column", "table-row-group", "table-column-group",
             "table-header-group", "table-footer-group", "table-caption", "list-item", "contents", "run-in", "ruby",
@@ -308,8 +311,12 @@ def _tirar_oculto(raiz) -> list:
         tecnica = None
         if el.get("hidden") is not None and not em_svg and efetivas.get("display") != "outro":
             tecnica = "atributo hidden"  # display do autor vence o hidden; revert volta a ele; no SVG não vale
-        elif not em_svg and (el.tag in _NAO_MOSTRA or (el.tag == "dialog" and el.get("open") is None)):
-            tecnica = "conteúdo que o navegador não mostra"
+        elif (
+            not em_svg
+            and efetivas.get("display") != "outro"
+            and (el.tag in _NAO_MOSTRA or (el.tag == "dialog" and el.get("open") is None))
+        ):
+            tecnica = "conteúdo que o navegador não mostra"  # o display do autor vence, como no hidden
         elif em_svg and el.tag in _SVG_NAO_DESENHA:
             tecnica = "parte do SVG que não é desenhada"
         elif efetivas.get("display") == "none" or efetivas.get("opacity", 1.0) <= 0:
@@ -324,6 +331,22 @@ def _tirar_oculto(raiz) -> list:
         px = efetivas.get("font-size", px)
         if el is raiz:
             raiz_px = px
+        if not em_svg and el.tag in _COM_ALTERNATIVO:  # tira só o alternativo; a mídia e as faixas ficam
+            partes = [el.text] + [f.tail for f in el]
+            for f in list(el):
+                if isinstance(f.tag, str) and f.tag in ("source", "track"):
+                    # elemento vazio: o parser HTML4 do libxml2 põe o alternativo dentro dele
+                    partes.append(f.text_content())
+                    for neto in list(f):
+                        f.remove(neto)
+                    f.text = f.tail = None
+                else:
+                    partes.append(f.text_content() if isinstance(f.tag, str) else "")
+                    el.remove(f)  # o tail do removido já foi guardado acima
+            el.text = None
+            if conteudo := " ".join(" ".join(p for p in partes if p).split()):
+                ocultos.append(("conteúdo que o navegador não mostra", conteudo))
+            continue
         if invisivel and el.tag == "img":  # imagem invisível não é lida (com fonte zero, a imagem aparece)
             _esvaziar(el)
             continue
