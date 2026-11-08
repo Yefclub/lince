@@ -636,13 +636,14 @@ LINHAS_POR_ABA_MAX = 5_000
 CELULAS_POR_ABA_MAX = 200_000
 CELULAS_TOTAL_MAX = 500_000
 CARACTERES_POR_CELULA_MAX = 500
+_VARREDURA_MAX = 10 * CELULAS_TOTAL_MAX  # células lidas, vazias inclusive: uma linha em XFD vale 16.384
 _BYTES_POR_CELULA = 20  # aba sem <dimension>: estimativa pelo tamanho do XML descompactado
 _DIMENSAO = re.compile(rb'<(?:\w+:)?dimension\s+ref="([A-Z]{1,3})(\d+)(?::([A-Z]{1,3})(\d+))?"')
 
 
 def _celulas_declaradas(path) -> int:
-    """Células que as abas declaram (<dimension> no começo de cada aba), sem ler as células; sem a dimensão, pelo
-    tamanho da parte. Barato: só os primeiros bytes de cada aba."""
+    """Células de cada aba pelo maior entre o que a <dimension> declara e o que o tamanho do XML comporta (a
+    dimensão pode mentir para menos), sem ler as células. Barato: só os primeiros bytes de cada aba."""
     from openpyxl.utils import column_index_from_string
 
     total = 0
@@ -652,11 +653,11 @@ def _celulas_declaradas(path) -> int:
                 continue
             with z.open(info) as f:
                 m = _DIMENSAO.search(f.read(4096))
+            declaradas = 0
             if m and m.group(3):
                 largura = column_index_from_string(m.group(3).decode()) - column_index_from_string(m.group(1).decode())
-                total += (largura + 1) * (int(m.group(4)) - int(m.group(2)) + 1)
-            else:
-                total += info.file_size // _BYTES_POR_CELULA
+                declaradas = (largura + 1) * (int(m.group(4)) - int(m.group(2)) + 1)
+            total += max(declaradas, info.file_size // _BYTES_POR_CELULA)
     return total
 
 
@@ -682,39 +683,56 @@ def _celula(v) -> str:
 def _xlsx_em_fluxo(path, ilegiveis) -> str:
     """Corpo da planilha grande, aba por aba (as ocultas e as vazias ficam de fora, como no leitor do corpo), em
     tabela Markdown, lida em fluxo. Acima dos tetos, o resto da aba (ou as abas seguintes) não entra, e o aviso fica
-    no próprio texto e em `ilegiveis`: quem lê nunca toma o recorte pelo todo."""
+    no próprio texto e em `ilegiveis`: quem lê nunca toma o recorte pelo todo. Os tetos contam as células que saem
+    no texto (a tabela é retangular) e as que só foram varridas: a <dimension> do arquivo não é confiável, nem para
+    mais nem para menos."""
     from openpyxl import load_workbook
 
-    partes, total = [], 0
+    partes, total, varridas, esgotado = [], 0, 0, None
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
-        for ws in wb.worksheets:
-            if ws.sheet_state != "visible":
-                continue
-            if total >= CELULAS_TOTAL_MAX:
-                aviso = f"aba {ws.title}: teto de {CELULAS_TOTAL_MAX} células do documento atingido antes dela"
-                partes.append(f"## {ws.title}\n\n[TRUNCADO: {aviso}; ela não está nesta leitura.]")
+        visiveis = [ws for ws in wb.worksheets if ws.sheet_state == "visible"]
+        for ws in visiveis:
+            titulo = f"## {ws.title}\n\n" if len(visiveis) > 1 else ""  # aba única vai sem título, como no corpo
+            if esgotado:
+                aviso = f"aba {ws.title}: {esgotado} atingido antes dela"
+                partes.append(f"{titulo}[TRUNCADO: {aviso}; ela não está nesta leitura.]")
                 ilegiveis.append(aviso)
                 continue
-            linhas, celulas, cortada, largura = [], 0, False, 0
+            ws.reset_dimensions()  # lê as linhas que existem, não as que a <dimension> declara
+            linhas, largura, cortada, vazias, inicio = [], 0, False, 0, None
             for valores in ws.iter_rows(values_only=True):
-                if not any(v is not None and str(v).strip() for v in valores):
-                    continue  # linha só com formatação
-                if len(linhas) > LINHAS_POR_ABA_MAX or celulas + len(valores) > min(
-                    CELULAS_POR_ABA_MAX, CELULAS_TOTAL_MAX - total
-                ):
+                varridas += len(valores) + 1
+                if varridas > _VARREDURA_MAX:
+                    cortada, esgotado = True, f"teto de {_VARREDURA_MAX} células varridas do documento"
+                    break
+                cheias = [i for i, v in enumerate(valores) if _celula(v)]
+                if not cheias:
+                    vazias += bool(linhas)  # linha vazia entre linhas com dados entra na tabela, como no corpo
+                    continue
+                nova, n = max(largura, cheias[-1] + 1), len(linhas) + vazias + 1
+                if nova * n > CELULAS_TOTAL_MAX - total:
+                    cortada, esgotado = True, f"teto de {CELULAS_TOTAL_MAX} células do documento"
+                    break
+                if n > LINHAS_POR_ABA_MAX + 1 or nova * n > CELULAS_POR_ABA_MAX:
                     cortada = True
                     break
-                linhas.append([_celula(v) for v in valores])
-                celulas += len(valores)
-                largura = max(largura, len(valores))
-            total += celulas
+                linhas += [[]] * vazias + [[_celula(v) for v in valores[: cheias[-1] + 1]]]
+                largura, vazias = nova, 0
+                inicio = cheias[0] if inicio is None else min(inicio, cheias[0])
+            total += largura * len(linhas)
             if not linhas:
+                if cortada:  # o teto chegou antes da primeira linha: a aba não some sem aviso
+                    aviso = f"aba {ws.title}: {esgotado} atingido antes dela"
+                    partes.append(f"{titulo}[TRUNCADO: {aviso}; ela não está nesta leitura.]")
+                    ilegiveis.append(aviso)
                 continue
-            corpo = [linha + [""] * (largura - len(linha)) for linha in linhas]
-            tabela = ["| " + " | ".join(corpo[0]) + " |", "|" + " --- |" * largura]
+            corpo = [
+                (linha + [""] * (largura - len(linha)))[inicio:] for linha in linhas
+            ]  # colunas à esquerda vazias saem
+            tabela = ["| " + " | ".join(corpo[0]) + " |", "|" + " --- |" * (largura - inicio)]
             tabela += ["| " + " | ".join(linha) + " |" for linha in corpo[1:]]
-            texto = f"## {ws.title}\n\n" + "\n".join(tabela)
+            texto = titulo + "\n".join(tabela)
             if cortada:
                 aviso = f"aba {ws.title} entregue com {len(linhas) - 1} linhas de dados por limite de extração"
                 texto += (
