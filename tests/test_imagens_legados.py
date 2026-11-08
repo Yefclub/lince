@@ -53,18 +53,22 @@ def _png(cor, lado=60):
 
 
 class _Ole:
-    """OLE de um stream só, com o que `legados.imagens` usa."""
+    """OLE com o que `legados.imagens` usa: o stream Pictures e, se pedido, muitos outros (que não são lidos)."""
 
-    def __init__(self, dados):
-        self.dados = dados
+    def __init__(self, dados, outros=0):
+        self.dados, self.outros, self.lidos = dados, outros, []
 
     def listdir(self):
-        return [["Pictures"]]
+        return [["Pictures"]] + [[f"Outro{n}"] for n in range(self.outros)]
+
+    def exists(self, nome):
+        return nome == "Pictures" or (nome.startswith("Outro") and int(nome[5:]) < self.outros)
 
     def get_size(self, nome):
         return len(self.dados)
 
     def openstream(self, nome):
+        self.lidos.append(nome)
         return io.BytesIO(self.dados)
 
 
@@ -171,3 +175,44 @@ def test_metafile_com_fluxo_cortado_nao_vira_imagem():
     cortado = _blip(0xF01A, 0x3D4, cab, zlib.compress(b"EMF" * 5000)[:-10])
     assert [len(d) for _, d in legados._blips(inteiro, legados.Orcamento(10**6))] == [15000]
     assert list(legados._blips(cortado, legados.Orcamento(10**6))) == []
+
+
+def test_so_os_streams_do_armazem_sao_lidos():
+    ole = _Ole(_png_blip("red"), outros=25_000)  # milhares de streams declarados não multiplicam o trabalho
+    achadas, corte = legados.imagens(ole, 10**6)
+    assert ole.lidos == ["Pictures"] and len(achadas) == 1 and corte is None
+
+
+def test_stream_maior_que_o_arquivo_corta_sem_perder_o_que_foi_achado():
+    class _Dois(_Ole):
+        def exists(self, nome):
+            return nome in ("Pictures", "Data")
+
+        def get_size(self, nome):
+            return len(self.dados) if nome == "Pictures" else 10**9  # o Data declara mais do que o arquivo
+
+    achadas, corte = legados.imagens(_Dois(_png_blip("red")), 10**6)
+    assert len(achadas) == 1 and "declara mais bytes" in corte
+
+
+def test_flush_quebrado_nao_derruba_o_resto(monkeypatch):
+    real = zlib.decompressobj
+
+    class _Quebra:
+        def __init__(self):
+            self.d = real()
+
+        def decompress(self, dados, n):
+            return self.d.decompress(dados, n)
+
+        @property
+        def unconsumed_tail(self):
+            return self.d.unconsumed_tail
+
+        def flush(self):
+            raise zlib.error("invalid distance too far back")
+
+    monkeypatch.setattr(zlib, "decompressobj", _Quebra)
+    stream = _png_blip("red") + _blip(0xF01A, 0x3D4, b"\x00" * 32 + b"\x00\xfe", zlib.compress(b"EMF" * 100))
+    achadas, corte = legados.imagens(_Ole(stream), len(stream))
+    assert [m for m, _ in achadas] == ["image/png"] and corte is None

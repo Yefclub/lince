@@ -153,6 +153,9 @@ _MSODRAWINGGROUP, _CONTINUE = 0x00EB, 0x003C
 IMAGENS_MAX = 512  # imagens distintas por arquivo; acima disso é arquivo hostil ou repetição sem fim
 _METAFILE_MAX = 64 * 1024 * 1024  # EMF/WMF guardado comprimido: teto do descomprimido
 _PEDACO = 1024 * 1024  # a descompressão anda neste passo, cobrando o orçamento a cada pedaço
+# onde o OfficeArt guarda as imagens: Pictures no PowerPoint, o Workbook (ou Book, no Excel 5) e, no Word, o Data
+# (imagens em linha) e o WordDocument (o armazém das flutuantes)
+_STREAMS_DE_IMAGEM = ("Pictures", "Workbook", "Book", "Data", "WordDocument")
 _CABECALHOS_DIB = {12, 40, 52, 56, 64, 108, 124}  # BITMAPCOREHEADER, INFO, V2, V3, OS/2 2, V4 e V5
 
 
@@ -253,11 +256,12 @@ def imagens(o, teto) -> tuple[list[tuple[str, bytes]], str | None]:
     corte quando a busca parou antes do fim (teto de imagens ou orçamento esgotado); o que já foi achado fica. A
     posição no documento não é recuperada: quem chama as põe juntas depois do texto."""
     vistas, saida = set(), []
-    for caminho in o.listdir():
-        nome = "/".join(caminho)
-        b = ler_stream(o, nome, teto)
-        orcamento = Orcamento(len(b))
+    for nome in _STREAMS_DE_IMAGEM:  # nomes fixos: um arquivo com milhares de streams não multiplica o trabalho
+        if not o.exists(nome):
+            continue
         try:
+            b = ler_stream(o, nome, teto)
+            orcamento = Orcamento(len(b))
             if nome in ("Workbook", "Book") and len(b) >= 8 and struct.unpack_from("<H", b, 0)[0] == _BOF:
                 b = _desenhos_xls(b, orcamento)
             for mime, dados in _blips(b, orcamento):
@@ -266,7 +270,7 @@ def imagens(o, teto) -> tuple[list[tuple[str, bytes]], str | None]:
                         return saida, f"mais de {IMAGENS_MAX} imagens: o resto ficou de fora"
                     vistas.add(marca)
                     saida.append((mime, dados))
-        except ValueError as e:  # orçamento esgotado: estrutura hostil neste stream
+        except ValueError as e:  # stream maior que o arquivo ou orçamento esgotado: estrutura hostil
             return saida, str(e)
     return saida, None
 
