@@ -126,12 +126,9 @@ class Leitor:
         if perfis := plano.pop("perfil_tabular", None):
             estrutura = plano["meta_arquivo"].setdefault("estrutura", {})
             visiveis = [a["nome"] for a in estrutura.get("abas", []) if not a["oculta"]]
-            pelo_titulo = {" ".join(n.split()): n for n in visiveis}  # o título do texto junta espaços do nome
-            for p in perfis:  # o nome é o da estrutura do arquivo; aba única sai sem título no texto
-                if p["aba"] is None:
-                    p["aba"] = visiveis[0] if len(visiveis) == 1 else None
-                else:
-                    p["aba"] = pelo_titulo.get(" ".join(p["aba"].split()), p["aba"])
+            for p in perfis:  # aba única sai sem título no texto: o nome vem da estrutura do arquivo
+                if p["aba"] is None and len(visiveis) == 1:
+                    p["aba"] = visiveis[0]
             estrutura["perfil_tabular"] = perfis
         plano["tarefas_originais"] = list(plano.get("tarefas", []))
         if self.agrupar and plano["tipo"] in ("pdf", "office"):

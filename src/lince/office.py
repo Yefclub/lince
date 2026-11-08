@@ -786,8 +786,8 @@ def _perfis(doc) -> list[dict]:
     aba única e CSV vêm sem título: o nome fica None)."""
     perfis, nome = [], None
     for b in doc.blocks:
-        if b.kind == "heading":
-            nome = _texto_simples([b])
+        if b.kind == "heading":  # o título da aba traz o nome exato, espaços inclusive
+            nome = "".join(x.text or "" for x in b.content or [] if x.kind == "text")
         elif b.kind == "table":
             aba = perfil_tabular.Aba(nome)
             for linha in b.table.grid:

@@ -21,5 +21,7 @@ aba cortada por um limite de leitura vem marcada com `extracao_cortada`, e a pla
 com `colunas_cortadas`. O resultado é o mesmo nos dois caminhos de leitura, o normal e o de planilha grande.
 
 Nos arquivos `.xlsx` e `.xlsm`, `estrutura.nomes_definidos` lista os intervalos com nome criados pelo usuário (até 32,
-sem os nomes internos do Excel, como a área de impressão). O contrato da
-API passa para a versão 1.8.0, só com campos novos.
+sem os nomes internos do Excel, como a área de impressão).
+
+O contrato da API passa para a versão 1.8.0, só com campos novos. Na leitura de planilha grande, a célula agora
+mantém os espaços de dentro do texto, como nas planilhas menores.

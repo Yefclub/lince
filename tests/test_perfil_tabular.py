@@ -43,10 +43,9 @@ def test_perfil_da_planilha_diz_colunas_tipos_amostra_e_linhas(tmp_path):
     ]  # fmt: skip
     assert vendas["linhas_extraidas"] == vendas["linhas_observadas"] == 8
     assert len(vendas["amostra"]) == 5 and vendas["amostra"][1][:2] == ["item 1", "1.5"]
-    assert vendas["amostra"][0][5] == "x" * 120 + "…" and vendas["amostra"][1][5] == "a|b"
-    assert (
-        vendas["amostra"][2][5] == "dois  espaços"
-    )  # como no texto: os espaços de dentro ficam  # sem escape do Markdown
+    assert vendas["amostra"][0][5] == "x" * 120 + "…"  # valor longo vem curto no perfil
+    assert vendas["amostra"][1][5] == "a|b"  # sem o escape do Markdown
+    assert vendas["amostra"][2][5] == "dois  espaços"  # os espaços de dentro ficam, como no texto
     assert "extracao_cortada" not in vendas and r.estrutura["nomes_definidos"] == ["Faixa"]
 
 
@@ -148,8 +147,10 @@ def test_tipos_saem_das_primeiras_linhas_observadas(tmp_path, monkeypatch):
 def test_perfil_igual_nos_dois_caminhos_com_dado_fora_de_a1_e_aba_vazia(tmp_path, monkeypatch):
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = " Jan  2026"  # espaços no nome: o perfil usa o nome do arquivo nos dois caminhos
+    ws.title = " Jan  2026"  # espaços no nome: o perfil usa o nome exato do arquivo nos dois caminhos
     ws["C4"], ws["D4"], ws["C5"], ws["D5"] = "nome", "qtd", "x", 1
+    wb.create_sheet("A B").append(["b"])
+    wb.create_sheet("A  B").append(["c"])  # nomes que só diferem nos espaços não se confundem
     wb.create_sheet("Vazia")
     p = tmp_path / "fora.xlsx"
     wb.save(p)
@@ -157,7 +158,7 @@ def test_perfil_igual_nos_dois_caminhos_com_dado_fora_de_a1_e_aba_vazia(tmp_path
     monkeypatch.setattr(office, "_CELULAS_ANYDOC_MAX", 0)
     fluxo = lince.ler(p)
     assert fluxo.estrutura["perfil_tabular"] == normal.estrutura["perfil_tabular"]
-    assert [a["aba"] for a in normal.estrutura["perfil_tabular"]] == [" Jan  2026"]
+    assert [a["aba"] for a in normal.estrutura["perfil_tabular"]] == [" Jan  2026", "A B", "A  B"]
 
 
 def test_aviso_de_corte_conta_as_mesmas_linhas_do_perfil(tmp_path, monkeypatch):
