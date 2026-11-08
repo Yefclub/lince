@@ -334,14 +334,19 @@ def _tirar_oculto(raiz) -> list:
         if el is raiz:
             raiz_px = px
         if not em_svg and el.tag in _COM_ALTERNATIVO:
+            # o texto alternativo, na ordem do documento, vai para o alerta, com a mídia visível ou não
+            if conteudo := " ".join(" ".join(el.itertext()).split()):
+                ocultos.append(("conteúdo que o navegador não mostra", conteudo))
             if invisivel:  # mídia invisível: sai como a imagem invisível
                 _esvaziar(el)
                 continue
-            # a mídia fica (atributos, todo <source> e <track>, em qualquer profundidade: o parser HTML4 do libxml2
-            # aninha um dentro do outro); o texto alternativo, na ordem do documento, vai para o alerta
-            if conteudo := " ".join(" ".join(el.itertext()).split()):
-                ocultos.append(("conteúdo que o navegador não mostra", conteudo))
-            faixas = [(f.tag, dict(f.attrib)) for f in el.iter("source", "track")]
+            # a mídia fica com os atributos e os <source>/<track> que o navegador usaria: os filhos diretos e a cadeia
+            # que o parser HTML4 do libxml2 aninha um dentro do outro; fonte de dentro do alternativo não conta
+            faixas, cadeia = [], [f for f in el if f.tag in ("source", "track")]
+            while cadeia:
+                f = cadeia.pop(0)
+                faixas.append((f.tag, dict(f.attrib)))
+                cadeia[:0] = [g for g in f if g.tag in ("source", "track")]
             for f in list(el):
                 el.remove(f)
             el.text = None
