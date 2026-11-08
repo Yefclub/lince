@@ -57,7 +57,8 @@ leitor = lince.Leitor(
 
 - Sem `ia`, o Lince devolve o texto nativo completo e marca o que ficou pendente.
 - `leitor.ler(arquivo, prazo=20)`: 20 s, a partir da chamada, para o documento (o chat lê com prazo; a base,
-  sem). A extração nativa conta no prazo, mas nunca é interrompida. Nenhuma leitura pela IA começa depois dele, e a
+  sem). A extração nativa conta no prazo; no PDF, a página que começa depois dele entra só com o texto (sem figuras,
+  escaneado nem conferência de texto oculto, que vira alerta), registrada em `cobertura.pendentes`. Nenhuma leitura pela IA começa depois dele, e a
   que está em curso no `OpenAICompativel` é cortada, sem novas tentativas: o que não coube vira a pendência
   `prazo esgotado`, e o texto nativo sai completo. Nada fica rodando depois da entrega. Toda leitura concluída chega em
   `ao_usar` e em `Resultado.uso`; a chamada cortada pode ser cobrada pelo provedor sem aparecer ali (ela já tinha sido
@@ -65,6 +66,23 @@ leitor = lince.Leitor(
   envio de uma imagem grande ou um DNS lento podem passar alguns segundos do prazo. Provedor próprio lê o tempo que sobra em `lince.prazo_restante()` e pode levantar `lince.PrazoEsgotado`.
 - 429 e 5xx do provedor são repetidos com espera exponencial e `Retry-After`.
 - Falha da IA nunca derruba o documento: a leitura nativa fica e a pendência é registrada.
+- `Uso.custo_usd` traz o custo da chamada quando o provedor informa (`usage.cost`, como no OpenRouter).
+
+### Em duas fases: a IA é de quem chama
+
+Para quem já tem controle de custo, modelos e cache próprios, o Lince não precisa chamar IA nenhuma:
+
+```python
+leitor = lince.Leitor()
+plano = leitor.preparar("relatorio.pdf")      # texto extraído + o que a IA precisa ler
+respostas = {t.id: meu_modelo(t.imagem, t.instrucao) for t in plano.tarefas}
+r = leitor.concluir(plano, respostas)         # o mesmo Resultado que sairia com a IA do Lince
+```
+
+Cada `TarefaVisual` traz a imagem (PNG), a instrução, o tipo (imagem, página escaneada, desenho, tabela, fórmula ou
+lote de recortes), onde ela está (página e caixa no PDF, `imagem 3` no Office), `chave` (hash da imagem, da instrução
+e da versão do prompt, para o seu cache) e `tokens_estimados`. A tarefa sem resposta fica em `cobertura.pendentes`
+com o texto nativo no lugar. `plano.para_json()` e `lince.Plano.de_json()` levam o plano entre processos.
 
 ## API HTTP
 
@@ -98,6 +116,7 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
 | `GET /v1/sessoes/{id}` | Estado da sessão e de cada documento; o que já terminou vem com `markdown`, `metadados`, `cobertura`, `alertas_injecao`, `uso` (tokens por leitura) e `estrutura`. Aceita `Prefer: wait=N`. |
 | `GET /v1/sessoes?referencia=…` | Sessões do token ainda não entregues, da mais nova para a mais antiga (resumo, sem o conteúdo lido). |
 | `DELETE /v1/sessoes/{id}` | Confirma o recebimento (ou cancela o que ainda não foi lido) e apaga a sessão na hora. |
+| `POST /v1/montagens` | Segunda fase do modo `tarefas`: recebe `{"plano", "respostas": {id: texto}}` e devolve o resultado montado. |
 | `GET /v1/openapi.json`, `GET /saude` | Contrato; serviço no ar e versões. |
 
 - **Idempotência**: repetir o envio com a mesma `Idempotency-Key` antes da entrega devolve a mesma sessão (`200`),
@@ -106,8 +125,13 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   (`urn:lince:erro:<codigo>`) e `instance` igual ao `X-Request-Id`. O `X-Request-Id` enviado volta em toda
   resposta, o que facilita o rastreio entre os dois sistemas.
 - **Sem `X-IA-URL`**: só a extração nativa; o que precisava de IA aparece em `cobertura.pendentes`.
+- **Modo `tarefas`** (`-F modo=tarefas`): o Lince não chama IA. Cada documento volta com `tarefas` (imagem em base64,
+  instrução, onde está, `chave` de cache e `tokens_estimados`) e um `plano` opaco, assinado pelo servidor para o token
+  e válido por 24 h. Quem chama lê as imagens com o próprio modelo e manda `POST /v1/montagens`; nada fica guardado
+  no servidor. Com várias réplicas, todas precisam do mesmo `LINCE_SEGREDO` (32+ caracteres aleatórios); sem ele, o
+  plano só monta na instância que o entregou.
 - **Prazo**: com `prazo=20`, cada documento tem 20 s a partir do início da leitura dele (a espera na fila não
-  conta; a extração nativa conta, mas não é interrompida); o que a IA não leu a tempo aparece em
+  conta; a extração nativa conta, e no PDF a página que começa depois do prazo entra só com o texto); o que a IA não leu a tempo aparece em
   `cobertura.pendentes` como `prazo esgotado`.
 - **Fila justa**: os documentos são atendidos em rodízio entre tokens, então quem manda 500 não trava quem
   mandou 1. Até 16 documentos em leitura ao mesmo tempo por instância.
@@ -292,8 +316,9 @@ ganha `macros: true`: VBA no Office (OOXML, inclusive `.xlsb`, e `.doc`, `.xls`,
 Cada extensão da tabela é testada no CI com um arquivo real em `tests/fixtures/reais/`: os de Word, Excel,
 PowerPoint, OpenDocument, RTF, EPUB, PDF, HTML, SVG, CSV e imagem vêm dos conjuntos de teste públicos do Apache POI e do
 Apache Tika, gravados pelos próprios programas; `.pps`, `.pot`, `.htm`, `.jpeg` e `.tiff` são cópias com outra extensão, e os de
-texto foram escritos à mão. Limite conhecido: `.xlsb` gravado fora da especificação falha na leitura com erro claro
-do documento (um de 23 arquivos reais testados; nenhum outro leitor livre testado o abre).
+texto foram escritos à mão. O `.xlsb` gravado fora da especificação (como o do Excel 2007 Beta 2), que o leitor do
+corpo recusa, é lido registro a registro: valores, fórmulas com o resultado guardado e strings compartilhadas, e o
+caminho fica registrado em `partes_ilegiveis`.
 
 E-mail (`.eml`, `.msg`) e arquivos compactados (`.zip`) ainda não são aceitos.
 
@@ -302,7 +327,17 @@ E-mail (`.eml`, `.msg`) e arquivos compactados (`.zip`) ainda não são aceitos.
 ```bash
 pip install "lince @ git+https://github.com/Yefclub/lince"              # biblioteca
 pip install "lince[servidor] @ git+https://github.com/Yefclub/lince"    # + API HTTP
+pip install "lince[emf] @ git+https://github.com/Yefclub/lince"         # + desenho de EMF e WMF
 ```
+
+O desenho de EMF e WMF (`lince[emf]`, metafile-render) é opcional: ele só tem wheel para Linux glibc, macOS e
+Windows, e ainda não instala no Python 3.15. Sem ele, a imagem EMF ou WMF fica marcada no texto e entra em
+`cobertura.pendentes` com o motivo; o resto do documento é lido igual.
+
+**Alpine (musl).** O `pdf-inspector` e o `html-to-markdown` não publicam wheel musllinux: em Alpine o `pip`
+compila os dois a partir do código-fonte e precisa de Rust (`apk add rust cargo`) e de um compilador C. O
+`lince[emf]` não instala em Alpine. Para rodar como serviço, a imagem de referência é a
+`ghcr.io/yefclub/lince` (Debian slim, Python 3.14, com o `lince[emf]`), chamada pela API HTTP.
 
 Linha de comando:
 
@@ -324,16 +359,37 @@ cada publicação; patch e minor entram sozinhos quando o CI passa.
 
 ## Estado
 
-Versão 0.1, em validação. Resultados medidos com o mesmo modelo de visão para os dois motores, testes no estilo
-olmOCR-Bench e documentos inéditos criados por um agente sem contexto:
+Em validação. A bancada `bench/medir.py` gera os próprios documentos (nada de arquivo de terceiro), lê com uma IA
+simulada e confere o que o Lince faz: texto nativo, roteamento, montagem, texto oculto e concorrência. Ela refaz a
+tabela abaixo em qualquer máquina, e a versão curta roda no CI (`tests/test_bench.py`):
 
-| Teste | Docling + IA | Lince |
+```bash
+uv run --extra emf python bench/medir.py
+```
+
+| Conferência | Resultado | |
+| --- | --- | --- |
+| Lote de faturas do mesmo modelo (PDF) | 12/12 faturas no texto, rodapé com a folha nos metadados (0.0 s) | ok |
+| PDF longo | 15000/15000 linhas de 300 páginas (1.6 s) | ok |
+| Currículos com injeção escondida (5 técnicas) | 5/5 removidas, 5/5 com alerta (0.1 s) | ok |
+| Apresentação com gráficos e logo repetido | 5/5 slides numerados, 5/5 gráficos no lugar, 6 leituras para 10 imagens (0.1 s) | ok |
+| Leitura em duas fases (IA de quem chama) | 6 tarefas, resultado igual ao da IA do Lince (0.1 s) | ok |
+| Planilha grande | 100000 linhas, perfil data/texto/texto/numero/numero, corte avisado no texto (1.8 s) | ok |
+| Concorrência | 42/42 documentos ao mesmo tempo, 0 erros (1.3 s) | ok |
+| Pico de memória do processo | 245 MB | ok |
+
+Medido num contêiner de 4 CPUs, Python 3.13; o tempo não inclui gerar os documentos.
+
+A qualidade da leitura pela IA depende do modelo e não entra nesta bancada. Na versão 0.1 ela foi medida uma vez,
+com o mesmo modelo de visão para os dois motores, em testes no estilo olmOCR-Bench e em documentos que não podem
+ser publicados, e a carga foi medida uma vez com a API. Por isso a medição abaixo não é refeita pela bancada:
+
+| Teste (medição única, v0.1) | Docling + IA | Lince |
 | --- | --- | --- |
 | Bateria pública (Falcon, ANP, arXiv, Office) | 84% | 92% |
 | Conjunto cego de documentos corporativos | 86% | 89% |
 | Escaneados com gabarito exato (média e pesada) | 78% | 85–86% |
 | Gráficos do ParseBench (pontos de dados) | 14% | 50–53% |
-| Currículos com injeção oculta | 4/5 removidas, sem alerta | 5/5 removidas, 6/6 alertas |
 | Carga com 16 usuários simultâneos | 10 GB RAM, 10/160 perdidos | 1,4 GB, 0/160 perdidos |
 | Carga com 200 usuários × 10 documentos | — | 2.000/2.000, 3,7 GB, 0 quedas |
 | Carga com 1.000 usuários simultâneos × 3 documentos | — | 3.000/3.000 processados, 0 perdidos, 3,4 GB, 0 quedas |

@@ -19,21 +19,25 @@ SECOES_MAX = 2000  # documento com mais títulos que isso é índice de livro: a
 _TITULO = re.compile(r"(#{1,6})[ \t]+([^ \t\r].*)")
 _CERCA = re.compile(r" {0,3}(`{3,}|~{3,})(.*?)\r?")
 _PAGINA = re.compile(r"<!-- página ([1-9]\d*) · \w+ -->\r?")  # exatamente o que a montagem do PDF escreve
+_SLIDE = re.compile(r"<!-- slide ([1-9]\d*) -->\r?")  # o que a leitura da apresentação escreve no começo de cada slide
 _PPTX = {".pptx", ".pptm", ".ppsx", ".ppsm"}
 _XLSX = {".xlsx", ".xlsm"}
 _ODF_TABLE = "{urn:oasis:names:tc:opendocument:xmlns:table:1.0}"
 _ODF_STYLE = "{urn:oasis:names:tc:opendocument:xmlns:style:1.0}"
 
 
-def secoes(md: str, pdf: bool = False) -> dict:
+def secoes(md: str, pdf: bool = False, apresentacao: bool = False) -> dict:
     """Títulos do Markdown fora de bloco de código (cercas pela regra do CommonMark), com nível e posição. No PDF,
     também onde começa cada página: o marcador é do próprio Lince e fecha qualquer cerca deixada aberta (uma resposta
     da IA cortada no teto não apaga as âncoras das páginas seguintes)."""
-    titulos, paginas, pos, cerca = [], [], 0, None  # cerca aberta: (caractere, tamanho)
+    titulos, paginas, slides, pos, cerca = [], [], [], 0, None  # cerca aberta: (caractere, tamanho)
     cortadas = False
     for linha in md.split("\n"):
         if pdf and (m := _PAGINA.fullmatch(linha)):
             paginas.append({"pagina": int(m.group(1)), "inicio": pos})
+            cerca = None
+        elif apresentacao and (m := _SLIDE.fullmatch(linha)):
+            slides.append({"slide": int(m.group(1)), "inicio": pos})
             cerca = None
         elif m := _CERCA.fullmatch(linha):
             marca, resto = m.group(1), m.group(2)
@@ -54,6 +58,8 @@ def secoes(md: str, pdf: bool = False) -> dict:
         saida["secoes_cortadas"] = True
     if paginas:
         saida["inicio_das_paginas"] = paginas
+    if slides:
+        saida["inicio_dos_slides"] = slides
     return saida
 
 

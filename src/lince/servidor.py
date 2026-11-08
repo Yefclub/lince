@@ -59,6 +59,9 @@ CABECALHOS_MAX = {"x-ia-url": 2048, "x-ia-modelo": 200, "x-ia-chave": 4096}
 ERROS_HTTP = {400: "requisicao-invalida", 404: "rota-inexistente", 405: "metodo-nao-permitido"}
 LISTA_MAX = 200
 ESFORCOS = {"padrao", "max"}
+MODOS = {"leitura", "tarefas"}  # tarefas: o Lince não chama a IA; devolve o que ela precisa ler e monta depois
+PLANO_VALIDADE = 24 * 3600  # plano devolvido no modo tarefas vale um dia para a montagem
+PLANO_MAX = 64 * 1024 * 1024  # plano descompactado (texto e estado do documento): acima disso é hostil
 PRAZO_MIN, PRAZO_MAX = 1, 3600  # segundos por documento; o chat usa poucos, a base não manda prazo
 MIDIA = {
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -161,6 +164,8 @@ class Servico:
         self.retidos: dict[str, int] = {}  # bytes de resultado em memória por cliente (sessões em curso e concluídas)
         self.trava = threading.Lock()
         self.fila = Fila(self._ler, DOCS_SIMULTANEOS)
+        # segredo que assina o plano do modo tarefas: só o servidor conhece (LINCE_SEGREDO para várias réplicas)
+        self.segredo_plano = os.urandom(32)
 
     # ---------------------------------------------------------------- identidade e limites
     def cliente(self, request: Request) -> str:
@@ -173,6 +178,11 @@ class Servico:
             if any(hmac.compare_digest(dado, t.encode()) for t in self.tokens):
                 return hashlib.sha256(dado).hexdigest()[:16]
         raise Problema(401, "nao-autorizado", "Token ausente ou inválido", cabecalhos={"WWW-Authenticate": "Bearer"})
+
+    def segredo(self, cliente: str) -> bytes:
+        """Chave que sela o plano do modo tarefas para um cliente, derivada do segredo do servidor: quem chama não a
+        conhece, então não assina plano nenhum; só monta o que o servidor entregou a ele."""
+        return hmac.digest(self.segredo_plano, b"lince-plano\0" + cliente.encode(), "sha256")
 
     def reservar(self, cliente, n=1) -> bool:
         """Conferir e ocupar as vagas numa só operação: envios paralelos não furam o teto."""
@@ -199,15 +209,19 @@ class Servico:
             doc["estado"], doc["inicio"] = "lendo", time.time()
             cache = CacheComEscopo(self.cache, sessao["cliente"]) if self.cache else None
             leitor = Leitor(ia=sessao["ia"], esforco=sessao["esforco"], cache=cache)
+            if sessao.get("modo") == "tarefas":
+                plano = leitor.preparar(doc["arquivo"], prazo=sessao.get("prazo"))
+                doc["resultado"] = {
+                    "tarefas": plano.para_json()["tarefas"],  # imagem em base64
+                    "pendentes": plano.estado.get("pendentes", []) + plano.pendentes,
+                    "plano": selar(sessao["segredo"], sessao["cliente"], plano),
+                }
+                if sessao.get("codigo"):
+                    doc["resultado"].update(_codigo_do_documento(doc))
+                estado = "pronto"
+                return
             r = leitor.ler(doc["arquivo"], prazo=sessao.get("prazo"))
-            doc["resultado"] = {
-                "markdown": r.markdown,
-                "metadados": r.metadados,
-                "cobertura": asdict(r.cobertura),
-                "alertas_injecao": r.alertas_injecao,
-                "uso": [asdict(u) for u in r.uso],
-                "estrutura": r.estrutura,
-            }
+            doc["resultado"] = _resultado_api(r)
             if sessao.get("codigo"):
                 doc["resultado"].update(_codigo_do_documento(doc))
             estado = "pronto"
@@ -302,6 +316,156 @@ class Servico:
                 404, "sessao-nao-encontrada", "Sessão não encontrada", "Não existe, expirou ou é de outro token."
             )
         return x
+
+
+# -------------------------------------------------------------------- plano do modo tarefas
+def selar(segredo: bytes, cliente: str, plano) -> str:
+    """O plano (texto e estado do documento, sem as imagens) compactado e assinado com a chave do servidor para o
+    cliente: a montagem não guarda nada no servidor, só o mesmo token monta, dentro de PLANO_VALIDADE, e ninguém (nem
+    o próprio cliente) altera ou forja o plano. A forma e os tetos ainda são conferidos, como rede."""
+    import base64
+    import zlib
+
+    corpo = {"v": 1, "c": cliente, "t": time.time(), "estado": plano.estado, "pendentes": plano.pendentes,
+             "tarefas": [t.id for t in plano.tarefas]}  # fmt: skip
+    texto = json.dumps(corpo, ensure_ascii=False).encode()
+    if len(texto) > PLANO_MAX:  # a montagem recusaria: falha já aqui, antes de quem chama pagar as leituras
+        raise ValueError(f"plano de {len(texto) // 2**20} MB, acima do teto de {PLANO_MAX // 2**20} MB da montagem")
+    dados = base64.urlsafe_b64encode(zlib.compress(texto, 6)).decode()
+    return dados + "." + base64.urlsafe_b64encode(hmac.digest(segredo, dados.encode(), "sha256")).decode()
+
+
+def abrir(segredo: bytes, cliente: str, selado: str):
+    """O plano de `selar`, conferido: assinatura, dono, validade e tamanho. Levanta Problema."""
+    import base64
+    import binascii
+    import zlib
+
+    from .tipos import Plano, TarefaVisual
+
+    dados, _, assinatura = (selado or "").partition(".")
+    esperada = base64.urlsafe_b64encode(hmac.digest(segredo, dados.encode("utf-8", "replace"), "sha256")).decode()
+    if not dados or not hmac.compare_digest(assinatura.encode("utf-8", "replace"), esperada.encode()):
+        raise Problema(422, "plano-invalido", "Plano inválido", "Não foi assinado para este token, ou foi alterado.")
+    try:
+        d = zlib.decompressobj()
+        corpo = json.loads(d.decompress(base64.urlsafe_b64decode(dados), PLANO_MAX))
+        if d.unconsumed_tail:
+            raise ValueError("grande demais")
+    except (binascii.Error, zlib.error, ValueError) as e:
+        raise Problema(422, "plano-invalido", "Plano inválido", str(e)[:200]) from None
+    if corpo.get("c") != cliente:
+        raise Problema(422, "plano-invalido", "Plano inválido", "É de outro token.")
+    if time.time() - corpo.get("t", 0) > PLANO_VALIDADE:
+        raise Problema(422, "plano-expirado", "Plano expirado", f"Vale {PLANO_VALIDADE // 3600} h depois da leitura.")
+    tarefas = [TarefaVisual(i, "", b"", "", "", 0) for i in corpo["tarefas"]]
+    return Plano(tarefas, corpo["estado"], corpo["pendentes"])
+
+
+PLANO_PAGINAS_MAX = 100_000
+PLANO_TAREFAS_MAX = 20_000
+# no documento: regiões x caracteres de cada página, o que a montagem percorre ao achar o lugar de cada leitura
+# (~1 s); um PDF de mil páginas com dez figuras por página de 5 KB usa 50 milhões
+PLANO_TRABALHO_MAX = 500_000_000
+RESPOSTAS_MAX = 64 * 1024 * 1024  # caracteres somados das respostas de uma montagem
+SAIDA_MAX = 256 * 1024 * 1024  # caracteres que a montagem escreve (a leitura em cada lugar em que entra)
+
+
+def _montar_pedido(segredo, cliente, corpo):
+    """O corpo de POST /v1/montagens até o resultado. O plano foi assinado pelo servidor; a forma e os tetos ainda são
+    conferidos antes da montagem, como rede, e o que ela não entende vira 422, nunca erro interno."""
+    try:
+        pedido = json.loads(corpo)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise Problema(400, "montagem-invalida", "O corpo precisa ser JSON", str(e)[:200]) from None
+    respostas = pedido.get("respostas") if isinstance(pedido, dict) else None
+    if not isinstance(respostas, dict) or not all(isinstance(v, str) for v in respostas.values()):
+        raise Problema(400, "montagem-invalida", 'Envie {"plano": ..., "respostas": {id: texto}}')
+    if len(respostas) > PLANO_TAREFAS_MAX or sum(len(v) for v in respostas.values()) > RESPOSTAS_MAX:
+        raise Problema(413, "envio-grande", "Respostas grandes demais", f"Até {RESPOSTAS_MAX // 2**20} M caracteres.")
+    plano = abrir(segredo, cliente, str(pedido.get("plano") or ""))
+    try:
+        _conferir_estado(plano.estado)
+        if _tamanho_da_saida(plano.estado, respostas) > SAIDA_MAX:
+            raise Problema(413, "saida-grande", "Resultado grande demais", f"Até {SAIDA_MAX // 2**20} M caracteres.")
+        return Leitor().concluir(plano, respostas)
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as e:
+        raise Problema(422, "plano-invalido", "Plano inválido", f"{type(e).__name__}: {str(e)[:200]}") from None
+
+
+def _tamanho_da_saida(e, respostas) -> int:
+    """Quanto texto a montagem vai escrever: cada marca vira a leitura (a mesma imagem repetida recebe a mesma
+    leitura em cada lugar) ou a tabela e a fórmula nativas. Conta antes de montar, para a saída ter teto como a
+    entrada tem: uma resposta grande copiada em mil lugares não estoura a memória do processo."""
+    from collections import Counter
+
+    lote_de = {tid: lid for lid, itens in (e.get("lotes") or {}).items() for _, tid in itens}
+
+    def leitura(tid):
+        tid = e.get("iguais", {}).get(tid, tid)
+        return len(respostas.get(lote_de.get(tid, tid), "")) + 64
+
+    total = len(e.get("md", "")) + sum(len(x) for x in e.get("extras", []))
+    marcas = Counter(re.findall(r"\{\{IA:(\w+)\}\}", e.get("md", "")))
+    total += sum(n * leitura(tid) for tid, n in marcas.items())
+    for p in e.get("paginas", []):
+        total += len(p.get("md", "")) + sum(leitura(r.get("tarefa", "")) for r in p.get("regioes", []))
+        if p.get("rota") == "pagina":  # página escaneada: cada metade lida entra inteira
+            total += sum(leitura(t) for t in (p.get("tarefas") or [p.get("tarefa", "")]))
+        tabelas, formulas = p.get("tabelas", []), p.get("formulas", [])
+        for tipo, k in re.findall(r"\{\{(TABELA|FORMULA):(\d+)\}\}", p.get("md", "")):
+            nativo = tabelas if tipo == "TABELA" else formulas
+            k = int(k)
+            total += max(
+                len(nativo[k]) if k < len(nativo) else 0,
+                max((leitura(r.get("tarefa", "")) for r in p.get("regioes", [])), default=0),
+            )
+    return total
+
+
+def _conferir_estado(e):
+    """Forma e tetos do estado do plano, para a montagem não ter custo sem limite com um estado montado à mão."""
+
+    def lista(x, tipo, maximo, nome):
+        if not isinstance(x, list) or len(x) > maximo or not all(isinstance(i, tipo) for i in x):
+            raise ValueError(f"{nome} fora da forma ou acima de {maximo}")
+
+    if not isinstance(e, dict) or e.get("tipo") not in ("pdf", "office", "imagem", "texto"):
+        raise ValueError("tipo do plano")
+    lista(e.get("tarefas", []), dict, PLANO_TAREFAS_MAX, "tarefas")
+    lista(e.get("tarefas_originais", []), dict, PLANO_TAREFAS_MAX, "tarefas_originais")
+    lista(e.get("extras", []), str, PLANO_TAREFAS_MAX, "extras")
+    if not isinstance(e.get("md", ""), str) or not isinstance(e.get("iguais", {}), dict):
+        raise ValueError("md ou iguais")
+
+    lotes = e.get("lotes") or {}
+    if (
+        not isinstance(lotes, dict)
+        or sum(len(v) if isinstance(v, list) else 0 for v in lotes.values()) > PLANO_TAREFAS_MAX
+    ):
+        raise ValueError("lotes")
+    lista(e.get("paginas", []), dict, PLANO_PAGINAS_MAX, "paginas")
+    trabalho = 0
+    for p in e.get("paginas", []):
+        if not isinstance(p.get("md", ""), str) or p.get("rota") not in ("nativa", "regioes", "pagina"):
+            raise ValueError("página")
+        lista(p.get("regioes", []), dict, PLANO_TAREFAS_MAX, "regiões")
+        lista(p.get("tabelas", []), str, PLANO_TAREFAS_MAX, "tabelas")
+        lista(p.get("formulas", []), str, PLANO_TAREFAS_MAX, "fórmulas")
+        trabalho += len(p.get("regioes", [])) * (len(p.get("md", "")) + 1)
+        if trabalho > PLANO_TRABALHO_MAX:
+            raise ValueError("regiões e texto demais no documento")
+
+
+def _resultado_api(r) -> dict:
+    return {
+        "markdown": r.markdown,
+        "metadados": r.metadados,
+        "cobertura": asdict(r.cobertura),
+        "alertas_injecao": r.alertas_injecao,
+        "uso": [asdict(u) for u in r.uso],
+        "estrutura": r.estrutura,
+    }
 
 
 # -------------------------------------------------------------------- representação (contrato)
@@ -405,9 +569,13 @@ class _Envelope:
 
 
 # -------------------------------------------------------------------- rotas
-def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=None) -> Starlette:
+def criar_app(
+    tokens: list[str], clamav: tuple[str, int] | None = None, cache=None, segredo: bytes | None = None
+) -> Starlette:
     s = Servico(tokens)
     s.clamav, s.cache = clamav, cache
+    if segredo:  # o mesmo em todas as réplicas: o plano de uma monta em qualquer outra
+        s.segredo_plano = segredo
 
     async def saude(request):
         return JSONResponse({"status": "ok", "versao": VERSAO, "contrato": CONTRATO["info"]["version"]})
@@ -444,7 +612,7 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=No
             raise _limite_pendentes()
         reservadas, sessao, form = 1, None, None
         try:
-            form = await request.form(max_files=ARQUIVOS_MAX, max_fields=ARQUIVOS_MAX + 4)
+            form = await request.form(max_files=ARQUIVOS_MAX, max_fields=ARQUIVOS_MAX + 5)
             arquivos = [a for a in form.getlist("arquivo") if hasattr(a, "read")]
             if not arquivos:
                 raise Problema(400, "arquivo-ausente", "Envie ao menos um campo multipart 'arquivo'")
@@ -469,6 +637,13 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=No
                 prazo = int(prazo)
             else:
                 prazo = None
+            modo = str(form.get("modo") or "leitura")
+            if modo not in MODOS:
+                raise Problema(400, "modo-invalido", "modo deve ser 'leitura' ou 'tarefas'")
+            if modo == "tarefas" and (ia is not None or esforco == "max"):
+                raise Problema(
+                    400, "modo-invalido", "No modo tarefas a IA é de quem chama", "Sem X-IA-* e sem esforco=max."
+                )
             pedir_codigo = str(form.get("codigo") or "nao")
             if pedir_codigo not in ("sim", "nao"):
                 raise Problema(400, "codigo-invalido", "codigo deve ser 'sim' ou 'nao'")
@@ -486,8 +661,9 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=No
                         f"{a.filename!r}: aceitos {', '.join(sorted(FORMATOS))}",
                     )
             sessao = await _receber(
-                s, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=pedir_codigo == "sim", prazo=prazo
-            )
+                s, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=pedir_codigo == "sim", prazo=prazo,
+                modo=modo, segredo=s.segredo(cliente),
+            )  # fmt: skip
         finally:
             if form is not None:
                 await form.close()  # o spool do multipart sai do disco já: o documento foi copiado
@@ -654,6 +830,28 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=No
     async def edicao(request: Request):
         return await {"GET": edicao_arquivo, "HEAD": edicao_arquivo, "DELETE": edicao_apagar}[request.method](request)
 
+    async def montar(request: Request):
+        cliente = s.cliente(request)
+        tamanho = request.headers.get("content-length")
+        if not tamanho or not tamanho.isdigit():
+            raise Problema(411, "tamanho-ausente", "Content-Length obrigatório", "Upload chunked não é aceito.")
+        if int(tamanho) > TAMANHO_MAX:
+            raise Problema(413, "envio-grande", "Envio grande demais", f"Teto de {TAMANHO_MAX // 2**20} MB por envio.")
+        with s.trava:
+            cheio = s.acima_do_teto(cliente)
+        if cheio:
+            raise _limite_retencao()
+        if not s.reservar(cliente, 1):  # a vaga antes do corpo: pedidos em paralelo não somam memória sem teto
+            raise _limite_pendentes()
+        try:
+            corpo = await request.body()
+            segredo = s.segredo(cliente)
+            # leitura do JSON, abertura do plano e montagem fora do laço de eventos: os outros clientes seguem
+            r = await asyncio.to_thread(_montar_pedido, segredo, cliente, corpo)
+        finally:
+            s.liberar(cliente)
+        return JSONResponse(_resultado_api(r))
+
     async def limpeza(app):
         async def laco():
             while True:
@@ -672,6 +870,7 @@ def criar_app(tokens: list[str], clamav: tuple[str, int] | None = None, cache=No
             Route("/v1/sessoes", sessoes, methods=["GET", "POST"]),
             Route("/v1/sessoes/{id:str}", sessao, methods=["GET", "DELETE"], name="sessao"),
             Route("/v1/edicoes", editar, methods=["POST"]),
+            Route("/v1/montagens", montar, methods=["POST"]),
             Route("/v1/edicoes/{id:str}/arquivo", edicao, methods=["GET", "DELETE"], name="edicao_arquivo"),
         ],
         exception_handlers={Problema: erro_de_contrato, HTTPException: erro_http, Exception: erro_interno},
@@ -703,7 +902,10 @@ async def _varrer(s: Servico, nome, arquivo):
         ) from None
 
 
-async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=False, prazo=None):
+async def _receber(
+    s: Servico, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=False, prazo=None, modo="leitura",
+    segredo=b"",
+):  # fmt: skip
     """Grava o lote, calcula hash e tamanho, aplica a idempotência e põe os documentos na fila."""
     pasta = tempfile.mkdtemp(prefix="lince-api-")
     try:
@@ -732,7 +934,7 @@ async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave
         if sum(d["bytes"] for d in itens) > TAMANHO_MAX:
             raise Problema(413, "envio-grande", "Envio grande demais", f"Teto de {TAMANHO_MAX // 2**20} MB por envio.")
         provedor = getattr(ia, "identidade", None)
-        conteudo = [referencia, esforco, provedor, codigo, [(d["nome"], d["sha256"]) for d in itens], prazo]
+        conteudo = [referencia, esforco, provedor, codigo, [(d["nome"], d["sha256"]) for d in itens], prazo, modo]
         impressao = hashlib.sha256(json.dumps(conteudo).encode()).hexdigest()
         s.limpar()
         if chave_idem:  # repetição ou chave reusada: responde antes de varrer (o envio aceito já foi varrido)
@@ -765,6 +967,8 @@ async def _receber(s: Servico, cliente, arquivos, referencia, esforco, ia, chave
                 "esforco": esforco,
                 "prazo": prazo,
                 "codigo": codigo,
+                "modo": modo,
+                "segredo": segredo,
                 "ia": ia,
                 "criada_em": time.time(),
                 "concluida_em": None,
@@ -806,9 +1010,13 @@ def main():
         cache = cache_do_ambiente(os.environ)
     except ValueError as e:
         raise SystemExit(str(e)) from None
+    segredo = os.environ.get("LINCE_SEGREDO", "")
+    if segredo and len(segredo) < 32:
+        raise SystemExit("LINCE_SEGREDO precisa de pelo menos 32 caracteres aleatórios.")
     import uvicorn
 
-    uvicorn.run(criar_app(tokens, clamav, cache), host=a.host, port=a.porta, proxy_headers=True, log_level="info")
+    app = criar_app(tokens, clamav, cache, segredo.encode() or None)
+    uvicorn.run(app, host=a.host, port=a.porta, proxy_headers=True, log_level="info")
 
 
 def cache_do_ambiente(env) -> CacheRedis | None:

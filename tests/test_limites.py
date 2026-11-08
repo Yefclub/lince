@@ -119,11 +119,12 @@ def test_grafico_hostil_nao_derruba_a_leitura_do_pptx(tmp_path):
     assert "Produção anual" in lince.ler(hostil).markdown
 
 
-def test_corpo_hostil_nao_quebra_a_busca_de_texto_oculto(tmp_path):
-    from lince.seguranca import texto_oculto_docx
+def test_corpo_que_nao_abre_nunca_passa_como_sem_texto_oculto(tmp_path):
+    from lince.seguranca import XMLIlegivel, texto_oculto_docx
 
     hostil = _docx_com_parte(tmp_path, "word/document.xml", b"<w:document><nao-fecha>")
-    assert texto_oculto_docx(hostil) == []
+    with pytest.raises(XMLIlegivel):  # quem chama trata como suspeita (alerta), não como "nada oculto"
+        texto_oculto_docx(hostil)
 
 
 def test_pagina_gigante_nao_vira_imagem_gigante():

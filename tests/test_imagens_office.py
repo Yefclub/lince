@@ -121,6 +121,7 @@ def test_emf_no_word_sem_o_desenhista_fica_marcado_como_emf(tmp_path, monkeypatc
     monkeypatch.setitem(sys.modules, "metafile_render", None)
     r, vistas = _ler(_docx_com(tmp_path, ext, mime, _emf_real()))
     assert not vistas and "[imagem 1: imagem EMF não lida]" in r.markdown
+    assert r.cobertura.pendentes == ['imagem 1: EMF não desenhado, sem metafile-render (instale "lince[emf]")']
 
 
 def test_assinaturas_de_wmf_e_emf():
@@ -172,4 +173,5 @@ def test_svgs_do_documento_tem_teto_de_tempo(tmp_path, monkeypatch):
 
 def test_svgs_do_documento_tem_teto_de_quantidade(tmp_path):
     r, vistas = _ler(_docx_com(tmp_path, "svg", "image/svg+xml", SVG_AZUL, imagens=DESENHOS_MAX + 3))
-    assert len(vistas) == DESENHOS_MAX and r.markdown.count("SVG não lida]") == 3
+    assert r.markdown.count("Lido pela IA.") == DESENHOS_MAX and r.markdown.count("SVG não lida]") == 3
+    assert len(vistas) == 1  # o mesmo desenho em todos os lugares: a IA lê uma vez

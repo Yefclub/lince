@@ -14,7 +14,7 @@ from .cache import CacheDisco, CacheMemoria, CacheRedis
 from .leitor import VERSAO as __version__
 from .leitor import FormatoNaoSuportado, Leitor, ler
 from .provedores import FuncaoLeitor, LeitorVisual, OpenAICompativel
-from .tipos import Cobertura, PrazoEsgotado, RespostaIA, Resultado, Uso
+from .tipos import Cobertura, Plano, PrazoEsgotado, RespostaIA, Resultado, TarefaVisual, Uso
 
 __all__ = [
     "Leitor",
@@ -29,6 +29,8 @@ __all__ = [
     "Resultado",
     "Cobertura",
     "Uso",
+    "Plano",
+    "TarefaVisual",
     "RespostaIA",
     "PrazoEsgotado",
     "prazo_restante",
