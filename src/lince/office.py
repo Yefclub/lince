@@ -185,11 +185,23 @@ def planejar_office(path, pasta, ext=None):
     doc = anydoc.to_document(open(path, "rb").read(), format="csv" if ext in (".csv", ".tsv") else None)
     tarefas = []
 
+    ilegiveis = []
+
     def ler_imagem(data, mime, onde):
-        tid = f"img{len(tarefas) + 1:02d}"
+        """A imagem vira tarefa da IA; a que não abre (EMF, WMF, formato quebrado) fica marcada no lugar e
+        registrada, nunca derruba o documento. SVG é desenhado pelo resvg, como o arquivo .svg."""
         from PIL import Image
 
-        Image.open(io.BytesIO(data)).convert("RGB").save(f"{pasta}/ia/{tid}.png")
+        tid = f"img{len(tarefas) + 1:02d}"
+        destino = f"{pasta}/ia/{tid}.png"
+        try:
+            Image.open(io.BytesIO(data)).convert("RGB").save(destino)
+        except MemoryError:  # falta de memória não é imagem ruim: derruba o documento, como no resto da leitura
+            raise
+        except Exception:  # noqa: BLE001 — decodificador do Pillow com arquivo hostil levanta de tudo
+            if "svg" not in (mime or "").lower() or desenhar_svg(data, destino) != "lido":
+                ilegiveis.append(f"{onde}: imagem {mime or 'sem tipo'} não lida")
+                return f"[{onde}: imagem {_FORMATOS.get((mime or '').lower(), mime or 'sem tipo')} não lida]"
         tarefas.append({"id": tid, "modo": "imagem", "ancora": onde})
         return f"{{{{IA:{tid}}}}}"
 
@@ -202,7 +214,7 @@ def planejar_office(path, pasta, ext=None):
             seguranca.append(
                 {"tecnicas": sorted({m for m, _ in ocultos}), "texto": " ".join(t for _, t in ocultos)[:500]}
             )
-    extras, ilegiveis = [], []
+    extras = []
     if ext == ".xlsx":  # o anydoc não extrai imagem de planilha: openpyxl, com aba e célula
         from openpyxl import load_workbook
 
@@ -212,7 +224,7 @@ def planejar_office(path, pasta, ext=None):
                 for im in getattr(ws, "_images", []):
                     a = im.anchor._from
                     onde = f"aba {ws.title}, célula {chr(65 + a.col) if a.col < 26 else a.col}{a.row + 1}"
-                    md += f"\n\n**Imagem ({onde}):**\n\n" + ler_imagem(im._data(), "image/png", onde)
+                    md += f"\n\n**Imagem ({onde}):**\n\n" + ler_imagem(im._data(), _tipo(im), onde)
 
         _complemento(imagens_planilha, "imagens da planilha", ilegiveis)
     if ext in (".xlsx", ".docx"):
@@ -245,6 +257,32 @@ def planejar_office(path, pasta, ext=None):
         "texto_oculto": seguranca,
         "ilegiveis": ilegiveis,
     }
+
+
+_FORMATOS = {"image/x-emf": "EMF", "image/emf": "EMF", "image/x-wmf": "WMF", "image/wmf": "WMF",
+             "image/svg+xml": "SVG"}  # fmt: skip
+
+
+def _tipo(im) -> str:
+    """O tipo da imagem da planilha pela extensão que o openpyxl guardou (EMF e WMF não são PNG)."""
+    ext = (getattr(im, "format", None) or getattr(im, "path", "") or "").rsplit(".", 1)[-1].lower()
+    return {"emf": "image/x-emf", "wmf": "image/x-wmf", "svg": "image/svg+xml"}.get(ext, f"image/{ext or 'png'}")
+
+
+def desenhar_svg(data, destino) -> str:
+    """SVG embutido no Office desenhado pelo resvg, lido como XML sem rede e sem entidade externa."""
+    from lxml import etree
+
+    from .desenho_svg import desenhar_lote
+    from .pagina_html import _SVG_XML
+
+    try:
+        svg = etree.fromstring(data, _SVG_XML)
+    except etree.XMLSyntaxError:
+        return "ilegivel"
+    if svg is None or etree.QName(svg).localname != "svg":
+        return "ilegivel"
+    return desenhar_lote([(svg, destino)])[0]
 
 
 def _complemento(funcao, nome, ilegiveis):
