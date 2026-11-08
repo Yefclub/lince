@@ -1,6 +1,6 @@
 [project]
 name = "lince"
-version = "0.1.1.dev20261108074522"
+version = "0.1.1.dev20261108153916"
 description = "Leitor único de documentos: extração nativa + modelo de visão plugável, com cache, metadados e proteção contra prompt injection."
 readme = "README.md"
 requires-python = ">=3.11"
