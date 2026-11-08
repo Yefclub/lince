@@ -144,13 +144,8 @@ def planejar_html(path, pasta) -> dict:
     prefixo = _prefixo_livre(texto)
     visiveis = set(raiz.iter("svg"))  # SVG dentro de trecho oculto saiu da árvore: não é desenhado
     externos = [s for s in externos if s in visiveis]
-    for svg in externos:  # o desenho só sai quando o Lince considera o texto do SVG visível
-        invisivel, px = herdado.get(svg, (False, 16.0))
-        if invisivel or px <= FONTE_INVISIVEL_PX:
-            copias[svg] = None  # escondido ou de fonte zero: o desenho mostraria o que o corpo tirou
-        else:  # a fonte que o Lince calculou (herança e style) manda no desenho, sem outra resolução
-            estilo = (copias[svg].get("style") or "").rstrip().rstrip(";")
-            copias[svg].set("style", f"{estilo};font-size:{px:g}px !important".lstrip(";"))
+    for svg in externos:
+        copias[svg] = _para_desenhar(copias[svg], herdado.get(svg))
     # ícone (abaixo de 48 px) não vai para a IA; acima do teto, o desenho fica só no texto
     grandes = [s for s in externos if copias[s] is not None and (lado := tamanho(copias[s])) and min(lado) >= 48]
     if len(grandes) > DESENHOS_MAX:
@@ -334,17 +329,20 @@ def _tirar_oculto(raiz, svgs=None) -> list:
     escondido, antes de olhar as imagens: imagem dentro de bloco oculto não é paga nem lida. Percurso com pilha, sem
     recursão, levando o estado herdado (tamanho da fonte em px, invisível): o texto de um nó escondido sai mesmo que
     um descendente volte a aparecer. O(1) por nó, mais o tamanho do style. Em `svgs` (opcional) fica, para cada
-    <svg> mais externo, o estado que ele herda do HTML: (invisível, fonte em px)."""
+    <svg> mais externo, (escondido, fonte em px): escondido quando ele herda o invisível do HTML ou quando algum
+    texto dele sai por fonte de até 1 px, que o desenho ampliado mostraria (display, opacidade e visibilidade dentro
+    do SVG o próprio desenho respeita)."""
     ocultos, raiz_px = [], 16.0
-    pilha = [(raiz, 16.0, False, False)]  # (elemento, fonte herdada em px, invisível, dentro de SVG)
+    pilha = [(raiz, 16.0, False, None)]  # (elemento, fonte herdada em px, invisível, <svg> mais externo ou None)
     while pilha:
-        el, px, invisivel, em_svg = pilha.pop()
+        el, px, invisivel, dono = pilha.pop()
         if not isinstance(el.tag, str):
             continue
         if el.tag in _SEM_CONTEUDO:
             _esvaziar(el)
             continue
-        em_svg = em_svg or el.tag == "svg"
+        dono = dono if dono is not None or el.tag != "svg" else el
+        em_svg = dono is not None
         efetivas = _efetivas(el, em_svg, px, raiz_px)
         tecnica = None
         if el.get("hidden") is not None and not em_svg and efetivas.get("display") != "outro":
@@ -369,7 +367,7 @@ def _tirar_oculto(raiz, svgs=None) -> list:
         px = efetivas.get("font-size", px)
         if el is raiz:
             raiz_px = px
-        if svgs is not None and el.tag == "svg" and not any(a.tag == "svg" for a in el.iterancestors()):
+        if svgs is not None and el is dono:
             svgs[el] = (invisivel, px)
         if not em_svg and el.tag in _COM_ALTERNATIVO:
             # o texto alternativo, na ordem do documento, vai para o alerta, com a mídia visível ou não
@@ -396,11 +394,13 @@ def _tirar_oculto(raiz, svgs=None) -> list:
             continue
         if px <= FONTE_INVISIVEL_PX or invisivel:  # o texto deste nó e o que vem entre os filhos estão escondidos
             tecnica = "estilo que esconde" if invisivel else "fonte zero"
-            for dono, campo in [(el, "text")] + [(f, "tail") for f in el]:
-                if (t := getattr(dono, campo)) and t.strip():
+            for dono_texto, campo in [(el, "text")] + [(f, "tail") for f in el]:
+                if (t := getattr(dono_texto, campo)) and t.strip():
                     ocultos.append((tecnica, " ".join(t.split())))
-                    setattr(dono, campo, None)
-        pilha.extend((f, px, invisivel, em_svg) for f in reversed(list(el)))
+                    setattr(dono_texto, campo, None)
+                    if dono is not None and svgs is not None and not invisivel:  # o resvg desenharia a fonte
+                        svgs[dono] = (True, svgs.get(dono, (False, px))[1])
+        pilha.extend((f, px, invisivel, dono) for f in reversed(list(el)))
     return ocultos
 
 
@@ -492,11 +492,17 @@ def planejar_svg(path, pasta) -> dict:
             props.setdefault("title" if f.tag == "title" else "description", texto)
         _esvaziar(f)
     plano["propriedades"] = props
-    desenho = desenhar_lote([(svg, f"{pasta}/ia/svg01.png")])[0]
-    if desenho != "lido":  # sem o desenho, a <image> embutida passa pelo caminho da <img>
-        for im in copia.iter("image"):
-            im.tag, im.attrib["src"] = "img", im.get("href") or ""
-    ocultos = _tirar_oculto(raiz)
+    for im in copia.iter("image"):  # a <image> do SVG passa pelo mesmo caminho da <img>
+        im.tag, im.attrib["src"] = "img", im.get("href") or ""
+    herdado = {}
+    ocultos = _tirar_oculto(raiz, herdado)
+    if (pronto := _para_desenhar(svg, herdado.get(copia))) is None:
+        desenho = "escondido"
+    else:
+        desenho = desenhar_lote([(pronto, f"{pasta}/ia/svg01.png")])[0]
+    if desenho == "lido":  # a imagem embutida já está no desenho: não é lida à parte
+        for im in list(copia.iter("img")):
+            _esvaziar(im)
     prefixo = _prefixo_livre(" ".join(raiz.itertext()))
     marcas = _imagens(raiz, pasta, plano["tarefas"], prefixo)
     linhas = []
@@ -504,7 +510,11 @@ def planejar_svg(path, pasta) -> dict:
         plano["tarefas"].append({"id": "svg01", "modo": "imagem", "ancora": props.get("title") or "desenho"})
         linhas.append("{{IA:svg01}}")
     elif desenho != "branco":
-        motivo = {"sem resvg": "resvg indisponível", "tempo": "tempo esgotado"}.get(desenho, "fora do padrão")
+        motivo = {
+            "sem resvg": "resvg indisponível",
+            "tempo": "tempo esgotado",
+            "escondido": "texto escondido no desenho",
+        }.get(desenho, "fora do padrão")
         plano["ilegiveis"].append(f"svg: desenho não lido ({motivo}); só o texto")
     for el in copia.iter():
         if any(a.tag in _SVG_LINHA for a in el.iterancestors()):
@@ -519,6 +529,18 @@ def planejar_svg(path, pasta) -> dict:
             {"tecnicas": sorted({t for t, _ in ocultos}), "texto": " ".join(t for _, t in ocultos)[:500]}
         )
     return plano
+
+
+def _para_desenhar(copia, estado):
+    """A cópia do SVG pronta para o desenho, ou None quando ele não pode ser desenhado: herdou o invisível do HTML
+    ou tem texto de até 1 px, que o desenho ampliado mostraria e o corpo tirou.
+    Sem registro do estado, também não desenha. A fonte que o Lince calculou é forçada na raiz da cópia."""
+    escondido, px = estado or (True, 0.0)
+    if escondido or px <= FONTE_INVISIVEL_PX:
+        return None
+    estilo = (copia.get("style") or "").rstrip().rstrip(";")
+    copia.set("style", f"{estilo};font-size:{px:g}px !important".lstrip(";"))
+    return copia
 
 
 def _propriedades(raiz) -> dict:
