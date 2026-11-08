@@ -464,11 +464,12 @@ _DRAW = "urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
 
 def _imagens_ods(path, ilegiveis) -> list[tuple[str, str, bytes]]:
     """(onde, MIME, bytes) das imagens das abas do .ods, na ordem do documento: draw:image dentro de draw:frame que
-    não é objeto embutido (o gráfico traz a prévia em ObjectReplacements e é lido à parte). content.xml é lido em
+    não é objeto embutido (o gráfico traz a prévia em ObjectReplacements e é lido à parte), só a primeira de cada
+    frame (as demais são representações alternativas da mesma imagem). content.xml é lido em
     streaming, limpando cada elemento: a planilha pode ser enorme. Mesma imagem, uma vez; até legados.IMAGENS_MAX."""
     from defusedxml.ElementTree import iterparse
 
-    achadas, alvos, aba, objeto = [], set(), "", 0
+    achadas, alvos, aba, objeto, imagem_no_frame = [], set(), "", 0, False
     with zipfile.ZipFile(path) as z:
         nomes = set(z.namelist())
         if "content.xml" not in nomes:
@@ -480,7 +481,8 @@ def _imagens_ods(path, ilegiveis) -> list[tuple[str, str, bytes]]:
                         aba = el.get(f"{{{_TB}}}name") or aba
                     elif el.tag == f"{{{_DRAW}}}object" or el.tag == f"{{{_DRAW}}}object-ole":
                         objeto += 1
-                    elif el.tag == f"{{{_DRAW}}}image" and not objeto:
+                    elif el.tag == f"{{{_DRAW}}}image" and not objeto and not imagem_no_frame:
+                        imagem_no_frame = True  # as seguintes do mesmo frame são alternativas (PNG de reserva do SVG)
                         alvo = (el.get(_XLINK) or "").removeprefix("./")
                         if alvo in nomes and alvo not in alvos:
                             if len(alvos) >= legados.IMAGENS_MAX:
@@ -492,7 +494,7 @@ def _imagens_ods(path, ilegiveis) -> list[tuple[str, str, bytes]]:
                             achadas.append((f"aba {aba}" if aba else "planilha", _mime(alvo), z.read(alvo)))
                     continue
                 if el.tag == f"{{{_DRAW}}}frame":
-                    objeto = 0  # o frame acabou: a próxima imagem não é prévia de objeto
+                    objeto, imagem_no_frame = 0, False  # o frame acabou: a próxima imagem é outra
                 el.clear()
     return achadas
 

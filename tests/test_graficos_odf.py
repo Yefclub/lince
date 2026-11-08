@@ -5,7 +5,7 @@ import zipfile
 from pathlib import Path
 
 import lince
-from lince import office
+from lince import legados, office
 
 REAIS = Path(__file__).parent / "fixtures" / "reais"
 
@@ -143,3 +143,36 @@ def test_imagem_da_planilha_do_libreoffice_e_lida_com_a_aba():
 def test_previa_do_grafico_nao_e_lida_como_imagem():
     ilegiveis = []
     assert office._imagens_ods(REAIS / "lince_grafico.ods", ilegiveis) == [] and not ilegiveis
+
+
+def _ods_com_imagens(tmp_path, quadros):
+    corpo = "".join(
+        "<draw:frame>" + "".join(f'<draw:image xlink:href="Pictures/{n}"/>' for n in nomes) + "</draw:frame>"
+        for nomes in quadros
+    )
+    p = tmp_path / "imagens.ods"
+    with zipfile.ZipFile(p, "w") as z:
+        z.writestr(
+            "content.xml",
+            '<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+            'xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" '
+            'xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" '
+            'xmlns:xlink="http://www.w3.org/1999/xlink"><office:body><office:spreadsheet>'
+            f'<table:table table:name="Painel">{corpo}</table:table></office:spreadsheet></office:body>'
+            "</office:document-content>",
+        )
+        for nome in {n for nomes in quadros for n in nomes}:
+            z.writestr(f"Pictures/{nome}", nome.encode())
+    return p
+
+
+def test_frame_com_svg_e_png_de_reserva_e_uma_imagem_so(tmp_path):
+    achadas = office._imagens_ods(_ods_com_imagens(tmp_path, [["logo.svg", "logo.png"]]), [])
+    assert [(onde, mime) for onde, mime, _ in achadas] == [("aba Painel", "image/svg+xml")]
+
+
+def test_teto_de_imagens_da_planilha_fica_registrado(tmp_path, monkeypatch):
+    monkeypatch.setattr(legados, "IMAGENS_MAX", 2)
+    ilegiveis = []
+    achadas = office._imagens_ods(_ods_com_imagens(tmp_path, [["a.png"], ["b.png"], ["c.png"], ["d.png"]]), ilegiveis)
+    assert len(achadas) == 2 and ilegiveis == ["imagens da planilha: mais de 2; o resto ficou de fora"]
