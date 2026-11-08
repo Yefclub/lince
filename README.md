@@ -302,7 +302,17 @@ E-mail (`.eml`, `.msg`) e arquivos compactados (`.zip`) ainda não são aceitos.
 ```bash
 pip install "lince @ git+https://github.com/Yefclub/lince"              # biblioteca
 pip install "lince[servidor] @ git+https://github.com/Yefclub/lince"    # + API HTTP
+pip install "lince[emf] @ git+https://github.com/Yefclub/lince"         # + desenho de EMF e WMF
 ```
+
+O desenho de EMF e WMF (`lince[emf]`, metafile-render) é opcional: ele só tem wheel para Linux glibc, macOS e
+Windows, e ainda não instala no Python 3.15. Sem ele, a imagem EMF ou WMF fica marcada no texto e entra em
+`cobertura.pendentes` com o motivo; o resto do documento é lido igual.
+
+**Alpine (musl).** O `pdf-inspector` e o `html-to-markdown` não publicam wheel musllinux: em Alpine o `pip`
+compila os dois a partir do código-fonte e precisa de Rust (`apk add rust cargo`) e de um compilador C. O
+`lince[emf]` não instala em Alpine. Para rodar como serviço, a imagem de referência é a
+`ghcr.io/yefclub/lince` (Debian slim, Python 3.14, com o `lince[emf]`), chamada pela API HTTP.
 
 Linha de comando:
 

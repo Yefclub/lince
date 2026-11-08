@@ -158,6 +158,7 @@ class Leitor:
                 paginas=len(plano.get("paginas", [])) or 1,
                 rotas={p["i"] + 1: p["rota"] for p in plano.get("paginas", [])},
             )
+            cobertura.pendentes += plano.get("pendentes", [])
             if plano["tipo"] == "texto":
                 return _com_estrutura(Resultado(plano["md"], plano.get("meta_arquivo", {}), cobertura), plano)
             tarefas = plano["tarefas"]

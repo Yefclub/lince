@@ -343,7 +343,7 @@ def planejar_office(path, pasta, ext=None):
         if grande
         else anydoc.to_document(open(path, "rb").read(), format="csv" if ext in (".csv", ".tsv") else None)
     )
-    tarefas, ilegiveis = [], []
+    tarefas, ilegiveis, pendentes = [], [], []  # pendentes: o que entra em cobertura.pendentes, com o motivo
     svgs, sentinela = [], f"LINCE{secrets.token_hex(8)}S"  # desenhos vetoriais, juntos no fim, num lote só
     vistas = set()  # imagens já lidas (sha256): o armazém dos binários não as repete
 
@@ -482,7 +482,7 @@ def planejar_office(path, pasta, ext=None):
             ilegiveis,
         )
     if svgs:
-        md = re.sub(rf"{sentinela}(\d+)X", _desenhar_svgs(svgs, pasta, tarefas, ilegiveis), md)
+        md = re.sub(rf"{sentinela}(\d+)X", _desenhar_svgs(svgs, pasta, tarefas, ilegiveis, pendentes), md)
     return {
         "tipo": "office",
         "md": md,
@@ -491,6 +491,7 @@ def planejar_office(path, pasta, ext=None):
         "texto_oculto": seguranca,
         "ilegiveis": ilegiveis,
         "perfil_tabular": perfis,
+        "pendentes": pendentes,
     }
 
 
@@ -823,7 +824,7 @@ def _metafile(data, mime) -> str | None:
     return (mime or "").lower() if (mime or "").lower() in _METAFILES else None
 
 
-def _desenhar_svgs(svgs, pasta, tarefas, ilegiveis):
+def _desenhar_svgs(svgs, pasta, tarefas, ilegiveis, pendentes):
     """Desenha os SVG, EMF e WMF do documento num lote só (o teto de tempo é do documento) e até DESENHOS_MAX;
     devolve a troca de cada marca provisória pela tarefa da IA ou pela marca de imagem não lida."""
     from lxml import etree
@@ -854,6 +855,9 @@ def _desenhar_svgs(svgs, pasta, tarefas, ilegiveis):
             trocas[k] = f"{{{{IA:{tid}}}}}"
         else:
             trocas[k] = _nao_lida(onde, mime, ilegiveis)
+            if feito.startswith("sem "):  # falta o desenhista: dá para resolver instalando, fica pendente
+                extra = ' (instale "lince[emf]")' if feito == "sem metafile-render" else ""
+                pendentes.append(f"{onde}: {_FORMATOS.get(mime, mime)} não desenhado, {feito}{extra}")
     return lambda m: trocas[int(m.group(1))]
 
 

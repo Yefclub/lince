@@ -121,6 +121,7 @@ def test_emf_no_word_sem_o_desenhista_fica_marcado_como_emf(tmp_path, monkeypatc
     monkeypatch.setitem(sys.modules, "metafile_render", None)
     r, vistas = _ler(_docx_com(tmp_path, ext, mime, _emf_real()))
     assert not vistas and "[imagem 1: imagem EMF não lida]" in r.markdown
+    assert r.cobertura.pendentes == ['imagem 1: EMF não desenhado, sem metafile-render (instale "lince[emf]")']
 
 
 def test_assinaturas_de_wmf_e_emf():

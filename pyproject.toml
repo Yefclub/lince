@@ -18,12 +18,14 @@ dependencies = [
   "html-to-markdown>=3.20,<4", # MIT — HTML para Markdown (núcleo em Rust, sem dependências)
   "tinycss2>=1.4,<2",          # BSD-3 — style do HTML com a sintaxe e a cascata do CSS
   "resvg-py>=0.5,<0.6",        # MIT (no LICENSE do pacote; o PyPI não traz o campo) — desenha o SVG
-  "metafile-render>=0.4.2,<0.5 ; python_full_version < '3.15'",  # MIT — desenha EMF e WMF (ainda sem o 3.15)
 ]
 
 [project.optional-dependencies]
 servidor = ["starlette>=1.10", "uvicorn>=0.54", "python-multipart>=0.0.32", "redis>=8.1,<9"]  # BSD-3 / BSD-3 / Apache-2.0 / MIT
 redis = ["redis>=8.1,<9"]  # MIT — CacheRedis para quem usa o Lince como lib
+# MIT — desenha EMF e WMF. Opcional: só tem wheel glibc (não instala em Alpine/musl) e ainda não instala no 3.15;
+# sem ele, a imagem EMF/WMF fica marcada no texto e entra em cobertura.pendentes com o motivo
+emf = ["metafile-render>=0.4.2,<0.5 ; python_full_version < '3.15'"]
 
 [dependency-groups]
 # só desenvolvimento e CI (não vão para a imagem); versões travadas no uv.lock e atualizadas pelo Dependabot
