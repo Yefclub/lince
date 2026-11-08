@@ -36,40 +36,74 @@ TIPOS_GRAFICO = {
 
 
 _CELULAS_SEM_CACHE_MAX = 100_000  # intervalo de série sem cache lido da planilha; um gráfico real tem centenas
+_UNIAO_SEM_CACHE_MAX = 1_000_000  # retângulo que cobre os intervalos de uma aba, lido de uma vez
+# onde cada campo da série aponta para a planilha quando o gráfico não guarda os valores
+_CAMPOS_SEM_CACHE = (
+    ("nome", ("c:tx/c:strRef",)),
+    ("cats", ("c:cat/c:strRef", "c:cat/c:numRef")),
+    ("vals", ("c:val/c:numRef",)),
+)
+
+
+def _intervalo(el, nomes_das_abas):
+    """(aba, col1, lin1, col2, lin2) da referência c:f de um gráfico sem cache, ou None: fora do padrão, aba que não
+    existe, coluna ou linha inteira, ou acima de _CELULAS_SEM_CACHE_MAX células."""
+    from openpyxl.utils import range_boundaries
+
+    f = el.find("c:f", NS) if el is not None else None
+    m = re.match(r"^'?(.+?)'?!(.+)$", (f.text or "") if f is not None else "")
+    if not m or m.group(1) not in nomes_das_abas:
+        return None
+    try:
+        c1, l1, c2, l2 = range_boundaries(m.group(2).replace("$", ""))
+    except ValueError:
+        return None
+    if None in (c1, l1, c2, l2) or (c2 - c1 + 1) * (l2 - l1 + 1) > _CELULAS_SEM_CACHE_MAX:
+        return None
+    return m.group(1), c1, l1, c2, l2
+
+
+def _valores_sem_cache(path, refs) -> dict:
+    """Valores de cada intervalo em `refs`, lidos da planilha em modo somente leitura (carregar a planilha inteira
+    custaria minutos e gigabytes numa base grande). Cada aba é percorrida uma vez, no retângulo que cobre todos os
+    intervalos dela; se ele passar de _UNIAO_SEM_CACHE_MAX, cada intervalo é lido à parte."""
+    from openpyxl import load_workbook
+
+    out, por_aba = {}, {}
+    for r in refs:
+        por_aba.setdefault(r[0], set()).add(r)
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        for aba, rs in por_aba.items():
+            c1, l1 = min(r[1] for r in rs), min(r[2] for r in rs)
+            c2, l2 = max(r[3] for r in rs), max(r[4] for r in rs)
+            if (c2 - c1 + 1) * (l2 - l1 + 1) <= _UNIAO_SEM_CACHE_MAX:
+                grade = list(wb[aba].iter_rows(min_row=l1, max_row=l2, min_col=c1, max_col=c2, values_only=True))
+                for r in rs:
+                    out[r] = [v for linha in grade[r[2] - l1 : r[4] - l1 + 1] for v in linha[r[1] - c1 : r[3] - c1 + 1]]
+            else:
+                for r in rs:
+                    linhas = wb[aba].iter_rows(min_row=r[2], max_row=r[4], min_col=r[1], max_col=r[3], values_only=True)
+                    out[r] = [v for linha in linhas for v in linha]
+    finally:
+        wb.close()
+    return out
 
 
 def graficos_ooxml(path):
-    """Gráfico nativo do Office: tipo, título, séries e valores do cache — dado exato."""
-    out, pasta_de_trabalho = [], []  # o workbook só é aberto se um gráfico vier sem cache
-
-    def resolver(el):
-        """Sem cache no gráfico: lê o intervalo referenciado direto da planilha, em modo somente leitura e só as
-        células do intervalo (carregar a planilha inteira custaria minutos e gigabytes numa base grande)."""
-        f = el.find("c:f", NS) if el is not None else None
-        if f is None or not path.lower().endswith((".xlsx", ".xlsm")):
-            return []
-        m = re.match(r"^'?(.+?)'?!(.+)$", f.text or "")
-        if not m:
-            return []
-        if not pasta_de_trabalho:
-            from openpyxl import load_workbook
-
-            pasta_de_trabalho.append(load_workbook(path, read_only=True, data_only=True))
-        wb = pasta_de_trabalho[0]
-        if m.group(1) not in wb.sheetnames:
-            return []
-        from openpyxl.utils import range_boundaries
-
-        try:
-            c1, l1, c2, l2 = range_boundaries(m.group(2).replace("$", ""))
-        except ValueError:
-            return []
-        if None in (c1, l1, c2, l2) or (c2 - c1 + 1) * (l2 - l1 + 1) > _CELULAS_SEM_CACHE_MAX:
-            return []  # coluna ou linha inteira, ou intervalo enorme: fica sem os valores, como gráfico sem cache
-        linhas = wb[m.group(1)].iter_rows(min_row=l1, max_row=l2, min_col=c1, max_col=c2, values_only=True)
-        return [v for linha in linhas for v in linha]
-
+    """Gráfico nativo do Office: tipo, título, séries e valores do cache — dado exato. Sem cache (gráfico gravado
+    por biblioteca), os valores vêm do intervalo na planilha, lidos depois de todos os gráficos, uma vez por aba."""
+    out, pendentes = [], []  # (série, campo, intervalo) a completar com os valores da planilha
+    planilha = path.lower().endswith((".xlsx", ".xlsm"))
     with zipfile.ZipFile(path) as z:
+        abas = set()
+        if planilha and "xl/workbook.xml" in z.namelist():
+            livro = xml_ou_nada(z.read("xl/workbook.xml"))
+            abas = (
+                {a.get("name") for a in livro.iter() if a.tag.rsplit("}", 1)[-1] == "sheet"}
+                if livro is not None
+                else set()
+            )
         for nome in sorted(n for n in z.namelist() if re.search(r"/charts/chart\d+\.xml$", n)):
             root = xml_ou_nada(z.read(nome))
             if root is None or root.find(".//c:plotArea", NS) is None:
@@ -82,26 +116,29 @@ def graficos_ooxml(path):
                     continue
                 series = []
                 for ser in tipo_el.findall("c:ser", NS):
-                    nome_s = " ".join(v.text or "" for v in ser.findall("c:tx//c:v", NS))
-                    if not nome_s:
-                        nome_s = " ".join(str(v) for v in resolver(ser.find("c:tx/c:strRef", NS))) or "série"
-                    cats = [v.text for v in ser.findall("c:cat//c:pt/c:v", NS)]
-                    if not cats:
-                        cats = [
-                            str(v)
-                            for v in resolver(ser.find("c:cat/c:strRef", NS))
-                            or resolver(ser.find("c:cat/c:numRef", NS))
-                        ]
-                    vals = [v.text for v in ser.findall("c:val//c:pt/c:v", NS)]
-                    if not vals:
-                        vals = [str(v) for v in resolver(ser.find("c:val/c:numRef", NS))]
                     ref = ser.find("c:val//c:f", NS)
-                    series.append(
-                        {"nome": nome_s, "cats": cats, "vals": vals, "ref": ref.text if ref is not None else None}
-                    )
+                    s = {
+                        "nome": " ".join(v.text or "" for v in ser.findall("c:tx//c:v", NS)),
+                        "cats": [v.text for v in ser.findall("c:cat//c:pt/c:v", NS)],
+                        "vals": [v.text for v in ser.findall("c:val//c:pt/c:v", NS)],
+                        "ref": ref.text if ref is not None else None,
+                    }
+                    for campo, caminhos in _CAMPOS_SEM_CACHE:
+                        if not s[campo] and planilha:
+                            for caminho in caminhos:
+                                if r := _intervalo(ser.find(caminho, NS), abas):
+                                    pendentes.append((s, campo, r))
+                                    break
+                    series.append(s)
                 out.append({"parte": nome, "tipo": TIPOS_GRAFICO[tag], "titulo": titulo, "series": series})
-    for wb in pasta_de_trabalho:
-        wb.close()
+    if pendentes:
+        valores = _valores_sem_cache(path, {r for _, _, r in pendentes})
+        for s, campo, r in pendentes:
+            lidos = [str(v) for v in valores.get(r, [])]
+            s[campo] = " ".join(lidos) if campo == "nome" else lidos
+    for g in out:
+        for s in g["series"]:
+            s["nome"] = s["nome"] or "série"
     return out
 
 
