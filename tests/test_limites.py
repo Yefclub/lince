@@ -159,6 +159,8 @@ def test_tabela_de_strings_do_xlsb_tem_teto_de_quantidade_e_de_texto(tmp_path, m
     assert legados.xlsb_tolerante(_xlsb_com_strings(tmp_path, 1000)) == ([], False)  # no teto, lê
     with pytest.raises(DocumentoRecusado, match="tabela de strings do .xlsb acima do teto"):
         legados.xlsb_tolerante(_xlsb_com_strings(tmp_path, 1001))
+    with pytest.raises(DocumentoRecusado, match="tabela de strings do .xlsb acima do teto"):
+        lince.ler(_xlsb_com_strings(tmp_path, 1001))  # o motivo chega a quem lê, não o erro do leitor do corpo
     monkeypatch.setattr(legados, "_XLSB_STRINGS_BYTES_MAX", 10 * 1024)  # poucas strings, mas longas
     with pytest.raises(DocumentoRecusado, match="MB de texto"):
         legados.xlsb_tolerante(_xlsb_com_strings(tmp_path, 3, texto="x" * 2000))

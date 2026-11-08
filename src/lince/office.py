@@ -13,7 +13,7 @@ from xml.etree import ElementTree as ET  # noqa: F401
 from lxml import etree
 
 from . import legados, perfil_tabular
-from .limites import xml_ou_nada
+from .limites import DocumentoRecusado, xml_ou_nada
 from .metadados import BINARIOS_OLE, ERROS_DE_PARTE, ODF
 from .seguranca import NAO_CONFERIDO, XMLIlegivel, _xml, limpar_docx, limpar_pptx
 
@@ -360,7 +360,7 @@ def planejar_office(path, pasta, ext=None):
             doc = None  # .xlsb fora da especificação (gravadores antigos): lido registro a registro
             try:
                 md_xlsb = _xlsb_tolerante(path, ilegiveis_xlsb := [])
-            except MemoryError:
+            except (MemoryError, DocumentoRecusado):  # o teto do leitor tolerante diz o motivo a quem chama
                 raise
             except Exception:  # noqa: BLE001 — o leitor tolerante também não abre: vale o erro do leitor do corpo
                 raise recusa from None
