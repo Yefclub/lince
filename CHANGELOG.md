@@ -354,7 +354,7 @@ do Office e a preservação das macros. Alguns arquivos `.xlsb` ainda falham na 
 Um documento do Word, do PowerPoint ou do LibreOffice com uma imagem que não abre (corrompida, ou EMF e WMF quando o
 desenhista não está instalado, como no Python 3.15) falhava inteiro, sem texto nenhum. Agora o documento é lido
 normalmente: a imagem fica marcada no lugar em que aparecia, com o formato (por exemplo
-`[imagem 1: imagem PNG não lida]`), e entra em `partes_ilegiveis`, para a plataforma saber o que ficou de fora.
+`[imagem 1: imagem EMF não lida]`), e entra em `partes_ilegiveis`, para a plataforma saber o que ficou de fora.
 
 #### SVG dentro do Office
 
