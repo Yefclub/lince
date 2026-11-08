@@ -27,10 +27,11 @@ import tinycss2
 from lxml import etree
 from lxml import html as lxml_html
 
-from .desenho_svg import de_html, desenhar, tamanho
+from .desenho_svg import de_html, desenhar_lote, tamanho
 
 IMAGEM_MAX = 20 * 1024 * 1024  # bytes de uma imagem embutida; maior que isso fica marcada, sem leitura
 PROFUNDIDADE_MAX = 2048  # o libxml2 com huge_tree corta aí; o html-to-markdown recebe o mesmo teto
+DESENHOS_MAX = 50  # SVGs inline desenhados por página: cada um é uma leitura da IA; o resto fica no texto
 _SEM_CONTEUDO = {"script", "style", "noscript", "template", "iframe", "object", "embed", "head"}
 # Estilo da própria tag lido pelo tinycss2 (a sintaxe do CSS: comentário, escape, string, url(), !important), com a
 # cascata do CSS: vale a última declaração válida, e !important vence; valor inválido é descartado. O atributo de
@@ -134,22 +135,36 @@ def planejar_html(path, pasta) -> dict:
     if any(e.type_name == "ERR_RESOURCE_LIMIT" for e in parser.error_log):
         plano["ilegiveis"].append(f"html: aninhado além de {PROFUNDIDADE_MAX} níveis; o resto ficou de fora")
     plano["propriedades"] = _propriedades(raiz)
+    # o desenho do SVG inline é copiado antes de tirar o oculto, que esvazia defs, gradientes, marcadores e <style>
+    externos = [s for s in raiz.iter("svg") if next(s.iterancestors("svg"), None) is None]  # só o mais externo
+    copias = {svg: de_html(svg) for svg in externos}
     ocultos = _tirar_oculto(raiz)
     prefixo = _prefixo_livre(texto)
-    # o conversor descarta SVG inline: o desenho vai para a IA (ícone, abaixo de 48 px, não) e o texto que ele
-    # desenha (rótulos de gráfico) fica, no lugar e na mesma linha, para valer mesmo sem a IA
+    visiveis = set(raiz.iter("svg"))  # SVG dentro de trecho oculto saiu da árvore: não é desenhado
+    externos = [s for s in externos if s in visiveis]
+    # ícone (abaixo de 48 px) não vai para a IA; acima do teto, o desenho fica só no texto
+    grandes = [s for s in externos if (lado := tamanho(copias[s])) and min(lado) >= 48]
+    if len(grandes) > DESENHOS_MAX:
+        plano["ilegiveis"].append(f"svg: {len(grandes) - DESENHOS_MAX} desenhos além do teto de {DESENHOS_MAX}")
+    lote = grandes[:DESENHOS_MAX]
+    feitos = desenhar_lote([(copias[s], f"{pasta}/ia/svg{k + 1:02d}.png") for k, s in enumerate(lote)])
+    if (cortados := feitos.count("tempo")) or feitos.count("ilegivel"):
+        plano["ilegiveis"].append(
+            f"svg: {cortados + feitos.count('ilegivel')} desenhos não lidos (tempo esgotado ou fora do padrão)"
+        )
+    resultado = {svg: (k, feito) for k, (svg, feito) in enumerate(zip(lote, feitos, strict=True))}
+    # o conversor descarta SVG inline: o texto que ele desenha (rótulos de gráfico) fica, no lugar e na mesma
+    # linha, para valer mesmo sem a IA; o desenho lido entra antes dele
     desenhos = {}
-    for svg in [s for s in raiz.iter("svg") if next(s.iterancestors("svg"), None) is None]:  # só o mais externo
+    for k, svg in enumerate(externos):
         rotulos = " ".join(" ".join(svg.itertext()).split())
         troca = etree.Element("span")
         troca.text, troca.tail = f" {rotulos} " if rotulos else "", svg.tail
-        real = de_html(svg)
-        if (lado := tamanho(real)) and min(lado) >= 48:
-            tid = f"svg{len(desenhos) + 1:02d}"
-            if desenhar(real, f"{pasta}/ia/{tid}.png") == "lido":
-                plano["tarefas"].append({"id": tid, "modo": "imagem", "ancora": f"desenho {len(desenhos) + 1}"})
-                desenhos[f"{prefixo}S{len(desenhos)}X"] = f"{{{{IA:{tid}}}}}"
-                troca.text = f"{prefixo}S{len(desenhos) - 1}X{troca.text}"
+        if (n := resultado.get(svg, (0, ""))) and n[1] == "lido":
+            tid = f"svg{n[0] + 1:02d}"
+            plano["tarefas"].append({"id": tid, "modo": "imagem", "ancora": f"desenho {len(desenhos) + 1}"})
+            desenhos[marca := f"{prefixo}S{k}X"] = f"{{{{IA:{tid}}}}}"
+            troca.text = marca + troca.text
         svg.getparent().replace(svg, troca)
     marcas = _imagens(raiz, pasta, plano["tarefas"], prefixo) | desenhos
     for a in raiz.iter("a"):  # link para data: carregaria o arquivo inteiro em base64 para o texto
@@ -465,8 +480,8 @@ def planejar_svg(path, pasta) -> dict:
             props.setdefault("title" if f.tag == "title" else "description", texto)
         _esvaziar(f)
     plano["propriedades"] = props
-    desenho = desenhar(svg, f"{pasta}/ia/svg01.png")
-    if desenho in ("sem resvg", "ilegivel"):  # sem o desenho, a <image> embutida passa pelo caminho da <img>
+    desenho = desenhar_lote([(svg, f"{pasta}/ia/svg01.png")])[0]
+    if desenho != "lido":  # sem o desenho, a <image> embutida passa pelo caminho da <img>
         for im in copia.iter("image"):
             im.tag, im.attrib["src"] = "img", im.get("href") or ""
     ocultos = _tirar_oculto(raiz)
@@ -477,7 +492,7 @@ def planejar_svg(path, pasta) -> dict:
         plano["tarefas"].append({"id": "svg01", "modo": "imagem", "ancora": props.get("title") or "desenho"})
         linhas.append("{{IA:svg01}}")
     elif desenho != "branco":
-        motivo = "resvg indisponível" if desenho == "sem resvg" else "o resvg não o desenha"
+        motivo = {"sem resvg": "resvg indisponível", "tempo": "tempo esgotado"}.get(desenho, "fora do padrão")
         plano["ilegiveis"].append(f"svg: desenho não lido ({motivo}); só o texto")
     for el in copia.iter():
         if any(a.tag in _SVG_LINHA for a in el.iterancestors()):

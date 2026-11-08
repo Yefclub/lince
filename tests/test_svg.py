@@ -1,13 +1,16 @@
 """SVG como arquivo e embutido no HTML: o desenho vai para a IA e o texto fica, mesmo sem ela."""
 
 import base64
-import builtins
 import io
+import sys
 import time
 
+from lxml import etree
 from PIL import Image
 
 import lince
+from lince import desenho_svg
+from lince.pagina_html import DESENHOS_MAX
 
 DIAGRAMA = (
     '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="8cm" height="4cm"'
@@ -52,14 +55,7 @@ def test_sem_ia_o_texto_do_svg_continua_e_o_desenho_fica_pendente(tmp_path):
 
 
 def test_sem_o_resvg_sai_o_texto_e_a_imagem_embutida_e_lida_a_parte(tmp_path, monkeypatch):
-    importar = builtins.__import__
-
-    def sem_resvg(nome, *a, **k):
-        if nome == "resvg_py":
-            raise ImportError(nome)
-        return importar(nome, *a, **k)
-
-    monkeypatch.setattr(builtins, "__import__", sem_resvg)
+    monkeypatch.setitem(sys.modules, "resvg_py", None)  # o pacote não está instalado
     foto = base64.b64encode(_png("red")).decode()
     p = tmp_path / "fluxo.svg"
     p.write_text(DIAGRAMA % f'<image width="100" height="100" xlink:href="data:image/png;base64,{foto}"/>', "utf-8")
@@ -105,7 +101,76 @@ def test_svg_no_html_vai_para_a_ia_e_icone_nao(tmp_path):
     vistas = []
     ia = lince.FuncaoLeitor(lambda img, instr: vistas.append(img) or "Diagrama lido.", "m")
     r = lince.Leitor(ia=ia, agrupar=False).ler(p)
-    assert len(vistas) == 1 and _imagem(vistas[0]).size == (1600, 800)  # proporção do viewBox
+    assert len(vistas) == 1 and _imagem(vistas[0]).size == (1200, 600)  # 4x o viewBox
     md = r.markdown
     assert md.index("Antes.") < md.index("Diagrama lido.") < md.index("Ícone")
     assert "Aprovado pela diretoria" in md  # o texto do desenho fica, para valer mesmo sem a IA
+
+
+def test_svg_no_html_e_desenhado_com_gradiente_seta_e_estilo(tmp_path):
+    p = tmp_path / "pagina.html"
+    p.write_text(
+        '<svg viewBox="0 0 300 150"><defs><linearGradient id="g"><stop offset="0" stop-color="#2561C1"/>'
+        '<stop offset="1" stop-color="#2561C1"/></linearGradient><marker id="seta" markerWidth="10" markerHeight="10"'
+        ' refX="5" refY="5"><path d="M0 0L10 5L0 10z" fill="#DC4521"/></marker></defs>'
+        "<style>.rotulo{fill:#28B877}</style>"
+        '<rect width="100" height="100" fill="url(#g)"/><circle class="rotulo" cx="250" cy="50" r="40"/>'
+        '<path d="M100 120L200 120" stroke="black" marker-end="url(#seta)"/></svg>',
+        encoding="utf-8",
+    )
+    vistas = []
+    lince.Leitor(ia=lince.FuncaoLeitor(lambda img, instr: vistas.append(img) or "ok", "m"), agrupar=False).ler(p)
+    cores = {c for _, c in _imagem(vistas[0]).getcolors(1 << 24)}
+    assert {(37, 97, 193), (40, 184, 119), (220, 69, 33)} <= cores  # gradiente, classe e ponta da seta
+
+
+def test_svg_nao_puxa_arquivo_externo_por_use_pattern_ou_feimage(tmp_path):
+    segredo = tmp_path / "segredo.png"
+    segredo.write_bytes(_png("red"))
+    externo = tmp_path / "externo.svg"
+    externo.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg"><rect id="r" width="300" height="150" fill="red"/></svg>'
+    )
+    p = tmp_path / "fluxo.svg"
+    p.write_text(
+        DIAGRAMA
+        % (
+            f'<use href="{externo}#r"/><pattern id="pt" width="300" height="150"><image href="{segredo}" width="300"'
+            ' height="150"/></pattern><rect width="300" height="150" fill="url(#pt)"/>'
+            f'<filter id="f"><feImage href="{segredo}"/></filter><rect width="300" height="150" filter="url(#f)"/>'
+        ),
+        encoding="utf-8",
+    )
+    vistas = []
+    lince.Leitor(ia=lince.FuncaoLeitor(lambda img, instr: vistas.append(img) or "ok", "m"), agrupar=False).ler(p)
+    assert (255, 0, 0) not in {c for _, c in _imagem(vistas[0]).getcolors(1 << 24)}
+
+
+def test_desenho_que_prende_o_resvg_e_cortado_e_o_texto_fica(tmp_path, monkeypatch):
+    monkeypatch.setattr(desenho_svg, "SEGUNDOS_MAX", 2)
+    filtro = '<filter id="t"><feTurbulence baseFrequency="0.05" numOctaves="100000"/></filter>'
+    p = tmp_path / "hostil.svg"
+    p.write_text(DIAGRAMA % (filtro + '<rect width="300" height="150" filter="url(#t)"/>'), encoding="utf-8")
+    inicio = time.monotonic()
+    r = lince.ler(p)
+    assert time.monotonic() - inicio < 10 and "Aprovado pela diretoria" in r.markdown
+    assert any("tempo esgotado" in x for x in r.metadados["partes_ilegiveis"])
+
+
+def test_pagina_com_milhares_de_svgs_tem_teto_de_desenhos(tmp_path):
+    p = tmp_path / "icones.html"
+    p.write_text('<svg width="48" height="48"><rect width="48" height="48"/></svg>' * 3000, encoding="utf-8")
+    inicio = time.monotonic()
+    r = lince.ler(p)
+    assert time.monotonic() - inicio < 20
+    assert len(r.cobertura.pendentes) == DESENHOS_MAX  # sem IA, cada desenho fica pendente; o resto, registrado
+    assert any("além do teto" in x for x in r.metadados["partes_ilegiveis"])
+
+
+def test_desenho_em_branco_ou_ilegivel_nao_vira_leitura(tmp_path):
+    branco = etree.fromstring('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"/>')
+    absurdo = etree.fromstring('<svg xmlns="http://www.w3.org/2000/svg" width="100000" height="1"><rect/></svg>')
+    outro = etree.fromstring('<svg xmlns="urn:outro" width="100" height="100"><rect width="9" height="9"/></svg>')
+    destinos = [tmp_path / f"{n}.png" for n in range(3)]
+    feitos = desenho_svg.desenhar_lote(list(zip([branco, absurdo, outro], destinos, strict=True)))
+    assert feitos == ["branco", "branco", "ilegivel"] and not any(d.exists() for d in destinos)

@@ -1,19 +1,27 @@
 """Desenho de SVG em PNG pelo resvg, para a IA ler o diagrama como ela lê uma imagem.
 
 O SVG nunca busca nada fora dele: toda referência que não seja a um trecho do próprio documento (#id) ou a dado
-embutido (data:) é tirada antes de desenhar, porque o resvg leria um arquivo local que o documento apontasse.
+embutido (data:) é tirada antes de desenhar, porque o resvg leria um arquivo local que o documento apontasse. O
+desenho roda num processo à parte (`_desenhar.py`), com teto de tempo e de memória.
 Sem o resvg instalado, quem chama segue com o texto do SVG.
 """
 
 import copy
-import io
+import importlib.util
+import json
 import re
+import subprocess
+import sys
+from pathlib import Path
 
 from lxml import etree
 
+from ._prazo import prazo_restante
+
 LADO_PX = 1600  # o lado maior do desenho: legível para a IA sem gerar imagem enorme
+LADO_MIN_PX = 800  # desenho pequeno é ampliado até aqui (4x o tamanho declarado, no máximo LADO_PX)
+SEGUNDOS_MAX = 30  # teto do lote de desenhos de um documento: filtro hostil prende o resvg por minutos
 SVG_NS, XLINK_NS = "http://www.w3.org/2000/svg", "http://www.w3.org/1999/xlink"
-_IMPORT = re.compile(r"@import[^;]*;?", re.I)
 _MEDIDA = re.compile(r"^\s*([0-9]*\.?[0-9]+(?:e[+-]?\d+)?)\s*([a-z]*)\s*$", re.I)
 _UNIDADES = {
     "": 1.0,
@@ -91,15 +99,8 @@ def tamanho(svg) -> tuple[float, float] | None:
     return None
 
 
-def desenhar(svg, destino) -> str:
-    """Desenha `svg` (elemento lxml com namespace) em PNG no `destino`. Devolve "lido" (há o que ler), "branco"
-    (nada desenhado), "sem resvg" (não instalado) ou "ilegivel" (o resvg não desenha este SVG)."""
-    try:
-        import resvg_py
-    except ImportError:
-        return "sem resvg"
-    from PIL import Image
-
+def _preparar(svg) -> tuple[str, dict] | None:
+    """O SVG pronto para o resvg e o lado do desenho, ou None se não há o que desenhar (proporção absurda)."""
     svg = copy.deepcopy(svg)
     for el in svg.iter():
         if not isinstance(el.tag, str):
@@ -108,20 +109,40 @@ def desenhar(svg, destino) -> str:
             valor = el.get(nome).strip()
             if not (valor.startswith("#") or valor.lower().startswith("data:")):
                 del el.attrib[nome]  # arquivo local ou endereço externo: nunca entra no desenho
-        if etree.QName(el).localname == "style" and el.text:
-            el.text = _IMPORT.sub("", el.text)
     w, h = tamanho(svg) or (LADO_PX, LADO_PX)
-    if min(w, h) * LADO_PX / max(w, h) < 1:  # proporção absurda: o outro lado sumiria
-        return "branco"
-    lado = {"width": LADO_PX} if w >= h else {"height": LADO_PX}
+    maior = min(LADO_PX, max(LADO_MIN_PX, 4 * max(w, h)))  # ícone não vira imagem de 1600 px
+    if min(w, h) * maior / max(w, h) < 1:  # proporção absurda: o outro lado sumiria
+        return None
+    return etree.tostring(svg, encoding="unicode"), {"width": round(maior)} if w >= h else {"height": round(maior)}
+
+
+def desenhar_lote(itens) -> list[str]:
+    """Desenha cada (svg, destino) em PNG, num processo à parte com teto de tempo e de memória. Para cada um:
+    "lido" (há o que ler), "branco" (nada desenhado), "ilegivel" (o resvg não o desenha), "tempo" (cortado pelo
+    teto ou pelo prazo do documento) ou "sem resvg" (não instalado)."""
+    if not itens:
+        return []
+    if importlib.util.find_spec("resvg_py") is None:
+        return ["sem resvg"] * len(itens)
+    resultados, trabalho, indices = ["branco"] * len(itens), [], []
+    for i, (svg, destino) in enumerate(itens):
+        if (pronto := _preparar(svg)) is not None:
+            trabalho.append([pronto[0], pronto[1], str(destino)])
+            indices.append(i)
+    if not trabalho:
+        return resultados
+    for i in indices:
+        resultados[i] = "tempo"
+    teto = SEGUNDOS_MAX if (resta := prazo_restante()) is None else max(0.1, min(SEGUNDOS_MAX, resta))
+    filho = [sys.executable, "-I", str(Path(__file__).with_name("_desenhar.py"))]
     try:
-        png = resvg_py.svg_to_bytes(
-            svg_string=etree.tostring(svg, encoding="unicode"), background="#ffffff", dpi=96.0, **lado
-        )
-        im = Image.open(io.BytesIO(bytes(png))).convert("RGB")
-    except (ValueError, OSError):
-        return "ilegivel"
-    if Image.eval(im, lambda v: 255 - v).getbbox() is None:  # tudo branco: nada a ler
-        return "branco"
-    im.save(destino)
-    return "lido"
+        saida = subprocess.run(  # noqa: S603 — o próprio Python e um script do pacote; o SVG vai pela entrada
+            filho, input=json.dumps(trabalho), capture_output=True, text=True, timeout=teto
+        ).stdout
+    except subprocess.TimeoutExpired as e:  # o run mata o filho; o que ele já concluiu vale
+        saida = e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout or ""
+    for linha in saida.splitlines():
+        k, _, resultado = linha.partition(" ")
+        if k.isdigit() and int(k) < len(indices) and resultado in ("lido", "branco", "ilegivel"):
+            resultados[indices[int(k)]] = resultado
+    return resultados
