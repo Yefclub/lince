@@ -19,6 +19,7 @@ from ._prazo import LIMITE, prazo_restante
 from ._trava import PDFIUM
 from .agrupamento import agrupar, distribuir_lotes, resposta_aproveitavel
 from .cache import Cache, chave
+from .estrutura import secoes
 from .instrucoes import PROMPT_PADRAO, VERSAO_PROMPT, instrucao
 from .limites import LADO_MAX_PX, conferir_zip
 from .metadados import metadados_arquivo
@@ -142,7 +143,7 @@ class Leitor:
                 rotas={p["i"] + 1: p["rota"] for p in plano.get("paginas", [])},
             )
             if plano["tipo"] == "texto":
-                return Resultado(plano["md"], plano.get("meta_arquivo", {}), cobertura)
+                return _com_estrutura(Resultado(plano["md"], plano.get("meta_arquivo", {}), cobertura), plano)
             tarefas = plano["tarefas"]
             if self.max_leituras is not None and len(tarefas) > self.max_leituras:
                 cobertura.pendentes += [f"{t['id']}: teto de leituras" for t in tarefas[self.max_leituras :]]
@@ -167,7 +168,7 @@ class Leitor:
             else:
                 md = montar(pasta, respostas)
                 meta = json.loads(Path(f"{pasta}/metadados.json").read_text(encoding="utf-8"))
-            return Resultado(md, meta, cobertura, usos)
+            return _com_estrutura(Resultado(md, meta, cobertura, usos), plano)
 
     def _ler_tarefas(self, plano, tarefas, pasta, cobertura):
         respostas, usos = {}, []
@@ -334,6 +335,15 @@ def _extensao_lida(caminho: str) -> str:
 
 def _avisar_cache(e):
     logging.getLogger("lince").warning("cache indisponível, lendo sem ele: %s: %s", type(e).__name__, str(e)[:200])
+
+
+def _com_estrutura(r: Resultado, plano) -> Resultado:
+    """Tira a estrutura dos metadados (onde a extração a deixa) e completa com páginas e seções do Markdown."""
+    r.estrutura = dict(r.metadados.pop("estrutura", None) or {})
+    if plano["tipo"] == "pdf":
+        r.estrutura["paginas"] = r.cobertura.paginas
+    r.estrutura.update(secoes(r.markdown))
+    return r
 
 
 def _vencido() -> bool:

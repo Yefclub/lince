@@ -14,6 +14,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET  # noqa: F401
 
 from . import legados
+from .estrutura import estrutura_arquivo
 from .limites import xml_ou_nada
 
 
@@ -32,7 +33,10 @@ def metadados_arquivo(path, ext=None):
             pass
         return meta
     if ext in ODF:
-        return _metadados_odf(path, meta, ext)
+        meta = _metadados_odf(path, meta, ext)
+        if estrutura := estrutura_arquivo(path, ext):
+            meta["estrutura"] = estrutura
+        return meta
     if ext == ".rtf":
         try:
             bordas, completo = legados.rtf(Path(path).read_bytes(), _linhas_rtf)
@@ -54,6 +58,8 @@ def metadados_arquivo(path, ext=None):
         return _metadados_ole(path, meta, ext)
     if ext not in OOXML:
         return meta
+    if estrutura := estrutura_arquivo(path, ext):
+        meta["estrutura"] = estrutura
     W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
     with zipfile.ZipFile(path) as z:
         nomes = set(z.namelist())
@@ -161,6 +167,9 @@ def _metadados_ole(path, meta, ext):
         meta["abas_ocultas"] = achado["ocultas"]
     if achado.get("macro"):
         meta["macros"] = True
+    estrutura = {k: achado[k] for k in ("abas", "slides") if k in achado}
+    if estrutura:
+        meta["estrutura"] = estrutura
     return meta
 
 

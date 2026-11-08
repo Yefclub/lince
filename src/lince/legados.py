@@ -117,8 +117,10 @@ def xls(o, teto) -> dict:
             codificacao = _codificacao_biff5(struct.unpack_from("<H", d, 0)[0])
         if tipo == _BOUNDSHEET and len(d) >= 7:
             abas.add(struct.unpack_from("<I", d, 0)[0])
+            nome_aba = _texto_xls(d, 6, codificacao, 1)[0]
+            saida.setdefault("abas", []).append({"nome": nome_aba, "oculta": bool(d[4] & 3)})
             if d[4] & 3:  # hsState: 1 oculta, 2 muito oculta (só macro reexibe)
-                saida["ocultas"].append(_texto_xls(d, 6, codificacao, 1)[0])
+                saida["ocultas"].append(nome_aba)
             if d[5] in (FOLHA_DE_MACRO, MODULO_VBA):
                 saida["macro"] = True
     for pos in sorted(abas):
@@ -139,7 +141,7 @@ def xls(o, teto) -> dict:
 # ---------- PowerPoint 97-2003 ----------
 
 _CONTEINER, _VBA_INFO, _VBA_INFO_ATOM, _CABECALHOS_RODAPES, _CSTRING = 0xF, 0x03FF, 0x0400, 0x0FD9, 0x0FBA
-_USER_EDIT, _PERSIST_DIRECTORY, _EDICOES_MAX = 0x0FF5, 0x1772, 4096
+_USER_EDIT, _PERSIST_DIRECTORY, _EDICOES_MAX, _SLIDE = 0x0FF5, 0x1772, 4096, 0x03EE
 
 
 def _objetos_vivos(b, usuario, orcamento):
@@ -181,6 +183,8 @@ def ppt(o, teto) -> dict:
     else:  # cada objeto vivo é um registro: o tamanho dele delimita a varredura
         pilha = [(p, min(p + 8 + struct.unpack_from("<I", b, p + 4)[0], len(b)), None) for p in vivos]
     saida, bordas = {"macro": False}, {}
+    if vivos is not None:  # só com a cadeia de edições: a varredura do stream inteiro contaria versões antigas
+        saida["slides"] = sum(1 for p in vivos if struct.unpack_from("<H", b, p + 2)[0] == _SLIDE)
     while pilha:
         i, fim, pai = pilha.pop()
         while i + 8 <= fim:

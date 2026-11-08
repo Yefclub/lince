@@ -14,6 +14,7 @@ r.markdown          # corpo do documento
 r.metadados         # versão, rodapé, marca d'água, propriedades, comentários, alertas de injeção
 r.cobertura         # rotas por página, leituras pela IA, leituras do cache, pendências
 r.uso               # custo de cada leitura (para o seu ledger)
+r.estrutura         # páginas, slides, abas (e quais são ocultas), seções com a posição no Markdown
 ```
 
 ## O que ele faz
@@ -93,7 +94,7 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
 | Rota | O que faz |
 | --- | --- |
 | `POST /v1/sessoes` | Envia 1 a 50 arquivos (campo `arquivo` repetido), com `referencia`, `esforco` (`padrao` ou `max`) e `prazo` (1 a 3600 s por documento) opcionais. Responde `201` com a sessão e `Location`. Com `Prefer: wait=N` (até 300 s), espera terminar. |
-| `GET /v1/sessoes/{id}` | Estado da sessão e de cada documento; o que já terminou vem com `markdown`, `metadados`, `cobertura`, `alertas_injecao` e `uso` (tokens por leitura). Aceita `Prefer: wait=N`. |
+| `GET /v1/sessoes/{id}` | Estado da sessão e de cada documento; o que já terminou vem com `markdown`, `metadados`, `cobertura`, `alertas_injecao`, `uso` (tokens por leitura) e `estrutura`. Aceita `Prefer: wait=N`. |
 | `GET /v1/sessoes?referencia=…` | Sessões do token ainda não entregues, da mais nova para a mais antiga (resumo, sem o conteúdo lido). |
 | `DELETE /v1/sessoes/{id}` | Confirma o recebimento (ou cancela o que ainda não foi lido) e apaga a sessão na hora. |
 | `GET /v1/openapi.json`, `GET /saude` | Contrato; serviço no ar e versões. |

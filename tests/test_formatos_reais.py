@@ -569,3 +569,55 @@ def test_rtf_com_torre_de_grupos_repetida_para_rapido_e_fica_parcial(tmp_path):
     inicio = time.monotonic()
     meta = metadados_arquivo(tmp_path / "torre.rtf")
     assert time.monotonic() - inicio < 5 and meta["partes_ilegiveis"] == ["cabeçalho e rodapé (parcial)"]
+
+
+@pytest.mark.parametrize(
+    ("nome", "esperado"),
+    [
+        ("poi_SampleShow.pptx", {"slides": 2}),
+        ("poi_SampleShow.ppt", {"slides": 2}),
+        ("testPPT.pptx", {"slides": 3}),  # o 2º e o 3º slides não têm título: o Markdown sozinho não os contaria
+        ("testMasterFooter.odp", {"slides": 1}),
+        ("testPDF.pdf", {"paginas": 1}),
+        ("poi_SampleSS.xlsx", {"abas": ["First Sheet", "Sheet Number 2", "Sheet3"]}),
+        ("poi_sample.xlsb", {"abas": ["Sheet1", "rich test", "Sheet3"]}),
+        ("testFooter.ods", {"abas": ["Sheet1", "Sheet2", "Sheet3"]}),
+        ("poi_45761.xls", {"abas": ["VisibleSheet", "HiddenSheet", "VeryHiddenSheet"]}),
+    ],
+)
+def test_estrutura_vem_do_arquivo(nome, esperado):
+    e = lince.ler(REAIS / nome).estrutura
+    for chave, valor in esperado.items():
+        assert (e[chave] if chave != "abas" else [a["nome"] for a in e["abas"]]) == valor
+
+
+def test_abas_ocultas_ficam_marcadas_na_estrutura():
+    abas = lince.ler(REAIS / "poi_45761.xls").estrutura["abas"]
+    assert [a["oculta"] for a in abas] == [False, True, True]
+    from lince.estrutura import _abas_ods
+
+    conteudo = (
+        b'<style:style style:name="ta2" style:family="table"><style:table-properties table:display="false"/>'
+        b'</style:style><table:table table:name="Vis\xc3\xadvel" table:style-name="ta1"></table:table>'
+        b'<table:table table:name="Escondida" table:style-name="ta2"></table:table>'
+    )
+    assert _abas_ods(conteudo)["abas"] == [{"nome": "Visível", "oculta": False}, {"nome": "Escondida", "oculta": True}]
+
+
+@pytest.mark.parametrize(
+    "nome", ["testWORD.docx", "testWORD.doc", "testEPUB.epub", "poi_SampleShow.pptx", "testPDF.pdf"]
+)
+def test_secoes_apontam_para_o_titulo_no_markdown(nome):
+    r = lince.ler(REAIS / nome)
+    assert r.estrutura["secoes"]
+    for s in r.estrutura["secoes"]:
+        assert r.markdown[s["inicio"] :].startswith("#" * s["nivel"] + " " + s["titulo"])
+    for p in r.estrutura.get("inicio_das_paginas", []):
+        assert r.markdown[p["inicio"] :].startswith(f"<!-- página {p['pagina']} ")
+
+
+def test_titulo_dentro_de_bloco_de_codigo_nao_e_secao():
+    from lince.estrutura import secoes
+
+    md = "# Um\n\n```python\n# comentário, não título\n```\n\n## Dois\n"
+    assert [s["titulo"] for s in secoes(md)["secoes"]] == ["Um", "Dois"]

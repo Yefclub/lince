@@ -43,6 +43,8 @@ class Resultado:
     metadados: dict[str, Any]  # versão, rodapé, marca d'água, propriedades, alertas
     cobertura: Cobertura
     uso: list[Uso] = field(default_factory=list)
+    # páginas (PDF), slides, abas (nome e se é oculta), seções do Markdown com posição e início de cada página
+    estrutura: dict[str, Any] = field(default_factory=dict)
 
     @property
     def alertas_injecao(self) -> list[str]:
