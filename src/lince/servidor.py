@@ -365,7 +365,9 @@ def abrir(segredo: bytes, cliente: str, selado: str):
 
 PLANO_PAGINAS_MAX = 100_000
 PLANO_TAREFAS_MAX = 20_000
-PLANO_TRABALHO_MAX = 20_000_000  # no documento: regiões x blocos de cada página, o que a montagem compara
+# no documento: regiões x caracteres de cada página, o que a montagem percorre ao achar o lugar de cada leitura
+# (~1 s); um PDF de mil páginas com dez figuras por página de 5 KB usa 50 milhões
+PLANO_TRABALHO_MAX = 500_000_000
 RESPOSTAS_MAX = 64 * 1024 * 1024  # caracteres somados das respostas de uma montagem
 
 
@@ -418,9 +420,9 @@ def _conferir_estado(e):
         lista(p.get("regioes", []), dict, PLANO_TAREFAS_MAX, "regiões")
         lista(p.get("tabelas", []), str, PLANO_TAREFAS_MAX, "tabelas")
         lista(p.get("formulas", []), str, PLANO_TAREFAS_MAX, "fórmulas")
-        trabalho += len(p.get("regioes", [])) * (p.get("md", "").count("\n\n") + 1)
+        trabalho += len(p.get("regioes", [])) * (len(p.get("md", "")) + 1)
         if trabalho > PLANO_TRABALHO_MAX:
-            raise ValueError("regiões e blocos demais no documento")
+            raise ValueError("regiões e texto demais no documento")
 
 
 def _resultado_api(r) -> dict:

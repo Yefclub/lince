@@ -335,3 +335,38 @@ def test_pptx_titulo_branco_sobre_foto_ou_faixa_escura_fica(tmp_path):
     p = tmp_path / "capa.pptx"
     prs.save(p)
     assert _visivel(p, "Título branco sobre a foto", "Rodapé branco na faixa")
+
+
+def test_padroes_de_injecao_sao_lineares_com_texto_hostil():
+    import time
+
+    inicio = time.monotonic()
+    for hostil in ("ignor" * 200_000, "ignor " + " " * 1_000_000, "desconsider" * 100_000, "recomend" * 120_000):
+        seguranca.alertas_injecao(hostil)
+    assert time.monotonic() - inicio < 10  # antes, minutos com um único parágrafo assim
+    assert seguranca.alertas_injecao(INJECAO) and not seguranca.alertas_injecao("Ignorei a reunião de ontem.")
+
+
+def test_pptx_texto_branco_sobre_faixa_do_layout_fica(tmp_path):
+    prs = Presentation()
+    layout = prs.slide_layouts[6]
+    s = prs.slides.add_slide(layout)
+    faixa = s.shapes.add_shape(1, Inches(0), Inches(6), prs.slide_width, Inches(1.5))._element
+    layout.shapes._spTree.append(faixa)  # a faixa vai para o layout: aparece em todo slide, embaixo do conteúdo
+    run = s.shapes.add_textbox(Inches(1), Inches(6.2), Inches(6), Inches(0.6)).text_frame.paragraphs[0].add_run()
+    run.text, run.font.color.rgb = "Rodapé branco na faixa do layout", PRGB(0xFF, 0xFF, 0xFF)
+    p = tmp_path / "layout.pptx"
+    prs.save(p)
+    assert _visivel(p, "Rodapé branco na faixa do layout")
+
+
+def test_papel_timbrado_atras_do_texto_no_cabecalho_deixa_o_fundo_incerto(tmp_path):
+    d = Document()
+    d.add_paragraph().add_run("Texto branco sobre o timbrado").font.color.rgb = RGBColor(255, 255, 255)
+    cab = d.sections[0].header.paragraphs[0]._p
+    ns = 'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"'
+    desenho = etree.SubElement(etree.SubElement(cab, qn("w:r")), qn("w:drawing"))
+    desenho.append(etree.fromstring(f'<wp:anchor {ns} behindDoc="1"/>'))
+    p = tmp_path / "timbrado.docx"
+    d.save(p)
+    assert seguranca.texto_oculto_docx(p) == []

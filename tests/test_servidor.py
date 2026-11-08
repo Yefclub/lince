@@ -786,9 +786,9 @@ def test_montagem_tem_teto_de_trabalho_no_documento_e_nas_respostas(api, monkeyp
 
     segredo = hashlib.sha256(b"lince-plano\0token-a").digest()
     cliente = hashlib.sha256(b"token-a").hexdigest()[:16]
-    pagina = {"rota": "regioes", "md": "\n\n".join(["bloco"] * 50), "regioes": [{"tarefa": "x"}] * 50}
+    pagina = {"rota": "regioes", "md": "x" * 5000, "regioes": [{"tarefa": "x"}] * 50}  # um bloco só, grande
     estado = {"tipo": "pdf", "paginas": [{**pagina, "i": k} for k in range(100)]}  # cada página cabe; o todo, não
-    monkeypatch.setattr(srv, "PLANO_TRABALHO_MAX", 200_000)
+    monkeypatch.setattr(srv, "PLANO_TRABALHO_MAX", 2_000_000)
     r = _montar(api, {"plano": srv.selar(segredo, cliente, Plano([], estado, [])), "respostas": {}})
     assert r.status_code == 422 and "no documento" in r.json()["detail"]
     monkeypatch.setattr(srv, "RESPOSTAS_MAX", 10)

@@ -29,10 +29,22 @@ PADROES_INJECAO = [
 ]
 
 
+def _limitado(padrao: str) -> re.Pattern:
+    """O padrão com toda repetição de \\w e \\s limitada e possessiva: cada começo de casamento custa no máximo
+    algumas dezenas de passos, e o texto inteiro, linear ("ignorignor..." de 1 MB não trava a leitura). Palavra
+    acima de 40 letras e espaço acima de 10 não existem nas frases que os padrões procuram."""
+    for de, para in ((r"\w*", r"\w{0,40}+"), (r"\w+", r"\w{1,40}+"), (r"\s*", r"\s{0,10}+"), (r"\s+", r"\s{1,10}+")):
+        padrao = padrao.replace(de, para)
+    return re.compile(padrao, re.I)
+
+
+_PADROES = [_limitado(p) for p in PADROES_INJECAO]
+
+
 def alertas_injecao(txt):
     out = []
-    for pad in PADROES_INJECAO:
-        for m in re.finditer(pad, txt, flags=re.I):
+    for pad in _PADROES:
+        for m in pad.finditer(txt):
             ini = max(0, m.start() - 60)
             out.append(txt[ini : m.end() + 60].replace("\n", " ").strip())
     return sorted(set(out))[:20]
@@ -233,13 +245,16 @@ def texto_oculto_docx(path):
         if "word/document.xml" not in nomes:
             return out
         raiz = _xml(z.read("word/document.xml"))
+        bordas = [_xml(z.read(n)) for n in sorted(nomes) if re.fullmatch(r"word/(header|footer)\d*\.xml", n)]
         estilos = _EstilosWord(_xml(z.read("word/styles.xml")) if "word/styles.xml" in nomes else None)
         tema = next((n for n in sorted(nomes) if re.fullmatch(r"word/theme/theme\d*\.xml", n)), None)
         tema = _esquema(_xml(z.read(tema))) if tema else {}
     fundo = raiz.find(f"{_W}background")
     pagina = (_rgb(fundo.get(f"{_W}color")) if fundo is not None else None) or (255, 255, 255)
     _WP = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
-    atras_do_texto = any(a.get("behindDoc") in ("1", "true") for a in raiz.iter(f"{_WP}anchor"))
+    atras_do_texto = any(  # no corpo ou no cabeçalho/rodapé (papel timbrado de página inteira atrás do texto)
+        a.get("behindDoc") in ("1", "true") for r in [raiz, *bordas] for a in r.iter(f"{_WP}anchor")
+    )
     if (fundo is not None and len(fundo)) or atras_do_texto:  # fundo de imagem ou figura atrás do texto: incerto
         pagina = _INCERTO
     for par in raiz.iter(f"{_W}p"):
@@ -342,6 +357,24 @@ def texto_oculto_pptx(path):
                         fundo = _cor_drawingml(next(iter(bgref), None), tema, mapa) or _INCERTO
                 break
             desenhadas = []  # caixas das formas já desenhadas que podem pintar o que vem por cima
+            # embaixo do slide vêm as formas do mestre e do layout que não são placeholder (faixa, foto, logo), a
+            # menos que o slide (ou o layout, para as do mestre) diga showMasterSp="0"
+            camadas_de_baixo = []
+            if slide._element.get("showMasterSp") not in ("0", "false"):
+                if slide.slide_layout._element.get("showMasterSp") not in ("0", "false"):
+                    camadas_de_baixo.append(mestre)
+                camadas_de_baixo.append(slide.slide_layout)
+            for camada in camadas_de_baixo:
+                for sh in camada.shapes:
+                    if not sh.is_placeholder and _pode_pintar(sh, tema, mapa):
+                        desenhadas.append(
+                            (
+                                sh.left or 0,
+                                sh.top or 0,
+                                (sh.left or 0) + (sh.width or 0),
+                                (sh.top or 0) + (sh.height or 0),
+                            )
+                        )
             for sh in slide.shapes:  # na ordem de desenho: o que vem antes fica atrás
                 caixa = (sh.left or 0, sh.top or 0, (sh.left or 0) + (sh.width or 0), (sh.top or 0) + (sh.height or 0))
                 atras = fundo if not any(_sobrepoe(caixa, d) for d in desenhadas) else _INCERTO
