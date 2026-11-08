@@ -491,6 +491,70 @@ def _fim_do_grupo(s: bytes, i: int) -> int:
     return -1 if prof else i
 
 
+# \\pict a ler, e os grupos que trazem uma cópia de reserva da mesma imagem (o WMF do \\nonshppict) e são pulados
+_PICT = re.compile(rb"\{\\(?:(pict)|nonshppict|(?:\*\\)?shprslt)(?![a-z])")
+_TIPO_PICT = re.compile(rb"\\(pngblip|jpegblip|emfblip|wmetafile|dibitmap)(?![a-z])")
+_MIME_PICT = {b"pngblip": "image/png", b"jpegblip": "image/jpeg", b"emfblip": "image/x-emf",
+              b"wmetafile": "image/x-wmf", b"dibitmap": "image/bmp"}  # fmt: skip
+_PALAVRA = re.compile(rb"\\[a-z]+-?\d* ?")
+
+
+def _nivel_de_cima(seg: bytes) -> bytes | None:
+    """O conteúdo do grupo sem os subgrupos ({\\*\\picprop{\\sp...}}, {\\*\\blipuid ...}), em qualquer profundidade."""
+    partes, pos = [], 0
+    while (k := seg.find(b"{", pos)) >= 0:
+        partes.append(seg[pos:k])
+        if (pos := _fim_do_grupo(seg, k + 1)) < 0:
+            return None
+    partes.append(seg[pos:])
+    return b"".join(partes)
+
+
+def _pict(seg: bytes) -> tuple[str, bytes] | None:
+    """(MIME, bytes) de um \\pict em hexadecimal, ou None se o tipo não é conhecido ou o conteúdo não é hexadecimal
+    (\\bin, quebrado). O bitmap cru (\\dibitmap) ganha o cabeçalho de arquivo BMP."""
+    if (topo := _nivel_de_cima(seg)) is None or not (tipo := _TIPO_PICT.search(topo)):
+        return None
+    try:
+        imagem = bytes.fromhex(re.sub(rb"\s", b"", _PALAVRA.sub(b"", topo)).decode("ascii"))
+    except ValueError:
+        return None
+    if tipo.group(1) == b"dibitmap":
+        imagem = _bmp_do_dib(imagem)
+    return (_MIME_PICT[tipo.group(1)], imagem) if imagem else None
+
+
+def imagens_rtf(dados: bytes) -> tuple[list[tuple[str, bytes]], bool]:
+    """Imagens (\\pict em hexadecimal) dos grupos \\header e \\footer, com os mesmos tetos de rtf(), distintas e até
+    IMAGENS_MAX. Devolve também se a leitura foi completa. A busca anda para a frente: cada \\pict (ou cópia de
+    reserva) é percorrido uma vez, mesmo aninhado."""
+    vistos, saida, marcas, percorridos = set(), [], set(), 0
+    for m in _GRUPO_BORDA.finditer(dados):
+        fim = _fim_do_grupo(dados, m.end())
+        if fim < 0:
+            return saida, False
+        percorridos += fim - m.end()
+        if percorridos > _RELEITURA_MAX * len(dados):
+            return saida, False
+        corpo = dados[m.end() : fim - 1]
+        if corpo in vistos:
+            continue
+        vistos.add(corpo)
+        if len(vistos) > _GRUPOS_MAX:
+            return saida, False
+        pos = 0
+        while p := _PICT.search(corpo, pos):
+            if (pos := _fim_do_grupo(corpo, p.end())) < 0:
+                break
+            if p.group(1) and (achada := _pict(corpo[p.end() : pos - 1])):
+                if (marca := hashlib.sha256(achada[1]).digest()) not in marcas:
+                    if len(saida) >= IMAGENS_MAX:
+                        return saida, False
+                    marcas.add(marca)
+                    saida.append(achada)
+    return saida, True
+
+
 def rtf(dados: bytes, ler_rtf) -> tuple[list[str], bool]:
     """Texto dos grupos \\header e \\footer (e variantes l, r, f). Cada grupo vira um RTF mínimo com o prólogo e a
     tabela de fontes do original e é lido pelo mesmo leitor do corpo (`ler_rtf`), que já resolve página de código

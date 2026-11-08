@@ -50,3 +50,6 @@ resto do repositório).
 `lince_imagem_em_linha.doc`: Word 97-2003 com um parágrafo, uma imagem PNG sintética (caixa e círculo coloridos) e
 outro parágrafo, montado com python-docx e convertido para `.doc` pelo LibreOffice. Sem dado de pessoa ou empresa;
 serve para provar que a imagem que o leitor do corpo já entrega não é lida duas vezes.
+
+`lince_imagem_no_cabecalho.odt`: documento do LibreOffice com a mesma imagem sintética no cabeçalho e um parágrafo
+no corpo, montado com python-docx e convertido pelo LibreOffice. Sem dado de pessoa ou empresa.
