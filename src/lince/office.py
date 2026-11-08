@@ -385,12 +385,15 @@ def planejar_office(path, pasta, ext=None):
             if not olefile.isOleFile(path):
                 return
             with olefile.OleFileIO(path) as o:
-                for g in legados.graficos_xls(o, os.path.getsize(path)):
-                    linhas = [f"**Gráfico ({g['tipo'] or 'tipo não identificado'}): {g['titulo'] or 'sem título'}**"]
-                    if g["series"]:
-                        linhas.append("Séries: " + ", ".join(g["series"]) + ".")
-                    linhas.append("_Os valores estão nas células da planilha, acima._")
-                    extras.append("\n".join(linhas))
+                graficos, corte = legados.graficos_xls(o, os.path.getsize(path))
+            if corte:
+                ilegiveis.append(f"gráficos: {corte}")
+            for g in graficos:
+                linhas = [f"**Gráfico ({g['tipo'] or 'tipo não identificado'}): {g['titulo'] or 'sem título'}**"]
+                if g["series"]:
+                    linhas.append("Séries: " + ", ".join(g["series"]) + ".")
+                linhas.append("_Os valores estão nas células da planilha, acima._")
+                extras.append("\n".join(linhas))
 
         _complemento(graficos_xls, "gráficos", ilegiveis)
     if ext in ODF:  # o leitor do corpo não entrega o gráfico do LibreOffice: tipo, título e os dados que ele desenha
