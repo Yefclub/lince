@@ -192,6 +192,7 @@ def montar(pasta, respostas):
 
 CABECALHO_MAX = 80  # linha de cabeçalho/rodapé corrido é curta; parágrafo que o leitor juntou numa linha, não
 FRACAO_MAX = 0.25  # se a remoção levaria mais que isso do texto nativo do documento, nada sai
+FIXA_MIN = 0.8  # linha idêntica na borda de ao menos esta fração das páginas é cabeçalho fixo ("Confidencial")
 
 
 DESLOCAMENTO_MAX = 50  # número impresso = índice da página + d (capa e páginas iniciais sem número): |d| até isto
@@ -215,9 +216,11 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
     Só sai a linha curta, na borda da página, igual em quase todas as páginas, em que só o número da própria página
     varia ("Página 3 de 12", "Relatório anual — 3"), com um deslocamento constante entre o número impresso e o índice
     da página (a capa sem número desloca todos); a linha só com o número da página, na primeira ou na última posição,
-    também sai, com o mesmo deslocamento em quase todas as páginas. Valor, data e número de documento que mudam entre
-    páginas não casam, a página escaneada e o texto lido pela IA não passam por aqui, título (linha com #) nunca sai
-    e, se o que sairia passa de FRACAO_MAX do texto nativo do documento, nada sai."""
+    também sai, com o mesmo deslocamento em quase todas as páginas, e vai para os metadados como a linha com o número
+    trocado por #. A linha curta idêntica na borda de FIXA_MIN das páginas, sem número de página, é cabeçalho fixo e
+    sai também, se couber em FRACAO_MAX junto com o resto (senão só ela fica). Valor, data e número de documento que
+    mudam entre páginas não casam, a página escaneada e o texto lido pela IA não passam por aqui, título (linha com #)
+    nunca sai e, se o que sairia passa de FRACAO_MAX do texto nativo do documento, nada sai."""
     from collections import Counter
 
     def linhas(blocos):
@@ -243,13 +246,23 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
         return out
 
     def so_numero(ln, pagina):
-        """Deslocamento do número de página que é a linha inteira ("3", "- 3 -", "Página 3 de 12", "iv"), ou None."""
+        """(deslocamento, forma com o número trocado por #) do número de página que é a linha inteira ("3", "- 3 -",
+        "Página 3 de 12", "iv"), ou None."""
         t = ln.strip()
         if not re.fullmatch(NUM_PAGINA, t, flags=re.I):
             return None
         m = re.search(r"\d{1,4}|[ivxlc]{1,6}", t, flags=re.I)
         v = _numero(m.group()) if m else None
-        return v - pagina if v is not None and abs(v - pagina) <= DESLOCAMENTO_MAX else None
+        if v is None or abs(v - pagina) > DESLOCAMENTO_MAX:
+            return None
+        return v - pagina, t[: m.start()] + "#" + t[m.end() :]
+
+    def fixa(ln):
+        """A linha, se ela pode ser cabeçalho fixo: curta, com letra, fora de título, tabela e marca do Lince."""
+        t = ln.strip()
+        if len(t) > CABECALHO_MAX or t.startswith(("#", "|", "<!--", "> [")) or not re.search(r"[^\W\d]", t):
+            return None
+        return t
 
     bordas = {}
     for i, blocos in nativas:
@@ -259,31 +272,54 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
     minimo = max(3, 0.6 * n)
     freq = Counter(c for i, _ in nativas for c in {c for _, _, ln in bordas[i] for c in chaves(ln, i + 1)})
     moveis = {c for c, v in freq.items() if n >= 3 and v >= minimo}
+    # cabeçalho fixo: em cada posição da borda, a linha que se repete idêntica; se a parte idêntica entra no corpo
+    # além das 2 linhas da borda (3ª linha do começo ou do fim também igual), são páginas iguais, e isso é conteúdo
+    por_posicao = {}
+    for _, blocos in nativas:
+        cheias = linhas(blocos)
+        for pos in (0, 1, 2, -1, -2, -3):
+            if -len(cheias) <= pos < len(cheias):
+                por_posicao.setdefault(pos, Counter())[cheias[pos][2].strip()] += 1
+    repetidas = {
+        pos: t for pos, c in por_posicao.items() for t, v in c.most_common(1) if n >= 3 and v >= max(3, FIXA_MIN * n)
+    }
+    terceira = {0: 2, 1: 2, -1: -3, -2: -3}  # de cada posição da borda, a primeira linha do corpo
+    fixas = {(pos, t) for pos, t in repetidas.items() if pos in terceira and terceira[pos] not in repetidas and fixa(t)}
     extremos = {}
     for i, blocos in nativas:
         cheias = linhas(blocos)
         extremos[i] = [
-            (k, j, ln, d) for k, j, ln in (cheias[:1] + cheias[-1:]) if (d := so_numero(ln, i + 1)) is not None
+            (k, j, ln, *x) for k, j, ln in (cheias[:1] + cheias[-1:]) if (x := so_numero(ln, i + 1)) is not None
         ]
     desloc = Counter(d for e in extremos.values() for d in {x[3] for x in e})
     numeros = {d for d, v in desloc.items() if n >= 2 and v >= max(2, 0.6 * n)}
-    tirar, total = {}, 0
+    tirar, tirar_fixas, total = {}, {}, 0
     for i, blocos in nativas:
         cheias = linhas(blocos)
         total += sum(len(ln.strip()) for _, _, ln in cheias)
         for k, j, ln in bordas[i]:
             if achadas := [c for c in chaves(ln, i + 1) if c in moveis]:
                 tirar[(i, k, j)] = (ln, achadas[0][0])
-        for k, j, ln, d in extremos[i]:
+        for pos, t in fixas:
+            if -len(cheias) <= pos < len(cheias) and cheias[pos][2].strip() == t:
+                tirar_fixas[(i, *cheias[pos][:2])] = (cheias[pos][2], t)
+        for k, j, ln, d, forma in extremos[i]:
             if d in numeros:
-                tirar.setdefault((i, k, j), (ln, None))
-    if sum(len(ln.strip()) for ln, _ in tirar.values()) > FRACAO_MAX * total:
+                tirar.setdefault((i, k, j), (ln, forma))
+
+    def peso(x):
+        return sum(len(ln.strip()) for ln, _ in x.values())
+
+    if peso(tirar) > FRACAO_MAX * total:
         return set()  # cabeçalho que pesaria tanto assim no texto não é cabeçalho: o documento fica como está
+    fixas_fora = {c: v for c, v in tirar_fixas.items() if c not in tirar}
+    if peso(tirar) + peso(fixas_fora) <= FRACAO_MAX * total:  # o fixo só sai se não levar o resto além do teto
+        tirar |= fixas_fora
     for i, blocos in nativas:
         for k in sorted({k for (pi, k, _) in tirar if pi == i}):
             partes = blocos[k].split("\n")
             blocos[k] = "\n".join(ln for j, ln in enumerate(partes) if (i, k, j) not in tirar)
-    return {c for _, c in tirar.values() if c}
+    return {c for _, c in tirar.values()}
 
 
 def tamanho_da_saida(e, respostas) -> int:
