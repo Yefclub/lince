@@ -142,9 +142,10 @@ class Leitor:
     # ------------------------------------------------------------------ leitura
     def ler(self, caminho: str | Path, prazo: float | None = None) -> Resultado:
         """`prazo`: segundos, a partir de agora, para o documento (o chat lê com prazo; a base, sem). A extração
-        nativa conta: no PDF, a página que começa depois do prazo entra só com o texto (pendência registrada). Nenhuma leitura pela IA começa depois do prazo, e a que está em curso
-        no `OpenAICompativel` é cortada (com a folga da rede), sem novas tentativas: o que não coube vira a pendência
-        "prazo esgotado" e o texto nativo sai completo. Provedor próprio lê o que sobra em `lince.prazo_restante()`."""
+        nativa conta: no PDF, a página que começa depois do prazo entra só com o texto (pendência registrada).
+        Nenhuma leitura pela IA começa depois do prazo, e a que está em curso no `OpenAICompativel` é cortada (com a
+        folga da rede), sem novas tentativas: o que não coube vira a pendência "prazo esgotado" e o texto nativo sai
+        completo. Provedor próprio lê o que sobra em `lince.prazo_restante()`."""
         if prazo is not None and not (math.isfinite(prazo) and prazo > 0):
             raise ValueError("prazo precisa ser um número de segundos maior que zero")
         token = LIMITE.set(time.monotonic() + prazo if prazo is not None else None)

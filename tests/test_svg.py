@@ -344,3 +344,20 @@ def test_so_imagem_raster_embutida_entra_no_desenho():
     pronto = etree.fromstring(desenho_svg._preparar(svg)[0])
     com_href = {el.get("id") for el in pronto.iter() if any(etree.QName(n).localname == "href" for n in el.attrib)}
     assert com_href == {"png", "interno"}  # SVG dentro do SVG não passaria pela limpeza do oculto
+
+
+def test_sem_fonte_no_sistema_o_texto_do_svg_ainda_e_desenhado(tmp_path):
+    import resvg_py
+
+    from lince import _desenhar
+
+    vazio = tmp_path / "sem-fontes"
+    vazio.mkdir()
+    fontes = _desenhar.opcoes_de_fonte(diretorios=[str(vazio)])
+    assert fontes["font_files"] and fontes["sans_serif_family"] == "Aileron"
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="80">'
+        '<text x="10" y="50" font-size="40">Moagem</text></svg>'
+    )
+    png = bytes(resvg_py.svg_to_bytes(svg_string=svg, background="#ffffff", skip_system_fonts=True, **fontes))
+    assert (0, 0, 0) in {c for _, c in _imagem(png).getcolors(1 << 24)}  # sem a fonte de reserva, sai em branco
