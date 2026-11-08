@@ -38,6 +38,7 @@ from . import codigo as codigo_doc
 from .cache import CacheComEscopo, CacheRedis
 from .leitor import FORMATOS, VERSAO, Leitor
 from .limites import DocumentoRecusado
+from .montagem import SAIDA_MAX, tamanho_da_saida
 from .provedores import OpenAICompativel
 
 CONTRATO = json.loads(files("lince").joinpath("openapi.json").read_text(encoding="utf-8"))
@@ -368,7 +369,6 @@ PLANO_TAREFAS_MAX = 20_000
 # (~1 s); um PDF de mil páginas com dez figuras por página de 5 KB usa 50 milhões
 PLANO_TRABALHO_MAX = 500_000_000
 RESPOSTAS_MAX = 64 * 1024 * 1024  # caracteres somados das respostas de uma montagem
-SAIDA_MAX = 256 * 1024 * 1024  # caracteres que a montagem escreve (a leitura em cada lugar em que entra)
 
 
 def _montar_pedido(segredo, cliente, corpo):
@@ -386,41 +386,11 @@ def _montar_pedido(segredo, cliente, corpo):
     plano = abrir(segredo, cliente, str(pedido.get("plano") or ""))
     try:
         _conferir_estado(plano.estado)
-        if _tamanho_da_saida(plano.estado, respostas) > SAIDA_MAX:
+        if tamanho_da_saida(plano.estado, respostas) > SAIDA_MAX:
             raise Problema(413, "saida-grande", "Resultado grande demais", f"Até {SAIDA_MAX // 2**20} M caracteres.")
         return Leitor().concluir(plano, respostas)
     except (KeyError, TypeError, ValueError, AttributeError, IndexError) as e:
         raise Problema(422, "plano-invalido", "Plano inválido", f"{type(e).__name__}: {str(e)[:200]}") from None
-
-
-def _tamanho_da_saida(e, respostas) -> int:
-    """Quanto texto a montagem vai escrever: cada marca vira a leitura (a mesma imagem repetida recebe a mesma
-    leitura em cada lugar) ou a tabela e a fórmula nativas. Conta antes de montar, para a saída ter teto como a
-    entrada tem: uma resposta grande copiada em mil lugares não estoura a memória do processo."""
-    from collections import Counter
-
-    lote_de = {tid: lid for lid, itens in (e.get("lotes") or {}).items() for _, tid in itens}
-
-    def leitura(tid):
-        tid = e.get("iguais", {}).get(tid, tid)
-        return len(respostas.get(lote_de.get(tid, tid), "")) + 64
-
-    total = len(e.get("md", "")) + sum(len(x) for x in e.get("extras", []))
-    marcas = Counter(re.findall(r"\{\{IA:(\w+)\}\}", e.get("md", "")))
-    total += sum(n * leitura(tid) for tid, n in marcas.items())
-    for p in e.get("paginas", []):
-        total += len(p.get("md", "")) + sum(leitura(r.get("tarefa", "")) for r in p.get("regioes", []))
-        if p.get("rota") == "pagina":  # página escaneada: cada metade lida entra inteira
-            total += sum(leitura(t) for t in (p.get("tarefas") or [p.get("tarefa", "")]))
-        tabelas, formulas = p.get("tabelas", []), p.get("formulas", [])
-        for tipo, k in re.findall(r"\{\{(TABELA|FORMULA):(\d+)\}\}", p.get("md", "")):
-            nativo = tabelas if tipo == "TABELA" else formulas
-            k = int(k)
-            total += max(
-                len(nativo[k]) if k < len(nativo) else 0,
-                max((leitura(r.get("tarefa", "")) for r in p.get("regioes", [])), default=0),
-            )
-    return total
 
 
 def _conferir_estado(e):

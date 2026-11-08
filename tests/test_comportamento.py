@@ -509,3 +509,63 @@ def test_leitura_que_da_certo_com_prazo_continua_dando_certo(tmp_path, chunked):
     srv.shutdown()
     assert "Gráfico lido." in r.markdown and r.cobertura.leituras_ia == 1 and not r.cobertura.pendentes
     assert [u.tokens_entrada for u in custos] == [9]
+
+
+def test_resposta_do_provedor_acima_do_teto_fica_pendente_e_o_texto_nativo_sai(tmp_path, monkeypatch):
+    import lince.provedores as prov
+
+    monkeypatch.setattr(prov, "RESPOSTA_MAX", 100_000)
+    pedidos = []
+
+    class Enorme(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            pedidos.append(1)
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")  # sem tamanho declarado: só lendo para saber
+            self.end_headers()
+            try:
+                for _ in range(50):  # 3,2 MB, bem acima do teto
+                    parte = b"x" * 65536
+                    self.wfile.write(f"{len(parte):x}\r\n".encode() + parte + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+            except OSError:
+                pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Enorme)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    ia = lince.OpenAICompativel(f"http://127.0.0.1:{srv.server_port}/v1", "m")
+    r = lince.Leitor(ia=ia, agrupar=False).ler(_pdf_com_figura(tmp_path))
+    srv.shutdown()
+    assert "Texto nativo do relatório." in r.markdown and r.cobertura.leituras_ia == 0
+    assert any("RespostaGrande" in p for p in r.cobertura.pendentes)
+    assert len(pedidos) == 1  # corpo grande não é falha passageira: não repete
+
+
+def test_leitura_copiada_alem_do_teto_de_saida_fica_pendente_e_o_texto_nativo_sai(tmp_path, monkeypatch):
+    from docx.shared import Inches
+    from PIL import Image
+
+    import lince.leitor as leitor_mod
+
+    Image.new("RGB", (600, 300), "navy").save(tmp_path / "selo.png")
+    d = Document()
+    d.add_paragraph("Anexo do contrato de fornecimento.")
+    for k in range(20):  # o mesmo selo em vinte cláusulas: uma leitura, copiada em cada lugar
+        d.add_paragraph(f"Cláusula {k + 1}.")
+        d.add_picture(str(tmp_path / "selo.png"), width=Inches(1))
+    d.save(tmp_path / "selos.docx")
+    arq = tmp_path / "selos.docx"
+    lidas = []
+    ia = lince.FuncaoLeitor(lambda img, i: lidas.append(1) or "Logo " + "z" * 5000, "m")
+    r = lince.Leitor(ia=ia, agrupar=False).ler(arq)
+    assert len(lidas) == 1 and r.markdown.count("Logo z") == 20  # abaixo do teto, cada lugar recebe a leitura
+    monkeypatch.setattr(leitor_mod, "SAIDA_MAX", 50_000)  # 20 cópias de 5 KB passam de 50 mil caracteres
+    r = lince.Leitor(ia=ia, agrupar=False).ler(arq)
+    assert "Logo z" not in r.markdown and "Anexo do contrato de fornecimento." in r.markdown
+    assert any(p.endswith("resultado grande demais") for p in r.cobertura.pendentes)

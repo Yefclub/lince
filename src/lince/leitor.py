@@ -24,7 +24,7 @@ from .estrutura import secoes
 from .instrucoes import PROMPT_PADRAO, VERSAO_PROMPT, instrucao
 from .limites import LADO_MAX_PX, conferir_zip
 from .metadados import metadados_arquivo
-from .montagem import montar
+from .montagem import SAIDA_MAX, montar, tamanho_da_saida
 from .office import planejar_office
 from .pagina_html import planejar_html, planejar_svg
 from .pdf import planejar_pdf
@@ -419,6 +419,10 @@ def _avisar_cache(e):
 def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
     """O fim da leitura, igual com a IA do Lince ou com a de quem chama: pendência de resposta vazia, montagem do
     texto e dos metadados, estrutura."""
+    if respostas and tamanho_da_saida(plano, respostas) > SAIDA_MAX:
+        # as leituras copiadas em cada lugar em que entram estourariam a memória: fica o texto nativo, com o motivo
+        cobertura.pendentes += [f"{tid}: resultado grande demais" for tid in respostas]
+        respostas = {}
     if conferir_vazias:  # resposta vazia não pode virar lacuna silenciosa no documento
         lidos = distribuir_lotes(plano, respostas)
         ja = {p.split(":", 1)[0] for p in cobertura.pendentes}
