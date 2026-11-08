@@ -117,7 +117,7 @@
                     "default": "nao"
                   },
                   "prazo": {
-                    "description": "Segundos para cada documento, contados do início da leitura dele (a espera na fila não conta; a extração nativa conta, mas não é interrompida). Nenhuma leitura pela IA começa depois do prazo, e a que está em curso é cortada quando ele vence (com a folga da rede); o que não coube vira a pendência `prazo esgotado` em `cobertura.pendentes`, e o texto nativo sai completo. A chamada cortada pode ser cobrada pelo provedor sem aparecer em `uso`. Sem prazo, o documento é lido até o fim.",
+                    "description": "Segundos para cada documento, contados do início da leitura dele (a espera na fila não conta; a extração nativa conta; no PDF, a página que começa depois do prazo entra só com o texto, sem figuras, escaneado nem conferência de texto oculto, registrada em `cobertura.pendentes`). Nenhuma leitura pela IA começa depois do prazo, e a que está em curso é cortada quando ele vence (com a folga da rede); o que não coube vira a pendência `prazo esgotado` em `cobertura.pendentes`, e o texto nativo sai completo. A chamada cortada pode ser cobrada pelo provedor sem aparecer em `uso`. Sem prazo, o documento é lido até o fim.",
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 3600

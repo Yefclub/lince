@@ -26,8 +26,11 @@ def metadados_arquivo(path, ext=None):
     if ext == ".pdf":
         import pypdfium2 as pdfium
 
+        from ._trava import PDFIUM
+
         try:
-            info = pdfium.PdfDocument(path).get_metadata_dict()
+            with PDFIUM:
+                info = pdfium.PdfDocument(path).get_metadata_dict()
             meta["propriedades"] = {k: v for k, v in info.items() if v}
         except Exception:  # noqa: BLE001, S110 — PDF sem propriedades legíveis: segue sem elas
             pass

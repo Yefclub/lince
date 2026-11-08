@@ -98,14 +98,14 @@ class Leitor:
 
     # ------------------------------------------------------------------ planejamento
     def planejar(self, caminho: str | Path, pasta: str | Path) -> dict:
-        with PDFIUM:
-            return self._planejar(str(caminho), str(pasta))
+        return self._planejar(str(caminho), str(pasta))
 
     def _planejar(self, caminho, pasta):
         os.makedirs(f"{pasta}/ia", exist_ok=True)
         ext = _extensao_lida(caminho)
         if ext == ".pdf":
-            plano = planejar_pdf(caminho, pasta)
+            with PDFIUM:  # só a PDFium é serial: Office, HTML e texto de outros documentos seguem em paralelo
+                plano = planejar_pdf(caminho, pasta)
         elif ext in IMAGEM:
             plano = _plano_imagem(caminho, pasta)
         elif ext in TEXTO:
@@ -142,7 +142,7 @@ class Leitor:
     # ------------------------------------------------------------------ leitura
     def ler(self, caminho: str | Path, prazo: float | None = None) -> Resultado:
         """`prazo`: segundos, a partir de agora, para o documento (o chat lê com prazo; a base, sem). A extração
-        nativa conta, mas não é interrompida. Nenhuma leitura pela IA começa depois do prazo, e a que está em curso
+        nativa conta: no PDF, a página que começa depois do prazo entra só com o texto (pendência registrada). Nenhuma leitura pela IA começa depois do prazo, e a que está em curso
         no `OpenAICompativel` é cortada (com a folga da rede), sem novas tentativas: o que não coube vira a pendência
         "prazo esgotado" e o texto nativo sai completo. Provedor próprio lê o que sobra em `lince.prazo_restante()`."""
         if prazo is not None and not (math.isfinite(prazo) and prazo > 0):
