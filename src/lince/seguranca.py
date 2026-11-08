@@ -54,7 +54,8 @@ def alertas_injecao(txt):
 
 def texto_oculto_pdf(page, itens, imgs, W, H):
     """Texto que a IA leria e o humano não vê: invisível fora de imagem (OCR legítimo fica),
-    fonte < 2,5 pt, fora da página, ou cor de texto ≈ cor do fundo."""
+    fonte < 2,5 pt, fora da página, ou cor de texto ≈ cor do fundo. Devolve (motivo, item): quem chama tira o item do
+    corpo pela posição dele, nunca procurando o texto (um texto visível igual ao oculto fica)."""
     from PIL import Image  # noqa: F401
 
     esc = escala(W, H, 0.5)
@@ -80,7 +81,7 @@ def texto_oculto_pdf(page, itens, imgs, W, H):
                 if sum(abs(a - b) for a, b in zip(cor, bg, strict=False)) < 60:
                     motivo = "cor igual ao fundo"
         if motivo:
-            ocultos.append((motivo, x.text))
+            ocultos.append((motivo, x))
     return ocultos
 
 

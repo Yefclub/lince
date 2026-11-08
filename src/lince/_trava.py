@@ -6,5 +6,62 @@ Para paralelismo de CPU, use vários processos.
 """
 
 import threading
+from collections import deque
 
-PDFIUM = threading.RLock()
+
+class TravaJusta:
+    """Trava reentrante que atende por ordem de chegada.
+
+    Um PDF grande toma a trava por faixa de páginas e a solta entre as faixas. Com `threading.Lock`, quem solta pode
+    pegá-la de volta na hora, antes de quem está esperando acordar, e um PDF de uma página espera o grande inteiro.
+    Aqui a trava passa direto para o primeiro da fila: quem solta e pede de novo vai para o fim dela."""
+
+    def __init__(self):
+        self._estado = threading.Lock()
+        self._dono = None
+        self._nivel = 0
+        self._fila = deque()  # (thread, evento) de quem espera, na ordem de chegada
+
+    def acquire(self, blocking=True, timeout=-1):
+        eu = threading.get_ident()
+        with self._estado:
+            if self._dono == eu:
+                self._nivel += 1
+                return True
+            if self._dono is None and not self._fila:
+                self._dono, self._nivel = eu, 1
+                return True
+            if not blocking:
+                return False
+            vez = (eu, threading.Event())
+            self._fila.append(vez)
+        vez[1].wait(None if timeout is None or timeout < 0 else timeout)
+        with self._estado:
+            if self._dono == eu:  # recebeu a trava, mesmo que no limite do timeout
+                return True
+            self._fila.remove(vez)
+            return False
+
+    def release(self):
+        with self._estado:
+            if self._dono != threading.get_ident():
+                raise RuntimeError("a trava da PDFium não é desta thread")
+            self._nivel -= 1
+            if self._nivel:
+                return
+            if self._fila:
+                self._dono, vez = self._fila.popleft()
+                self._nivel = 1
+                vez.set()
+            else:
+                self._dono = None
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *_):
+        self.release()
+
+
+PDFIUM = TravaJusta()
