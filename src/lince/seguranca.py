@@ -86,12 +86,16 @@ def texto_oculto_pdf(page, itens, imgs, W, H):
 
 
 _W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_M = "{http://schemas.openxmlformats.org/officeDocument/2006/math}"
 _A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_P = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
 _WP = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
 _WPS = "{http://schemas.microsoft.com/office/word/2010/wordprocessingShape}"
 _V = "{urn:schemas-microsoft-com:vml}"
 _R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
-_MC_FALLBACK = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
+_MC = "{http://schemas.openxmlformats.org/markup-compatibility/2006}"
+_PKG = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+_A14 = "{http://schemas.microsoft.com/office/drawing/2010/main}"
 NAO_CONFERIDO = "texto oculto não conferido"  # o alerta e a pendência levam a parte e o motivo depois de ": "
 _DESTAQUES = {"white": "FFFFFF", "black": "000000", "yellow": "FFFF00", "green": "00FF00", "cyan": "00FFFF",
               "magenta": "FF00FF", "blue": "0000FF", "red": "FF0000", "darkBlue": "000080", "darkCyan": "008080",
@@ -100,6 +104,15 @@ _DESTAQUES = {"white": "FFFFFF", "black": "000000", "yellow": "FFFF00", "green":
 _TEMA = {"dark1": "dk1", "text1": "dk1", "tx1": "dk1", "light1": "lt1", "background1": "lt1", "bg1": "lt1",
          "dark2": "dk2", "text2": "dk2", "tx2": "dk2", "light2": "lt2", "background2": "lt2", "bg2": "lt2",
          "hyperlink": "hlink", "followedHyperlink": "folHlink"}  # fmt: skip
+# os namespaces cujo mc:Choice o anydoc entende (SUPPORTED_NS em formats/docx/content.rs e formats/pptx/mod.rs): o
+# ramo que ele lê é o primeiro Choice que só exige esses, ou o Fallback
+_LIDOS_WORD = {f"http://schemas.openxmlformats.org/{n}" for n in (
+    "wordprocessingml/2006/main", "drawingml/2006/main", "drawingml/2006/picture",
+    "drawingml/2006/wordprocessingDrawing", "markup-compatibility/2006", "drawingml/2006/chart",
+    "drawingml/2006/diagram")} | {"urn:schemas-microsoft-com:vml", "urn:schemas-microsoft-com:office:office",
+    "http://schemas.microsoft.com/office/word/2010/wordprocessingShape",
+    "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"}  # fmt: skip
+_LIDOS_PPTX = {"http://schemas.openxmlformats.org/presentationml/2006/main", _A[1:-1], _R[1:-1], _MC[1:-1], _A14[1:-1]}
 
 
 class XMLIlegivel(Exception):
@@ -129,12 +142,47 @@ def _xml(dados):
     return raiz
 
 
-def _serializar(raiz) -> bytes:
-    """A parte regravada pela árvore inteira: o DOCTYPE (com as entidades sem expandir) continua o mesmo."""
+def _serializar(raiz, original: bytes) -> bytes:
+    """A parte regravada: o que vem antes da raiz (declaração, DOCTYPE com as entidades sem expandir, comentários)
+    sai como estava no arquivo, na mesma codificação, e a raiz pela árvore. O lxml perde o DOCTYPE quando a raiz tem
+    prefixo (w:document), por isso o prólogo não passa por ele."""
     from lxml import etree
 
-    arvore = raiz.getroottree()
-    return etree.tostring(arvore, xml_declaration=True, encoding="UTF-8", standalone=arvore.docinfo.standalone)
+    codificacao = raiz.getroottree().docinfo.encoding or "UTF-8"
+    texto = original.decode(codificacao)
+    corpo = etree.tostring(raiz, encoding="unicode") + "".join(
+        etree.tostring(irmao, encoding="unicode") for irmao in raiz.itersiblings()
+    )
+    return (texto[: _fim_do_prologo(texto)] + corpo).encode(codificacao)
+
+
+def _fim_do_prologo(texto) -> int:
+    """Onde começa o elemento raiz: depois da declaração, de comentários, instruções e do DOCTYPE (com o subconjunto
+    interno, aspas e comentários dentro dele)."""
+    i = 0
+    while i < len(texto):
+        if texto[i] in " \t\r\n\ufeff":
+            i += 1
+        elif texto.startswith("<?", i):
+            i = texto.index("?>", i) + 2
+        elif texto.startswith("<!--", i):
+            i = texto.index("-->", i) + 3
+        elif texto.startswith("<!DOCTYPE", i):
+            aspas, subconjunto = None, False
+            while texto[i] != ">" or aspas or subconjunto:
+                if aspas:
+                    aspas = None if texto[i] == aspas else aspas
+                elif texto.startswith("<!--", i):
+                    i = texto.index("-->", i) + 2
+                elif texto[i] in "\"'":
+                    aspas = texto[i]
+                elif texto[i] in "[]":
+                    subconjunto = texto[i] == "["
+                i += 1
+            i += 1
+        else:
+            break
+    return i
 
 
 def _regravar(z, limpas: dict) -> bytes:
@@ -148,6 +196,91 @@ def _regravar(z, limpas: dict) -> bytes:
 
 def _motivo(e) -> str:
     return str(e)[:200] if isinstance(e, XMLIlegivel) else f"{type(e).__name__}: {str(e)[:200]}"
+
+
+def _esvaziar(t):
+    """Tira o texto do elemento e só ele: atributos (xml:space) e o que vem depois dele no XML ficam."""
+    t.text = None
+    for filho in list(t):
+        t.remove(filho)
+
+
+def _resolver(base, alvo) -> str:
+    """A parte para onde a relação aponta, como o anydoc resolve (package/path.rs): relativa à pasta da parte de
+    origem, ou absoluta a partir da raiz; "..", fragmento e consulta como no OPC."""
+    from urllib.parse import unquote
+
+    alvo = alvo.split("#", 1)[0].split("?", 1)[0]
+    if not alvo:
+        return base
+    partes = [] if alvo.startswith("/") else [p for p in base.split("/")[:-1] if p]
+    for seg in alvo.split("/"):
+        if seg == "..":
+            if partes:
+                partes.pop()
+        elif seg not in ("", "."):
+            partes.append(unquote(seg))
+    return "/".join(partes)
+
+
+class _Pacote:
+    """As partes e as relações do pacote, lidas uma vez. A parte (ou a relação) que não abre vai para `falhas`."""
+
+    def __init__(self, z):
+        self.z, self.nomes, self.falhas, self._arvores, self._rels = z, set(z.namelist()), [], {}, {}
+
+    def falhou(self, nome, e):
+        self.falhas.append(f"{nome} ({_motivo(e)})")
+
+    def arvore(self, nome):
+        """A árvore da parte (a mesma a cada chamada: a limpeza muda essa), ou None se não existe ou não abre."""
+        if nome not in self._arvores:
+            self._arvores[nome] = None
+            if nome in self.nomes:
+                try:
+                    self._arvores[nome] = _xml(self.z.read(nome))
+                except MemoryError:
+                    raise
+                except Exception as e:  # noqa: BLE001 — XML hostil ou CRC errado: a parte fica como está
+                    self.falhou(nome, e)
+        return self._arvores[nome]
+
+    def relacoes(self, parte) -> list:
+        """(Id, tipo, alvo) das relações internas da parte, na ordem do Id: a primeira de cada tipo é a que o anydoc
+        usa. O tipo é o fim do URI, igual no OOXML de transição e no estrito."""
+        if parte not in self._rels:
+            pasta, _, arquivo = parte.rpartition("/")
+            nome = f"{pasta}/_rels/{arquivo}.rels" if pasta else f"_rels/{arquivo}.rels"
+            raiz, out = self.arvore(nome), []
+            for rel in raiz.iter(f"{_PKG}Relationship") if raiz is not None else ():
+                rid, alvo = rel.get("Id"), rel.get("Target")
+                if rid is not None and alvo is not None and (rel.get("TargetMode") or "").lower() != "external":
+                    out.append((rid, (rel.get("Type") or "").rsplit("/", 1)[-1], _resolver(parte, alvo)))
+            self._rels[parte] = sorted(out)
+        return self._rels[parte]
+
+    def do_tipo(self, parte, tipo):
+        return next((alvo for _, t, alvo in self.relacoes(parte) if t == tipo), None)
+
+    def de_todos(self, parte, tipo) -> list:
+        return [alvo for _, t, alvo in self.relacoes(parte) if t == tipo]
+
+    def alvo(self, parte, rid):
+        return next((alvo for i, _, alvo in self.relacoes(parte) if i == rid), None)
+
+    def principal(self, padrao):
+        return self.do_tipo("", "officeDocument") or padrao
+
+
+def _ramo_lido(alt, suportados):
+    """O ramo do mc:AlternateContent que o anydoc lê (shared/mc.rs): o primeiro Choice cujo Requires só exige
+    namespaces que ele entende, ou o Fallback."""
+    for ramo in alt:
+        if ramo.tag == f"{_MC}Choice":
+            exige = (ramo.get("Requires") or "").split()
+            if all(ramo.nsmap.get(p) in suportados for p in exige):
+                return ramo
+    return alt.find(f"{_MC}Fallback")
 
 
 def _num(valor):
@@ -175,7 +308,7 @@ def _iguais(a, b):
     """O humano não separa as duas cores: contraste (WCAG) abaixo de 1,25:1 entre cores do mesmo tom (nenhum canal
     a mais de 64). E8E8E8 sobre branco fica em 1,22:1; o cinza D9D9D9 (1,41:1) e a letra branca na faixa azul (4,7:1)
     se leem, e o amarelo puro sobre branco tem o tom que o separa."""
-    if a is None or b is None or max(abs(x - y) for x, y in zip(a, b, strict=True)) > 64:
+    if not isinstance(a, tuple) or not isinstance(b, tuple) or max(abs(x - y) for x, y in zip(a, b, strict=True)) > 64:
         return False
     la, lb = _luminancia(a), _luminancia(b)
     return (max(la, lb) + 0.05) / (min(la, lb) + 0.05) < 1.25
@@ -197,13 +330,33 @@ def _local(el):
     return el.tag.rsplit("}", 1)[-1] if isinstance(el.tag, str) else ""
 
 
+_INCERTO = object()  # o que o Lince não sabe dizer (fundo de estilo de tabela, foto, cor com tom): não decide nada
 _CADEIA_MAX = 64  # profundidade de basedOn: o Word não passa disso; arquivo forjado com mais não custa mais
+
+
+def _ligado(el):
+    return el is not None and el is not _INCERTO and (el.get(f"{_W}val") or "true").lower() not in _DESLIGADO
+
+
+_DESLIGADO = ("0", "false", "off", "none")
+
+
+def _mesmo(a, b) -> bool:
+    return a is b or (a is not None and b is not None and dict(a.attrib) == dict(b.attrib))
+
+
+class _Lugar(NamedTuple):
+    """Onde o run está: as propriedades do parágrafo e, dentro de célula, o estilo da tabela e as condições dele
+    (firstRow, band1Horz...) que se aplicam à célula, cada uma certa ou só possível."""
+
+    ppr: object
+    tabela: tuple | None = None
 
 
 class _EstilosWord:
     """Propriedades de run e parágrafo pela cadeia do Word: run, estilo de caractere, estilo de parágrafo (o padrão,
-    quando o parágrafo não diz qual) com basedOn, e padrão do documento. Memoriza cada propriedade por estilo: o custo
-    é linear no documento, por mais longa que seja a cadeia."""
+    quando o parágrafo não diz qual) com basedOn, estilo da tabela (condicional e inteiro) e padrão do documento.
+    Memoriza cada propriedade por estilo: o custo é linear no documento, por mais longa que seja a cadeia."""
 
     def __init__(self, raiz, ilegivel=False):
         self.estilos, self.padrao, self.memoria, self.ilegivel = {}, None, {}, ilegivel
@@ -229,27 +382,94 @@ class _EstilosWord:
             yield st
             sid = base
 
+    def _memo(self, chave, calcula):
+        if chave not in self.memoria:
+            self.memoria[chave] = calcula()
+        return self.memoria[chave]
+
     def _do_estilo(self, sid, caminho):
         """O primeiro `caminho` (rPr/x ou pPr/x) pela cadeia de basedOn do estilo, memorizado."""
-        chave = (sid, caminho)
-        if chave not in self.memoria:
-            self.memoria[chave] = next((el for st in self._cadeia(sid) if (el := st.find(caminho)) is not None), None)
-        return self.memoria[chave]
+        return self._memo(
+            (sid, caminho), lambda: next((el for st in self._cadeia(sid) if (el := st.find(caminho)) is not None), None)
+        )
+
+    def _paridade(self, sid, nome) -> bool:
+        """Propriedade alternante (vanish, b, i, caps: ECMA-376 §17.7.3) pela cadeia de basedOn do estilo: cada
+        "ligado" inverte o herdado e "desligado" não muda nada, como o anydoc (run_toggles)."""
+        return self._memo(
+            (sid, "paridade", nome),
+            lambda: sum(_ligado(st.find(f"{_W}rPr/{_W}{nome}")) for st in self._cadeia(sid)) % 2 == 1,
+        )
+
+    def _condicional(self, sid, tipo, nome):
+        """O `nome` do tblStylePr do `tipo` pela cadeia do estilo de tabela."""
+
+        def calcula():
+            for st in self._cadeia(sid):
+                for cond in st.iterfind(f"{_W}tblStylePr"):
+                    if cond.get(f"{_W}type") == tipo and (el := cond.find(f"{_W}rPr/{_W}{nome}")) is not None:
+                        return el
+            return None
+
+        return self._memo((sid, tipo, nome), calcula)
+
+    def estilo_da_tabela(self, tbl):
+        """O estilo que vale na tabela: o citado, ou o padrão quando ela não cita ou cita um que não existe."""
+        st = tbl.find(f"{_W}tblPr/{_W}tblStyle")
+        sid = st.get(f"{_W}val") if st is not None else None
+        return sid if sid in self.estilos else self.tabela_padrao
+
+    def faixa(self, sid, nome) -> int:
+        el = self._do_estilo(sid, f"{_W}tblPr/{_W}{nome}") if sid else None
+        return max(_num(el.get(f"{_W}val")) or 1, 1) if el is not None else 1
+
+    def _da_tabela(self, tabela, nome):
+        """O `nome` que o estilo da tabela dá à célula: a condição mais forte que se aplica e o define, senão o do
+        estilo inteiro. Se uma condição só possível (tblLook ausente) daria outro valor, é _INCERTO."""
+        sid, condicoes = tabela
+        achado, possiveis = None, []
+        for tipo, certa in condicoes:
+            if (el := self._condicional(sid, tipo, nome)) is None:
+                continue
+            if certa:
+                achado = el
+                break
+            possiveis.append(el)
+        if achado is None:
+            achado = self._do_estilo(sid, f"{_W}rPr/{_W}{nome}")
+        return _INCERTO if any(not _mesmo(el, achado) for el in possiveis) else achado
 
     def _estilo_do_paragrafo(self, ppr):
         ps = ppr.find(f"{_W}pStyle") if ppr is not None else None
         return ps.get(f"{_W}val") if ps is not None else self.paragrafo_padrao
 
-    def run(self, rpr, ppr, nome):
-        """O valor de `nome` (filho de rPr) pela cadeia, ou None."""
+    def run(self, rpr, lugar, nome):
+        """O valor de `nome` (filho de rPr) pela cadeia, None, ou _INCERTO."""
         if rpr is not None and (el := rpr.find(f"{_W}{nome}")) is not None:
             return el
         if rpr is not None and (rs := rpr.find(f"{_W}rStyle")) is not None:
             if (el := self._do_estilo(rs.get(f"{_W}val"), f"{_W}rPr/{_W}{nome}")) is not None:
                 return el
-        if (el := self._do_estilo(self._estilo_do_paragrafo(ppr), f"{_W}rPr/{_W}{nome}")) is not None:
+        if (el := self._do_estilo(self._estilo_do_paragrafo(lugar.ppr), f"{_W}rPr/{_W}{nome}")) is not None:
+            return el
+        if lugar.tabela is not None and (el := self._da_tabela(lugar.tabela, nome)) is not None:
             return el
         return self.padrao.find(f"{_W}{nome}") if self.padrao is not None else None
+
+    def alternante(self, rpr, lugar, nome):
+        """True, False ou None (incerto) da propriedade alternante: a do run vale como está; nos estilos, cada camada
+        (tabela, parágrafo, caractere) inverte a anterior sobre o padrão do documento."""
+        if rpr is not None and (el := rpr.find(f"{_W}{nome}")) is not None:
+            return _ligado(el)
+        valor = _ligado(self.padrao.find(f"{_W}{nome}")) if self.padrao is not None else False
+        if lugar.tabela is not None:
+            if (el := self._da_tabela(lugar.tabela, nome)) is _INCERTO:
+                return None
+            valor ^= _ligado(el)
+        valor ^= self._paridade(self._estilo_do_paragrafo(lugar.ppr), nome)
+        if rpr is not None and (rs := rpr.find(f"{_W}rStyle")) is not None:
+            valor ^= self._paridade(rs.get(f"{_W}val"), nome)
+        return valor
 
     def sombreamento_paragrafo(self, ppr):
         el = ppr.find(f"{_W}shd") if ppr is not None else None
@@ -258,23 +478,129 @@ class _EstilosWord:
         return _fundo_do_sombreamento(el)
 
     def tabela_pinta(self, sid) -> bool:
-        """O estilo da tabela (o padrão, sem tblStyle) pinta alguma célula: há sombreamento na cadeia, inteiro ou
-        condicional (primeira linha, faixas). Table Grid e os estilos só de borda não pintam. Estilo citado e não
-        definido vale como o padrão, como o Word desenha; com styles.xml ilegível, nenhum estilo é certo."""
+        """O estilo da tabela pinta alguma célula: há sombreamento na cadeia, inteiro ou condicional (primeira linha,
+        faixas). Table Grid e os estilos só de borda não pintam; com styles.xml ilegível, nenhum estilo é certo."""
         if self.ilegivel:
             return True
-        if (sid is None or sid not in self.estilos) and (sid := self.tabela_padrao) is None:
+        if sid is None:
             return False
-        chave = (sid, "pinta")
-        if chave not in self.memoria:
-            self.memoria[chave] = any(_pinta(shd) for st in self._cadeia(sid) for shd in st.iter(f"{_W}shd"))
-        return self.memoria[chave]
+        return self._memo(
+            (sid, "pinta"), lambda: any(_pinta(shd) for st in self._cadeia(sid) for shd in st.iter(f"{_W}shd"))
+        )
+
+
+_CONDICOES = (
+    "nwCell",
+    "neCell",
+    "swCell",
+    "seCell",
+    "firstRow",
+    "lastRow",
+    "firstCol",
+    "lastCol",
+    "band1Horz",
+    "band2Horz",
+    "band1Vert",
+    "band2Vert",
+)  # fmt: skip — da mais forte à mais fraca
+_VISUAL = {
+    "firstRow": 0x20,
+    "lastRow": 0x40,
+    "firstColumn": 0x80,
+    "lastColumn": 0x100,
+    "noHBand": 0x200,
+    "noVBand": 0x400,
+}  # fmt: skip — bits de tblLook w:val
+
+
+def _filhos(el, tag):
+    """Os filhos `tag`, atravessando sdt, sdtContent e customXml (não a tabela aninhada)."""
+    for f in el:
+        if f.tag == tag:
+            yield f
+        elif f.tag in (f"{_W}sdt", f"{_W}sdtContent", f"{_W}customXml"):
+            yield from _filhos(f, tag)
+
+
+def _visual(tbl) -> dict:
+    """As opções de formatação condicional da tabela (tblLook): True, False, ou None quando ela não diz."""
+    look = tbl.find(f"{_W}tblPr/{_W}tblLook")
+    if look is None:
+        return dict.fromkeys(_VISUAL)
+    if any(look.get(f"{_W}{n}") is not None for n in _VISUAL):
+        return {n: _ligado_attr(look.get(f"{_W}{n}")) for n in _VISUAL}
+    try:
+        bits = int(look.get(f"{_W}val") or "", 16)
+    except ValueError:
+        return dict.fromkeys(_VISUAL)
+    return {n: bool(bits & b) for n, b in _VISUAL.items()}
+
+
+def _ligado_attr(v) -> bool:
+    return v is not None and v.lower() not in _DESLIGADO
+
+
+class _Tabela:
+    """Posição de cada célula da tabela e as condições do estilo que valem nela. A tabela sem tblLook pode ter as
+    opções ligadas ou não: a condição que depende delas é só possível."""
+
+    def __init__(self, tbl, estilos):
+        self.sid, self.visual, self.pos = estilos.estilo_da_tabela(tbl), _visual(tbl), {}
+        self.faixa_linha, self.faixa_coluna = (
+            estilos.faixa(self.sid, "tblStyleRowBandSize"),
+            estilos.faixa(self.sid, "tblStyleColBandSize"),
+        )
+        linhas = list(_filhos(tbl, f"{_W}tr"))
+        self.linhas, self.colunas = len(linhas), len(tbl.findall(f"{_W}tblGrid/{_W}gridCol"))
+        for i, tr in enumerate(linhas):
+            antes = tr.find(f"{_W}trPr/{_W}gridBefore")
+            j = max(_num(antes.get(f"{_W}val")) or 0, 0) if antes is not None else 0
+            for tc in _filhos(tr, f"{_W}tc"):
+                span = tc.find(f"{_W}tcPr/{_W}gridSpan")
+                span = max(_num(span.get(f"{_W}val")) or 1, 1) if span is not None else 1
+                self.pos[tc] = (i, j, span)
+                j += span
+            self.colunas = max(self.colunas, j)
+        self.memo = {}
+
+    def condicoes(self, tc) -> tuple:
+        if self.sid is None or tc not in self.pos:
+            return None
+        i, j, span = self.pos[tc]
+        # o que decide as condições, com a faixa de cada opção de primeira linha e coluna: poucas chaves por tabela
+        faixas = [(i - f) // self.faixa_linha % 2 for f in (0, 1)] + [(j - f) // self.faixa_coluna % 2 for f in (0, 1)]
+        chave = (i == 0, i == self.linhas - 1, j == 0, j + span >= self.colunas, *faixas)
+        if chave not in self.memo:
+            incertas = [n for n, v in self.visual.items() if v is None]
+            mundos = []
+            for k in range(2 ** len(incertas)):  # cada combinação possível das opções que a tabela não diz
+                v = dict(self.visual) | {n: bool(k >> b & 1) for b, n in enumerate(incertas)}
+                mundos.append(self._aplicadas(v, i, j, span))
+            self.memo[chave] = (
+                self.sid,
+                [(c, all(c in m for m in mundos)) for c in _CONDICOES if any(c in m for m in mundos)],
+            )
+        return self.memo[chave]
+
+    def _aplicadas(self, v, i, j, span) -> set:
+        primeira, ultima = v["firstRow"] and i == 0, v["lastRow"] and i == self.linhas - 1
+        pcol, ucol = v["firstColumn"] and j == 0, v["lastColumn"] and j + span >= self.colunas
+        out = {n for n, sim in (("firstRow", primeira), ("lastRow", ultima), ("firstCol", pcol), ("lastCol", ucol),
+                                ("nwCell", primeira and pcol), ("neCell", primeira and ucol),
+                                ("swCell", ultima and pcol), ("seCell", ultima and ucol)) if sim}  # fmt: skip
+        if not v["noHBand"] and not primeira and not ultima:
+            out.add(f"band{(i - v['firstRow']) // self.faixa_linha % 2 + 1}Horz")
+        if not v["noVBand"] and not pcol and not ucol:
+            out.add(f"band{(j - v['firstColumn']) // self.faixa_coluna % 2 + 1}Vert")
+        return out
 
 
 def _fundo_do_sombreamento(shd):
     """Cor que o sombreamento pinta atrás do texto: `fill`, ou `color` no padrão sólido; None se não houver."""
     if shd is None:
         return None
+    if shd is _INCERTO:
+        return _INCERTO
     if (shd.get(f"{_W}val") or "").lower() == "solid":
         return _rgb(shd.get(f"{_W}color"))
     return _rgb(shd.get(f"{_W}fill"))
@@ -282,13 +608,6 @@ def _fundo_do_sombreamento(shd):
 
 def _pinta(shd) -> bool:
     return _fundo_do_sombreamento(shd) is not None or (shd.get(f"{_W}val") or "clear").lower() not in ("clear", "nil")
-
-
-def _ligado(el):
-    return el is not None and (el.get(f"{_W}val") or "true").lower() not in ("0", "false", "off")
-
-
-_INCERTO = object()  # fundo que o Lince não sabe dizer (estilo de tabela, imagem): a cor não decide nada
 
 
 def _cor_vml(valor):
@@ -320,11 +639,11 @@ def _fundo_da_caixa(txbx, tema):
     return _cor_vml(forma.get("fillcolor") or "white")  # o VML pinta de branco quando não diz a cor
 
 
-def _fundo_do_run(run, fundo_par, pagina, estilos, tema, cobertos):
+def _fundo_do_run(run, lugar, pagina, estilos, tema, cobertos):
     """O que fica atrás do run: o sombreamento do parágrafo, a forma da caixa de texto, a célula, a linha ou a tabela
     em que ele está, a imagem atrás do texto que cobre o parágrafo, a página. Cada um vale só para o que está nele."""
-    if fundo_par is not None:
-        return fundo_par
+    if lugar.fundo is not None:
+        return lugar.fundo
     coberto, el = False, run.getparent()
     while el is not None:
         if el.tag == f"{_W}p":
@@ -342,58 +661,149 @@ def _fundo_do_run(run, fundo_par, pagina, estilos, tema, cobertos):
             tbl = el.find(f"{_W}tblPr")
             if tbl is not None and (cor := _fundo_do_sombreamento(tbl.find(f"{_W}shd"))) is not None:
                 return cor
-            st = tbl.find(f"{_W}tblStyle") if tbl is not None else None
-            if estilos.tabela_pinta(st.get(f"{_W}val") if st is not None else None):
+            if estilos.tabela_pinta(estilos.estilo_da_tabela(el)):
                 return _INCERTO
         el = el.getparent()
     return _INCERTO if coberto else pagina
 
 
-def _motivo_do_run(r, ppr, fundo_par, estilos, tema, pagina, cobertos):
+# letras que o Word desenha com as propriedades de escrita complexa (szCs): hebraico, árabe, siríaco, thaana, n'ko,
+# samaritano, mandaico, as formas de apresentação e o tailandês
+_ESCRITA_COMPLEXA = re.compile("[\u0590-\u08ff\u0e00-\u0e7f\ufb1d-\ufdff\ufe70-\ufeff]")
+
+
+def _meios_pontos(estilos, rpr, lugar, nome):
+    """Tamanho em meios pontos pela cadeia (10 pt quando ninguém diz), ou None quando é incerto."""
+    el = estilos.run(rpr, lugar, nome)
+    if el is _INCERTO:
+        return None
+    return 20 if el is None or (n := _num(el.get(f"{_W}val"))) is None else n
+
+
+def _tamanhos(estilos, rpr, lugar, txt) -> list:
+    """Os tamanhos com que o Word desenha o run: o run de escrita complexa (w:cs, w:rtl) inteiro em szCs; os outros em
+    sz, e as letras árabes, hebraicas etc. dele em szCs."""
+    complexo = [estilos.run(rpr, lugar, n) for n in ("cs", "rtl")]
+    if any(_ligado(el) for el in complexo):
+        nomes = ["szCs"]
+    elif any(el is _INCERTO for el in complexo):
+        nomes = ["sz", "szCs"]
+    else:
+        letras = [_ESCRITA_COMPLEXA.match(c) is not None for c in txt if not c.isspace()]
+        nomes = ["sz"] * (not all(letras)) + ["szCs"] * any(letras)
+    return [_meios_pontos(estilos, rpr, lugar, n) for n in nomes]
+
+
+def _motivo_do_run(r, lugar, estilos, tema, pagina, cobertos, txt):
     """Por que o humano não vê o run (vanish, fonte minúscula, escala minúscula, cor igual ao fundo), ou None. Só
     conclui "cor igual ao fundo" quando as duas cores são certas: com tom de tema vale a cor que o Word gravou; com
-    fundo incerto, o texto fica."""
+    fundo ou cor incertos, o texto fica."""
     rpr = r.find(f"{_W}rPr")
-    if _ligado(estilos.run(rpr, ppr, "vanish")):
+    if estilos.alternante(rpr, lugar, "vanish"):
         return "oculto (vanish)"
-    sz = estilos.run(rpr, ppr, "sz")
-    sz = _num(sz.get(f"{_W}val")) if sz is not None else None
-    if sz is not None and sz <= 4:
+    tamanhos = _tamanhos(estilos, rpr, lugar, txt)
+    if all(t is not None and t <= 4 for t in tamanhos):
         return "fonte minúscula"
-    escala_x = estilos.run(rpr, ppr, "w")
-    escala_x = _num(escala_x.get(f"{_W}val")) if escala_x is not None else None
-    if escala_x is not None and escala_x <= 10 and (sz if sz is not None else 20) <= 8:  # até 10% em até 4 pt
+    escala_x = estilos.run(rpr, lugar, "w")
+    escala_x = _num(escala_x.get(f"{_W}val")) if escala_x is not None and escala_x is not _INCERTO else None
+    if escala_x is not None and escala_x <= 10 and all(t is not None and t <= 8 for t in tamanhos):  # 10% em 4 pt
         return "escala minúscula"
-    cor_el = estilos.run(rpr, ppr, "color")
-    if cor_el is None:  # automática: o Word escolhe a que contrasta com o fundo
+    cor_el = estilos.run(rpr, lugar, "color")
+    if cor_el is None or cor_el is _INCERTO:  # automática: o Word escolhe a que contrasta com o fundo
         return None
     cor = _rgb(cor_el.get(f"{_W}val"))
     if (nome := cor_el.get(f"{_W}themeColor")) and not (cor_el.get(f"{_W}themeTint") or cor_el.get(f"{_W}themeShade")):
         cor = tema.get(_TEMA.get(nome, nome))  # tema sem tom: a cor é a do tema; com tom, a que o Word gravou em val
-    destaque = estilos.run(rpr, ppr, "highlight")
+    destaque = estilos.run(rpr, lugar, "highlight")
+    if destaque is _INCERTO:
+        return None
     atras = _rgb(_DESTAQUES.get(destaque.get(f"{_W}val"), "")) if destaque is not None else None
     atras = (
         atras
-        or _fundo_do_sombreamento(estilos.run(rpr, ppr, "shd"))
-        or _fundo_do_run(r, fundo_par, pagina, estilos, tema, cobertos)
+        or _fundo_do_sombreamento(estilos.run(rpr, lugar, "shd"))
+        or _fundo_do_run(r, lugar, pagina, estilos, tema, cobertos)
     )
     return "cor igual ao fundo" if atras is not _INCERTO and _iguais(cor, atras) else None
 
 
-def _atras_do_texto(raiz):
-    return (a for a in raiz.iter(f"{_WP}anchor") if (a.get("behindDoc") or "").lower() in ("1", "true"))
+class _Atras(NamedTuple):
+    """Imagem ou forma atrás do texto: onde está presa e o que se sabe do tamanho e da posição vertical (EMU)."""
+
+    el: object
+    cx: int | None
+    cy: int | None
+    rel: str | None  # a que a posição é relativa: page, margin, topMargin, bottomMargin, paragraph, line
+    desloc: int | None  # deslocamento a partir de `rel`; None quando a forma é alinhada (topo, centro, base)
+    alinha: str | None
 
 
-def _fluxo(raiz, estilos) -> list:
-    """(parágrafo, topo, altura) de cada parágrafo da parte, em EMU, na ordem em que o Word os empilha: as células de
-    uma linha ficam lado a lado (a linha tem a altura da maior). A altura é a mínima (uma linha do maior tamanho de
-    fonte), o que aproxima os parágrafos e só exagera a área que uma imagem pode cobrir."""
-    saida = []
+# VML: as formas que o Word desenha e a posição relativa no nome do DrawingML
+_FORMAS_VML = tuple(f"{_V}{n}" for n in ("shape", "rect", "roundrect", "oval", "image", "group", "line", "polyline",
+                                          "arc", "curve"))  # fmt: skip
+_RELATIVO_VML = {"page": "page", "margin": "margin", "top-margin-area": "topMargin",
+                 "bottom-margin-area": "bottomMargin", "text": "paragraph", "line": "line"}  # fmt: skip
+_UNIDADES = {"pt": 12700, "in": 914400, "cm": 360000, "mm": 36000, "pc": 152400, "px": 9525, "": 9525}
+
+
+def _medida(valor):
+    """Medida CSS do VML em EMU ("612pt", "8.5in"), ou None."""
+    m = re.fullmatch(r"\s*(-?\d{1,9}(?:\.\d{1,9})?)\s*([a-z]{0,2})\s*", valor or "")
+    return int(float(m.group(1)) * _UNIDADES[m.group(2)]) if m and m.group(2) in _UNIDADES else None
+
+
+def _atras_do_texto(raiz) -> list:
+    """As imagens atrás do texto da parte: âncora DrawingML com behindDoc e forma VML com z-index negativo."""
+    out = []
+    for a in raiz.iter(f"{_WP}anchor"):
+        if (a.get("behindDoc") or "").lower() in ("1", "true"):
+            ext, pv = a.find(f"{_WP}extent"), a.find(f"{_WP}positionV")
+            desloc = pv.find(f"{_WP}posOffset") if pv is not None else None
+            alinha = pv.find(f"{_WP}align") if pv is not None else None
+            out.append(_Atras(
+                a, _num(ext.get("cx")) if ext is not None else None, _num(ext.get("cy")) if ext is not None else None,
+                pv.get("relativeFrom") if pv is not None else None, _num(desloc.text) if desloc is not None else None,
+                (alinha.text or "").strip() if alinha is not None else None,
+            ))  # fmt: skip
+    for v in raiz.iter(*_FORMAS_VML):
+        if v.getparent() is not None and v.getparent().tag in _FORMAS_VML:  # dentro de um grupo: vale o grupo
+            continue
+        css = dict(
+            (k.strip().lower(), x.strip()) for k, _, x in (d.partition(":") for d in (v.get("style") or "").split(";"))
+        )
+        z = re.fullmatch(r"-?\d{1,12}", css.get("z-index", ""))
+        if z is None or int(z.group()) >= 0:
+            continue
+        alinha = css.get("mso-position-vertical")
+        desloc = None if alinha not in (None, "absolute") else _medida(css.get("margin-top") or css.get("top") or "0")
+        relativo = _RELATIVO_VML.get(css.get("mso-position-vertical-relative", "text"))
+        out.append(_Atras(v, _medida(css.get("width")), _medida(css.get("height")), relativo, desloc, alinha))
+    return out
+
+
+def _fluxo(raiz, estilos, altura_texto) -> list:
+    """(parágrafo, topo, altura, topo na página, quebra) de cada parágrafo da parte, em EMU, na ordem em que o Word os
+    empilha: as células de uma linha ficam lado a lado (a linha tem a altura da maior). A altura é a mínima (uma linha
+    do maior tamanho de fonte), o que aproxima os parágrafos e só exagera a área que uma imagem pode cobrir. A página
+    recomeça na quebra de página, na quebra que o Word gravou ao desenhar (lastRenderedPageBreak), no parágrafo que
+    começa página e depois de quebra de seção; fora disso, a cada altura da área do texto."""
+    saida, inicio, nova = [], [0], [False]
 
     def bloco(el, y):
         for f in el:
             if f.tag == f"{_W}p":
-                saida.append((f, y, h := _altura(f, estilos)))
+                ppr = f.find(f"{_W}pPr")
+                quebra = any(
+                    x.tag != f"{_W}br" or x.get(f"{_W}type") == "page"
+                    for x in f.iter(f"{_W}lastRenderedPageBreak", f"{_W}br")
+                )
+                antes = ppr.find(f"{_W}pageBreakBefore") if ppr is not None else None
+                if antes is None:
+                    antes = estilos._do_estilo(estilos._estilo_do_paragrafo(ppr), f"{_W}pPr/{_W}pageBreakBefore")
+                if quebra or nova[0] or _ligado(antes):
+                    inicio[0], nova[0] = y, False
+                h = _altura(f, estilos)
+                saida.append((f, y, h, (y - inicio[0]) % altura_texto, quebra))
+                nova[0] = ppr is not None and ppr.find(f"{_W}sectPr") is not None
                 y += h
             elif f.tag == f"{_W}tr":
                 y = max([bloco(tc, y) for tc in f if tc.tag == f"{_W}tc"], default=y)
@@ -407,56 +817,64 @@ def _fluxo(raiz, estilos) -> list:
 
 def _altura(p, estilos) -> int:
     ppr = p.find(f"{_W}pPr")
-    marca = ppr.find(f"{_W}rPr") if ppr is not None else None
-    tamanhos = [estilos.run(marca, ppr, "sz")]
-    tamanhos += [estilos.run(r.find(f"{_W}rPr"), ppr, "sz") for r in p.iter(f"{_W}r") if r.find(f"{_W}t") is not None]
-    meios_pontos = max(
-        (n for el in tamanhos if el is not None and (n := _num(el.get(f"{_W}val"))) is not None), default=20
-    )
-    return max(meios_pontos, 1) * 6350  # meio ponto em EMU
+    lugar = _Lugar(ppr)
+    tamanhos = [_meios_pontos(estilos, ppr.find(f"{_W}rPr") if ppr is not None else None, lugar, "sz")]
+    tamanhos += [
+        _meios_pontos(estilos, r.find(f"{_W}rPr"), lugar, "sz")
+        for r in p.iter(f"{_W}r")
+        if r.find(f"{_W}t") is not None
+    ]
+    return max(max((t for t in tamanhos if t is not None), default=20), 1) * 6350  # meio ponto em EMU
 
 
-def _cobertos(raiz, estilos, geometria) -> set:
-    """Parágrafos que uma imagem atrás do texto (behindDoc) pode cobrir: o parágrafo âncora e os vizinhos até a
-    altura da imagem somada ao deslocamento dela. O Word não grava a posição do texto na página: a distância vem do
-    fluxo da parte. Imagem sem tamanho declarado cobre a parte inteira."""
-    ancoras = list(_atras_do_texto(raiz))
-    if not ancoras:
-        return set()
-    fluxo = _fluxo(raiz, estilos)
-    onde = {p: (y, h) for p, y, h in fluxo}
-    faixas = []
-    for a in ancoras:
-        p = next((x for x in a.iterancestors(f"{_W}p") if x in onde), None)
-        ext = a.find(f"{_WP}extent")
-        cy = _num(ext.get("cy")) if ext is not None else None
-        if p is None or cy is None:
-            return set(raiz.iter(f"{_W}p"))
-        desloc = a.find(f"{_WP}positionV/{_WP}posOffset")
-        desloc = _num(desloc.text) if desloc is not None else None
-        if desloc is None:  # alinhada (topo, centro, base) ou posição simples: pode estar em qualquer altura da página
-            desloc = geometria[1]
-        y, h = onde[p]
-        raio = abs(cy) + abs(desloc)
-        faixas.append((y - raio, y + h + raio))
+def _juntas(faixas) -> tuple:
+    """As faixas (início, fim) unidas e ordenadas, com a lista dos inícios para busca binária."""
     juntas = []
     for ini, fim in sorted(faixas):
         if juntas and ini <= juntas[-1][1]:
             juntas[-1][1] = max(juntas[-1][1], fim)
         else:
             juntas.append([ini, fim])
-    inicios = [ini for ini, _ in juntas]
-    out = set()
-    for p, y, h in fluxo:  # a faixa que começa por último antes do fim do parágrafo é a única que pode tocá-lo
-        k = bisect.bisect_left(inicios, y + h) - 1
-        if k >= 0 and juntas[k][1] > y:
-            out.add(p)
-    return out
+    return juntas, [ini for ini, _ in juntas]
+
+
+def _toca(juntas, inicios, ini, fim) -> bool:
+    k = bisect.bisect_left(inicios, fim) - 1  # a faixa que começa por último antes do fim é a única que pode tocar
+    return k >= 0 and juntas[k][1] > ini
+
+
+def _cobertos(raiz, estilos, geometria, faixas=()) -> set:
+    """Parágrafos que uma imagem atrás do texto pode cobrir. Na própria parte: o parágrafo âncora e os vizinhos até a
+    altura da imagem somada ao deslocamento dela (o Word não grava a posição do texto na página: a distância vem do
+    fluxo da parte; imagem sem tamanho declarado cobre a parte inteira). `faixas` é o que as imagens do cabeçalho e
+    do rodapé cobrem da área do texto em cada página: vale pela posição do parágrafo na página."""
+    ancoras = _atras_do_texto(raiz)
+    if not ancoras and not faixas:
+        return set()
+    largura, altura, cima, baixo, *_ = geometria
+    fluxo = _fluxo(raiz, estilos, max(altura - cima - baixo, 1))
+    onde = {p: (y, h) for p, y, h, _, _ in fluxo}
+    perto = []
+    for a in ancoras:
+        p = next((x for x in a.el.iterancestors(f"{_W}p") if x in onde), None)
+        if p is None or a.cy is None:
+            return set(raiz.iter(f"{_W}p"))
+        desloc = altura if a.desloc is None else a.desloc  # alinhada: pode estar em qualquer altura da página
+        y, h = onde[p]
+        raio = abs(a.cy) + abs(desloc)
+        perto.append((y - raio, y + h + raio))
+    perto, ini_perto = _juntas(perto)
+    faixas, ini_faixas = _juntas(faixas)
+    return {
+        p
+        for p, y, h, yp, quebra in fluxo
+        if _toca(perto, ini_perto, y, y + h) or (faixas and (quebra or _toca(faixas, ini_faixas, yp, yp + h)))
+    }
 
 
 def _geometria(corpo) -> tuple:
-    """Largura e altura da página e margens (cima, baixo, esquerda, direita) da última seção, em EMU; Carta com
-    margens de 1" quando o arquivo não diz."""
+    """Largura e altura da página, margens (cima, baixo, esquerda, direita) e distância do cabeçalho e do rodapé à
+    borda, da última seção, em EMU; Carta com margens de 1" e bordas a 0,5" quando o arquivo não diz."""
     sec = corpo.find(f"{_W}body/{_W}sectPr") if corpo is not None else None
     tam = sec.find(f"{_W}pgSz") if sec is not None else None
     mar = sec.find(f"{_W}pgMar") if sec is not None else None
@@ -465,41 +883,48 @@ def _geometria(corpo) -> tuple:
         n = _num(el.get(f"{_W}{nome}")) if el is not None else None
         return abs(padrao if n is None else n) * 635  # twip em EMU
 
-    return v(tam, "w", 12240), v(tam, "h", 15840), *(v(mar, lado, 1440) for lado in ("top", "bottom", "left", "right"))
+    lados = ("top", "bottom", "left", "right", "header", "footer")
+    return v(tam, "w", 12240), v(tam, "h", 15840), *(v(mar, lado, 720 if lado in lados[4:] else 1440) for lado in lados)
 
 
-def _timbrado(a, geometria) -> bool:
-    """A imagem atrás do texto do cabeçalho ou do rodapé é papel timbrado: cobre ao menos um quarto da área do texto e
-    chega até ela. O logo pequeno no cabeçalho só deixa incerto o parágrafo dele."""
-    largura, altura, cima, baixo, esquerda, direita = geometria
-    ext = a.find(f"{_WP}extent")
-    cx, cy = (_num(ext.get("cx")), _num(ext.get("cy"))) if ext is not None else (None, None)
-    if cx is None or cy is None:
-        return True
-    if 4 * abs(cx) * abs(cy) < (largura - esquerda - direita) * (altura - cima - baixo):
-        return False
-    pv = a.find(f"{_WP}positionV")
-    base = {"page": 0, "topMargin": 0, "margin": cima, "bottomMargin": altura - baixo}.get(
-        pv.get("relativeFrom") if pv is not None else None
-    )
-    desloc = pv.find(f"{_WP}posOffset") if pv is not None else None
-    desloc = _num(desloc.text) if desloc is not None else None
-    if base is None or desloc is None:  # alinhada ou presa ao parágrafo: pode chegar ao texto
-        return True
-    return base + desloc < altura - baixo and base + desloc + abs(cy) > cima
+def _faixa_da_borda(a, geometria, cabecalho):
+    """O que a imagem atrás do texto do cabeçalho (ou do rodapé) cobre da área do texto de cada página, como
+    (início, fim) a partir do topo dessa área; None se ela não chega lá; "tudo" para o papel timbrado (um quarto da
+    área do texto ou mais) e para a imagem cuja posição o Lince não sabe dizer."""
+    largura, altura, cima, baixo, esquerda, direita, dist_cab, dist_rod = geometria
+    if a.cx is None or a.cy is None:
+        return "tudo"
+    base = {"page": 0, "topMargin": 0, "margin": cima, "bottomMargin": altura - baixo}.get(a.rel)
+    referencia = {"page": altura, "topMargin": cima, "margin": altura - cima - baixo, "bottomMargin": baixo}.get(a.rel)
+    if a.rel in ("paragraph", "line"):  # o parágrafo do cabeçalho começa na distância dele; o do rodapé, na margem
+        base, referencia = (dist_cab if cabecalho else altura - baixo), None
+    if base is None:
+        return "tudo"
+    if a.desloc is not None:
+        topo = base + a.desloc
+    elif referencia is not None and a.alinha in ("top", "center", "bottom"):
+        topo = base + {"top": 0, "center": (referencia - abs(a.cy)) // 2, "bottom": referencia - abs(a.cy)}[a.alinha]
+    else:
+        return "tudo"
+    ini, fim = max(topo, cima), min(topo + abs(a.cy), altura - baixo)
+    if ini >= fim:
+        return None
+    if 4 * abs(a.cx) * abs(a.cy) >= (largura - esquerda - direita) * (altura - cima - baixo):
+        return "tudo"
+    return ini - cima, fim - cima
 
 
-_PARTES_WORD = re.compile(r"word/(document|header\d*|footer\d*|footnotes|endnotes|comments)\.xml")
 _BORDA = re.compile(r"word/(header|footer)\d*\.xml")
 
 
 def limpar_docx(dados: bytes) -> Limpeza:
     """Texto do Word que a IA leria e o humano não vê, esvaziado no próprio XML antes da conversão: corpo, caixas de
-    texto, notas de rodapé e de fim, comentários, cabeçalho e rodapé. Só as partes alteradas são regravadas; texto
-    visível igual a um oculto fica onde está. A parte que não pode ser lida vai para `falhas` e fica como estava."""
+    texto, notas de rodapé e de fim, comentários, cabeçalho e rodapé, achados pelas relações do pacote, como o anydoc
+    acha. Só as partes alteradas são regravadas; texto visível igual a um oculto fica onde está. A parte que não pode
+    ser lida vai para `falhas` e fica como estava."""
     try:
         with zipfile.ZipFile(io.BytesIO(dados)) as z:
-            ocultos, limpas, falhas = _conferir_word(z, set(z.namelist()))
+            ocultos, limpas, falhas = _conferir_word(z)
             return Limpeza(ocultos, _regravar(z, limpas) if limpas else dados, falhas)
     except MemoryError:
         raise
@@ -511,76 +936,131 @@ def bordas_sem_oculto(z) -> dict:
     """Cabeçalho, rodapé e comentários sem o texto oculto (só as partes que mudaram), para os metadados: o que sai do
     corpo não volta por lá. A falha já aparece pela conferência do corpo; aqui a parte só fica como está."""
     try:
-        return _conferir_word(z, {n for n in z.namelist() if _BORDA.fullmatch(n) or n == "word/comments.xml"})[1]
+        return _conferir_word(z, so_metadados=True)[1]
     except MemoryError:
         raise
     except Exception:  # noqa: BLE001 — a mesma falha vai no resultado pela leitura do corpo
         return {}
 
 
-def _conferir_word(z, alvo) -> tuple:
-    nomes, falhas = set(z.namelist()), []
+def _conferir_word(z, so_metadados=False) -> tuple:
+    """As partes que o anydoc lê (a principal pelo officeDocument; estilos e notas pelas relações dela) e as que os
+    metadados leem (cabeçalho, rodapé e comentários, pelas relações e pelo nome)."""
+    pac = _Pacote(z)
+    corpo_nome = pac.principal("word/document.xml")
 
-    def arvore(nome):
-        try:
-            return _xml(z.read(nome))
-        except MemoryError:
-            raise
-        except Exception as e:  # noqa: BLE001 — XML hostil ou CRC errado: a parte fica como está e a falha aparece
-            falhas.append(f"{nome} ({_motivo(e)})")
-            return None
+    def tipo(t, padrao):
+        return pac.do_tipo(corpo_nome, t) or _resolver(corpo_nome, padrao)
 
-    raiz = arvore("word/styles.xml") if "word/styles.xml" in nomes else None
-    estilos = _EstilosWord(raiz, ilegivel=raiz is None and "word/styles.xml" in nomes)
-    tema = next((n for n in sorted(nomes) if re.fullmatch(r"word/theme/theme\d*\.xml", n)), None)
-    tema = _esquema(raiz) if tema and (raiz := arvore(tema)) is not None else {}
-    corpo = arvore("word/document.xml") if "word/document.xml" in nomes else None
-    partes = sorted((n for n in nomes & alvo if _PARTES_WORD.fullmatch(n)), key=lambda n: (n != "word/document.xml", n))
-    partes = {n: corpo if n == "word/document.xml" else arvore(n) for n in partes}
+    estilos_nome = tipo("styles", "styles.xml")
+    raiz = pac.arvore(estilos_nome)
+    estilos = _EstilosWord(raiz, ilegivel=raiz is None and estilos_nome in pac.nomes)
+    tema = pac.do_tipo(corpo_nome, "theme") or next(
+        (n for n in sorted(pac.nomes) if re.fullmatch(r"word/theme/theme\d*\.xml", n)), None
+    )
+    tema = _esquema(raiz) if tema and (raiz := pac.arvore(tema)) is not None else {}
+    corpo = pac.arvore(corpo_nome)
+    papeis = {corpo_nome: "corpo", tipo("footnotes", "footnotes.xml"): "nota", tipo("endnotes", "endnotes.xml"): "nota"}
+    papeis |= dict.fromkeys([tipo("comments", "comments.xml"), "word/comments.xml"], "comentario")
+    bordas = {n: "cabecalho" for n in pac.de_todos(corpo_nome, "header")}
+    bordas |= {n: "rodape" for n in pac.de_todos(corpo_nome, "footer")}
+    bordas |= {n: ("cabecalho" if "header" in n else "rodape") for n in pac.nomes if _BORDA.fullmatch(n)}
+    papeis |= bordas
+    if so_metadados:  # os metadados leem cabeçalho, rodapé e comentários pelo nome
+        papeis = {n: p for n, p in papeis.items() if _BORDA.fullmatch(n) or n == "word/comments.xml"}
+    partes = {n: pac.arvore(n) for n in sorted(papeis, key=lambda n: (n != corpo_nome, n)) if n in pac.nomes}
     fundo = corpo.find(f"{_W}background") if corpo is not None else None
     pagina = (_rgb(fundo.get(f"{_W}color")) if fundo is not None else None) or (255, 255, 255)
     if fundo is not None and len(fundo):  # fundo de imagem ou degradê
         pagina = _INCERTO
     geometria = _geometria(corpo)
-    for nome, raiz in partes.items():
-        if _BORDA.fullmatch(nome) and raiz is not None and any(_timbrado(a, geometria) for a in _atras_do_texto(raiz)):
-            pagina = _INCERTO  # o papel timbrado fica atrás de tudo o que está na página
+    faixas = []  # o que as imagens atrás do texto do cabeçalho e do rodapé cobrem da área do texto
+    for nome in pac.de_todos(corpo_nome, "header") + pac.de_todos(corpo_nome, "footer"):  # as que o Word desenha
+        raiz = pac.arvore(nome)
+        for a in _atras_do_texto(raiz) if raiz is not None else ():
+            if (faixa := _faixa_da_borda(a, geometria, bordas[nome] == "cabecalho")) == "tudo":
+                pagina = _INCERTO  # o papel timbrado fica atrás de tudo o que está na página
+            elif faixa is not None:
+                faixas.append(faixa)
     ocultos, limpas = [], {}
     for nome, raiz in partes.items():
         if raiz is None:
             continue
-        atras = (255, 255, 255) if nome == "word/comments.xml" else pagina  # o comentário fica no balão, fora da página
-        achados, mudou = _conferir_parte(raiz, estilos, tema, atras, geometria)
+        papel = papeis[nome]
+        atras = (255, 255, 255) if papel == "comentario" else pagina  # o comentário fica no balão, fora da página
+        cobre = faixas if papel == "corpo" else [(-1, 1 << 62)] if faixas and papel == "nota" else ()
+        achados, mudou = _conferir_parte(raiz, estilos, tema, atras, geometria, cobre, papel)
         ocultos += achados
         if mudou:
-            limpas[nome] = _serializar(raiz)
-    return ocultos, limpas, falhas
+            limpas[nome] = _serializar(raiz, z.read(nome))
+    return ocultos, limpas, pac.falhas
 
 
-def _conferir_parte(raiz, estilos, tema, pagina, geometria) -> tuple:
-    """Esvazia o texto dos runs ocultos da parte; devolve o que saiu e se a parte mudou. A cópia do mc:Fallback (a
-    caixa de texto em VML) também é esvaziada, mas não conta de novo."""
-    cobertos = _cobertos(raiz, estilos, geometria)
-    achados, mudou, sombras = [], False, {}
-    for r in raiz.iter(f"{_W}r"):
-        textos = r.findall(f"{_W}t")  # só os do run: o texto de uma caixa dentro dele é de outro run
+class _Paragrafo(NamedTuple):
+    ppr: object
+    tabela: tuple | None
+    fundo: object
+
+
+def _do_paragrafo(par, estilos, tabelas) -> _Paragrafo:
+    ppr = par.find(f"{_W}pPr") if par is not None else None
+    tc = next(par.iterancestors(f"{_W}tc", f"{_W}txbxContent"), None) if par is not None else None
+    tabela = None
+    if tc is not None and tc.tag == f"{_W}tc" and (tbl := next(tc.iterancestors(f"{_W}tbl"), None)) is not None:
+        if tbl not in tabelas:
+            tabelas[tbl] = _Tabela(tbl, estilos)
+        tabela = tabelas[tbl].condicoes(tc)
+    return _Paragrafo(ppr, tabela, estilos.sombreamento_paragrafo(ppr))
+
+
+def _lido(r, papel, ramos) -> bool:
+    """O run está no que é lido: no corpo e nas notas, no ramo do mc:AlternateContent que o anydoc usa (dentro do
+    desenho, ele pega todo Choice e pula o Fallback); no cabeçalho, no rodapé e nos comentários, fora do Fallback,
+    como os metadados leem. A cópia que ninguém lê também é esvaziada, mas não conta."""
+    for ramo in r.iterancestors(f"{_MC}Choice", f"{_MC}Fallback"):
+        alt = ramo.getparent()
+        if alt is None:
+            continue
+        if papel not in ("corpo", "nota"):
+            if ramo.tag == f"{_MC}Fallback":
+                return False
+            continue
+        if alt not in ramos:
+            dono = next(alt.iterancestors(f"{_W}drawing", f"{_W}pict", f"{_W}object", f"{_W}txbxContent",
+                                          f"{_W}p"), None)  # fmt: skip
+            ramos[alt] = "desenho" if dono is not None and dono.tag in (f"{_W}drawing", f"{_W}pict", f"{_W}object") \
+                else _ramo_lido(alt, _LIDOS_WORD)  # fmt: skip
+        lido = ramos[alt]
+        if (lido == "desenho" and ramo.tag == f"{_MC}Fallback") or (lido != "desenho" and ramo is not lido):
+            return False
+    return True
+
+
+def _conferir_parte(raiz, estilos, tema, pagina, geometria, faixas, papel) -> tuple:
+    """Esvazia o texto dos runs ocultos da parte (w:t do run, em todos os ramos de mc:AlternateContent dele, e m:t da
+    fórmula); devolve o que saiu do que é lido e se a parte mudou."""
+    cobertos = _cobertos(raiz, estilos, geometria, faixas)
+    runs = {}
+    for t in raiz.iter(f"{_W}t", f"{_M}t"):  # o texto de uma caixa dentro do run é do run de dentro
+        if (r := next(t.iterancestors(f"{_W}r", f"{_M}r"), None)) is not None:
+            runs.setdefault(r, []).append(t)
+    achados, mudou, pars, tabelas, ramos = [], False, {}, {}, {}
+    for r, textos in runs.items():
         txt = "".join("".join(t.itertext()) for t in textos)
         if not txt.strip():
             continue
         par = next(r.iterancestors(f"{_W}p"), None)
-        ppr = par.find(f"{_W}pPr") if par is not None else None
-        if par not in sombras:
-            sombras[par] = estilos.sombreamento_paragrafo(ppr)
-        if motivo := _motivo_do_run(r, ppr, sombras[par], estilos, tema, pagina, cobertos):
+        if par not in pars:
+            pars[par] = _do_paragrafo(par, estilos, tabelas)
+        if motivo := _motivo_do_run(r, pars[par], estilos, tema, pagina, cobertos, txt):
             for t in textos:
-                t.clear()
+                _esvaziar(t)
             mudou = True
-            if not any(a.tag == _MC_FALLBACK for a in r.iterancestors()):
+            if _lido(r, papel, ramos):
                 achados.append((motivo, txt))
     return achados, mudou
 
 
-_P = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
 _MAPA_PADRAO = {"bg1": "lt1", "tx1": "dk1", "bg2": "lt2", "tx2": "dk2"}
 
 
@@ -600,9 +1080,9 @@ def _cor_drawingml(el, tema, mapa):
     return None
 
 
-def _preenchimento(el, tema, mapa, parte=None, imagens=None):
-    """Cor de um spPr/bgPr: a do solidFill quando é certa, ou a da imagem de uma cor só; _INCERTO para foto, degradê
-    ou cor incerta; None sem preenchimento declarado. `parte` é a do slide, para achar a imagem."""
+def _preenchimento(el, tema, mapa, imagem=None):
+    """Cor de um spPr/bgPr/tcPr: a do solidFill quando é certa, ou a da imagem de uma cor só (`imagem(blip)`);
+    _INCERTO para foto, degradê ou cor incerta; None sem preenchimento declarado."""
     if el is None:
         return None
     if el.find(f"{_A}noFill") is not None:
@@ -610,216 +1090,554 @@ def _preenchimento(el, tema, mapa, parte=None, imagens=None):
     if (solido := el.find(f"{_A}solidFill")) is not None:
         return _cor_drawingml(next(iter(solido), None), tema, mapa) or _INCERTO
     if (blip := el.find(f"{_A}blipFill")) is not None:
-        return _cor_da_imagem(blip.find(f"{_A}blip"), parte, imagens) if parte is not None else _INCERTO
+        return imagem(blip.find(f"{_A}blip")) if imagem is not None else _INCERTO
     if any(el.find(f"{_A}{t}") is not None for t in ("gradFill", "pattFill", "grpFill")):
         return _INCERTO
     return None
 
 
-def _cor_da_imagem(blip, parte, imagens):
+def _cor_da_imagem(blip, pac, parte, imagens):
     """A cor da imagem quando ela é toda de uma cor só (a imagem branca que esconde a letra branca); _INCERTO para
     foto, transparência, efeito de cor ou imagem que não abre."""
     from PIL import Image
 
     if blip is None or any(_local(f) != "extLst" for f in blip):  # duotone, lum, alphaModFix: a cor muda
         return _INCERTO
-    try:
-        alvo = parte.related_part(blip.get(f"{_R}embed"))
-    except Exception:  # noqa: BLE001 — relação quebrada ou para fora do pacote
+    alvo = pac.alvo(parte, blip.get(f"{_R}embed"))
+    if alvo is None or alvo not in pac.nomes:
         return _INCERTO
-    chave = str(alvo.partname)
-    if chave not in imagens:
-        imagens[chave] = _INCERTO
+    if alvo not in imagens:
+        imagens[alvo] = _INCERTO
         try:
-            with Image.open(io.BytesIO(alvo.blob)) as im:
+            with Image.open(io.BytesIO(pac.z.read(alvo))) as im:
                 im.thumbnail((512, 512))  # a cor uniforme sobrevive à redução; o custo fica pequeno
                 faixas = im.convert("RGBA").getextrema()
         except MemoryError:
             raise
-        except Exception:  # noqa: BLE001, S110 — EMF, SVG ou imagem quebrada: o fundo fica incerto
+        except Exception:  # noqa: BLE001, S110 — EMF, SVG, CRC errado ou imagem quebrada: o fundo fica incerto
             pass
         else:
             if faixas[3][0] == 255 and all(alto - baixo <= 8 for baixo, alto in faixas[:3]):
-                imagens[chave] = tuple((baixo + alto) // 2 for baixo, alto in faixas[:3])
-    return imagens[chave]
+                imagens[alvo] = tuple((baixo + alto) // 2 for baixo, alto in faixas[:3])
+    return imagens[alvo]
+
+
+# Comparar a caixa de cada forma com texto com as já desenhadas é quadrático no slide (~1 µs por comparação). Um
+# slide real tem dezenas de formas (SmartArt e gráfico ficam em partes próprias); acima de 500 (125 mil comparações,
+# ~0,1 s) o slide vira falha e fica como está, em vez de travar a leitura com um slide forjado.
+_FORMAS_MAX = 500
+# O mesmo custo somado na apresentação: 400 KB de zip com slides no teto custavam 19 s. 3 milhões de comparações
+# (~3 s) cobrem 600 slides de 100 formas; daí em diante cada slide vira falha, sem nem ser aberto.
+_COMPARACOES_MAX = 3_000_000
+_FORMAS = tuple(f"{_P}{n}" for n in ("sp", "cxnSp", "pic", "graphicFrame", "grpSp", "contentPart"))
+_SEM_ESTILO = {"{2D5ABB26-0587-4C30-8999-92F81FD0307C}", "{5940675A-B579-460E-94D1-54222C63F5DA}"}  # sem pintura
+_PREENCHE_TEXTO = tuple(f"{_A}{n}" for n in ("solidFill", "noFill", "gradFill", "blipFill", "pattFill", "grpFill"))
+
+
+class _Teto(XMLIlegivel):
+    """O slide passou de um teto de custo: fica como está e vira falha, com o teto no motivo."""
+
+
+class _Placeholders:
+    """Os placeholders de um layout ou mestre, para a herança pelo `ph` (type e idx), como o anydoc casa."""
+
+    def __init__(self, arvore_formas):
+        self.idx, self.tipo, self.classe = {}, {}, {}  # o primeiro de cada, na ordem do arquivo
+        for sp in arvore_formas.iter(f"{_P}sp") if arvore_formas is not None else ():
+            if (ph := _ph(sp)) is not None:
+                tipo, idx = ph
+                if idx is not None:
+                    self.idx.setdefault(idx, sp)
+                self.tipo.setdefault(tipo, sp)
+                self.classe.setdefault(_classe(tipo), sp)
+
+    def casar(self, tipo, idx):
+        """Pelo idx; senão pelo tipo (os de título valem entre si); senão o primeiro da mesma classe."""
+        if idx is not None and idx in self.idx:
+            return self.idx[idx]
+        classe = _classe(tipo)
+        if classe == "body" and tipo in self.tipo:
+            return self.tipo[tipo]
+        return self.classe.get(classe)
+
+
+def _classe(tipo):
+    return "title" if tipo in ("title", "ctrTitle") else "body"
+
+
+def _nv(el):
+    """O cNvPr e o nvPr da forma (nvSpPr, nvPicPr, nvGraphicFramePr...)."""
+    nv = next((x for x in el if _local(x).startswith("nv")), None)
+    return (nv.find(f"{_P}cNvPr"), nv.find(f"{_P}nvPr")) if nv is not None else (None, None)
+
+
+def _ph(el):
+    nvpr = _nv(el)[1]
+    ph = nvpr.find(f"{_P}ph") if nvpr is not None else None
+    return (ph.get("type") or "body", ph.get("idx")) if ph is not None else None
+
+
+class _Camada(NamedTuple):
+    """Slide, layout, mestre ou página de anotações: a parte, a árvore, os placeholders e o que ela herda."""
+
+    nome: str
+    raiz: object
+    phs: object
+    pai: object  # o layout do slide, o mestre do layout, None no mestre
+
+
+class _Apresentacao:
+    """O que vale para todos os slides: o pacote, o tamanho, o estilo de texto padrão e os layouts e mestres lidos."""
+
+    def __init__(self, pac):
+        self.pac, self.camadas, self.temas, self.imagens, self.comparacoes = pac, {}, {}, {}, 0
+        self.nome = pac.principal("ppt/presentation.xml")
+        self.raiz = pac.arvore(self.nome)
+        if self.raiz is None:
+            raise XMLIlegivel("a apresentação não abre") if self.nome in pac.nomes else KeyError(self.nome)
+        tam = self.raiz.find(f"{_P}sldSz")
+        self.W, self.H = (_num(tam.get("cx")) or 0, _num(tam.get("cy")) or 0) if tam is not None else (0, 0)
+        self.padrao = self.raiz.find(f"{_P}defaultTextStyle")
+        estilos = pac.arvore(pac.do_tipo(self.nome, "tableStyles") or "")
+        self.tabela_padrao = estilos.get("def") if estilos is not None else None
+
+    def slides(self) -> list:
+        lista = self.raiz.find(f"{_P}sldIdLst")
+        alvos = [self.pac.alvo(self.nome, s.get(f"{_R}id")) for s in (lista if lista is not None else [])]
+        return [a for a in alvos if a]
+
+    def camada(self, nome, tipo_pai):
+        """O layout (ou o mestre) `nome`, com o pai dele (`tipo_pai`: slideMaster, notesMaster ou None)."""
+        if nome not in self.camadas:
+            raiz = self.pac.arvore(nome) if nome else None
+            if raiz is None:
+                self.camadas[nome] = None
+            else:
+                pai = self.camada(self.pac.do_tipo(nome, tipo_pai), None) if tipo_pai else None
+                self.camadas[nome] = _Camada(nome, raiz, _Placeholders(raiz.find(f"{_P}cSld/{_P}spTree")), pai)
+        return self.camadas[nome]
+
+    def tema(self, mestre) -> tuple:
+        """O esquema de cores do tema do mestre e o mapa de cores dele."""
+        if mestre is None:
+            return {}, {}
+        if mestre.nome not in self.temas:
+            raiz = self.pac.arvore(self.pac.do_tipo(mestre.nome, "theme") or "")
+            clr = mestre.raiz.find(f"{_P}clrMap")
+            self.temas[mestre.nome] = (
+                _esquema(raiz) if raiz is not None else {},
+                dict(clr.attrib) if clr is not None else {},
+            )
+        return self.temas[mestre.nome]
+
+    def imagem(self, parte):
+        return lambda blip: _cor_da_imagem(blip, self.pac, parte, self.imagens)
 
 
 def limpar_pptx(dados: bytes) -> Limpeza:
-    """Texto dos slides que a IA leria e o humano não vê, esvaziado no próprio XML antes da conversão: o run oculto
-    e, se a caixa estiver fora do slide, a caixa inteira. Só os slides alterados são regravados; texto visível igual a
-    um oculto fica onde está. Pacote que não pode ser conferido fica como estava, com a parte em `falhas`."""
+    """Texto dos slides e das anotações que a IA leria e o humano não vê, esvaziado no próprio XML antes da conversão:
+    o run oculto e, se a forma estiver fora do slide ou oculta, o texto inteiro dela. O percurso é o do anydoc: os
+    slides do sldIdLst, cada forma do spTree (com mc:AlternateContent e grupos), as células de tabela e as anotações.
+    Só as partes alteradas são regravadas; texto visível igual a um oculto fica onde está. A parte que não pode ser
+    conferida fica como estava e vai para `falhas`."""
     try:
-        ocultos, alvos = _conferir_pptx(dados)
-        if not alvos:
-            return Limpeza(ocultos, dados, [])
         with zipfile.ZipFile(io.BytesIO(dados)) as z:
-            limpas = {}
-            for parte, elementos in alvos.items():
-                raiz = _xml(z.read(parte))
-                for caminho, tag in elementos:
-                    el = raiz
-                    for k in caminho:
-                        el = el[k]
-                    if el.tag != tag:
-                        raise XMLIlegivel(f"{parte}: a forma não está onde o leitor a viu")
-                    for t in el.iter(f"{_A}t"):
-                        t.clear()
-                limpas[parte] = _serializar(raiz)
-            return Limpeza(ocultos, _regravar(z, limpas), [])
+            ocultos, limpas, falhas = _conferir_pptx(z)
+            return Limpeza(ocultos, _regravar(z, limpas) if limpas else dados, falhas)
     except MemoryError:
         raise
-    except Exception as e:  # noqa: BLE001 — o python-pptx levanta de tudo com pacote hostil: não conferido
-        return Limpeza([], dados, [f"{_parte_ilegivel(dados) or 'apresentação'} ({_motivo(e)})"])
+    except Exception as e:  # noqa: BLE001 — zip que não abre, apresentação sem presentation.xml: nada conferido
+        return Limpeza([], dados, [f"apresentação ({_motivo(e)})"])
 
 
-def _parte_ilegivel(dados):
-    """A primeira parte XML da apresentação que não abre: é ela que o alerta aponta."""
+def _conferir_pptx(z) -> tuple:
+    pac = _Pacote(z)
     try:
-        with zipfile.ZipFile(io.BytesIO(dados)) as z:
-            for nome in z.namelist():
-                if nome.endswith((".xml", ".rels")):
-                    try:
-                        _xml(z.read(nome))
-                    except Exception:  # noqa: BLE001 — XML hostil, CRC errado, parte cifrada
-                        return nome
-    except Exception:  # noqa: BLE001 — nem o zip abre: o alerta fala da apresentação
-        return None
+        ap = _Apresentacao(pac)
+    except XMLIlegivel:  # a falha da parte já está em pac.falhas
+        return [], {}, pac.falhas
+    ocultos, limpas = [], {}
+    for nome in ap.slides():
+        if ap.comparacoes > _COMPARACOES_MAX:
+            pac.falhou(nome, _Teto(f"sobreposição de formas acima do teto de {_COMPARACOES_MAX} comparações"))
+            continue
+        slide = ap.pac.arvore(nome)
+        if slide is None:
+            continue
+        layout = ap.camada(pac.do_tipo(nome, "slideLayout"), "slideMaster")
+        try:
+            achados, mudou = _conferir_slide(ap, _Camada(nome, slide, None, layout))
+        except MemoryError:
+            raise
+        except Exception as e:  # noqa: BLE001 — teto de custo ou XML forjado que o percurso não previu: o slide
+            pac.falhou(nome, e)  # fica como está (a árvore só muda no fim da conferência, que não chegou)
+        else:
+            ocultos += achados
+            if mudou:  # também quando só a cópia que o anydoc não lê saiu
+                limpas[nome] = _serializar(slide, z.read(nome))
+        if (notas := pac.do_tipo(nome, "notesSlide")) and (raiz := pac.arvore(notas)) is not None:
+            mestre = ap.camada(pac.do_tipo(notas, "notesMaster"), None)
+            if achados := _conferir_anotacoes(ap, _Camada(notas, raiz, None, mestre)):
+                ocultos += achados
+                limpas[notas] = _serializar(raiz, z.read(notas))
+    return ocultos, limpas, pac.falhas
+
+
+def _mestre(camada):
+    """O fim da cadeia de herança (o mestre do layout do slide), ou None sem layout."""
+    c = camada.pai
+    while c is not None and c.pai is not None:
+        c = c.pai
+    return c
+
+
+def _fundo_da_camada(ap, camadas, tema, mapa):
+    """O fundo do slide: o primeiro de slide, layout e mestre que declara um."""
+    for camada in camadas:
+        if camada is None or (bg := camada.raiz.find(f"{_P}cSld/{_P}bg")) is None:
+            continue
+        bgpr, bgref = bg.find(f"{_P}bgPr"), bg.find(f"{_P}bgRef")
+        if bgpr is not None:
+            return _preenchimento(bgpr, tema, mapa, ap.imagem(camada.nome)) or _INCERTO
+        if bgref is not None and _num(bgref.get("idx") or "0") in (0, 1001):  # sólido com a cor do bgRef é certo
+            return _cor_drawingml(next(iter(bgref), None), tema, mapa) or _INCERTO
+        return _INCERTO  # estilo de fundo do tema
+    return (255, 255, 255)
+
+
+def _mapa(camadas, mapa):
+    """O mapa de cores do mestre, ou o que o slide (ou o layout) põe no lugar dele (clrMapOvr)."""
+    for camada in camadas:
+        if camada is not None and (ovr := camada.raiz.find(f"{_P}clrMapOvr/{_A}overrideClrMapping")) is not None:
+            return dict(ovr.attrib)
+    return mapa
+
+
+def _formas(pai, lido=True, desenhado=True):
+    """(forma, lida pelo anydoc, desenhada) dos filhos do spTree ou do grupo, na ordem de desenho. No
+    mc:AlternateContent, o anydoc lê o ramo que entende e o PowerPoint desenha o primeiro Choice."""
+    for f in pai:
+        if f.tag == f"{_MC}AlternateContent":
+            lido_ramo, ramos = _ramo_lido(f, _LIDOS_PPTX), [x for x in f if x.tag in (f"{_MC}Choice", f"{_MC}Fallback")]
+            for ramo in ramos:
+                yield from _formas(ramo, lido and ramo is lido_ramo, desenhado and ramo is ramos[0])
+        elif f.tag in _FORMAS:
+            yield f, lido, desenhado
+
+
+def _oculta(el) -> bool:
+    """A forma está oculta (painel de seleção): o PowerPoint não a desenha, e o anydoc lê o texto dela."""
+    pr = _nv(el)[0]
+    return pr is not None and (pr.get("hidden") or "").lower() in ("1", "true")
+
+
+def _caixa(el, herdadas=()):
+    """(x0, y0, x1, y1) da forma em EMU, a do placeholder de onde ela herda quando não tem a sua, ou None."""
+    for f in (el, *herdadas):
+        if f is None:
+            continue
+        xfrm = f.find(f"{_P}xfrm") if f.tag == f"{_P}graphicFrame" else None
+        if xfrm is None:
+            pr = next((x for x in f if _local(x) in ("spPr", "grpSpPr")), None)
+            xfrm = pr.find(f"{_A}xfrm") if pr is not None else None
+        off, ext = (xfrm.find(f"{_A}off"), xfrm.find(f"{_A}ext")) if xfrm is not None else (None, None)
+        if off is not None and ext is not None:
+            x, y, cx, cy = (_num(off.get("x")), _num(off.get("y")), _num(ext.get("cx")), _num(ext.get("cy")))
+            if None not in (x, y, cx, cy):
+                return x, y, x + cx, y + cy
     return None
 
 
-def _caminho(el) -> list:
-    """Posição do elemento na árvore da parte, filho a filho desde a raiz."""
-    out = []
-    while (pai := el.getparent()) is not None:
-        out.append(pai.index(el))
-        el = pai
-    return out[::-1]
+def _herdadas(el, camada):
+    """Os placeholders do layout e do mestre de onde a forma herda (posição, preenchimento, texto)."""
+    if (ph := _ph(el)) is None:
+        return []
+    out, c = [], camada.pai
+    while c is not None:
+        out.append(c.phs.casar(*ph))
+        c = c.pai
+    return out
 
 
-def _conferir_pptx(dados) -> tuple:
-    """O texto oculto dos slides e onde ele está ({parte: [(caminho, tag)]}): caixa fora do slide, fonte minúscula e
-    cor igual ao fundo (preenchimento da forma, formas embaixo, fundo do slide, do layout ou do mestre, com o tema e
-    o mapa de cores do mestre). Só conclui "cor igual ao fundo" quando as cores são certas: foto, degradê, estilo do
-    tema ou cor com transformação deixam o texto onde está."""
-    from pptx import Presentation
-    from pptx.util import Pt
-
-    prs = Presentation(io.BytesIO(dados))
-    W, H = prs.slide_width or 0, prs.slide_height or 0
-    out, alvos, temas, imagens = [], {}, {}, {}
-    for slide in prs.slides:
-        mestre = slide.slide_layout.slide_master
-        if id(mestre) not in temas:
-            rel = next((r for r in mestre.part.rels.values() if r.reltype.endswith("/theme")), None)
-            tema = _esquema(_xml(rel.target_part.blob)) if rel is not None else {}
-            clr = mestre._element.find(f"{_P}clrMap")
-            mapa = dict(clr.attrib) if clr is not None else {}
-            temas[id(mestre)] = (tema, mapa)
-        tema, mapa = temas[id(mestre)]
-        fundo = (255, 255, 255)
-        for camada in (slide, slide.slide_layout, mestre):  # o primeiro que declara fundo vale
-            bg = camada._element.find(f"{_P}cSld/{_P}bg")
-            if bg is None:
-                continue
-            bgpr, bgref = bg.find(f"{_P}bgPr"), bg.find(f"{_P}bgRef")
-            if bgpr is not None:
-                fundo = _preenchimento(bgpr, tema, mapa, camada.part, imagens) or _INCERTO
-            else:  # bgRef: estilo de fundo do tema; sólido com a cor do bgRef é certo, o resto não
-                fundo = _INCERTO
-                if bgref is not None and _num(bgref.get("idx") or "0") in (0, 1001):
-                    fundo = _cor_drawingml(next(iter(bgref), None), tema, mapa) or _INCERTO
-            break
-        desenhadas = []  # (caixa, o que ela pinta) das formas já desenhadas, de baixo para cima
-        # embaixo do slide vêm as formas do mestre e do layout que não são placeholder (faixa, foto, logo), a
-        # menos que o slide (ou o layout, para as do mestre) diga showMasterSp="0"
-        camadas_de_baixo = []
-        if slide._element.get("showMasterSp") not in ("0", "false"):
-            if slide.slide_layout._element.get("showMasterSp") not in ("0", "false"):
-                camadas_de_baixo.append(mestre)
-            camadas_de_baixo.append(slide.slide_layout)
-        for camada in camadas_de_baixo:
-            for sh in camada.shapes:
-                if not sh.is_placeholder and (cor := _pintura(sh, camada.part, tema, mapa, imagens)) is not None:
-                    desenhadas.append((_caixa(sh), cor))
-        parte = str(slide.part.partname).lstrip("/")
-        for sh in slide.shapes:  # na ordem de desenho: o que vem antes fica atrás
-            caixa = _caixa(sh)
-            embaixo = _embaixo(caixa, fundo, desenhadas)
-            achados = _oculto_na_forma(sh, True, W, H, embaixo, tema, mapa, Pt, slide.part, imagens)
-            for f in _dentro_do_grupo(sh):  # no grupo, posição e camadas são do grupo: só o preenchimento certo
-                achados += _oculto_na_forma(f, False, W, H, [_INCERTO], tema, mapa, Pt, slide.part, imagens)
-            for motivo, texto, el in achados:
-                out.append((motivo, texto))
-                alvos.setdefault(parte, []).append((_caminho(el), el.tag))
-            if (cor := _pintura(sh, slide.part, tema, mapa, imagens)) is not None:
-                desenhadas.append((caixa, cor))
-    return out, alvos
+def _pintura(el, herdadas, tema, mapa, imagem):
+    """O que a forma pinta embaixo do que vem por cima: a cor certa (preenchimento sólido, imagem de uma cor só),
+    _INCERTO (foto, gráfico, tabela, grupo, estilo do tema) ou None (sem preenchimento, oculta)."""
+    if _oculta(el):
+        return None
+    if el.tag == f"{_P}pic":
+        return imagem(el.find(f"{_P}blipFill/{_A}blip"))
+    if el.tag in (f"{_P}graphicFrame", f"{_P}grpSp", f"{_P}contentPart"):
+        return _INCERTO
+    return _preenchimento_da_forma(el, herdadas, tema, mapa, imagem)
 
 
-def _caixa(sh) -> tuple:
-    return (sh.left or 0, sh.top or 0, (sh.left or 0) + (sh.width or 0), (sh.top or 0) + (sh.height or 0))
+def _preenchimento_da_forma(el, herdadas, tema, mapa, imagem):
+    """O preenchimento da forma (spPr, estilo do tema), ou o do placeholder de onde ela herda quando não declara."""
+    for f in (el, *herdadas):
+        if f is None:
+            continue
+        sppr = f.find(f"{_P}spPr")
+        if sppr is not None and any(x.tag in _PREENCHE_TEXTO for x in sppr):
+            return _preenchimento(sppr, tema, mapa, imagem if f is el else None)
+        ref = f.find(f"{_P}style/{_A}fillRef")
+        if ref is not None:
+            return _INCERTO if _num(ref.get("idx") or "0") else None
+    return None
 
 
-def _sobrepoe(a, b) -> bool:
-    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
-
-
-def _embaixo(caixa, fundo, desenhadas) -> list:
+def _embaixo(ap, caixa, fundo, desenhadas) -> list:
     """O que pode estar atrás da caixa: o fundo do slide e cada forma já desenhada que a sobrepõe; a que a cobre
-    inteira esconde o que veio antes dela."""
+    inteira esconde o que veio antes dela. Caixa desconhecida pode estar sob qualquer uma."""
+    ap.comparacoes += len(desenhadas)
+    if ap.comparacoes > _COMPARACOES_MAX:
+        raise _Teto(f"sobreposição de formas acima do teto de {_COMPARACOES_MAX} comparações")
     fundos = [fundo]
     for d, cor in desenhadas:
-        if _sobrepoe(caixa, d):
+        if caixa is None or d is None:
+            fundos.append(cor)
+        elif caixa[0] < d[2] and d[0] < caixa[2] and caixa[1] < d[3] and d[1] < caixa[3]:
             cobre = d[0] <= caixa[0] and d[1] <= caixa[1] and caixa[2] <= d[2] and caixa[3] <= d[3]
             fundos = [cor] if cobre else [*fundos, cor]
     return fundos
 
 
-def _pintura(sh, parte, tema, mapa, imagens):
-    """O que a forma pinta embaixo do que vem por cima: a cor certa (preenchimento sólido, imagem de uma cor só),
-    _INCERTO (foto, gráfico, tabela, grupo, estilo do tema) ou None, para a caixa sem preenchimento nenhum."""
-    el = sh._element
-    if el.tag == f"{_P}pic":
-        return _cor_da_imagem(el.find(f"{_P}blipFill/{_A}blip"), parte, imagens)
-    if sh.shape_type in (6, 13) or el.tag in (f"{_P}graphicFrame", f"{_P}grpSp"):
+class _Texto(NamedTuple):
+    """O que decide o tamanho e a cor do texto de uma forma: de dentro para fora, o lstStyle dela, a cor do estilo
+    (fontRef), os placeholders do layout e do mestre, o estilo de texto do mestre (title, body, other ou notes) e o
+    padrão da apresentação. `parar` encerra a cadeia como incerta (o estilo de tabela, que o Lince não lê)."""
+
+    niveis: list
+    fonte: object
+    parar: bool = False
+
+
+def _cadeia_de_texto(ap, el, herdadas, mestre, notas=False) -> _Texto:
+    lst = el.find(f"{_P}txBody/{_A}lstStyle")
+    niveis = [lst] + [h.find(f"{_P}txBody/{_A}lstStyle") for h in herdadas if h is not None]
+    ph = _ph(el)
+    if mestre is not None:
+        estilos = mestre.raiz.find(f"{_P}notesStyle") if notas else mestre.raiz.find(f"{_P}txStyles")
+        if notas:
+            niveis.append(estilos if ph is not None else None)
+        elif estilos is not None:
+            nome = "otherStyle" if ph is None else ("titleStyle" if _classe(ph[0]) == "title" else "bodyStyle")
+            niveis.append(estilos.find(f"{_P}{nome}"))
+    niveis.append(ap.padrao)
+    return _Texto(niveis, el.find(f"{_P}style/{_A}fontRef"))
+
+
+def _declarado(el, nome, tema, mapa):
+    """O tamanho (centésimos de ponto) ou a cor que o rPr/defRPr/fontRef declara, _INCERTO, ou None se não declara."""
+    if el is None:
+        return None
+    if el.tag == f"{_A}fontRef":
+        filho = next(iter(el), None)
+        return None if nome == "sz" or filho is None else (_cor_drawingml(filho, tema, mapa) or _INCERTO)
+    if nome == "sz":
+        return _num(el.get("sz"))
+    f = next((x for x in el if x.tag in _PREENCHE_TEXTO), None)
+    if f is None:
+        return None
+    return (_cor_drawingml(next(iter(f), None), tema, mapa) or _INCERTO) if f.tag == f"{_A}solidFill" else _INCERTO
+
+
+def _do_texto(rpr, ppr, nivel, texto, nome, tema, mapa):
+    """`nome` (sz ou cor) do run pela cadeia; _INCERTO quando não é certo; None quando ninguém declara. O defRPr do
+    próprio parágrafo deixa incerto: o PowerPoint não o aplica sempre."""
+    if (v := _declarado(rpr, nome, tema, mapa)) is not None:
+        return v
+    if ppr is not None and _declarado(ppr.find(f"{_A}defRPr"), nome, tema, mapa) is not None:
         return _INCERTO
-    if (cor := _preenchimento(el.find(f"{_P}spPr"), tema, mapa, parte, imagens)) is not None:
-        return cor
-    ref = el.find(f"{_P}style/{_A}fillRef")
-    return _INCERTO if ref is not None and _num(ref.get("idx") or "0") else None
+    fontes = [texto.niveis[0], texto.fonte, *texto.niveis[1:]] if texto.fonte is not None else texto.niveis
+    for lst in fontes:
+        d = lst if lst is None or lst.tag == f"{_A}fontRef" else lst.find(f"{_A}lvl{nivel + 1}pPr/{_A}defRPr")
+        if (v := _declarado(d, nome, tema, mapa)) is not None:
+            return v
+    return _INCERTO if texto.parar else None
 
 
-def _dentro_do_grupo(sh):
-    if sh.shape_type == 6:  # grupo
-        for f in sh.shapes:
-            yield f
-            yield from _dentro_do_grupo(f)
+def _escala(corpo) -> float:
+    """O fator da autoajuste (normAutofit fontScale, em milésimos de por cento ou "62.5%")."""
+    ajuste = corpo.find(f"{_A}bodyPr/{_A}normAutofit")
+    valor = (ajuste.get("fontScale") or "") if ajuste is not None else ""
+    try:
+        return float(valor[:-1]) / 100 if valor.endswith("%") else (int(valor) / 100_000 if valor else 1.0)
+    except ValueError:
+        return 1.0
 
 
-def _oculto_na_forma(sh, solta, W, H, fundos, tema, mapa, Pt, parte, imagens) -> list:
-    """(motivo, texto, elemento a esvaziar) do que está oculto na forma. `fundos` é o que pode estar atrás dela: o
-    texto só é da cor do fundo se for da cor de todos."""
-    if not getattr(sh, "has_text_frame", False) or not sh.text_frame.text.strip():
-        return []
-    x, y, w, h = sh.left or 0, sh.top or 0, sh.width or 0, sh.height or 0
-    if solta and W and H and (x + w <= 0 or y + h <= 0 or x >= W or y >= H):
-        return [("fora do slide", sh.text_frame.text, sh._element)]
-    atras = _preenchimento(sh._element.find(f"{_P}spPr"), tema, mapa, parte, imagens)
-    if atras is None and (ref := sh._element.find(f"{_P}style/{_A}fillRef")) is not None:
-        atras = _INCERTO if _num(ref.get("idx") or "0") else None  # o estilo do tema pinta a forma
-    fundos = fundos if atras is None else [atras]
-    certos = not any(f is _INCERTO for f in fundos)
+def _runs_do_corpo(corpo):
+    """(run, rPr, pPr, nível) do que o anydoc lê do corpo de texto: a:r e a:fld filhos de a:p, e os runs da fórmula."""
+    for p in corpo.iterfind(f"{_A}p"):
+        ppr = p.find(f"{_A}pPr")
+        nivel = min(max(_num(ppr.get("lvl")) or 0, 0), 8) if ppr is not None else 0
+        for r in p:
+            if r.tag in (f"{_A}r", f"{_A}fld"):
+                yield r, r.find(f"{_A}rPr"), ppr, nivel
+            elif r.tag == f"{_A14}m":
+                for mr in r.iter(f"{_M}r"):
+                    yield mr, mr.find(f"{_A}rPr"), ppr, nivel
+
+
+def _textos(el):
+    return [t for t in el.iter(f"{_A}t", f"{_M}t")]
+
+
+def _conferir_corpo(corpo, texto, fundos, tema, mapa, todo=None) -> list:
+    """(motivo, texto, [a:t]) do que está oculto no corpo de texto. `todo` é o motivo que vale para o texto inteiro
+    (forma oculta ou fora do slide); senão, run a run: fonte minúscula, ou cor igual à de todos os `fundos`."""
     out = []
-    for par in sh.text_frame.paragraphs:
-        for run in par.runs:
-            if not run.text.strip():
-                continue
-            if run.font.size is not None and run.font.size <= Pt(2.5):
-                out.append(("fonte minúscula", run.text, run._r))
-                continue
-            rpr = run._r.find(f"{_A}rPr")
-            solido = rpr.find(f"{_A}solidFill") if rpr is not None else None
-            cor = _cor_drawingml(next(iter(solido), None), tema, mapa) if solido is not None else None
-            if certos and cor is not None and all(_iguais(cor, f) for f in fundos):
-                out.append(("cor igual ao fundo", run.text, run._r))
+    escala = _escala(corpo)
+    certos = not any(f is _INCERTO for f in fundos)
+    for r, rpr, ppr, nivel in _runs_do_corpo(corpo):
+        textos = _textos(r)
+        txt = "".join("".join(t.itertext()) for t in textos)
+        if not txt.strip():
+            continue
+        if todo:
+            out.append((todo, txt, textos))
+            continue
+        sz = _do_texto(rpr, ppr, nivel, texto, "sz", tema, mapa)
+        sz = 1800 if sz is None else sz
+        if sz is not _INCERTO and sz * escala <= 250:  # até 2,5 pt
+            out.append(("fonte minúscula", txt, textos))
+        elif certos and isinstance(cor := _do_texto(rpr, ppr, nivel, texto, "cor", tema, mapa), tuple):
+            if all(_iguais(cor, f) for f in fundos):
+                out.append(("cor igual ao fundo", txt, textos))
     return out
+
+
+def _conferir_slide(ap, slide) -> tuple:
+    """O texto oculto do slide que o anydoc lê e se a árvore mudou (o texto sai de todos os ramos): forma oculta, caixa
+    fora do slide, fonte minúscula (com a autoajuste) e cor igual ao fundo (preenchimento da forma ou da célula, formas
+    embaixo, fundo do slide, do layout ou do mestre, com o tema e o mapa de cores do mestre). Só conclui "cor igual ao
+    fundo" com as cores certas."""
+    arvore = slide.raiz.find(f"{_P}cSld/{_P}spTree")
+    if arvore is None:
+        return [], False
+    layout = slide.pai
+    mestre = _mestre(slide)
+    camadas = [slide, layout, mestre]
+    tema, mapa = ap.tema(mestre)
+    mapa = _mapa(camadas[:2], mapa)
+    fundo = _fundo_da_camada(ap, camadas, tema, mapa)
+    # embaixo do slide vêm as formas do mestre e do layout que não são placeholder (faixa, foto, logo), a menos que o
+    # slide (ou o layout, para as do mestre) diga showMasterSp="0"
+    de_baixo = []
+    if slide.raiz.get("showMasterSp") not in ("0", "false") and layout is not None:
+        if layout.raiz.get("showMasterSp") not in ("0", "false") and mestre is not None:
+            de_baixo.append(mestre)
+        de_baixo.append(layout)
+    de_baixo = [(c, a) for c in de_baixo if (a := c.raiz.find(f"{_P}cSld/{_P}spTree")) is not None]
+    formas = sum(1 for _ in arvore.iter(*_FORMAS))
+    formas += sum(1 for _, a in de_baixo for el in a.iter(*_FORMAS) if _ph(el) is None)  # os placeholders não vêm
+    if formas > _FORMAS_MAX:
+        raise _Teto(f"{formas} formas, acima do teto de {_FORMAS_MAX} por slide")
+    desenhadas = []  # (caixa, o que ela pinta) das formas já desenhadas, de baixo para cima
+    for camada, formas_de_baixo in de_baixo:
+        for el, _, desenhado in _formas(formas_de_baixo):
+            if desenhado and _ph(el) is None:
+                if (cor := _pintura(el, [], tema, mapa, ap.imagem(camada.nome))) is not None:
+                    desenhadas.append((_caixa(el), cor))
+    out, imagem = [], ap.imagem(slide.nome)
+    for el, lido, desenhado in _formas(arvore):
+        herdadas = _herdadas(el, slide)
+        caixa = _caixa(el, herdadas)
+        if el.tag == f"{_P}grpSp":  # no grupo, posição e camadas são do grupo: só o preenchimento certo decide
+            for f, lido_f, oculta in _no_grupo(el, lido, _oculta(el)):
+                achados = _conferir_forma(ap, f, slide, [], None, [_INCERTO], tema, mapa, imagem,
+                                          "forma oculta" if oculta else None)  # fmt: skip
+                out += [(m, t, ts, lido_f) for m, t, ts in achados]
+        elif next(el.iter(f"{_A}t"), None) is not None:
+            todo = "forma oculta" if _oculta(el) else None
+            if todo is None and caixa is not None and ap.W and ap.H:
+                if caixa[2] <= 0 or caixa[3] <= 0 or caixa[0] >= ap.W or caixa[1] >= ap.H:
+                    todo = "fora do slide"
+            fundos = _embaixo(ap, caixa, fundo, desenhadas) if todo is None else [_INCERTO]
+            achados = _conferir_forma(ap, el, slide, herdadas, caixa, fundos, tema, mapa, imagem, todo)
+            out += [(m, t, ts, lido) for m, t, ts in achados]
+        if desenhado and (cor := _pintura(el, herdadas, tema, mapa, imagem)) is not None:
+            desenhadas.append((caixa, cor))
+    for _, _, textos, _ in out:
+        for t in textos:
+            _esvaziar(t)
+    return [(m, t) for m, t, _, lido in out if lido], bool(out)
+
+
+def _no_grupo(grupo, lido, oculta):
+    """(forma, lida, oculta) de dentro do grupo, em qualquer profundidade: o grupo oculto esconde o que tem dentro."""
+    for f, lido_f, _ in _formas(grupo, lido):
+        if f.tag == f"{_P}grpSp":
+            yield from _no_grupo(f, lido_f, oculta or _oculta(f))
+        else:
+            yield f, lido_f, oculta or _oculta(f)
+
+
+def _conferir_forma(ap, el, camada, herdadas, caixa, fundos, tema, mapa, imagem, todo) -> list:
+    """O oculto do texto da forma (sp, cxnSp) ou das células da tabela (graphicFrame) que o anydoc lê."""
+    mestre = _mestre(camada)
+    if el.tag in (f"{_P}sp", f"{_P}cxnSp"):
+        if (ph := _ph(el)) is not None and ph[0] in ("sldNum", "dt", "ftr"):  # o anydoc não lê
+            return []
+        corpo = el.find(f"{_P}txBody")
+        if corpo is None:
+            return []
+        atras = _preenchimento_da_forma(el, herdadas, tema, mapa, imagem)
+        texto = _cadeia_de_texto(ap, el, herdadas, mestre)
+        return _conferir_corpo(corpo, texto, fundos if atras is None else [atras], tema, mapa, todo)
+    if el.tag != f"{_P}graphicFrame" or (tbl := next(el.iter(f"{_A}tbl"), None)) is None:
+        return []
+    estilo = tbl.find(f"{_A}tblPr/{_A}tableStyleId")
+    estilo = (estilo.text or "").strip() if estilo is not None else ap.tabela_padrao
+    pinta = estilo is not None and estilo not in _SEM_ESTILO  # o estilo de tabela pinta a célula e a letra
+    tblpr = tbl.find(f"{_A}tblPr")
+    debaixo = _preenchimento(tblpr, tema, mapa) if tblpr is not None else None
+    debaixo = fundos if debaixo is None else [debaixo]
+    outro = mestre.raiz.find(f"{_P}txStyles/{_P}otherStyle") if mestre is not None else None
+    out = []
+    for tr in tbl.iterfind(f"{_A}tr"):
+        for tc in tr.iterfind(f"{_A}tc"):
+            if (tc.get("hMerge") or tc.get("vMerge") or "").lower() in ("1", "true"):  # o anydoc pula a coberta
+                continue
+            corpo = tc.find(f"{_A}txBody")
+            if corpo is None:
+                continue
+            tcpr = tc.find(f"{_A}tcPr")
+            cor = (
+                _preenchimento(tcpr, tema, mapa)
+                if tcpr is not None and any(x.tag in _PREENCHE_TEXTO for x in tcpr)
+                else None
+            )
+            if cor is None and tcpr is not None and tcpr.find(f"{_A}noFill") is not None:
+                atras = debaixo
+            elif cor is not None:
+                atras = [cor]
+            else:
+                atras = [_INCERTO] if pinta else debaixo
+            texto = _Texto([corpo.find(f"{_A}lstStyle")] + ([] if pinta else [outro, ap.padrao]), None, pinta)
+            out += _conferir_corpo(corpo, texto, atras, tema, mapa, todo)
+    return out
+
+
+def _conferir_anotacoes(ap, notas) -> list:
+    """O oculto das anotações do orador, que o anydoc lê depois do slide: todo p:sp da página (menos imagem do
+    slide, número, cabeçalho, rodapé e data), com o fundo da página e a cadeia do mestre de anotações."""
+    mestre = notas.pai
+    tema, mapa = ap.tema(mestre)
+    fundo = _fundo_da_camada(ap, [notas, mestre], tema, mapa)
+    imagem, out = ap.imagem(notas.nome), []
+    for sp in notas.raiz.iter(f"{_P}sp"):
+        if (ph := _ph(sp)) is not None and ph[0] in ("sldImg", "sldNum", "hdr", "ftr", "dt"):
+            continue
+        corpo = sp.find(f"{_P}txBody")
+        if corpo is None:
+            continue
+        herdadas = [mestre.phs.casar(*ph)] if ph is not None and mestre is not None else []
+        atras = _preenchimento_da_forma(sp, herdadas, tema, mapa, imagem)
+        texto = _cadeia_de_texto(ap, sp, herdadas, mestre, notas=True)
+        out += _conferir_corpo(corpo, texto, [fundo] if atras is None else [atras], tema, mapa,
+                               "forma oculta" if _oculta(sp) else None)  # fmt: skip
+    for _, _, textos in out:
+        for t in textos:
+            _esvaziar(t)
+    return [(m, t) for m, t, _ in out]
