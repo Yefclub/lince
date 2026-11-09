@@ -72,6 +72,12 @@ class TravaJusta:
 
     # Como em `threading.Lock`, a entrada do `with` é a própria `acquire`: nenhuma interrupção cai entre pegar a trava
     # e o `with` saber que precisa soltá-la.
+    #
+    # Limite da saída: `__exit__`, `release` e `_passar` são Python, e não C como em `threading.Lock`. Uma exceção
+    # assíncrona nas poucas instruções entre a entrada de `__exit__` e o fim de `vez.set()` (o KeyboardInterrupt, que só
+    # chega à thread principal, ou uma `PyThreadState_SetAsyncExc`) pode deixar a trava com quem saía, ou passada a
+    # quem espera sem acordá-lo. Em Python puro, sem consultar o estado em intervalos, não há como tornar essa passagem
+    # atômica; o servidor lê os documentos em threads de trabalho, que não recebem sinais.
     __enter__ = acquire
 
     def __exit__(self, *_):

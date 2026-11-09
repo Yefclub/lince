@@ -329,8 +329,9 @@ class Leitor:
             for t in alvos:  # renderizar em 4–8x custa: para assim que o prazo vence
                 if _vencido():
                     break
-                with PDFIUM:  # um recorte por vez: outro PDF entra entre eles (a trava é justa)
-                    preparados.append((t, _recortes_ampliados(doc, t, io)))
+                with PDFIUM:  # uma renderização por vez: outro PDF entra entre elas (a trava é justa)
+                    img = _ampliada(doc, t)
+                preparados.append((t, _recortes_ampliados(img, io)))  # o recorte e o PNG, fora da trava
         finally:
             with PDFIUM:  # fechado dentro da trava, mesmo com exceção: o finalizador da PDFium não roda fora dela
                 doc.close()
@@ -370,16 +371,25 @@ class Leitor:
         return usos
 
 
-def _recortes_ampliados(doc, t, io):
-    """Recorte da tarefa em 2–3x a resolução da 1ª leitura, fatiado para caber no limite do provedor. Chamar com a
-    trava; a página vale pela mesma caixa da 1ª leitura."""
+def _ampliada(doc, t):
+    """A caixa da tarefa renderizada em 2–3x a resolução da 1ª leitura (no máximo LADO_MAX_PX) e convertida pelo
+    Pillow: uma cópia, que não depende mais da PDFium. Chamar com a trava; a página vale pela mesma caixa da 1ª
+    leitura e é fechada aqui."""
     page = pagina_visivel(doc, t["pagina"])
-    W, H = page.get_size()
-    l, b, r, tp = t["caixa"]
-    l, b, r, tp = max(0, l), max(0, b), min(W, r), min(H, tp)
-    lado = max(r - l, tp - b) or 1
-    esc = min(min(8.0, max(4.0, 3000 / lado)), LADO_MAX_PX / lado)
-    img = page.render(scale=esc, crop=(l, b, W - r, H - tp)).to_pil().convert("RGB")
+    try:
+        W, H = page.get_size()
+        l, b, r, tp = t["caixa"]
+        l, b, r, tp = max(0, l), max(0, b), min(W, r), min(H, tp)
+        lado = max(r - l, tp - b) or 1
+        esc = min(min(8.0, max(4.0, 3000 / lado)), LADO_MAX_PX / lado)
+        return page.render(scale=esc, crop=(l, b, W - r, H - tp)).to_pil().convert("RGB")
+    finally:
+        page.close()
+
+
+def _recortes_ampliados(img, io):
+    """O recorte ampliado (`_ampliada`) fatiado para caber no limite do provedor, em PNG. Sem a PDFium: roda fora da
+    trava."""
     partes, n = [], max(1, -(-max(img.width, img.height) // 1500))
     for k in range(n):
         if img.height >= img.width:
