@@ -100,9 +100,12 @@ def aberto(caminho, senha: str | None, pasta) -> str:
         raise ValueError("a cópia decifrada precisa de outra pasta, não a do arquivo")
     try:
         decifrar(caminho, senha, destino, formato)
-    except BaseException:
+    except BaseException as e:
         if os.path.exists(destino):
             os.unlink(destino)  # cópia pela metade não fica para trás
+        if isinstance(e, Exception) and not isinstance(e, (DocumentoProtegido, DocumentoRecusado, MemoryError)):
+            # zip, deflate ou PDF quebrados no meio da decifração: o arquivo, não o serviço
+            raise DocumentoProtegido(formato, "arquivo corrompido") from None
         raise
     return destino
 
@@ -208,18 +211,18 @@ def _decifrar_office(caminho, senha, destino, formato):
             raise DocumentoProtegido(formato, "criptografia que o Lince não decifra") from None
         if arquivo.format == "ooxml" and getattr(arquivo, "info", {}).get("spinValue", 0) > VOLTAS_MAX:
             raise DocumentoProtegido(formato, f"derivação da chave acima de {VOLTAS_MAX} voltas")
-        saida = io.BytesIO()
-        try:
-            if arquivo.format == "ooxml":  # a senha conferida antes, e o pacote decifrado conferido pelo HMAC
-                arquivo.load_key(password=senha, verify_password=True)
-                arquivo.decrypt(saida, verify_integrity=True)
-            else:  # os binários sempre conferem a senha ao carregar a chave
-                arquivo.load_key(password=senha)
-                arquivo.decrypt(saida)
+        ooxml = arquivo.format == "ooxml"
+        try:  # a senha é conferida aqui: no OOXML pelo verificador, nos binários sempre ao carregar a chave
+            arquivo.load_key(password=senha, verify_password=True) if ooxml else arquivo.load_key(password=senha)
         except exceptions.InvalidKeyError:
             raise SenhaIncorreta(formato) from None
         except Exception:  # noqa: BLE001 — cifra ou variante fora do que o msoffcrypto decifra (XOR do Word, por exemplo)
             raise DocumentoProtegido(formato, "criptografia que o Lince não decifra") from None
+        saida = io.BytesIO()
+        try:  # com a senha já certa, o que falha aqui (o HMAC do pacote, por exemplo) é arquivo corrompido, não senha
+            arquivo.decrypt(saida, verify_integrity=True) if ooxml else arquivo.decrypt(saida)
+        except Exception:  # noqa: BLE001
+            raise DocumentoProtegido(formato, "arquivo corrompido") from None
     with open(destino, "wb") as f:
         f.write(saida.getbuffer())
 

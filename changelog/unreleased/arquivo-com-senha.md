@@ -27,7 +27,9 @@ tentativas seguintes são recusadas com `429 tentativas-de-senha` e `Retry-After
 da janela.
 
 **O que fica só reconhecido.** Documentos do OpenOffice antigo (cifra Blowfish), do formato ODF 1.4 (AES-GCM) e Word
-com ofuscação XOR são reconhecidos como protegidos, mas não decifrados; voltam como `arquivo-protegido`, com o motivo.
+com ofuscação XOR são reconhecidos como protegidos, mas não decifrados; voltam como `arquivo-protegido`, com o motivo. O
+arquivo que a senha certa abre, mas que está corrompido, também volta como `arquivo-protegido` ("arquivo corrompido"),
+sem contar como senha errada.
 
 Contrato 1.13.0: o campo `senha` e os códigos `arquivo-protegido`, `senha-incorreta`, `tentativas-de-senha` e
 `senha-invalida` (senha acima de 1024 caracteres) são novos e opcionais; nada muda para quem já usa a `/v1`.

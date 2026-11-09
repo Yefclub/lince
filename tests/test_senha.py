@@ -403,3 +403,44 @@ def test_office_cifrado_e_reconhecido_pelo_conteiner_mesmo_sem_a_extensao(tmp_pa
     with pytest.raises(lince.DocumentoProtegido) as e:  # o contêiner OLE com EncryptionInfo, não a extensão
         lince.ler(_gravar(tmp_path, "sem_extensao.bin", _cifrado(_docx())))
     assert e.value.formato == "ooxml"
+
+
+def _pacote_alterado(dados):
+    """O OOXML cifrado com um byte trocado no EncryptedPackage: a senha continua certa, o HMAC do pacote não."""
+    import olefile
+
+    f = io.BytesIO(dados)
+    with olefile.OleFileIO(f, write_mode=True) as ole:
+        pacote = bytearray(ole.openstream("EncryptedPackage").read())
+        pacote[len(pacote) // 2] ^= 0xFF
+        ole.write_stream("EncryptedPackage", bytes(pacote))
+    return f.getvalue()
+
+
+def _crc_errado(dados, parte):
+    """O zip com o CRC de `parte` trocado no diretório central: a parte não sai do zip."""
+    dados, k = bytearray(dados), 0
+    while (k := dados.find(b"PK\x01\x02", k + 1)) >= 0:
+        tamanho = int.from_bytes(dados[k + 28 : k + 30], "little")
+        if dados[k + 46 : k + 46 + tamanho] == parte.encode():
+            dados[k + 16] ^= 0xFF
+            return bytes(dados)
+    raise AssertionError(parte)
+
+
+def test_api_arquivo_corrompido_com_a_senha_certa_nao_e_senha_errada(api):
+    alvos = [
+        ("relatorio.docx", _pacote_alterado(_cifrado(_docx()))),
+        ("lince_protegido.odt", _crc_errado((REAIS / "lince_protegido.odt").read_bytes(), "content.xml")),
+    ]
+    for nome, dados in alvos:
+        for _ in range(srv.SENHAS_ERRADAS_POR_ARQUIVO + 1):  # não conta como senha errada: nunca vira 429
+            corpo = _problema(enviar(api, (nome, dados), A, senha=SENHA), "arquivo-protegido")
+            assert "corrompido" in corpo["detail"] and corpo["arquivo"] == nome
+    assert api.app.state.servico.senhas_erradas == {}
+
+
+def test_api_odf_que_se_expande_demais_ao_decifrar_e_recusado(api, monkeypatch):
+    monkeypatch.setattr(protecao, "PARTE_MAX", 100)  # o content.xml decifrado passa do teto de uma parte
+    r = enviar(api, ("lince_protegido.odt", (REAIS / "lince_protegido.odt").read_bytes()), A, senha=SENHA)
+    assert "100" in _problema(r, "documento-recusado")["detail"]

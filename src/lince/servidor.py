@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 from collections import OrderedDict, deque
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -51,6 +52,9 @@ DOCS_SIMULTANEOS = 16  # medido na carga: o tempo é espera da IA, não CPU
 # ocupar uma vaga delas. Duas: o GIL serializa o trabalho, então mais threads só disputariam a CPU com as leituras, e a
 # segunda deixa uma montagem curta passar enquanto outra, grande, termina.
 MONTAGENS_SIMULTANEAS = 2
+# A decifração de um arquivo com senha deriva a chave (até milhões de voltas de hash) e segura algumas cópias dele na
+# memória: tem fila justa própria, com poucas vagas, para não ocupar o executor que copia os envios dos outros tokens.
+DECIFRACOES_SIMULTANEAS = 2
 ESPERA_MAX = 300  # teto do Prefer: wait, abaixo do timeout comum de proxy reverso
 ENTREGA_PRAZO = 15 * 60  # resultado não buscado em 15 min depois de concluído é descartado
 # Depois da entrega, a sessão fica 60 s para o cliente repetir o pedido se a resposta se perdeu (rede, timeout);
@@ -182,18 +186,20 @@ class Servico:
         self.tetos = {_identidade(t): n for t, n in (tetos or {}).items()}
         # o resultado de cada documento pronto fica aqui até ser entregue: a memória do processo é das leituras
         self.guardados = tempfile.mkdtemp(prefix="lince-resultados-")
+        weakref.finalize(self, shutil.rmtree, self.guardados, True)  # sai com o serviço, com ou sem o lifespan
         self.sessoes: dict[str, dict] = {}
         self.idempotencia: dict[tuple[str, str], str] = {}
         self.clamav: tuple[str, int] | None = None  # LINCE_CLAMAV: todo arquivo recebido passa pelo antivírus
         self.cache = None  # LINCE_REDIS: transcrições da IA reaproveitadas entre envios do mesmo token
         self.edicoes: dict[str, dict] = {}  # arquivo editado esperando download (entrega única, como as sessões)
         self.vagas: dict[str, int] = {}  # documentos pendentes por cliente, reservados antes do upload
-        self.retidos: dict[str, int] = {}  # bytes de resultado em memória por cliente (sessões em curso e concluídas)
+        self.retidos: dict[str, int] = {}  # bytes de resultado esperando entrega por cliente (em curso e concluídas)
         # instantes das senhas erradas na janela, por (cliente, sha256 do arquivo) e por (cliente, "") para o token
         self.senhas_erradas: dict[tuple[str, str], deque] = {}
         self.trava = threading.Lock()
         self.fila = Fila(self._ler, DOCS_SIMULTANEOS)
         self.montagens = Fila(lambda trabalho: trabalho(), MONTAGENS_SIMULTANEAS)
+        self.decifracoes = Fila(lambda trabalho: trabalho(), DECIFRACOES_SIMULTANEAS)
         # segredo que assina o plano do modo tarefas: só o servidor conhece (LINCE_SEGREDO para várias réplicas)
         self.segredo_plano = os.urandom(32)
 
@@ -314,10 +320,16 @@ class Servico:
             self.liberar(sessao["cliente"])
             guardado, real = None, 0
             if doc.get("resultado") is not None:  # para o disco, fora da trava: a memória fica para as leituras
-                dados = json.dumps(doc.pop("resultado"), ensure_ascii=False).encode()
-                guardado, real = os.path.join(self.guardados, f"{doc['id']}.json"), len(dados)
-                Path(guardado).write_bytes(dados)
-                del dados
+                guardado = os.path.join(self.guardados, f"{doc['id']}.json")
+                try:
+                    dados = json.dumps(doc.pop("resultado"), ensure_ascii=False).encode()
+                    Path(guardado).write_bytes(dados)
+                    real = len(dados)
+                    del dados
+                except Exception as e:  # noqa: BLE001 — disco cheio ou sem memória: o documento falha, nunca fica preso
+                    Path(guardado).unlink(missing_ok=True)
+                    guardado, estado = None, "falhou"
+                    doc["erro"] = f"o resultado não pôde ser guardado: {type(e).__name__}: {str(e)[:200]}"
             with self.trava:
                 if sessao["id"] in self.sessoes:
                     # troca a reserva feita na entrada (bytes do arquivo) pelo tamanho real do resultado
@@ -362,7 +374,7 @@ class Servico:
                 for d in sessao["itens"]:
                     self._reter(sessao["cliente"], -d.get("bytes_retidos", 0))
                     d["bytes_retidos"] = 0
-        return _com_resultados(corpo)
+        return corpo
 
     def _reter(self, cliente, delta):
         """Chamar com a trava."""
@@ -377,10 +389,11 @@ class Servico:
         """O 429 de retenção se `entrada` bytes a mais passam do teto do cliente, ou None. Chamar com a trava.
         Retry-After é quando o próximo resultado dele que ninguém buscou vence (a limpeza o descarta); com tudo ainda
         em leitura, 30 s."""
+        agora = time.time()
+        self._sem_vencidas(agora)  # o que já venceu não conta nem dá Retry-After no passado
         em_uso, teto = self.retidos.get(cliente, 0), self.teto(cliente)
         if em_uso + entrada <= teto:
             return None
-        agora = time.time()
         vencem = [
             x["concluida_em"] + ENTREGA_PRAZO - agora
             for x in [*self.sessoes.values(), *self.edicoes.values()]
@@ -392,18 +405,22 @@ class Servico:
     def limpar(self):
         agora = time.time()
         with self.trava:
-            vencidas = [k for k, x in self.sessoes.items() if _vencida(x, agora)]
-            for sid in vencidas:
-                self._remover(sid)
-            for eid in [k for k, x in self.edicoes.items() if _vencida(x, agora)]:
-                self._remover_edicao(eid)
+            self._sem_vencidas(agora)
             for chave in list(self.senhas_erradas):
                 self._erros_na_janela(chave, agora)
+
+    def _sem_vencidas(self, agora):
+        """Remove as sessões e edições vencidas. Chamar com a trava."""
+        for sid in [k for k, x in self.sessoes.items() if _vencida(x, agora)]:
+            self._remover(sid)
+        for eid in [k for k, x in self.edicoes.items() if _vencida(x, agora)]:
+            self._remover_edicao(eid)
 
     def _remover_edicao(self, eid):
         """Chamar com a trava."""
         x = self.edicoes.pop(eid)
         self._reter(x["cliente"], -x.get("bytes_retidos", 0))
+        Path(x["guardado"]).unlink(missing_ok=True)
 
     def da_edicao(self, cliente, eid) -> dict:
         """Chamar com a trava."""
@@ -667,6 +684,11 @@ def _com_resultados(corpo):
     return corpo
 
 
+async def _lidos(corpo):
+    """`_com_resultados` numa thread: ler e decodificar o resultado do disco não para o laço de eventos."""
+    return await asyncio.to_thread(_com_resultados, corpo)
+
+
 def _sessao(x):
     itens = [
         {
@@ -852,12 +874,12 @@ def criar_app(
             if sessao is None or sessao.get("repetida"):
                 s.liberar(cliente, reservadas)  # não entrou na fila (erro, exceção ou repetição idempotente)
         if sessao.get("repetida"):
-            return JSONResponse(s.entregar(sessao["original"]), status_code=200)
+            return JSONResponse(await _lidos(s.entregar(sessao["original"])), status_code=200)
         if (t := _espera(request)) > 0:
             await _aguardar(sessao["pronta"], t)
         local = str(request.url_for("sessao", id=sessao["id"]))
         # cliente que desistiu da espera não recebe nada: a sessão não conta como entregue
-        entregue = s.entregar(sessao, marcar=not await request.is_disconnected())
+        entregue = await _lidos(s.entregar(sessao, marcar=not await request.is_disconnected()))
         return JSONResponse(entregue, status_code=201, headers={"Location": local})
 
     async def listar(request: Request):
@@ -889,8 +911,8 @@ def criar_app(
         if request.method == "HEAD":  # HEAD não leva corpo, então não conta como entrega
             with s.trava:
                 corpo = _sessao(sessao)
-            return JSONResponse(_com_resultados(corpo))
-        return JSONResponse(s.entregar(sessao, marcar=not await request.is_disconnected()))
+            return JSONResponse(await _lidos(corpo))
+        return JSONResponse(await _lidos(s.entregar(sessao, marcar=not await request.is_disconnected())))
 
     async def apagar(request: Request):
         cliente = s.cliente(request)
@@ -977,12 +999,22 @@ def criar_app(
             s.liberar(cliente)
         eid = uuid.uuid4().hex
         agora = time.time()
-        edicao = {"id": eid, "cliente": cliente, "nome": nome, "dados": novo, "criada_em": agora, "concluida_em": agora,
-                  "bytes_retidos": len(novo)}  # fmt: skip
+        guardado = os.path.join(s.guardados, f"edicao-{eid}")  # no disco, como os resultados: fora da memória
+        edicao = {"id": eid, "cliente": cliente, "nome": nome, "guardado": guardado, "tamanho": len(novo),
+                  "criada_em": agora, "concluida_em": agora, "bytes_retidos": len(novo)}  # fmt: skip
         with s.trava:
             if cheio := s.sem_espaco(cliente, len(novo)):
                 raise cheio
             s._reter(cliente, len(novo))
+        try:
+            await asyncio.to_thread(Path(guardado).write_bytes, novo)
+        except Exception:
+            with s.trava:
+                s._reter(cliente, -len(novo))
+            Path(guardado).unlink(missing_ok=True)
+            raise
+        del novo
+        with s.trava:
             s.edicoes[eid] = edicao
         url = str(request.url_for("edicao_arquivo", id=eid))
         corpo = {"id": eid, "nome": nome, "arquivo_url": url, "expira_em": _iso(agora + ENTREGA_PRAZO), **relatorio}
@@ -998,12 +1030,16 @@ def criar_app(
                 x["bytes_retidos"] = 0
         tipo = MIDIA.get(Path(x["nome"]).suffix.lower(), "application/octet-stream")
         nome_seguro = re.sub(r"[^A-Za-z0-9._-]", "_", x["nome"]) or "documento"
+        try:
+            dados = await asyncio.to_thread(Path(x["guardado"]).read_bytes) if request.method == "GET" else b""
+        except FileNotFoundError:  # apagada (DELETE ou prazo) entre a trava e a leitura
+            raise Problema(404, "edicao-nao-encontrada", "Edição não encontrada", "Foi apagada.") from None
         return Response(
-            x["dados"] if request.method == "GET" else b"",
+            dados,
             media_type=tipo,
             headers={
                 "Content-Disposition": f'attachment; filename="{nome_seguro}"',
-                "Content-Length": str(len(x["dados"])),
+                "Content-Length": str(x["tamanho"]),
             },
         )
 
@@ -1153,7 +1189,8 @@ async def _abrir(s: Servico, cliente, d, senha, pasta) -> bool:
         )
     errada, lido = False, None
     try:
-        lido = await asyncio.to_thread(protecao.aberto, d["arquivo"], senha, pasta)
+        # CPU e memória de várias vezes o arquivo: na fila justa das decifrações, com poucas vagas
+        lido = await _na_fila(s.decifracoes, cliente, lambda: protecao.aberto(d["arquivo"], senha, pasta), lambda: None)
     except protecao.SenhaIncorreta as e:
         errada = True  # fica na conta
         raise Problema(
@@ -1162,6 +1199,8 @@ async def _abrir(s: Servico, cliente, d, senha, pasta) -> bool:
         ) from None  # fmt: skip
     except protecao.DocumentoProtegido as e:
         raise _protegido(d["nome"], e.formato, e.motivo) from None
+    except DocumentoRecusado as e:  # o decifrado passa dos tetos (zip bomb dentro do ODF, por exemplo)
+        raise Problema(422, "documento-recusado", "Documento recusado", f"{d['nome']!r}: {e}") from None
     finally:
         if not errada:
             with s.trava:

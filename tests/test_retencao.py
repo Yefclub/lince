@@ -1,7 +1,10 @@
 """Teto de resultados esperando entrega por token (issue #55): 1 GiB por padrão, um por token na LINCE_TOKENS, em
 disco, liberado na entrega e com um 429 que diz quanto esperar."""
 
+import json
 import os
+import threading
+from pathlib import Path
 
 import pytest
 from starlette.testclient import TestClient
@@ -25,13 +28,22 @@ class _Pesado:
         return Resultado("x" * self.tamanho, {}, Cobertura(paginas=1))
 
 
+def _editar(api):
+    pedido = {"operacoes": json.dumps({"operacoes": []})}
+    return api.post("/v1/edicoes", files=[("arquivo", ("d.pptx", b"PK"))], data=pedido, headers=A)
+
+
 def _pronta(api, sid):
     assert api.app.state.servico.sessoes[sid]["pronta"].wait(60)
 
 
 def test_teto_padrao_cabe_seis_documentos_pesados_e_o_setimo_espera(monkeypatch):
     monkeypatch.setattr(srv, "Leitor", _Pesado)
-    api = TestClient(srv.criar_app(["token-a", "token-b"]))
+    with TestClient(srv.criar_app(["token-a", "token-b"])) as api:
+        _seis_e_o_setimo(api)
+
+
+def _seis_e_o_setimo(api):
     ids = []
     for k in range(6):  # 6 x 170 MiB = 1020 MiB, dentro de 1 GiB: em sessões simultâneas, nenhuma buscada
         r = enviar(api, (f"d{k}.txt", b"documento pesado"), A)
@@ -63,12 +75,12 @@ def test_teto_de_cada_token_na_lince_tokens():
 def test_token_com_teto_proprio_recebe_429_no_dele(monkeypatch):
     monkeypatch.setattr(srv, "Leitor", _Pesado)
     monkeypatch.setattr(_Pesado, "tamanho", 3 * MB)
-    api = TestClient(srv.criar_app(["token-a", "token-b"], tetos={"token-a": 5 * MB}))
-    _pronta(api, enviar(api, ("a.txt", b"a"), A).json()["id"])
-    r = enviar(api, ("a.txt", b"a" * (3 * MB)), A)  # 3 + 3 passa dos 5 MiB do token-a
-    assert r.status_code == 429 and r.json()["teto_bytes"] == 5 * MB
-    _pronta(api, enviar(api, ("b.txt", b"b"), B).json()["id"])  # o token-b fica no padrão
-    assert enviar(api, ("b.txt", b"b" * (3 * MB)), B).status_code == 201
+    with TestClient(srv.criar_app(["token-a", "token-b"], tetos={"token-a": 5 * MB})) as api:
+        _pronta(api, enviar(api, ("a.txt", b"a"), A).json()["id"])
+        r = enviar(api, ("a.txt", b"a" * (3 * MB)), A)  # 3 + 3 passa dos 5 MiB do token-a
+        assert r.status_code == 429 and r.json()["teto_bytes"] == 5 * MB
+        _pronta(api, enviar(api, ("b.txt", b"b"), B).json()["id"])  # o token-b fica no padrão
+        assert enviar(api, ("b.txt", b"b" * (3 * MB)), B).status_code == 201
 
 
 def test_resultado_some_do_disco_quando_a_sessao_some(monkeypatch):
@@ -84,3 +96,71 @@ def test_resultado_some_do_disco_quando_a_sessao_some(monkeypatch):
         assert not os.path.exists(guardado) and s.retidos == {}
         pasta = s.guardados
     assert not os.path.exists(pasta)  # o serviço parou: a pasta dos resultados sai junto
+
+
+def test_disco_que_falha_ao_guardar_falha_o_documento_e_nao_prende_o_teto(monkeypatch):
+    monkeypatch.setattr(srv, "Leitor", _Pesado)
+    monkeypatch.setattr(_Pesado, "tamanho", 1000)
+    gravar = Path.write_bytes
+
+    def cheio(self, dados):
+        if self.suffix == ".json":
+            raise OSError(28, "No space left on device")
+        return gravar(self, dados)
+
+    monkeypatch.setattr(Path, "write_bytes", cheio)
+    with TestClient(srv.criar_app(["token-a"])) as api:
+        s = api.app.state.servico
+        sid = enviar(api, ("a.txt", b"a"), A).json()["id"]
+        _pronta(api, sid)
+        item = api.get(f"/v1/sessoes/{sid}", headers=A).json()["itens"][0]
+        assert item["estado"] == "falhou" and "não pôde ser guardado" in item["erro"]
+        assert s.retidos == {} and os.listdir(s.guardados) == []
+
+
+def test_sessao_vencida_nao_conta_nem_vira_retry_after_no_passado(monkeypatch):
+    monkeypatch.setattr(srv, "Leitor", _Pesado)
+    monkeypatch.setattr(_Pesado, "tamanho", 3 * MB)
+    monkeypatch.setattr(srv.codigo_doc, "editar", lambda *_: (b"E" * (3 * MB), {"diff": {}}))
+    with TestClient(srv.criar_app(["token-a"], tetos={"token-a": 5 * MB})) as api:
+        sid = enviar(api, ("a.txt", b"a"), A).json()["id"]
+        _pronta(api, sid)
+        api.app.state.servico.sessoes[sid]["concluida_em"] -= srv.ENTREGA_PRAZO + 60  # venceu sem a limpeza passar
+        assert _editar(api).status_code == 201  # a edição não passa pela limpeza do POST de sessão
+
+
+def test_com_tudo_ainda_em_leitura_o_retry_after_e_30(monkeypatch):
+    solta = threading.Event()
+
+    class _Lento(_Pesado):
+        def ler(self, caminho, prazo=None):
+            solta.wait(60)
+            return super().ler(caminho, prazo)
+
+    monkeypatch.setattr(srv, "Leitor", _Lento)
+    monkeypatch.setattr(_Pesado, "tamanho", 10)
+    with TestClient(srv.criar_app(["token-a"], tetos={"token-a": 3 * MB})) as api:
+        try:
+            assert enviar(api, ("a.txt", b"a" * (2 * MB)), A).status_code == 201  # o envio reserva os bytes dele
+            r = enviar(api, ("b.txt", b"b" * (2 * MB)), A)
+            assert r.status_code == 429 and r.headers["Retry-After"] == "30"
+        finally:
+            solta.set()
+
+
+def test_edicao_fica_no_disco_e_libera_o_teto_quando_baixada(monkeypatch):
+    novo = b"E" * (3 * MB)
+    monkeypatch.setattr(srv.codigo_doc, "editar", lambda *_: (novo, {"diff": {}}))
+    with TestClient(srv.criar_app(["token-a"], tetos={"token-a": 5 * MB})) as api:
+        s = api.app.state.servico
+
+        r = _editar(api)
+        assert r.status_code == 201
+        (x,) = s.edicoes.values()
+        assert os.path.getsize(x["guardado"]) == len(novo) and list(s.retidos.values()) == [len(novo)]
+        assert _editar(api).status_code == 429  # 3 + 3 passa dos 5 MiB
+        baixado = api.get(r.headers["location"], headers=A)
+        assert baixado.content == novo and s.retidos == {}  # baixou: deixa de contar
+        assert _editar(api).status_code == 201
+        assert api.delete(r.headers["location"], headers=A).status_code == 204
+        assert not os.path.exists(x["guardado"])

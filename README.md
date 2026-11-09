@@ -147,7 +147,8 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   do documento protegido também não entram no cache. Depois de 5 senhas erradas para o mesmo arquivo (ou 50 no
   token) em 15 min, as tentativas seguintes recebem `429 tentativas-de-senha` com `Retry-After`. O decifrado também
   passa pelo antivírus. O que o Lince não decifra (ODF cifrado com Blowfish ou AES-GCM, Word com ofuscação XOR) volta
-  como `arquivo-protegido`, com o motivo em `detail`.
+  como `arquivo-protegido`, com o motivo em `detail`; o arquivo que a senha certa abre, mas está corrompido, também
+  (`arquivo corrompido`), sem contar como senha errada. A decifração tem fila justa própria, com poucas vagas.
 - **Modo `tarefas`** (`-F modo=tarefas`): o Lince não chama IA. Cada documento volta com `tarefas` (imagem em base64,
   instrução, onde está, `chave` de cache e `tokens_estimados`) e um `plano` opaco, assinado pelo servidor para o token
   e válido por 24 h. Quem chama lê as imagens com o próprio modelo e manda `POST /v1/montagens`; nada fica guardado
@@ -174,7 +175,7 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   ficar no teto do contêiner. Em outra libc (Alpine/musl) nada muda.
 - **Limites**: 100 MB por envio (com `Content-Length`), 50 arquivos por sessão, 64 documentos pendentes e 1 GiB
   de resultado esperando entrega por token (cerca de 6 documentos pesados de uma vez), guardado num diretório
-  temporário em disco, e não na memória do processo: reserve no disco a soma dos tetos dos tokens. O resultado deixa
+  temporário em disco, e não na memória do processo (veja Deploy: volume de disco em `/tmp`). O resultado deixa
   de contar no teto assim que é entregue. Acima do teto, `429` com `Retry-After` (quando o próximo resultado não
   buscado vence) e `em_uso_bytes` e `teto_bytes` no corpo. A montagem aceita até 20 mil
   respostas e 64 M caracteres delas (acima, `413 envio-grande`, com o teto que passou no detalhe) e põe leituras no resultado até ele chegar a 16 M caracteres,
@@ -267,7 +268,11 @@ elementos XML é recusado, e o pedido inteiro que passa de 60 s não aplica nada
 
 ## Deploy
 
-A imagem roda sem root, tem healthcheck em `/saude` e não grava nada (não precisa de volume). Tags publicadas:
+A imagem roda sem root e tem healthcheck em `/saude`. Ela só grava em `/tmp`: o documento enquanto é lido e os
+resultados esperando entrega (até o teto de cada token). Monte um volume de disco em `/tmp`, e não `tmpfs`: `tmpfs`
+é memória e conta no limite do contêiner. Reserve nele a soma dos tetos dos tokens com folga: o teto é conferido na
+entrada de cada envio, e um documento já aceito guarda o resultado inteiro, então com muitos documentos em leitura
+o uso pode passar do teto por alguns resultados. Tags publicadas:
 `X.Y.Z` e `X.Y`, para `linux/amd64` e `linux/arm64`, com atestado de procedência do GitHub.
 
 ```yaml
@@ -279,8 +284,10 @@ services:
     ports:
       - "8000:8000"
     read_only: true
-    tmpfs:
-      - /tmp # o documento só existe aqui enquanto é lido
+    volumes:
+      - lince-tmp:/tmp # disco: o documento enquanto é lido e os resultados até a entrega
+volumes:
+  lince-tmp:
 ```
 
 Coloque atrás de um proxy reverso com TLS e timeout de leitura acima de 300 s.
@@ -300,11 +307,12 @@ services:
     depends_on: [clamav]
     ports: ["8000:8000"]
     read_only: true
-    tmpfs: [/tmp]
+    volumes: [lince-tmp:/tmp]
   clamav:
     image: clamav/clamav:stable  # baixa e atualiza as assinaturas sozinho
     volumes: [clamav-db:/var/lib/clamav]
 volumes:
+  lince-tmp:
   clamav-db:
 ```
 
