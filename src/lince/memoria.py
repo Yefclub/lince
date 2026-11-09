@@ -1,10 +1,11 @@
 """Memória do processo do servidor: o que o alocador do glibc guarda depois de liberado volta ao sistema.
 
-Medido com 8 leituras de PDF com imagens grandes em paralelo: o processo saía de ~63 MB e ficava em ~170 MB depois
-delas, sem nada vivo no Python. Com as imagens decodificadas em várias threads, o limite dinâmico de mmap do glibc
-sobe depois do primeiro buffer grande liberado, os buffers seguintes vêm das arenas das threads e as fragmentam;
-`malloc_trim` sozinho devolvia só parte (~140 MB). Com o limite fixo em LIMIAR_MMAP, o buffer grande vem de mmap e
-volta inteiro ao ser liberado (~70 MB), a ~7% de tempo nessa carga; o `malloc_trim` periódico devolve o resto.
+Medido com 8 leituras de PDF com imagens grandes em paralelo: o processo saía de ~63 MB e ficava em ~160 MB depois
+delas, sem nada vivo no Python. O glibc sobe sozinho o limite de mmap depois do primeiro buffer grande liberado e,
+junto, o limite de devolução do heap; os buffers seguintes ficam nas arenas das threads e as fragmentam, e
+`malloc_trim` sozinho devolvia só parte (~130 MB). Com o limite fixo em LIMIAR_MMAP o ajuste dinâmico fica desligado,
+e o `malloc_trim` periódico devolve quase tudo (~67 MB), sem mudar o tempo dessa carga (30 s nos dois casos, em três
+rodadas alternadas; com 1 a 4 MiB custava ~7%, pelos buffers de imagem que passavam a ser mapeados um a um).
 
 Em outra libc (musl no Alpine, macOS, Windows) as duas chamadas não existem e nada muda.
 """
@@ -13,9 +14,9 @@ import ctypes
 import os
 
 _M_MMAP_THRESHOLD = -3  # mallopt(3): opção do limite de mmap
-# 1 MiB: acima dele a alocação vem de mmap e volta ao sistema ao ser liberada. Uma página renderizada ou uma imagem
-# decodificada passa disso; os objetos pequenos do Python ficam no heap, como antes.
-LIMIAR_MMAP = 1024 * 1024
+# 16 MiB, fixo (o ajuste dinâmico do glibc vai até 32 MiB em 64 bits). Os buffers de imagem (alguns MiB) ficam no
+# heap, sem o custo de mapear um a um, e o heap volta a ser devolvido; só o buffer enorme vem de mmap.
+LIMIAR_MMAP = 16 * 1024 * 1024
 
 
 def _libc():
@@ -33,7 +34,8 @@ _GLIBC = _libc()
 
 
 def ajustar_alocador() -> bool:
-    """Fixa o limite de mmap em LIMIAR_MMAP. Chamar uma vez, no início do serviço."""
+    """Fixa o limite de mmap em LIMIAR_MMAP. Muda o alocador do processo inteiro (o mallopt não é seguro entre threads):
+    chamar uma vez, no início do serviço, antes de criar as threads; o `main` do servidor chama."""
     return bool(_GLIBC and _GLIBC[1](_M_MMAP_THRESHOLD, LIMIAR_MMAP))
 
 

@@ -24,9 +24,7 @@ _CARGA = textwrap.dedent(
     import lince.servidor as srv
     from lince import memoria
 
-    if sys.argv[1] == "sem":  # o serviço de antes: nem o limite de mmap, nem a devolução periódica
-        memoria.ajustar_alocador = lambda: False
-        memoria.devolver = lambda: False
+    memoria.ajustar_alocador()  # como o main do servidor, antes das threads
     srv.LIMPEZA_INTERVALO = 0.3
     d = tempfile.mkdtemp()
     Image.effect_noise((1600, 1200), 80).convert("RGB").save(f"{d}/f.jpg", quality=90)
@@ -52,17 +50,18 @@ _CARGA = textwrap.dedent(
 )
 
 
-def _medir(modo):
+def _medir():
     import json
 
-    comando = [sys.executable, "-c", _CARGA, modo]  # o próprio interpretador, com o roteiro deste arquivo
-    saida = subprocess.run(comando, capture_output=True, text=True, timeout=600, check=True)  # noqa: S603
+    comando = [sys.executable, "-c", _CARGA]  # o próprio interpretador, com o roteiro deste arquivo
+    saida = subprocess.run(comando, capture_output=True, text=True, timeout=600)  # noqa: S603
+    assert saida.returncode == 0, saida.stderr[-3000:]
     return json.loads(saida.stdout.strip().splitlines()[-1])
 
 
 def test_memoria_das_leituras_volta_ao_sistema_em_um_intervalo():
-    m = _medir("com")
-    # sem o ajuste (modo "sem"), a mesma carga deixava o processo em ~2,4× (medido: 100 → ~240 MB)
+    m = _medir()
+    # sem o ajuste e sem a devolução, a mesma carga deixava o processo em ~2,3× (medido: 100 → ~234 MB)
     assert m["depois"] < 2 * m["antes"], m
 
 
@@ -70,3 +69,27 @@ def test_saude_informa_a_memoria_e_as_funcoes_sao_seguras_fora_do_glibc(monkeypa
     assert memoria.rss() > 0
     monkeypatch.setattr(memoria, "_GLIBC", None)  # outra libc: nada muda, nada quebra
     assert memoria.devolver() is False and memoria.ajustar_alocador() is False
+
+
+def test_limpeza_periodica_devolve_a_memoria_em_um_intervalo_fora_do_laco(monkeypatch):
+    """Independe do glibc: a limpeza do serviço chama a devolução a cada intervalo, depois de limpar as sessões e
+    numa thread que não é a do laço de eventos."""
+    import threading
+    import time
+
+    from starlette.testclient import TestClient
+
+    import lince.servidor as srv
+
+    chamadas, limpezas = [], []
+    monkeypatch.setattr(srv, "LIMPEZA_INTERVALO", 0.2)
+    monkeypatch.setattr(memoria, "devolver", lambda: chamadas.append((time.monotonic(), threading.get_ident())))
+    monkeypatch.setattr(srv.Servico, "limpar", lambda self: limpezas.append(time.monotonic()))
+    with TestClient(srv.criar_app(["t"])) as api:
+        laco = api.portal.call(threading.get_ident)  # a thread do laço de eventos do app
+        inicio = time.monotonic()
+        while not chamadas and time.monotonic() - inicio < 5:
+            time.sleep(0.02)
+    assert chamadas and chamadas[0][0] - inicio < 2 * 0.2 + 0.3  # dentro do primeiro intervalo, com folga de agenda
+    assert limpezas and limpezas[0] <= chamadas[0][0]  # depois de limpar as sessões
+    assert all(fio != laco for _, fio in chamadas)  # fora do laço de eventos

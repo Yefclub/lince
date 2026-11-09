@@ -595,7 +595,6 @@ class _Envelope:
 def criar_app(
     tokens: list[str], clamav: tuple[str, int] | None = None, cache=None, segredo: bytes | None = None
 ) -> Starlette:
-    memoria.ajustar_alocador()  # buffer grande vem de mmap e volta inteiro ao sistema (memoria.py)
     s = Servico(tokens)
     s.clamav, s.cache = clamav, cache
     if segredo:  # o mesmo em todas as réplicas: o plano de uma monta em qualquer outra
@@ -1097,6 +1096,7 @@ def main():
         raise SystemExit("LINCE_SEGREDO precisa de pelo menos 32 caracteres aleatórios.")
     import uvicorn
 
+    memoria.ajustar_alocador()  # uma vez, antes das threads do serviço (memoria.py); quem embute o app decide o seu
     app = criar_app(tokens, clamav, cache, segredo.encode() or None)
     uvicorn.run(app, host=a.host, port=a.porta, proxy_headers=True, log_level="info")
 
