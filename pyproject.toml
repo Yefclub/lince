@@ -78,3 +78,6 @@ testpaths = ["tests"]
 [tool.uv]
 # Versão publicada há menos de 3 dias não entra (janela para retirada de pacote comprometido); igual ao cooldown do Dependabot.
 exclude-newer = "3 days"
+# O cffi (do cryptography, que o msoffcrypto-tool usa) passou para a MIT-0 na 2.1, fora da lista de licenças aceitas:
+# fica na 2.0.x, que é MIT.
+constraint-dependencies = ["cffi<2.1"]

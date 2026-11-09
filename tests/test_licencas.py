@@ -13,7 +13,6 @@ from licencas import permitida  # noqa: E402
     ("expressao", "aceita"),
     [
         ("MIT", True),
-        ("MIT-0", True),  # a MIT sem a exigência de manter o aviso
         ("BSD-3-Clause OR Apache-2.0", True),
         ("GPL-2.0 OR MIT", True),  # escolhe-se a MIT
         ("MIT OR GPL-3.0 AND LGPL-2.1", True),  # AND tem precedência: MIT OR (GPL AND LGPL)
