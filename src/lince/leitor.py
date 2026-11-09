@@ -246,8 +246,9 @@ class Leitor:
             with open(f"{pasta}/plano.json", "w", encoding="utf-8") as f:
                 json.dump(estado, f, ensure_ascii=False)
             r = _resultado(pasta, estado, respostas, cobertura, [], conferir_vazias=True)
-        # as leituras que entraram no texto: o teto de saída tira as outras e as registra como pendência
-        cortadas = {p.split(":", 1)[0] for p in cobertura.pendentes if p.endswith(": resultado grande demais")}
+        # as leituras que entraram no texto: o teto de saída tira as outras, e a resposta vazia não entra
+        fora = (": resultado grande demais", ": resposta vazia da IA")
+        cortadas = {p.split(":", 1)[0] for p in cobertura.pendentes if p.endswith(fora)}
         cobertura.leituras_ia = len(respostas.keys() - cortadas)
         return r
 

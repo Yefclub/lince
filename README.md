@@ -151,8 +151,8 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
 - **Isolamento**: um token nunca vê sessão nem referência de outro. `LINCE_TOKENS` aceita vários tokens
   separados por vírgula, um por plataforma. Para uso local sem token: `lince-servidor --sem-autenticacao`.
 - **Limites**: 100 MB por envio (com `Content-Length`), 50 arquivos por sessão, 64 documentos pendentes e 256 MB
-  de resultado esperando entrega por token. Acima disso, `429` com `Retry-After`. A montagem aceita até 64 M
-  caracteres de respostas (acima, `413 envio-grande`) e põe leituras no resultado até ele chegar a 16 M caracteres,
+  de resultado esperando entrega por token. Acima disso, `429` com `Retry-After`. A montagem aceita até 20 mil
+  respostas e 64 M caracteres delas (acima, `413 envio-grande`, com o teto que passou no detalhe) e põe leituras no resultado até ele chegar a 16 M caracteres,
   contando o texto nativo: a leitura da mesma imagem repetida entra uma vez, e as outras posições levam só a
   referência. As que passam desse teto ficam em `cobertura.pendentes` (`resultado grande demais`), com o texto nativo
   no lugar, como na leitura com a IA do Lince. O teto vale para as leituras: o texto nativo sai sempre inteiro, mesmo

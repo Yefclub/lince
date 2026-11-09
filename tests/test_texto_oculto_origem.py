@@ -505,3 +505,26 @@ def test_documentos_normais_sem_alarme_falso(tmp_path):
         r = lince.ler(_salvar(capa, tmp_path, f"capa-{nome}.docx"))
         assert "Relatório anual da capa" in r.markdown and "Subtítulo sem posição" in r.markdown, nome
         assert "texto_oculto_removido" not in r.metadados and not r.alertas_injecao, nome
+
+
+def test_caixas_sobre_desenhos_tem_teto_somado_de_comparacoes(tmp_path, monkeypatch):
+    """Cada caixa sem preenchimento é comparada com cada desenho da parte: o custo somado tem o teto do PPTX, e passar
+    dele deixa a parte como está, com a falha no resultado (milhares de caixas sobre 500 desenhos levariam minutos)."""
+    from lince import seguranca
+
+    d = Document()
+    d.add_paragraph("Texto visível do contrato de fornecimento.")
+    capa = d.add_paragraph()
+    _flutuante(capa, _foto())
+    for k in range(6):  # caixas longe da foto e umas das outras: cada uma percorre os desenhos da parte
+        par = etree.fromstring(
+            f"<w:p {_NS}>{_caixa_flutuante(914400, 4572000 + k * 1_000_000, f'CAIXA BRANCA {k}')}</w:p>"
+        )
+        capa._p.addnext(par)
+    arq = _salvar(d, tmp_path)
+    r = lince.ler(arq)
+    assert "CAIXA BRANCA 0" in _removidos(r) and not any("teto" in p for p in r.cobertura.pendentes)  # confere
+    monkeypatch.setattr(seguranca, "_COMPARACOES_MAX", 3)
+    r = lince.ler(arq)
+    assert any("caixas de texto acima do teto" in p for p in r.cobertura.pendentes)
+    assert "CAIXA BRANCA 0" in r.markdown  # a parte ficou como está, com a falha visível

@@ -753,3 +753,5 @@ def test_leituras_ia_da_segunda_fase_conta_so_as_que_entraram_no_texto(monkeypat
         "c: resultado grande demais",
     ]
     assert "Figura a " in r.markdown and r.cobertura.leituras_ia == 1  # as duas que o teto tirou não contam
+    vazia = lince.Leitor().concluir(plano, {"a": respostas["a"], "b": "  "})
+    assert "b: resposta vazia da IA" in vazia.cobertura.pendentes and vazia.cobertura.leituras_ia == 1

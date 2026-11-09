@@ -1419,8 +1419,9 @@ class _Embaixo:
     """O que pode estar embaixo do texto da parte: os parágrafos que uma imagem atrás do texto pode cobrir e, sob a
     caixa de texto flutuante que não pinta, as outras âncoras, figuras e formas da parte."""
 
-    def __init__(self, raiz, cobertos, geometria):
+    def __init__(self, raiz, cobertos, geometria, conta):
         self.raiz, self.cobertos, self.geometria, self._desenhos, self._memo = raiz, cobertos, geometria, None, {}
+        self.conta = conta  # comparações somadas no pacote: [n]
 
     def sob_a_caixa(self, txbx) -> bool:
         """A caixa de texto (w:txbxContent) sem preenchimento pode estar sobre outro desenho: a de posição conhecida,
@@ -1443,6 +1444,9 @@ class _Embaixo:
         if len(self._desenhos) > _FORMAS_MAX:  # comparar cada caixa com cada desenho é quadrático: incerto
             return True
         caixa, ramos = _retangulo(dono, self.geometria), _ramos(dono)
+        self.conta[0] += len(self._desenhos)  # cada caixa contra cada desenho: o custo somado tem o teto do PPTX
+        if self.conta[0] > _COMPARACOES_MAX:
+            raise _Teto(f"sobreposição de caixas de texto acima do teto de {_COMPARACOES_MAX} comparações")
         for el, ret in self._desenhos:
             if el is dono or any(ramos.get(alt, ramo) is not ramo for alt, ramo in _ramos(el).items()):
                 continue  # a própria caixa, ou outro ramo do mesmo mc:AlternateContent (a cópia em VML dela)
@@ -1570,7 +1574,7 @@ def _conferir_word(z, so_metadados=False) -> tuple:
                 pagina = _INCERTO  # o papel timbrado fica atrás de tudo o que está na página
             elif faixa is not None:
                 faixas.append(faixa)
-    ocultos, limpas, vistas, pprs = [], {}, set(), []
+    ocultos, limpas, vistas, pprs, conta = [], {}, set(), [], [0]
     for nome, raiz in partes.items():
         if raiz is None:
             continue
@@ -1579,9 +1583,13 @@ def _conferir_word(z, so_metadados=False) -> tuple:
         cobre = faixas if papel == "corpo" else [(-1, 1 << 62)] if faixas and papel == "nota" else ()
         # o anydoc lê o corpo e as notas; o resto, só os metadados
         emitido = _emitido_word(raiz, papel) if papel in ("corpo", "nota") else None
-        achados, mudou = _conferir_parte(
-            raiz, estilos, tema, atras, geometria, cobre, papel, imagem(nome), emitido, vistas
-        )
+        try:
+            achados, mudou = _conferir_parte(
+                raiz, estilos, tema, atras, geometria, cobre, papel, imagem(nome), emitido, vistas, conta
+            )
+        except _Teto as e:  # a parte fica como está e vira falha, com o teto no motivo
+            pac.falhou(nome, e)
+            continue
         ocultos += achados
         if mudou:
             limpas[nome] = _serializar(raiz, z.read(nome))
@@ -1648,11 +1656,11 @@ def _lido(r, papel, ramos) -> bool:
     return True
 
 
-def _conferir_parte(raiz, estilos, tema, pagina, geometria, faixas, papel, imagem, emitido, vistas) -> tuple:
+def _conferir_parte(raiz, estilos, tema, pagina, geometria, faixas, papel, imagem, emitido, vistas, conta) -> tuple:
     """Esvazia o texto dos runs ocultos da parte (w:t do run, em todos os ramos de mc:AlternateContent dele, e m:t da
     fórmula); devolve o que saiu do que é lido e se a parte mudou. Com o que o anydoc emite da parte (`emitido`), junta
     em `vistas` as palavras do que foi conferido e ele escreve, depois da limpeza."""
-    embaixo = _Embaixo(raiz, _cobertos(raiz, estilos, geometria, faixas, imagem, pagina), geometria)
+    embaixo = _Embaixo(raiz, _cobertos(raiz, estilos, geometria, faixas, imagem, pagina), geometria, conta)
     runs = {}
     for t in raiz.iter(f"{_W}t", f"{_M}t"):  # o texto de uma caixa dentro do run é do run de dentro
         if (r := next(t.iterancestors(f"{_W}r", f"{_M}r"), None)) is not None:

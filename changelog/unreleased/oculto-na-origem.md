@@ -79,7 +79,8 @@ inclusive com o símbolo ≝ numa fórmula.
 Quando uma parte do arquivo não pode ser conferida (por exemplo, XML com entidade sem definição), ela fica como está,
 o alerta diz qual parte falhou e por quê, e a mesma linha entra em `cobertura.pendentes`
 ("texto oculto não conferido: word/document.xml (motivo)"), para quem chama poder decidir. O mesmo vale para o slide
-forjado com formas demais (mais de 500) ou para a apresentação cuja conferência passaria do teto de custo: esses
-slides ficam como estão, com o motivo, em vez de travar a leitura.
+forjado com formas demais (mais de 500), para a apresentação cuja conferência passaria do teto de custo e para o
+Word com caixas de texto demais sobre desenhos: esses slides e partes ficam como estão, com o motivo, em vez de travar
+a leitura.
 
 O que sai do arquivo é só o texto oculto: declaração, `DOCTYPE`, namespaces e o resto da parte ficam como estavam.

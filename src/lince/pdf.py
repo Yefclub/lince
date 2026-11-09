@@ -59,10 +59,12 @@ CELULA = 8
 # multiplica o percurso. Página real tem poucos milhares; acima do teto, ela entra só com o texto, com a pendência e o
 # alerta de texto oculto não conferido, e o próximo PDF não espera.
 OBJETOS_MAX = 100_000
-# Tempo da análise em Python de uma página, que roda fora da trava: página real leva dezenas de milissegundos; a hostil
-# (dezenas de milhares de desenhos espaçados, milhares de invisíveis sobre milhares de imagens, fórmula enorme) levaria
-# de segundos a minutos, prendendo o worker e dividindo a GIL com os outros documentos. Passou dele, a página entra só
-# com o texto, com a pendência e o alerta de texto oculto não conferido, e a leitura segue na próxima.
+# Tempo de CPU da análise em Python de uma página, que roda fora da trava: página real leva dezenas de milissegundos; a
+# hostil (dezenas de milhares de desenhos espaçados, milhares de invisíveis sobre milhares de imagens, fórmula enorme)
+# levaria de segundos a minutos, prendendo o worker e dividindo a GIL com os outros documentos. Passou dele, a página
+# entra só com o texto, com a pendência e o alerta de texto oculto não conferido, e a leitura segue na próxima. É tempo
+# de CPU da própria thread (`time.thread_time`), não de relógio: a espera pela trava e pela GIL, que depende de quantos
+# outros documentos estão sendo lidos, não conta, e a mesma página sai igual com o servidor cheio ou vazio.
 ANALISE_PAGINA_S = 3.0
 _ANALISE = threading.local()
 
@@ -73,7 +75,7 @@ class _AnaliseLonga(Exception):
 
 def _tique():
     """Conferido nos laços da análise da página que crescem mais que linear no que a página tem."""
-    if (fim := getattr(_ANALISE, "fim", None)) is not None and time.monotonic() > fim:
+    if (fim := getattr(_ANALISE, "fim", None)) is not None and time.thread_time() > fim:
         raise _AnaliseLonga
 
 
@@ -194,15 +196,13 @@ def planejar_pdf(path, pasta):
                     paginas.append(_so_o_texto(i, md_de.get(i, "")))
                     recorte = None
                 else:
-                    marcas = len(seguranca), len(pendentes), len(tarefas), set(cache)
-                    _ANALISE.fim = time.monotonic() + ANALISE_PAGINA_S
+                    marcas = len(seguranca), len(pendentes)  # tarefas e cache só mudam em `recortar`, depois
+                    _ANALISE.fim = time.thread_time() + ANALISE_PAGINA_S
                     try:
                         info, recorte = _pagina(doc, i, col, md_de.get(i, ""), i in ocr, itens_de.get(i, []), pasta,
                                                 tarefas, cache, seguranca, pendentes)  # fmt: skip
                     except _AnaliseLonga:  # a página não deixa rastro: entra só com o texto, como no teto
-                        del seguranca[marcas[0] :], pendentes[marcas[1] :], tarefas[marcas[2] :]
-                        for chave in set(cache) - marcas[3]:
-                            del cache[chave]
+                        del seguranca[marcas[0] :], pendentes[marcas[1] :]
                         info, recorte = _so_o_texto(i, md_de.get(i, "")), None
                         _marcar(so_texto, i, i + 1, f"análise da página passou de {ANALISE_PAGINA_S:g} s")
                     finally:
