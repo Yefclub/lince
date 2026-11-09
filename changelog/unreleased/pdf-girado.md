@@ -14,4 +14,4 @@ parte visível era medida pela folha errada: num desenho com a área visível na
 metade esquerda, e a página que ficava sem área visível entrava só com o texto. Agora a área visível vem da mesma
 conta que a renderização faz.
 
-Os PDFs sem rotação saem iguais.
+Os demais PDFs sem rotação saem iguais.

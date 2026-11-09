@@ -494,7 +494,8 @@ def _sem_ocultos(doc, i, alvos, n):
 
 
 def pagina_visivel(doc, i):
-    """A página `i` no referencial em que a análise trabalha (chamar com a trava). Só na memória:
+    """A página `i` no referencial em que a análise trabalha (chamar com a trava). No documento aberto, nunca no
+    arquivo (e o que muda aqui vale para as próximas cargas da página enquanto ele estiver aberto):
     - a CropBox que não sobrepõe a MediaBox dá caixa vazia; aí vale a MediaBox, herdada ou não, como no pdf_inspector
       (a decisão é pela caixa da PDFium, que normaliza e herda do /Pages, e não pelas caixas gravadas na página);
     - a rotação de exibição (/Rotate) é desligada: os objetos da PDFium e as posições do pdf_inspector vêm sem ela, e
@@ -504,13 +505,26 @@ def pagina_visivel(doc, i):
     l, b, r, t = page.get_bbox()
     if not (l < r and b < t):
         page.set_cropbox(-_SEM_LIMITE, -_SEM_LIMITE, _SEM_LIMITE, _SEM_LIMITE)  # a interseção com ela é a MediaBox
-    page.rotacao_exibida = page.get_rotation()
-    if page.rotacao_exibida:
+    # a rotação original, guardada no documento na primeira carga: desligada, ela não volta na carga seguinte
+    originais = doc.__dict__.setdefault("lince_rotacoes", {})
+    page.rotacao_exibida = originais.setdefault(i, page.get_rotation())
+    if page.get_rotation():
         page.set_rotation(0)
     return page
 
 
 _SEM_LIMITE = 1e7  # pontos: maior que qualquer MediaBox (o PDF limita a 14.400 por lado)
+
+
+def _caixa_da_faixa(frac, W, H, rotacao):
+    """A faixa horizontal (de cima para baixo, frações f0 a f1) da página como é exibida, no referencial sem rotação."""
+    f0, f1 = frac
+    return {
+        0: [0, H * (1 - f1), W, H * (1 - f0)],
+        90: [W * f0, 0, W * f1, H],
+        180: [0, H * f0, W, H * f1],
+        270: [W * (1 - f1), 0, W * (1 - f0), H],
+    }[rotacao % 360]
 
 
 def de_pe(img, rotacao):
@@ -792,7 +806,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     }
     if rota == "nativa":
         return info, None
-    retrato = (H >= W) == (rotacao in (0, 180))  # como a página é exibida: a de pé ganha o dobro e é dividida
+    retrato = (H >= W) if rotacao in (0, 180) else (W >= H)  # como é exibida: a de pé ganha o dobro e é dividida
     fator = (2 * 1568 / max(W, H) if retrato else 1568 / max(W, H)) if rota == "pagina" else escala(W, H, 2.0)
 
     def recortar(img):
@@ -824,7 +838,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
             for s, (y0, y1) in zip("ab", metades, strict=False):
                 tid = f"p{i + 1:03d}{s if len(metades) > 1 else ''}"
                 img.crop((0, y0, img.width, y1)).save(f"{pasta}/ia/{tid}.png")
-                frac = (y0 / img.height, y1 / img.height) if not rotacao else (0, 1)
+                frac = (y0 / img.height, y1 / img.height)
                 tarefas.append(
                     {
                         "id": tid,
@@ -833,7 +847,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                         "motivo": motivo,
                         "ancora": md[:6000],
                         "pagina": i,
-                        "caixa": [0, H * (1 - frac[1]), W, H * (1 - frac[0])],
+                        "caixa": _caixa_da_faixa(frac, W, H, rotacao),
                     }
                 )
                 info["tarefas"].append(tid)

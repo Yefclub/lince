@@ -89,3 +89,84 @@ def test_releitura_ampliada_da_pagina_girada_vai_de_pe(tmp_path):
         leitor(rotacao).ler(p)
     (w0, h0), (w90, h90) = ampliadas[0], ampliadas[90]
     assert (w90, h90) == (h0, w0)  # o mesmo pedaço da figura, girado como a página é exibida
+
+
+def _salvo_girado(origem, destino, rotacao):
+    import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument(str(origem))
+    doc[0].set_rotation(rotacao)
+    doc.save(str(destino))
+    doc.close()
+    return destino
+
+
+def test_releitura_de_duas_figuras_na_mesma_pagina_girada_vai_de_pe(tmp_path):
+    import io
+
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+
+    for nome, cor in (("a", "navy"), ("b", "darkred")):
+        Image.new("RGB", (400, 300), cor).save(tmp_path / f"{nome}.png")
+    reto = tmp_path / "duas.pdf"
+    c = canvas.Canvas(str(reto), pagesize=letter)
+    c.drawString(60, 760, "Planta com duas figuras.")
+    c.drawImage(str(tmp_path / "a.png"), 60, 450, width=240, height=180)  # deitadas: mais largas que altas
+    c.drawImage(str(tmp_path / "b.png"), 320, 100, width=240, height=180)
+    c.save()
+    girado = _salvo_girado(reto, tmp_path / "duas90.pdf", 90)
+
+    def ampliadas(p):
+        vistas = []
+
+        def ia(img, instrucao):
+            if "SEGUNDA LEITURA" in instrucao:
+                vistas.append(Image.open(io.BytesIO(img)).size)
+                return "Figura lida de novo."
+            return "valor [ilegível]"
+
+        lince.Leitor(ia=lince.FuncaoLeitor(ia, "m"), esforco="max", agrupar=False).ler(p)
+        return vistas
+
+    retas, giradas = ampliadas(reto), ampliadas(girado)
+    assert len(giradas) == 2  # as duas figuras: a segunda também de pé, não só a primeira
+    assert giradas == [(h, w) for w, h in retas]
+
+
+@pytest.mark.parametrize("rotacao", [90, 270])
+def test_metades_da_pagina_girada_tem_a_caixa_de_cada_metade(tmp_path, monkeypatch, rotacao):
+    from reportlab.pdfgen import canvas
+
+    from lince import pdf as pdf_mod
+
+    monkeypatch.setattr(pdf_mod, "densidade_matematica", lambda md: 9.0)  # a rota "pagina", como numa escaneada
+    reto = tmp_path / "paisagem.pdf"  # gravada deitada (792×612): com /Rotate 90 ou 270 é exibida em retrato
+    c = canvas.Canvas(str(reto), pagesize=(792, 612))
+    c.saveState()
+    c.translate(0, 612) if rotacao == 90 else c.translate(792, 0)
+    c.rotate(-90 if rotacao == 90 else 90)
+    for k in range(70):  # linhas que, de pé, enchem a página: ela é dividida em duas metades
+        c.drawString(40, 770 - k * 11, f"Linha {k + 1} do laudo digitalizado, com texto corrido.")
+    c.restoreState()
+    c.save()
+    plano = lince.Leitor().planejar(_salvo_girado(reto, tmp_path / "g.pdf", rotacao), tmp_path / "p")
+    a, b = sorted(plano["tarefas"], key=lambda t: t["id"])
+    assert (a["id"], b["id"]) == ("p001a", "p001b")
+    (ax0, _, ax1, _), (bx0, _, bx1, _) = a["caixa"], b["caixa"]
+    assert ax1 - ax0 < 0.6 * 792 and bx1 - bx0 < 0.6 * 792  # cada metade, não a página inteira
+    if rotacao == 90:  # o alto da página exibida é a esquerda da página gravada
+        assert ax0 == 0 and bx1 == pytest.approx(792)
+    else:  # e com 270, a direita
+        assert ax1 == pytest.approx(792) and bx0 == 0
+
+
+def test_pagina_quadrada_girada_tem_a_mesma_resolucao(tmp_path, monkeypatch):
+    from lince import pdf as pdf_mod
+
+    monkeypatch.setattr(pdf_mod, "densidade_matematica", lambda md: 9.0)  # a rota "pagina", como numa escaneada
+    tamanhos = []
+    for rotacao in (0, 90):
+        p = _girado(_pdf(tmp_path / f"q{rotacao}.pdf", [0, 0, 700, 700], TEXTO), rotacao)
+        tamanhos.append(_recorte(p, tmp_path / f"q{rotacao}").size)
+    assert tamanhos[0] == tamanhos[1]  # girada, a quadrada não perde metade da resolução
