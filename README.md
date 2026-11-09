@@ -38,11 +38,11 @@ renderizado de novo em 2–3x a resolução e relido com a primeira leitura como
 
 **Metadados corporativos**: cabeçalho e rodapé corridos saem do corpo e vão para os metadados (versão,
 revisão, código, classificação). No PDF, sai a linha curta da borda da página em que só o número da página muda,
-rotulado como página ("Página 3 de 12", "fls. 3"), o número sozinho (registrado como `#`, também em "3 de 12") e a
-linha idêntica na borda de ao menos 80% das páginas ("Contrato 123/2026 - Confidencial"). O número sem rótulo no meio
-de outras palavras fica no texto: no carnê com uma parcela por página, "Parcela 3 de 12" é conteúdo. Também vão para
-os metadados a marca d'água, as propriedades do arquivo, os comentários e as alterações rastreadas do Word e as abas
-ocultas do Excel.
+rotulado como página ("Página 3 de 12", "fls. 3"), a linha que é só o número ("3", "3 de 12", "- 3 -", "(3)",
+registrada com o número trocado por `#`) e a linha idêntica na borda de ao menos 80% das páginas ("Contrato
+123/2026 - Confidencial"). O número sem rótulo no meio de outras palavras fica no texto: no carnê com uma parcela por
+página, "Parcela 3 de 12" é conteúdo. Também vão para os metadados a marca d'água, as propriedades do arquivo, os
+comentários e as alterações rastreadas do Word e as abas ocultas do Excel.
 
 **Segurança**: texto que a IA leria e uma pessoa não vê (branco no branco, fonte minúscula, modo invisível,
 oculto do Word) sai do corpo e gera alerta; padrões de prompt injection em português e inglês geram alerta.
@@ -152,11 +152,12 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   separados por vírgula, um por plataforma. Para uso local sem token: `lince-servidor --sem-autenticacao`.
 - **Limites**: 100 MB por envio (com `Content-Length`), 50 arquivos por sessão, 64 documentos pendentes e 256 MB
   de resultado esperando entrega por token. Acima disso, `429` com `Retry-After`. A montagem aceita até 64 M
-  caracteres de respostas (acima, `413 envio-grande`) e escreve até 16 M caracteres de resultado, contando o texto
-  nativo: a leitura da mesma imagem repetida entra uma vez, e as outras posições levam só a referência. Acima desse
-  teto, entram as leituras que cabem e as outras ficam em `cobertura.pendentes` (`resultado grande demais`), com o
-  texto nativo no lugar, como na leitura com a IA do Lince. No `.xlsb` que só o leitor tolerante abre, a tabela de
-  strings compartilhadas tem teto de 1 milhão de strings e 64 MB de texto; acima disso, o arquivo é recusado.
+  caracteres de respostas (acima, `413 envio-grande`) e põe leituras no resultado até ele chegar a 16 M caracteres,
+  contando o texto nativo: a leitura da mesma imagem repetida entra uma vez, e as outras posições levam só a
+  referência. As que passam desse teto ficam em `cobertura.pendentes` (`resultado grande demais`), com o texto nativo
+  no lugar, como na leitura com a IA do Lince. O teto vale para as leituras: o texto nativo sai sempre inteiro, mesmo
+  que sozinho passe dele. No `.xlsb` que só o leitor tolerante abre, a tabela de strings compartilhadas tem teto de 1
+  milhão de strings e 64 MB de texto; acima disso, o arquivo é recusado.
 - **Escala**: as sessões ficam na memória da instância. Para várias réplicas, use `Prefer: wait` (resposta na
   mesma conexão) ou afinidade por id da sessão no balanceador.
 
