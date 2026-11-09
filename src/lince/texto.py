@@ -97,7 +97,13 @@ def lixo(txt):
     return ruins / len(txt)
 
 
-NUM_PAGINA = r"\s*((p[aá]g(ina)?\.?\s*)?\d{1,4}(\s*(de|/|of)\s*\d{1,4})?|[ivxlc]{1,6})\s*"
+# a linha que é só o número da página: "3", "- 3 -", "— 3 —", "(3)", "Página 3 de 12", "pág. 3/12", "iv"; o número
+# fica no grupo `n` (algarismos) ou `r` (romano, só a palavra inteira, nunca o "i" de "Página")
+NUM_PAGINA = (
+    r"\s*(?:[-–—]\s*|\(\s*)?"
+    r"(?:(?:p[aá]g(?:ina)?\.?\s*)?(?P<n>\d{1,4})(?:\s*(?:de|/|of)\s*\d{1,4})?|(?P<r>[ivxlc]{1,6}))"
+    r"(?:\s*[-–—]|\s*\))?\s*"
+)
 
 
 def sem_repeticao(txt, limite=10):

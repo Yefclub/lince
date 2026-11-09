@@ -254,15 +254,15 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
 
     def so_numero(ln, pagina):
         """(deslocamento, forma com o número trocado por #) do número de página que é a linha inteira ("3", "- 3 -",
-        "Página 3 de 12", "iv"), ou None."""
+        "(3)", "Página 3 de 12", "Página 3/12", "iv"), ou None."""
         t = ln.strip()
-        if not re.fullmatch(NUM_PAGINA, t, flags=re.I):
+        if not (m := re.fullmatch(NUM_PAGINA, t, flags=re.I)):
             return None
-        m = re.search(r"\d{1,4}|[ivxlc]{1,6}", t, flags=re.I)
-        v = _numero(m.group()) if m else None
+        g = "n" if m.group("n") else "r"  # o número depois do rótulo, nunca uma letra dele
+        v = _numero(m.group(g))
         if v is None or abs(v - pagina) > DESLOCAMENTO_MAX:
             return None
-        return v - pagina, t[: m.start()] + "#" + t[m.end() :]
+        return v - pagina, t[: m.start(g)] + "#" + t[m.end(g) :]
 
     def fixa(ln):
         """A linha, se ela pode ser cabeçalho fixo: curta, com letra, fora de título, tabela e marca do Lince."""
