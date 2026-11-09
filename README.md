@@ -171,12 +171,14 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   mandou 1. Até 16 documentos em leitura ao mesmo tempo por instância. As montagens (`POST /v1/montagens`) têm fila
   justa própria, com até 2 ao mesmo tempo: não esperam atrás de leituras presas na IA nem tomam a vaga delas.
 - **PDF em processos**: a fase 1 do PDF (o texto de cada faixa de 50 páginas, a análise, a renderização e os
-  recortes de cada página) roda num pool de processos, um por CPU do contêiner (`os.sched_getaffinity`, até 8,
-  `limites.PROCESSOS_PDF_MAX`). As páginas de um mesmo documento e os documentos diferentes andam em paralelo, com
-  fila justa entre documentos: um PDF de 2.000 páginas não segura os outros. O plano sai igual ao da leitura em série
-  (texto, tarefas e recortes). Se um processo cai, ele é trocado e o documento é lido de novo, uma vez; sem processos,
-  a leitura segue em série. Cada fase 1 deixa uma linha no log com o tempo de cada etapa (abrir, inspecionar,
-  coletar, regiões, renderizar, recortar), a sessão e o documento.
+  recortes de cada página) roda num pool de processos, um por CPU do contêiner (o cpuset, por
+  `os.sched_getaffinity`, e a cota de CPU do cgroup, como `--cpus`; até 8, `limites.PROCESSOS_PDF_MAX`). Sem
+  trabalho por 15 s, os processos são trocados por novos, que sobem no próximo PDF: o documento lido não fica aberto
+  neles. As páginas de um mesmo documento e os documentos diferentes andam em paralelo, com fila justa entre
+  documentos: um PDF de 2.000 páginas não segura os outros. O plano sai igual ao da leitura em série (texto, tarefas
+  e recortes). Se um processo cai, ele é trocado e o documento é lido de novo, uma vez; sem processos, a leitura
+  segue em série. Cada fase 1 deixa uma linha no log com o tempo de cada etapa (abrir, inspecionar, coletar,
+  regiões, renderizar, recortar), a sessão e o documento.
 - **Isolamento**: um token nunca vê sessão nem referência de outro. `LINCE_TOKENS` aceita vários tokens
   separados por vírgula, um por plataforma; cada um pode ter o próprio teto de retenção como `nome:token:teto`
   (`qa:abc123:2G`, `prod:def456:4G`; sem teto, vale o padrão). Para uso local sem token: `lince-servidor --sem-autenticacao`.

@@ -5,9 +5,9 @@ titulo: PDF grande lido em paralelo, com o mesmo resultado e o tempo de cada eta
 
 **A fase 1 do PDF usa todas as CPUs.** Antes, a leitura de um PDF (o texto, a análise das páginas, a renderização e
 os recortes das figuras) andava uma página por vez no serviço inteiro, e vários PDFs grandes chegando juntos faziam
-fila. Agora ela roda num pool de processos, um por CPU do contêiner (até 8): as páginas de um mesmo documento e os
-documentos diferentes andam ao mesmo tempo, com fila justa entre eles, para um PDF de 2.000 páginas não segurar os
-outros. Vale para o modo `tarefas` e para a leitura com a IA do Lince.
+fila. Agora ela roda num pool de processos, um por CPU do contêiner (até 8, respeitando a cota de CPU dele): as
+páginas de um mesmo documento e os documentos diferentes andam ao mesmo tempo, com fila justa entre eles, para um
+PDF de 2.000 páginas não segurar os outros. Vale para o modo `tarefas` e para a leitura com a IA do Lince.
 
 **Mesmo resultado.** O texto, as tarefas e os recortes saem iguais aos da leitura em série, inclusive a mesma imagem
 repetida em várias páginas (o logo do cabeçalho), lida uma vez só. Conferido em 108 PDFs reais e gerados.

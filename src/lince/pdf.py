@@ -1,5 +1,6 @@
 """PDF: texto nativo por página, regiões visuais (raster e vetor), tabela duvidosa e roteamento."""
 
+import concurrent.futures as cf
 import contextvars
 import ctypes
 import hashlib  # noqa: F401
@@ -339,16 +340,19 @@ def _em_processos(distribuidor, path, pasta, total, lidas, inicio, etapas):
 
 
 def _distribuir(distribuidor, path, pasta, total, lidas, inicio, etapas):
-    dono, limite = object(), LIMITE.get()
+    # `leitura`: o documento aberto num processo serve só a esta leitura, e é fechado no próximo trabalho dele depois
+    # que ela termina (`Distribuidor.encerrada`)
+    dono, limite, leitura = object(), LIMITE.get(), os.urandom(8).hex()
     paginas, tarefas, cache, seguranca, pendentes, so_texto, nao_lidas = [], [], {}, [], [], [], []
-    parada, faixas, seguinte = None, deque(), 0
+    parada, faixas, seguinte, despachadas = None, deque(), 0, []
 
     def adiantar():
         """O pdf_inspector das próximas faixas, até uma por processo à frente: ele é a parte em série de cada faixa."""
         nonlocal seguinte
         while seguinte < lidas and len(faixas) < distribuidor.processos:
             fim = min(seguinte + FAIXA, lidas)
-            faixas.append((seguinte, distribuidor.submeter(dono, _faixa_no_processo, path, seguinte, fim)))
+            pedido = (path, leitura, distribuidor.encerradas(), seguinte, fim)
+            faixas.append((seguinte, distribuidor.submeter(dono, _faixa_no_processo, *pedido)))
             seguinte = fim
 
     try:
@@ -365,16 +369,36 @@ def _distribuir(distribuidor, path, pasta, total, lidas, inicio, etapas):
             faixa = range(a, min(a + FAIXA, lidas))
             if abertas < len(faixa):
                 parada = faixa[abertas]
+            fechar = distribuidor.encerradas()
             trabalhos = [
-                distribuidor.submeter(
-                    dono, _pagina_no_processo, path, i, md_de.get(i, ""), i in ocr, itens_de.get(i, []), pasta, limite
+                (
+                    i,
+                    distribuidor.submeter(
+                        dono,
+                        _pagina_no_processo,
+                        path,
+                        leitura,
+                        fechar,
+                        i,
+                        md_de.get(i, ""),
+                        i in ocr,
+                        itens_de.get(i, []),
+                        pasta,
+                        limite,
+                    ),
                 )  # fmt: skip
                 for i in faixa[:abertas]
             ]
+            despachadas += [f for _, f in trabalhos]
             if parada is None:
                 adiantar()
-            for trabalho in trabalhos:
-                r = trabalho.result()
+            for i, trabalho in trabalhos:
+                if _vencido():  # o que ainda está na fila não espera a vez só para dizer "prazo esgotado"
+                    distribuidor.cancelar(dono)
+                if trabalho.cancelled():
+                    r = {"i": i, "info": _so_o_texto(i, md_de.get(i, "")), "motivo": "prazo esgotado", "etapas": {}}
+                else:
+                    r = trabalho.result()
                 _somar(etapas, r["etapas"])
                 if r.get("parada"):  # a página não abre: a leitura para nela
                     parada = r["i"]
@@ -387,6 +411,10 @@ def _distribuir(distribuidor, path, pasta, total, lidas, inicio, etapas):
             _marcar(nao_lidas, lidas, total, f"teto de {PAGINAS_TEXTO_MAX} páginas de texto")
     finally:
         distribuidor.cancelar(dono)
+        # as páginas que já estão num processo gravam os recortes na pasta: a leitura só termina depois delas (a
+        # pasta pode ser apagada logo em seguida, e a releitura depois de um processo que caiu grava os mesmos nomes)
+        cf.wait([f for f in despachadas if not f.cancelled()])
+        distribuidor.encerrada(leitura)
     return paginas, tarefas, seguranca, pendentes, so_texto, nao_lidas
 
 
@@ -430,24 +458,26 @@ _DOCS: OrderedDict = OrderedDict()
 DOCS_ABERTOS = 2
 
 
-def _doc_do_processo(caminho):
-    st = os.stat(caminho)
-    chave = (caminho, st.st_mtime_ns, st.st_size)
-    doc = _DOCS.pop(chave, None)
+def _doc_do_processo(caminho, leitura, fechar):
+    """O documento da `leitura` aberto neste processo. Antes, fecha os das leituras que já terminaram (`fechar`): o
+    arquivo apagado não fica ocupando o disco nem a memória, e a cópia decifrada de um protegido não fica legível."""
+    for k in [k for k in _DOCS if k in fechar]:
+        _DOCS.pop(k).close()
+    doc = _DOCS.pop(leitura, None)
     if doc is None:
         while len(_DOCS) >= DOCS_ABERTOS:
             _DOCS.popitem(last=False)[1].close()
         doc = pdfium.PdfDocument(caminho)
-    _DOCS[chave] = doc
+    _DOCS[leitura] = doc
     return doc
 
 
-def _faixa_no_processo(caminho, a, b):
+def _faixa_no_processo(caminho, leitura, fechar, a, b):
     """No processo: a cópia das páginas [a, b) e o pdf_inspector sobre ela (`_vez_da_faixa` e `_extrair`). Os itens do
     pdf_inspector vão como atributos simples: o TextItem dele não passa de um processo para outro."""
     gastos = {}
     t = time.monotonic()
-    doc = _doc_do_processo(caminho)
+    doc = _doc_do_processo(caminho, leitura, fechar)
     gastos["abrir"] = time.monotonic() - t
     t = time.monotonic()
     with PDFIUM:
@@ -462,7 +492,7 @@ def _atributos(x):
     return {k: getattr(x, k) for k in dir(x) if not k.startswith("_") and not callable(getattr(x, k))}
 
 
-def _pagina_no_processo(caminho, i, md, eh_ocr, itens, pasta, limite):
+def _pagina_no_processo(caminho, leitura, fechar, i, md, eh_ocr, itens, pasta, limite):
     """No processo: a página `i` inteira, como no laço da leitura em série (coleta, análise, renderização e recortes),
     com o prazo do documento (`limite`). Devolve a página, as tarefas, o texto oculto e as pendências dela, o hash de
     cada recorte (as repetidas entre páginas saem em `_juntar`) e o tempo de cada etapa."""
@@ -472,7 +502,7 @@ def _pagina_no_processo(caminho, i, md, eh_ocr, itens, pasta, limite):
         if motivo := _so_texto(i):
             return {"i": i, "info": _so_o_texto(i, md), "motivo": motivo, "etapas": gastos}
         t = time.monotonic()
-        doc = _doc_do_processo(caminho)
+        doc = _doc_do_processo(caminho, leitura, fechar)
         gastos["abrir"] += time.monotonic() - t
         t = time.monotonic()
         with PDFIUM:

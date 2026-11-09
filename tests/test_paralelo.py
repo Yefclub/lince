@@ -2,13 +2,16 @@
 imagens repetidas entre páginas), documentos diferentes dividem os processos de forma justa, um processo que cai não
 derruba o documento, e sem processos a leitura segue em série."""
 
+import concurrent.futures as cf
 import hashlib
 import io
 import json
 import logging
+import multiprocessing
 import os
 import threading
 import time
+from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 
 import pytest
@@ -108,15 +111,28 @@ def test_leitura_completa_em_processos_e_igual(relatorio, em_processos):
                                                                       sem.cobertura.pendentes)  # fmt: skip
 
 
-def test_sem_processos_a_leitura_segue_em_serie(relatorio, monkeypatch):
-    def sem_processos(*_):
-        raise OSError("sem processos neste ambiente")
+class _SemProcessos(type(multiprocessing.get_context("spawn"))):
+    """Contêiner no teto de processos: o processo do pool não sobe (ele só sobe no primeiro trabalho)."""
 
-    monkeypatch.setattr(paralelo, "Distribuidor", sem_processos)
+    class Process(multiprocessing.get_context("spawn").Process):
+        def start(self):
+            raise OSError(11, "Resource temporarily unavailable")
+
+
+def test_sem_processos_a_leitura_segue_em_serie(relatorio, monkeypatch):
+    def executor_sem_processos(self):
+        return ProcessPoolExecutor(self.processos, mp_context=_SemProcessos())
+
+    monkeypatch.setattr(paralelo.Distribuidor, "_novo_executor", executor_sem_processos)
     assert paralelo.ativar(4) is False and paralelo.pool() is None
     assert paralelo.ativar(1) is False  # uma CPU: nada a paralelizar
-    plano = lince.Leitor().preparar(relatorio)
-    assert plano.tarefas and len(plano.estado["paginas"]) == 60
+    serie = _despejo(lince.Leitor().preparar(relatorio))
+    monkeypatch.undo()
+    assert paralelo.ativar(2)
+    try:
+        assert _despejo(lince.Leitor().preparar(relatorio)) == serie
+    finally:
+        paralelo.desativar()
 
 
 def test_processo_que_cai_e_trocado_e_o_documento_seguinte_e_lido(relatorio, em_processos):
@@ -173,8 +189,61 @@ def test_documento_que_desiste_tira_o_que_falta_da_fila(em_processos):
 
 def test_prazo_vale_nos_processos(relatorio, em_processos):
     plano = lince.Leitor().preparar(relatorio, prazo=0.001)
-    assert len(plano.estado["paginas"]) == 50  # a primeira faixa sempre entra, só com o texto
+    assert len(plano.estado["paginas"]) == 50 and not plano.tarefas  # a primeira faixa sempre entra, só com o texto
+    pendentes = plano.estado["pendentes"]
+    assert any(p.startswith("páginas 1–50: só o texto") and "prazo esgotado" in p for p in pendentes)
+    assert "páginas 51–60: não lidas (prazo esgotado)" in pendentes
+
+
+def test_prazo_vale_com_os_processos_ocupados_por_outro_documento(relatorio, em_processos):
+    """Passado o prazo, as páginas que ainda esperam a vez entram só com o texto na hora, sem esperar a rodada."""
+    carga = [em_processos.submeter("outro", time.sleep, 0.5) for _ in range(40)]
+    inicio = time.monotonic()
+    plano = lince.Leitor().preparar(relatorio, prazo=1.5)
+    assert time.monotonic() - inicio < 8  # sem cortar a fila: ~25 s, uma página por vaga a cada 0,5 s
     assert any("prazo esgotado" in p for p in plano.estado["pendentes"])
+    em_processos.cancelar("outro")
+    cf.wait(carga)
+
+
+def test_cota_de_cpu_do_conteiner(tmp_path):
+    (tmp_path / "cpu.max").write_text("150000 100000\n")
+    assert paralelo.cota_de_cpu(tmp_path) == 2  # 1,5 CPU: dois processos
+    (tmp_path / "cpu.max").write_text("max 100000\n")
+    assert paralelo.cota_de_cpu(tmp_path) is None
+    (tmp_path / "cpu.max").unlink()
+    (tmp_path / "cpu").mkdir()
+    (tmp_path / "cpu" / "cpu.cfs_quota_us").write_text("400000")
+    (tmp_path / "cpu" / "cpu.cfs_period_us").write_text("100000")
+    assert paralelo.cota_de_cpu(tmp_path) == 4  # cgroup v1
+    assert paralelo.cota_de_cpu(tmp_path / "nada") is None
+
+
+def test_processos_ociosos_sao_trocados(relatorio, em_processos, monkeypatch):
+    """Sem trabalho, o pool é trocado: os documentos abertos e a memória dos processos voltam ao sistema."""
+    monkeypatch.setattr(paralelo, "OCIOSO_S", 0.3)
+    lince.Leitor().preparar(relatorio)
+    usado = em_processos._executor
+    with em_processos._cv:
+        em_processos._cv.notify()  # o despacho passa a esperar com o tempo novo
+    limite = time.monotonic() + 10
+    while em_processos._executor is usado and time.monotonic() < limite:
+        time.sleep(0.1)
+    assert em_processos._executor is not usado
+    assert len(lince.Leitor().preparar(relatorio).estado["paginas"]) == 60  # o pool novo sobe no próximo PDF
+
+
+def test_documento_da_leitura_que_terminou_e_fechado_no_processo(relatorio, em_processos):
+    lince.Leitor().preparar(relatorio)
+    (leitura,) = em_processos.encerradas()[-1:]
+    assert len(leitura) == 16
+    try:
+        pdf._doc_do_processo(str(relatorio), "a", ())
+        pdf._doc_do_processo(str(relatorio), "b", ("a",))  # o próximo trabalho fecha o da leitura encerrada
+        assert list(pdf._DOCS) == ["b"]
+    finally:
+        while pdf._DOCS:
+            pdf._DOCS.popitem()[1].close()
 
 
 def test_tempo_de_cada_etapa_no_log(relatorio, em_processos, caplog):
@@ -215,3 +284,24 @@ def test_servidor_le_nos_processos_e_registra_a_sessao_no_log(relatorio, em_proc
         assert item["estado"] == "pronto" and item["resultado"]["tarefas"]
     (linha,) = [r.getMessage() for r in caplog.records if "fase 1 do PDF" in r.getMessage()]
     assert f"sessão {r.json()['id']}, documento {item['id']}" in linha and "2 processos" in linha
+
+
+def test_pool_que_nao_pode_ser_recriado_nao_prende_ninguem(em_processos, monkeypatch):
+    """Logo depois de um processo morrer, criar o pool novo pode falhar (sem descritores, sem memória): os trabalhos
+    recebem o erro, em vez de ficar esperando para sempre."""
+
+    def sem_descritores(self):
+        raise OSError(24, "Too many open files")
+
+    def erro(futuro):
+        try:
+            futuro.result(timeout=30)
+        except TimeoutError:  # antes de OSError: TimeoutError é um OSError
+            pytest.fail("o trabalho ficou esperando para sempre")
+        except (BrokenProcessPool, OSError) as e:
+            return e
+        pytest.fail("o trabalho devia ter falhado")
+
+    monkeypatch.setattr(paralelo.Distribuidor, "_novo_executor", sem_descritores)
+    erro(em_processos.submeter("hostil", os._exit, 1))
+    erro(em_processos.submeter("outro", time.sleep, 0))
