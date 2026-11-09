@@ -48,6 +48,13 @@ comentários e as alterações rastreadas do Word e as abas ocultas do Excel.
 oculto do Word) sai do corpo e gera alerta; padrões de prompt injection em português e inglês geram alerta.
 O conteúdo das imagens é tratado como dado, nunca como instrução.
 
+**Arquivo com senha**: PDF com senha de abertura, Office (`.docx`, `.xlsx`, `.pptx` e os binários `.doc`, `.xls`,
+`.ppt`) e ODF protegidos são reconhecidos antes de qualquer leitura e recusados com `lince.DocumentoProtegido` (com o
+`formato`), sem ler nada nem chamar a IA. Com `Leitor().ler(arquivo, senha=...)` (ou `preparar`), o arquivo é
+decifrado numa cópia temporária só para a leitura; a senha errada levanta `lince.SenhaIncorreta`. A senha não é
+guardada, e as leituras do documento protegido não entram no cache. O PDF que só tem senha de permissões abre sem ela
+e é lido como sempre.
+
 ## Peças plugáveis
 
 ```python
@@ -118,7 +125,7 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
 
 | Rota | O que faz |
 | --- | --- |
-| `POST /v1/sessoes` | Envia 1 a 50 arquivos (campo `arquivo` repetido), com `referencia`, `esforco` (`padrao` ou `max`), `prazo` (1 a 3600 s por documento), `modo` (`leitura` ou `tarefas`) e `max_tarefas` (só no modo `tarefas`) opcionais. Responde `201` com a sessão e `Location`. Com `Prefer: wait=N` (até 300 s), espera terminar. |
+| `POST /v1/sessoes` | Envia 1 a 50 arquivos (campo `arquivo` repetido), com `referencia`, `esforco` (`padrao` ou `max`), `prazo` (1 a 3600 s por documento), `modo` (`leitura` ou `tarefas`), `max_tarefas` (só no modo `tarefas`) e `senha` (dos arquivos protegidos) opcionais. Responde `201` com a sessão e `Location`. Com `Prefer: wait=N` (até 300 s), espera terminar. |
 | `GET /v1/sessoes/{id}` | Estado da sessão e de cada documento; o que já terminou vem com `markdown`, `metadados`, `cobertura`, `alertas_injecao`, `uso` (tokens por leitura) e `estrutura`. Aceita `Prefer: wait=N`. |
 | `GET /v1/sessoes?referencia=…` | Sessões do token ainda não entregues, da mais nova para a mais antiga (resumo, sem o conteúdo lido). |
 | `DELETE /v1/sessoes/{id}` | Confirma o recebimento (ou cancela o que ainda não foi lido) e apaga a sessão na hora. |
@@ -131,6 +138,16 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   (`urn:lince:erro:<codigo>`) e `instance` igual ao `X-Request-Id`. O `X-Request-Id` enviado volta em toda
   resposta, o que facilita o rastreio entre os dois sistemas.
 - **Sem `X-IA-URL`**: só a extração nativa; o que precisava de IA aparece em `cobertura.pendentes`.
+- **Arquivo com senha**: sem o campo `senha`, o envio com um arquivo protegido é recusado na hora com
+  `422 arquivo-protegido` (com `formato` e `arquivo` no corpo), sem ler nada nem chamar a IA; quem chama pede a senha
+  ao usuário e envia de novo com `-F senha=...`. A senha errada dá `422 senha-incorreta`. Com a certa, o arquivo é
+  decifrado na pasta temporária da sessão, só para a leitura, e apagado com ela; a montagem, a releitura ampliada e
+  `codigo=sim` trabalham sobre ele, sem pedir a senha de novo. A senha vale nos modos `leitura` e `tarefas`, para
+  cada arquivo do envio que pede senha, e não vai para a sessão, o plano, o log, o cache nem a resposta; as leituras
+  do documento protegido também não entram no cache. Depois de 5 senhas erradas para o mesmo arquivo (ou 50 no
+  token) em 15 min, as tentativas seguintes recebem `429 tentativas-de-senha` com `Retry-After`. O decifrado também
+  passa pelo antivírus. O que o Lince não decifra (ODF cifrado com Blowfish ou AES-GCM, Word com ofuscação XOR) volta
+  como `arquivo-protegido`, com o motivo em `detail`.
 - **Modo `tarefas`** (`-F modo=tarefas`): o Lince não chama IA. Cada documento volta com `tarefas` (imagem em base64,
   instrução, onde está, `chave` de cache e `tokens_estimados`) e um `plano` opaco, assinado pelo servidor para o token
   e válido por 24 h. Quem chama lê as imagens com o próprio modelo e manda `POST /v1/montagens`; nada fica guardado
@@ -349,6 +366,10 @@ caminho fica registrado em `partes_ilegiveis`.
 
 E-mail (`.eml`, `.msg`) e arquivos compactados (`.zip`) ainda não são aceitos.
 
+Arquivo protegido por senha: PDF com senha de abertura (pela PDFium), Office OOXML e os binários `.doc`, `.xls` e
+`.ppt` (pelo [msoffcrypto-tool](https://github.com/nolze/msoffcrypto-tool)) e ODF no padrão ODF 1.2 (AES-256-CBC com
+PBKDF2, como grava o LibreOffice) são decifrados com a senha. Cifras fora disso ficam reconhecidas, com o motivo.
+
 ## Instalação
 
 ```bash
@@ -387,7 +408,8 @@ lince relatorio.pdf --url https://openrouter.ai/api/v1 --modelo seu/modelo --cha
 Todas com licença permissiva: [anydoc](https://github.com/firecrawl/anydoc) (MIT),
 [pdf-inspector](https://github.com/firecrawl/pdf-inspector) (MIT), [pypdfium2](https://github.com/pypdfium2-team/pypdfium2)
 (Apache-2.0/BSD-3), openpyxl (MIT), python-pptx (MIT), Pillow (MIT-CMU), lxml (BSD-3), defusedxml (PSF),
-[olefile](https://github.com/decalage2/olefile) (BSD-2), [html-to-markdown](https://github.com/xberg-io/html-to-markdown) (MIT), tinycss2 (BSD-3); na API, Starlette e Uvicorn (BSD-3) e
+[olefile](https://github.com/decalage2/olefile) (BSD-2), [msoffcrypto-tool](https://github.com/nolze/msoffcrypto-tool)
+(MIT) com cryptography (Apache-2.0/BSD-3), [html-to-markdown](https://github.com/xberg-io/html-to-markdown) (MIT), tinycss2 (BSD-3); na API, Starlette e Uvicorn (BSD-3) e
 python-multipart (Apache-2.0). Nada de GPL/AGPL. O CI e o build da imagem reprovam qualquer dependência fora
 dessa lista, e a imagem leva `THIRD_PARTY_NOTICES.md` gerado do que foi instalado.
 

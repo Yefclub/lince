@@ -35,7 +35,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from . import antivirus, memoria
+from . import antivirus, memoria, protecao
 from . import codigo as codigo_doc
 from .cache import CacheComEscopo, CacheRedis
 from .leitor import FORMATOS, VERSAO, Leitor
@@ -75,6 +75,16 @@ PRAZO_MIN, PRAZO_MAX = 1, 3600  # segundos por documento; o chat usa poucos, a b
 # pendências do preparo, com o motivo; `max_tarefas` só baixa o do documento.
 TAREFAS_POR_DOCUMENTO = 200
 TAREFAS_POR_SESSAO = 300
+# Senha de arquivo protegido: o Office aceita até 255 caracteres e o PDF, 127 bytes; acima de 1024 não é senha.
+SENHA_MAX = 1024
+# Senhas erradas numa janela, para o Lince não servir de quebrador de senha. Por arquivo (o sha256): quem digita erra
+# poucas vezes, e cinco erros em 15 min pedem uma pausa. Por token, um teto alto o bastante para os usuários de uma
+# plataforma que errarem ao mesmo tempo: sem ele, o mesmo arquivo com um byte a mais no fim (outro hash, a mesma
+# senha) recomeçaria a conta. Acima de um deles, 429 até o erro mais antigo da janela vencer; a senha certa zera a do
+# arquivo.
+SENHAS_ERRADAS_POR_ARQUIVO = 5
+SENHAS_ERRADAS_POR_TOKEN = 50
+SENHAS_JANELA = 15 * 60
 MIDIA = {
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ".pptm": "application/vnd.ms-powerpoint.presentation.macroEnabled.12",
@@ -179,6 +189,8 @@ class Servico:
         self.edicoes: dict[str, dict] = {}  # arquivo editado esperando download (entrega única, como as sessões)
         self.vagas: dict[str, int] = {}  # documentos pendentes por cliente, reservados antes do upload
         self.retidos: dict[str, int] = {}  # bytes de resultado em memória por cliente (sessões em curso e concluídas)
+        # instantes das senhas erradas na janela, por (cliente, sha256 do arquivo) e por (cliente, "") para o token
+        self.senhas_erradas: dict[tuple[str, str], deque] = {}
         self.trava = threading.Lock()
         self.fila = Fila(self._ler, DOCS_SIMULTANEOS)
         self.montagens = Fila(lambda trabalho: trabalho(), MONTAGENS_SIMULTANEAS)
@@ -223,6 +235,43 @@ class Servico:
             if not self.vagas[cliente]:
                 del self.vagas[cliente]
 
+    # ---------------------------------------------------------------- tentativas de senha
+    def espera_por_senha(self, cliente, sha256) -> int | None:
+        """Segundos até o cliente poder tentar de novo a senha deste arquivo, ou None se pode já. Chamar com a trava."""
+        agora, espera = time.time(), 0.0
+        for chave, teto in (((cliente, sha256), SENHAS_ERRADAS_POR_ARQUIVO), ((cliente, ""), SENHAS_ERRADAS_POR_TOKEN)):
+            erros = self._erros_na_janela(chave, agora)
+            if len(erros) >= teto:  # libera quando o erro que completou o teto sai da janela
+                espera = max(espera, erros[-teto] + SENHAS_JANELA - agora)
+        return max(1, math.ceil(espera)) if espera else None
+
+    def tentar_senha(self, cliente, sha256) -> float:
+        """Conta a tentativa como errada já, antes de decifrar: tentativas em paralelo não furam o teto. Devolve a marca
+        para `desfazer_tentativa`. Chamar com a trava."""
+        agora = time.time()
+        for chave in ((cliente, sha256), (cliente, "")):
+            self.senhas_erradas.setdefault(chave, deque()).append(agora)
+        return agora
+
+    def desfazer_tentativa(self, cliente, sha256, marca, certa):
+        """A tentativa não foi senha errada: sai da conta. Com a senha certa, a conta do arquivo recomeça (a do token,
+        não). Chamar com a trava."""
+        for chave in ((cliente, sha256), (cliente, "")):
+            if marca in (erros := self.senhas_erradas.get(chave, ())):
+                erros.remove(marca)
+            self._erros_na_janela(chave, time.time())
+        if certa:
+            self.senhas_erradas.pop((cliente, sha256), None)
+
+    def _erros_na_janela(self, chave, agora) -> deque:
+        """Chamar com a trava."""
+        erros = self.senhas_erradas.get(chave, deque())
+        while erros and agora - erros[0] > SENHAS_JANELA:
+            erros.popleft()
+        if not erros:
+            self.senhas_erradas.pop(chave, None)
+        return erros
+
     # ---------------------------------------------------------------- leitura
     def _ler(self, doc):
         sessao = doc["sessao"]
@@ -232,7 +281,9 @@ class Servico:
                 estado = "cancelado"
                 return
             doc["estado"], doc["inicio"] = "lendo", time.time()
-            cache = CacheComEscopo(self.cache, sessao["cliente"]) if self.cache else None
+            # o documento protegido não entra no cache: a transcrição dele não fica guardada nem serve a quem não tem
+            # a senha
+            cache = CacheComEscopo(self.cache, sessao["cliente"]) if self.cache and not doc.get("protegido") else None
             if sessao.get("modo") == "tarefas":
                 teto = min(TAREFAS_POR_DOCUMENTO, sessao.get("max_tarefas") or TAREFAS_POR_DOCUMENTO)
                 plano = Leitor(max_leituras=teto).preparar(doc["arquivo"], prazo=sessao.get("prazo"))
@@ -346,6 +397,8 @@ class Servico:
                 self._remover(sid)
             for eid in [k for k, x in self.edicoes.items() if _vencida(x, agora)]:
                 self._remover_edicao(eid)
+            for chave in list(self.senhas_erradas):
+                self._erros_na_janela(chave, agora)
 
     def _remover_edicao(self, eid):
         """Chamar com a trava."""
@@ -725,7 +778,7 @@ def criar_app(
             raise _limite_pendentes()
         reservadas, sessao, form = 1, None, None
         try:
-            form = await request.form(max_files=ARQUIVOS_MAX, max_fields=ARQUIVOS_MAX + 5)
+            form = await request.form(max_files=ARQUIVOS_MAX, max_fields=ARQUIVOS_MAX + 6)
             arquivos = [a for a in form.getlist("arquivo") if hasattr(a, "read")]
             if not arquivos:
                 raise Problema(400, "arquivo-ausente", "Envie ao menos um campo multipart 'arquivo'")
@@ -772,6 +825,9 @@ def criar_app(
             pedir_codigo = str(form.get("codigo") or "nao")
             if pedir_codigo not in ("sim", "nao"):
                 raise Problema(400, "codigo-invalido", "codigo deve ser 'sim' ou 'nao'")
+            senha = form.get("senha") or None  # vazia é sem senha, como os outros campos
+            if senha is not None and (not isinstance(senha, str) or len(senha) > SENHA_MAX):
+                raise Problema(400, "senha-invalida", f"senha deve ser texto de até {SENHA_MAX} caracteres")
             for a in arquivos:
                 ext = Path(a.filename or "").suffix.lower()
                 if not re.fullmatch(r"\.[a-z0-9]{1,8}", ext):
@@ -787,8 +843,9 @@ def criar_app(
                     )
             sessao = await _receber(
                 s, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=pedir_codigo == "sim", prazo=prazo,
-                modo=modo, segredo=s.segredo(cliente), kid=s.kid(), max_tarefas=max_tarefas,
+                modo=modo, segredo=s.segredo(cliente), kid=s.kid(), max_tarefas=max_tarefas, senha=senha,
             )  # fmt: skip
+            senha = None  # a senha só abriu os arquivos: não fica com o pedido
         finally:
             if form is not None:
                 await form.close()  # o spool do multipart sai do disco já: o documento foi copiado
@@ -1072,11 +1129,64 @@ async def _varrer(s: Servico, nome, arquivo):
         ) from None
 
 
+async def _abrir(s: Servico, cliente, d, senha, pasta) -> bool:
+    """Arquivo protegido por senha: sem senha, 422 `arquivo-protegido`; com a senha errada, 422 `senha-incorreta` (e,
+    errando demais, 429 `tentativas-de-senha`); com a certa, a cópia decifrada toma o lugar do arquivo recebido, na
+    pasta da sessão (apagada com ela), e passa pelo antivírus como ele. Devolve se o arquivo estava protegido. A
+    detecção e a decifração rodam fora do laço de eventos; a senha não vai para a sessão, o log nem o erro."""
+    if senha is None:
+        if formato := await asyncio.to_thread(protecao.formato_protegido, d["arquivo"]):
+            raise _protegido(d["nome"], formato)
+        return False
+    with s.trava:
+        espera = s.espera_por_senha(cliente, d["sha256"])
+        marca = None if espera else s.tentar_senha(cliente, d["sha256"])
+    if espera:
+        raise Problema(
+            429,
+            "tentativas-de-senha",
+            "Tentativas de senha demais",
+            f"{d['nome']!r}: até {SENHAS_ERRADAS_POR_ARQUIVO} senhas erradas por arquivo e {SENHAS_ERRADAS_POR_TOKEN}"
+            f" por token em {SENHAS_JANELA // 60} min.",
+            {"Retry-After": str(espera)},
+            extras={"arquivo": d["nome"]},
+        )
+    errada, lido = False, None
+    try:
+        lido = await asyncio.to_thread(protecao.aberto, d["arquivo"], senha, pasta)
+    except protecao.SenhaIncorreta as e:
+        errada = True  # fica na conta
+        raise Problema(
+            422, "senha-incorreta", "Senha incorreta", f"{d['nome']!r}: a senha não abre o arquivo.",
+            extras={"arquivo": d["nome"], "formato": e.formato},
+        ) from None  # fmt: skip
+    except protecao.DocumentoProtegido as e:
+        raise _protegido(d["nome"], e.formato, e.motivo) from None
+    finally:
+        if not errada:
+            with s.trava:
+                s.desfazer_tentativa(cliente, d["sha256"], marca, certa=lido is not None and lido != d["arquivo"])
+    if lido == d["arquivo"]:  # não pedia senha: a enviada não serve para nada
+        return False
+    os.replace(lido, d["arquivo"])  # o cifrado sai já; o decifrado é apagado assim que lido, como todo arquivo
+    os.rmdir(pasta)
+    await _varrer(s, d["nome"], d["arquivo"])  # o que chega aos leitores é o decifrado: ele também passa pelo antivírus
+    return True
+
+
+def _protegido(nome, formato, motivo=""):
+    detalhe = f"{nome!r}: envie a senha no campo 'senha'." if not motivo else f"{nome!r}: {motivo}."
+    return Problema(
+        422, "arquivo-protegido", "Arquivo protegido por senha", detalhe, extras={"arquivo": nome, "formato": formato}
+    )
+
+
 async def _receber(
     s: Servico, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=False, prazo=None, modo="leitura",
-    segredo=b"", kid="", max_tarefas=None,
+    segredo=b"", kid="", max_tarefas=None, senha=None,
 ):  # fmt: skip
-    """Grava o lote, calcula hash e tamanho, aplica a idempotência e põe os documentos na fila."""
+    """Grava o lote, calcula hash e tamanho, aplica a idempotência, abre o que é protegido por senha e põe os documentos
+    na fila."""
     pasta = tempfile.mkdtemp(prefix="lince-api-")
     try:
         itens = []
@@ -1107,6 +1217,8 @@ async def _receber(
         conteudo = [referencia, esforco, provedor, codigo, [(d["nome"], d["sha256"]) for d in itens], prazo, modo]
         if max_tarefas is not None:  # só entra na impressão quando enviado: a de um envio sem ele não muda
             conteudo.append(max_tarefas)
+        if senha is not None:  # só que veio senha, nunca ela nem um hash dela (a impressão fica com a sessão)
+            conteudo.append("com senha")
         impressao = hashlib.sha256(json.dumps(conteudo).encode()).hexdigest()
         s.limpar()
         if chave_idem:  # repetição ou chave reusada: responde antes de varrer (o envio aceito já foi varrido)
@@ -1121,6 +1233,8 @@ async def _receber(
                     return {"repetida": True, "original": s.sessoes[sid]}
         for d, a in zip(itens, arquivos, strict=True):  # antes de qualquer leitura
             await _varrer(s, a.filename, d["arquivo"])
+        for k, d in enumerate(itens):  # protegido: recusado aqui, no pedido, ou decifrado para a leitura
+            d["protegido"] = await _abrir(s, cliente, d, senha, os.path.join(pasta, f"aberto-{k}"))
         with s.trava:
             if chave_idem and (sid := s.idempotencia.get((cliente, chave_idem))) and sid in s.sessoes:
                 original = s.sessoes[sid]

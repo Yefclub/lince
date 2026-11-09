@@ -19,6 +19,7 @@ precisa. Biblioteca Python (`src/lince/`) e API HTTP (`lince.servidor`), empacot
 | Prompt de leitura | `src/lince/prompts/leitura.md` (`VERSAO_PROMPT` em `instrucoes.py`) |
 | Documento como código e edição cirúrgica | `src/lince/codigo/` (`pacote.py`, `pptx.py`, `docx.py`, `xlsx.py`) |
 | Limites contra arquivo hostil | `src/lince/limites.py` |
+| Arquivo protegido por senha (detecção e decifração) | `src/lince/protecao.py` |
 | Contrato da API (OpenAPI 3.1) | `src/lince/openapi.json` |
 | API HTTP, sessões e fila justa | `src/lince/servidor.py` |
 
@@ -112,7 +113,7 @@ estática do Python e dos workflows. Rode o equivalente local antes de commitar.
 
 ## Dependências
 
-- Só licença permissiva: MIT, Apache-2.0, BSD, ISC, PSF, Zlib, 0BSD, Unlicense. Nunca GPL, LGPL, AGPL,
+- Só licença permissiva: MIT, MIT-0, Apache-2.0, BSD, ISC, PSF, Zlib, 0BSD, Unlicense. Nunca GPL, LGPL, AGPL,
   SSPL, MPL, EUPL. `scripts/licencas.py --checar` aplica a regra no CI e no build da imagem.
 - Antes de escrever do zero, procure biblioteca mantida que já resolva; diga o motivo se não usar.
 - Versão publicada há menos de 3 dias não entra (`exclude-newer` no pyproject, `cooldown` no Dependabot).

@@ -2,9 +2,9 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Lince",
-    "version": "1.12.0",
+    "version": "1.13.0",
     "summary": "Leitor único de documentos para bases de conhecimento e IA.",
-    "description": "Cada envio (um documento ou um lote) cria uma **sessão**. Quem chama marca a sessão com uma `referencia` própria (o id do usuário ou do processo no sistema de origem) e recupera os resultados pela sessão ou pela referência.\n\nO documento não é guardado: o arquivo é apagado assim que lido. Só se o servidor tiver cache ligado, a transcrição que a IA fez de cada recorte ou página fica no Redis por alguns dias, separada por token, para não ser paga de novo. O resultado fica guardado (em disco, fora da memória do serviço) só até ser **entregue**: a primeira resposta que traz a sessão `concluida` (o `POST` com `Prefer: wait` ou um `GET`) é a entrega. Depois dela, a sessão fica 60 s para o cliente repetir o pedido se a resposta se perdeu, e então some; `DELETE` confirma o recebimento e apaga na hora. Resultado não buscado é descartado 15 min depois de concluída. `expira_em` sempre diz até quando a sessão existe. Cada token pode ter até 1 GiB de resultado esperando entrega (ou o teto que o serviço configurou para ele); o resultado entregue deixa de contar na hora. Acima disso, novos envios recebem 429, com `Retry-After` e o uso no corpo, até o token buscar o que é dele.\n\nO modelo de visão é de quem chama, informado em cada envio (`X-IA-URL`, `X-IA-Modelo`, `X-IA-Chave`); a chave não é guardada nem registrada.\n\nErros seguem a RFC 9457 (`application/problem+json`). Toda resposta traz `X-Request-Id`.\n\n**Documento como código.** Com `codigo=sim`, cada documento de formato editável (PPTX, DOCX, XLSX) traz também `resultado.codigo`: a estrutura do documento com ids estáveis tirados do próprio arquivo (slide, forma, parágrafo, célula, série de gráfico). Com esses ids, `POST /v1/edicoes` aplica operações nomeadas e devolve o arquivo novo, alterando só as partes tocadas; o resto do pacote sai idêntico em bytes.\n\n**Antivírus.** Se o serviço estiver configurado com ClamAV, todo arquivo é varrido antes de ser lido ou editado: arquivo infectado recusa o envio inteiro ou a edição (422 `arquivo-infectado`) e antivírus fora do ar recusa com 503 `antivirus-indisponivel` (nunca lê sem varrer).",
+    "description": "Cada envio (um documento ou um lote) cria uma **sessão**. Quem chama marca a sessão com uma `referencia` própria (o id do usuário ou do processo no sistema de origem) e recupera os resultados pela sessão ou pela referência.\n\nO documento não é guardado: o arquivo é apagado assim que lido. Só se o servidor tiver cache ligado, a transcrição que a IA fez de cada recorte ou página fica no Redis por alguns dias, separada por token, para não ser paga de novo. O resultado fica guardado (em disco, fora da memória do serviço) só até ser **entregue**: a primeira resposta que traz a sessão `concluida` (o `POST` com `Prefer: wait` ou um `GET`) é a entrega. Depois dela, a sessão fica 60 s para o cliente repetir o pedido se a resposta se perdeu, e então some; `DELETE` confirma o recebimento e apaga na hora. Resultado não buscado é descartado 15 min depois de concluída. `expira_em` sempre diz até quando a sessão existe. Cada token pode ter até 1 GiB de resultado esperando entrega (ou o teto que o serviço configurou para ele); o resultado entregue deixa de contar na hora. Acima disso, novos envios recebem 429, com `Retry-After` e o uso no corpo, até o token buscar o que é dele.\n\nO modelo de visão é de quem chama, informado em cada envio (`X-IA-URL`, `X-IA-Modelo`, `X-IA-Chave`); a chave não é guardada nem registrada.\n\nErros seguem a RFC 9457 (`application/problem+json`). Toda resposta traz `X-Request-Id`.\n\n**Documento como código.** Com `codigo=sim`, cada documento de formato editável (PPTX, DOCX, XLSX) traz também `resultado.codigo`: a estrutura do documento com ids estáveis tirados do próprio arquivo (slide, forma, parágrafo, célula, série de gráfico). Com esses ids, `POST /v1/edicoes` aplica operações nomeadas e devolve o arquivo novo, alterando só as partes tocadas; o resto do pacote sai idêntico em bytes.\n\n**Arquivo com senha.** PDF com senha de abertura, Office (OOXML e os binários `.doc`, `.xls`, `.ppt`) e ODF protegidos por senha são reconhecidos antes de qualquer leitura: sem o campo `senha`, o envio é recusado com 422 `arquivo-protegido` (com o `formato` e o `arquivo` no corpo), sem ler nada nem chamar IA. Com `senha`, o arquivo é decifrado numa cópia temporária, só para a leitura, apagada com o documento; a senha errada dá 422 `senha-incorreta`, e senhas erradas demais dão 429 `tentativas-de-senha`. A senha não é guardada nem registrada, e as leituras do documento protegido não entram no cache. O PDF que só tem senha de permissões abre sem ela e é lido como os outros.\n\n**Antivírus.** Se o serviço estiver configurado com ClamAV, todo arquivo é varrido antes de ser lido ou editado: arquivo infectado recusa o envio inteiro ou a edição (422 `arquivo-infectado`) e antivírus fora do ar recusa com 503 `antivirus-indisponivel` (nunca lê sem varrer).",
     "license": {
       "name": "MIT",
       "identifier": "MIT"
@@ -135,6 +135,12 @@
                     "description": "Só no modo `tarefas`: baixa o teto de tarefas de cada documento (200); valor acima dele vale o teto. As que passam ficam em `pendentes` do preparo (`teto de leituras`) e, depois, em `cobertura.pendentes` da montagem. Fora do modo `tarefas`, ou se não for inteiro maior que zero, 400 `max-tarefas-invalido`.",
                     "type": "integer",
                     "minimum": 1
+                  },
+                  "senha": {
+                    "description": "Senha dos arquivos protegidos do envio (PDF com senha de abertura, Office e ODF), válida nos modos `leitura` e `tarefas`. Vale para cada arquivo do envio que pede senha e é ignorada nos outros. Decifra uma cópia temporária só para a leitura; a montagem, a releitura ampliada e `codigo=sim` trabalham sobre ela, sem pedir a senha de novo. Senha errada: 422 `senha-incorreta`. Depois de 5 senhas erradas para o mesmo arquivo (ou 50 no token) em 15 min, as tentativas seguintes recebem 429 `tentativas-de-senha` com `Retry-After`. Cifra que o Lince não decifra: 422 `arquivo-protegido` com o motivo em `detail`. Acima de 1024 caracteres: 400 `senha-invalida`. A senha não é guardada, registrada nem devolvida.",
+                    "type": "string",
+                    "maxLength": 1024,
+                    "writeOnly": true
                   }
                 }
               },
@@ -777,7 +783,7 @@
         }
       },
       "Limite": {
-        "description": "Limite do token (RFC 9457): documentos pendentes (`limite-pendentes`) ou resultados esperando entrega (`limite-retencao`, 1 GiB por padrão, ou o teto do token). Retry-After diz quando tentar de novo: na retenção, quando vence o próximo resultado que o token não buscou (buscar ou apagar uma sessão libera na hora).",
+        "description": "Limite do token (RFC 9457): documentos pendentes (`limite-pendentes`) resultados esperando entrega (`limite-retencao`, 1 GiB por padrão, ou o teto do token) ou senhas erradas demais (`tentativas-de-senha`: 5 por arquivo ou 50 por token em 15 min). Retry-After diz quando tentar de novo: na retenção, quando vence o próximo resultado que o token não buscou (buscar ou apagar uma sessão libera na hora); nas senhas, quando a senha errada mais antiga da janela vence.",
         "headers": {
           "X-Request-Id": {
             "$ref": "#/components/headers/RequestId"
@@ -1337,7 +1343,7 @@
         "properties": {
           "type": {
             "type": "string",
-            "description": "`urn:lince:erro:<codigo>`, estável para tratar no código (ex.: nao-autorizado, limite-pendentes, sessao-nao-encontrada, idempotency-key-reutilizada, plano-invalido, plano-de-outra-chave, rota-inexistente, metodo-nao-permitido, interno)."
+            "description": "`urn:lince:erro:<codigo>`, estável para tratar no código (ex.: nao-autorizado, limite-pendentes, sessao-nao-encontrada, idempotency-key-reutilizada, plano-invalido, plano-de-outra-chave, arquivo-protegido, senha-incorreta, tentativas-de-senha, senha-invalida, rota-inexistente, metodo-nao-permitido, interno)."
           },
           "title": {
             "type": "string"
@@ -1369,6 +1375,14 @@
             "type": "integer",
             "minimum": 0,
             "description": "Teto de retenção do token (`limite-retencao`)."
+          },
+          "arquivo": {
+            "type": "string",
+            "description": "Nome do arquivo do envio a que o erro se refere (`arquivo-protegido`, `senha-incorreta`, `tentativas-de-senha`)."
+          },
+          "formato": {
+            "type": "string",
+            "description": "Formato do arquivo protegido por senha, como `pdf`, `docx`, `xlsx`, `doc`, `xls`, `ppt`, `odt` (`arquivo-protegido`, `senha-incorreta`)."
           }
         }
       },

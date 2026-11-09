@@ -24,6 +24,7 @@ PERMITIDAS = {
     "ISC",
     "PSF-2.0",
     "0BSD",
+    "MIT-0",  # a MIT sem a exigência de manter o aviso: mais permissiva que ela (o cffi, desde a 2.1)
     "Zlib",
     "Unlicense",
     "BSL-1.0",  # Boost: permissiva, sem copyleft (a biblioteca Clipper, dentro do pyclipper)

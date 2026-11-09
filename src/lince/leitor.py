@@ -28,6 +28,7 @@ from .montagem import SAIDA_MAX, montar, tamanho_da_saida
 from .office import planejar_office
 from .pagina_html import planejar_html, planejar_svg
 from .pdf import de_pe, pagina_visivel, planejar_pdf
+from .protecao import DocumentoProtegido, aberto, formato_protegido
 from .provedores import LeitorVisual
 from .tipos import Cobertura, Plano, PrazoEsgotado, Resultado, Uso
 
@@ -101,6 +102,8 @@ class Leitor:
         return self._planejar(str(caminho), str(pasta))
 
     def _planejar(self, caminho, pasta):
+        if formato := formato_protegido(caminho):  # nada é lido nem vai para a IA: quem chama pede a senha
+            raise DocumentoProtegido(formato)
         os.makedirs(f"{pasta}/ia", exist_ok=True)
         nome_diz = os.path.splitext(caminho)[1].lower()
         if nome_diz not in (".pdf", *IMAGEM, *TEXTO, *HTML, *SVG) and zipfile.is_zipfile(caminho):
@@ -142,23 +145,29 @@ class Leitor:
         return plano
 
     # ------------------------------------------------------------------ leitura
-    def ler(self, caminho: str | Path, prazo: float | None = None) -> Resultado:
+    def ler(self, caminho: str | Path, prazo: float | None = None, senha: str | None = None) -> Resultado:
         """`prazo`: segundos, a partir de agora, para o documento (o chat lê com prazo; a base, sem). A extração
         nativa conta: no PDF, a página que começa depois do prazo entra só com o texto, e a faixa de páginas que não
         cabe nele não é lida (pendências registradas; a primeira faixa sempre entra).
         Nenhuma leitura pela IA começa depois do prazo, e a que está em curso no `OpenAICompativel` é cortada (com a
         folga da rede), sem novas tentativas: o que não coube vira a pendência "prazo esgotado" e o texto nativo sai
-        completo. Provedor próprio lê o que sobra em `lince.prazo_restante()`."""
+        completo. Provedor próprio lê o que sobra em `lince.prazo_restante()`.
+
+        `senha`: abre o arquivo protegido por senha (PDF, Office, ODF), decifrado numa cópia temporária só para esta
+        leitura; sem ela, o arquivo protegido levanta `DocumentoProtegido`, e com a senha errada, `SenhaIncorreta`. A
+        senha não é guardada, e as leituras do documento protegido não entram no cache. No arquivo sem senha, é
+        ignorada."""
         if prazo is not None and not (math.isfinite(prazo) and prazo > 0):
             raise ValueError("prazo precisa ser um número de segundos maior que zero")
         token = LIMITE.set(time.monotonic() + prazo if prazo is not None else None)
         try:
-            return self._ler(caminho)
+            return self._ler(caminho, senha)
         finally:
             LIMITE.reset(token)
 
-    def _ler(self, caminho):
+    def _ler(self, caminho, senha):
         with tempfile.TemporaryDirectory(prefix="lince-") as pasta:
+            caminho, protegido = _com_senha(caminho, senha, pasta)
             plano = self.planejar(caminho, pasta)
             cobertura = Cobertura(
                 paginas=_paginas(plano),
@@ -171,33 +180,35 @@ class Leitor:
             if self.max_leituras is not None and len(tarefas) > self.max_leituras:
                 cobertura.pendentes += [f"{t['id']}: teto de leituras" for t in tarefas[self.max_leituras :]]
                 tarefas = tarefas[: self.max_leituras]
-            respostas, usos = self._ler_tarefas(plano, tarefas, pasta, cobertura)
+            respostas, usos = self._ler_tarefas(plano, tarefas, pasta, cobertura, com_cache=not protegido)
             if self.esforco == "max" and self.ia is not None and plano["tipo"] == "pdf" and not _vencido():
                 respostas = distribuir_lotes(plano, respostas)
                 usos += self._segunda_passada(str(caminho), plano, respostas, cobertura)
             return _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias=self.ia is not None)
 
     # ------------------------------------------------------------------ em duas fases (a IA é de quem chama)
-    def preparar(self, caminho: str | Path, prazo: float | None = None) -> Plano:
+    def preparar(self, caminho: str | Path, prazo: float | None = None, senha: str | None = None) -> Plano:
         """Fase 1: extrai o texto e devolve as leituras que a IA precisa fazer, sem chamar modelo nenhum. Quem chama
         lê cada `TarefaVisual` com o seu modelo (custo, roteamento, cache e cancelamento são dele) e passa as respostas
         para `concluir`. O teto `max_leituras` vale aqui: o que passar dele fica nas pendências. `prazo` vale para a
         extração, como em `ler`: no PDF, a página que começa depois dele entra só com o texto, e a faixa que não cabe
-        nele não é lida."""
+        nele não é lida. `senha` abre o arquivo protegido, como em `ler`; o plano não a guarda, e `concluir` não a
+        pede."""
         if prazo is not None and not (math.isfinite(prazo) and prazo > 0):
             raise ValueError("prazo precisa ser um número de segundos maior que zero")
         token = LIMITE.set(time.monotonic() + prazo if prazo is not None else None)
         try:
-            return self._preparar(caminho)
+            return self._preparar(caminho, senha)
         finally:
             LIMITE.reset(token)
 
-    def _preparar(self, caminho):
+    def _preparar(self, caminho, senha):
         from PIL import Image
 
         from .tipos import TarefaVisual
 
         with tempfile.TemporaryDirectory(prefix="lince-") as pasta:
+            caminho, _ = _com_senha(caminho, senha, pasta)
             plano = self.planejar(caminho, pasta)
             tarefas, pendentes = plano.get("tarefas", []), []
             if self.max_leituras is not None and len(tarefas) > self.max_leituras:
@@ -254,7 +265,7 @@ class Leitor:
         cobertura.leituras_ia = len(respostas.keys() - cortadas)
         return r
 
-    def _ler_tarefas(self, plano, tarefas, pasta, cobertura):
+    def _ler_tarefas(self, plano, tarefas, pasta, cobertura, com_cache=True):
         respostas, usos = {}, []
         if not tarefas:
             return respostas, usos
@@ -271,10 +282,10 @@ class Leitor:
             # a chave é o que muda a resposta: imagem, instrução, modelo e versão do prompt (não a versão do pacote,
             # senão cada release leria e pagaria tudo de novo)
             k = chave(img, instr, getattr(self.ia, "identidade", self.ia.modelo), VERSAO_PROMPT)
-            if (txt := self._cache_obter(k)) is not None:
+            if com_cache and (txt := self._cache_obter(k)) is not None:
                 return t["id"], txt, Uso(self.ia.modelo, cache=True, tarefa=t["id"])
             r = self.ia.ler(img, instr)
-            if resposta_aproveitavel(plano, t["id"], r.texto):
+            if com_cache and resposta_aproveitavel(plano, t["id"], r.texto):
                 self._cache_guardar(k, r.texto)
             r.uso.tarefa = t["id"]
             return t["id"], r.texto, r.uso
@@ -562,9 +573,18 @@ def _vencido() -> bool:
     return (restante := prazo_restante()) is not None and restante <= 0
 
 
-def ler(caminho: str | Path, prazo: float | None = None, **opcoes) -> Resultado:
+def ler(caminho: str | Path, prazo: float | None = None, senha: str | None = None, **opcoes) -> Resultado:
     """Atalho: `lince.ler("arquivo.pdf", ia=OpenAICompativel(...))`."""
-    return Leitor(**opcoes).ler(caminho, prazo=prazo)
+    return Leitor(**opcoes).ler(caminho, prazo=prazo, senha=senha)
+
+
+def _com_senha(caminho, senha, pasta) -> tuple[str, bool]:
+    """O arquivo a ler e se ele estava protegido. Com senha, o protegido é decifrado numa subpasta da leitura (apagada
+    com ela, com o mesmo nome do arquivo); sem senha, a detecção do `planejar` é que recusa."""
+    if senha is None:
+        return str(caminho), False
+    lido = aberto(caminho, senha, os.path.join(pasta, "aberto"))
+    return lido, lido != str(caminho)
 
 
 def _texto(caminho):
