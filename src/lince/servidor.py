@@ -33,7 +33,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from . import antivirus
+from . import antivirus, memoria
 from . import codigo as codigo_doc
 from .cache import CacheComEscopo, CacheRedis
 from .leitor import FORMATOS, VERSAO, Leitor
@@ -595,13 +595,17 @@ class _Envelope:
 def criar_app(
     tokens: list[str], clamav: tuple[str, int] | None = None, cache=None, segredo: bytes | None = None
 ) -> Starlette:
+    memoria.ajustar_alocador()  # buffer grande vem de mmap e volta inteiro ao sistema (memoria.py)
     s = Servico(tokens)
     s.clamav, s.cache = clamav, cache
     if segredo:  # o mesmo em todas as réplicas: o plano de uma monta em qualquer outra
         s.segredo_plano = segredo
 
     async def saude(request):
-        return JSONResponse({"status": "ok", "versao": VERSAO, "contrato": CONTRATO["info"]["version"]})
+        corpo = {"status": "ok", "versao": VERSAO, "contrato": CONTRATO["info"]["version"]}
+        if (residente := memoria.rss()) is not None:
+            corpo["memoria"] = {"rss_bytes": residente}
+        return JSONResponse(corpo)
 
     async def contrato(request):
         return JSONResponse(CONTRATO)
@@ -898,6 +902,8 @@ def criar_app(
             while True:
                 await asyncio.sleep(LIMPEZA_INTERVALO)
                 s.limpar()
+                # a memória que as leituras liberaram volta ao sistema: uma vez por intervalo, fora de trava e do laço
+                await asyncio.to_thread(memoria.devolver)
 
         tarefa = asyncio.create_task(laco())
         yield
