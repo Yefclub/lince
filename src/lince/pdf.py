@@ -7,6 +7,7 @@ import json  # noqa: F401
 import math
 import os  # noqa: F401
 import re  # noqa: F401
+import threading
 import time
 import zipfile  # noqa: F401
 from collections import defaultdict, deque
@@ -58,6 +59,24 @@ CELULA = 8
 # multiplica o percurso. Página real tem poucos milhares; acima do teto, ela entra só com o texto, com a pendência e o
 # alerta de texto oculto não conferido, e o próximo PDF não espera.
 OBJETOS_MAX = 100_000
+# Tempo da análise em Python de uma página, que roda fora da trava: página real leva dezenas de milissegundos; a hostil
+# (dezenas de milhares de desenhos espaçados, milhares de invisíveis sobre milhares de imagens, fórmula enorme) levaria
+# de segundos a minutos, prendendo o worker e dividindo a GIL com os outros documentos. Passou dele, a página entra só
+# com o texto, com a pendência e o alerta de texto oculto não conferido, e a leitura segue na próxima.
+ANALISE_PAGINA_S = 3.0
+_ANALISE = threading.local()
+
+
+class _AnaliseLonga(Exception):
+    """A análise da página passou de ANALISE_PAGINA_S."""
+
+
+def _tique():
+    """Conferido nos laços da análise da página que crescem mais que linear no que a página tem."""
+    if (fim := getattr(_ANALISE, "fim", None)) is not None and time.monotonic() > fim:
+        raise _AnaliseLonga
+
+
 # Teto de pixels dos fundos guardados de uma vez: a coleta das páginas de uma vez fica na memória até a análise de cada
 # uma, e uma folha gigante tem um fundo de até LADO_MAX_PX × LADO_MAX_PX (300 MB em RGB). 20 milhões (~60 MB) cobrem
 # as 50 páginas A4 de uma faixa (0,13 milhão cada); passando dele, a vez acaba, e a página seguinte fica para a próxima.
@@ -96,6 +115,7 @@ def regioes_vetoriais(objs, W, H):
     # união por proximidade (12 pt)
     grupos = []
     for bx in caixas:
+        _tique()
         bx = list(bx)
         mudou = True
         while mudou:
@@ -174,8 +194,19 @@ def planejar_pdf(path, pasta):
                     paginas.append(_so_o_texto(i, md_de.get(i, "")))
                     recorte = None
                 else:
-                    info, recorte = _pagina(doc, i, col, md_de.get(i, ""), i in ocr, itens_de.get(i, []), pasta,
-                                            tarefas, cache, seguranca, pendentes)  # fmt: skip
+                    marcas = len(seguranca), len(pendentes), len(tarefas), set(cache)
+                    _ANALISE.fim = time.monotonic() + ANALISE_PAGINA_S
+                    try:
+                        info, recorte = _pagina(doc, i, col, md_de.get(i, ""), i in ocr, itens_de.get(i, []), pasta,
+                                                tarefas, cache, seguranca, pendentes)  # fmt: skip
+                    except _AnaliseLonga:  # a página não deixa rastro: entra só com o texto, como no teto
+                        del seguranca[marcas[0] :], pendentes[marcas[1] :], tarefas[marcas[2] :]
+                        for chave in set(cache) - marcas[3]:
+                            del cache[chave]
+                        info, recorte = _so_o_texto(i, md_de.get(i, "")), None
+                        _marcar(so_texto, i, i + 1, f"análise da página passou de {ANALISE_PAGINA_S:g} s")
+                    finally:
+                        _ANALISE.fim = None
                     paginas.append(info)
                 k += 1
                 ultima = k == len(fila) and (parada is not None or faixa[-1] + 1 == lidas)
@@ -529,7 +560,8 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     # Imagens vizinhas viram um grupo: texto fatiado em imagens ("Version 8 –
     # March 2025" da capa da Falcon são 6 fatias) e logotipo pequeno contam.
     imgs = [list(bx) for tipo, bx in objs if tipo == c.FPDF_PAGEOBJ_IMAGE]
-    ocultos = texto_oculto_pdf(col["fundo"], [x for x in itens_pg if not x.text.startswith("[Image:")], imgs, W, H)
+    itens_txt = [x for x in itens_pg if not x.text.startswith("[Image:")]
+    ocultos = texto_oculto_pdf(col["fundo"], itens_txt, imgs, W, H, tique=_tique)
     alt = col["texto"] if eh_ocr else ""
     vistos = re.sub(r"\s+", " ", " ".join(x.text for x in itens_pg)).lower()
     sobrou = []
@@ -554,6 +586,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     regioes = []
     grupos = []
     for bx in imgs:
+        _tique()
         mudou = True
         while mudou:
             mudou = False
@@ -595,6 +628,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
             pendentes.append(alerta)
     # Tabela nativa duvidosa: recorte da tabela vai para a IA (com o nativo como âncora).
     for k, tb in enumerate(tabelas):
+        _tique()
         if not tb["complexa"]:
             continue
         dentro = [
@@ -612,6 +646,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
             tabela_de[id(caixa)] = k
             regioes.append(("tabela", caixa))
     for g in regioes_vetoriais(objs, W, H):
+        _tique()
         if any(_sobrepoe(g, rr) > 0.5 for tp, rr in regioes if tp == "imagem"):
             continue
         # desenho sobre "tabela duvidosa": a tabela eram os rótulos do gráfico — o desenho fica
@@ -642,6 +677,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
         mudou = False
         des = [k for k, (tp, _) in enumerate(regioes) if tp == "desenho"]
         for a in des:
+            _tique()
             for b in des:
                 if a < b:
                     A, Bx = regioes[a][1], regioes[b][1]
@@ -658,6 +694,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     # Tabela nativa que cai quase toda dentro de um gráfico são os rótulos dele: sai do texto
     # (a leitura do gráfico traz os valores no lugar certo).
     for k, tb in enumerate(tabelas):
+        _tique()
         caixas = [g for tp, g in regioes if tp in ("desenho", "imagem")]
         itens_tb = [
             x
@@ -690,6 +727,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     if formulas and not precisa_pagina:
         itens_txt = [x for x in itens_pg if not x.text.startswith("[Image:")]
         for bloco in formulas:
+            _tique()
             limpo = re.sub(r"</?su[bp]>|[*_]", "", bloco)
             dentro = [x for x in itens_txt if len(x.text.strip()) >= 1 and x.text.strip() in limpo]
             if not dentro:

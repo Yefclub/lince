@@ -665,6 +665,9 @@ def _invisiveis(monkeypatch):
     ],
 )
 def test_analise_da_pagina_hostil_nao_segura_a_trava(tmp_path, monkeypatch, caso):
+    # o teto de tempo da análise cortaria a página hostil: aqui ela é analisada inteira, para provar que a análise
+    # longa, fora da trava, não faz o PDF pequeno esperar
+    monkeypatch.setattr(pdf_mod, "ANALISE_PAGINA_S", 600)
     if caso == "fórmula":
         p = _formula(tmp_path / "formula.pdf", 24_000)
     elif caso == "desenhos espaçados":
@@ -739,3 +742,25 @@ def test_so_a_pdfium_roda_com_a_trava(tmp_path, monkeypatch):
     assert len(com_a_trava["extract_pages_markdown_bytes"]) == 2  # a faixa e a cópia sem o oculto
     assert len(com_a_trava["_coincide"]) and len(com_a_trava["save"]) > 3
     assert {nome: any(v) for nome, v in com_a_trava.items()} == dict.fromkeys(com_a_trava, False)
+
+
+def test_analise_longa_da_pagina_entra_so_com_o_texto_sem_rastro(tmp_path, monkeypatch):
+    p = tmp_path / "planta.pdf"
+    lado = 100 * 30 + 40
+    c = canvas.Canvas(str(p), pagesize=(lado, lado))
+    c.drawString(20, lado - 20, "Planta baixa do galpão.")
+    for i in range(100):  # 10 mil desenhos espaçados: nenhum se junta, o agrupamento é quadrático
+        for j in range(100):
+            c.rect(20 + 30 * i, 20 + 30 * j, 3, 3, fill=1)
+    c.showPage()
+    c.drawString(60, 800, "Memorial descritivo.")
+    c.save()
+    monkeypatch.setattr(pdf_mod, "ANALISE_PAGINA_S", 0.05)
+    inicio = time.monotonic()
+    r = lince.Leitor().ler(p)
+    assert time.monotonic() - inicio < 3
+    assert "Memorial descritivo." in r.markdown  # o pdf_inspector não tira texto da planta, com ou sem o teto
+    assert r.cobertura.rotas[1] == "nativa" and not any(x.startswith("p001") for x in r.cobertura.pendentes)
+    assert any("página 1: só o texto" in x and "análise da página passou" in x for x in r.cobertura.pendentes)
+    assert any(a.startswith("texto oculto não conferido: página 1") for a in r.metadados.get("alertas_injecao", []))
+    assert not any("página 2" in x for x in r.cobertura.pendentes)  # a seguinte é analisada normalmente

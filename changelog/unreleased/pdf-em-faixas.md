@@ -62,3 +62,8 @@ Agora as duas levam centésimos. A decisão continua pelo vocabulário do docume
 aparece sozinha no texto ou quando o par aparece em outro lugar como duas partes de uma palavra hifenizada
 ("propellant- based" com "propellant-based"). O par precisa aparecer inteiro: "co- op" vira "coop" mesmo com
 "co-operation" no texto, onde antes bastava "co-op" estar dentro de outra palavra.
+
+**Página que levaria tempo demais para analisar.** A análise da página, que agora roda fora da vez da PDFium, tem
+3 s por página: uma página montada para travar a leitura (dezenas de milhares de desenhos espaçados, milhares de
+textos invisíveis sobre milhares de imagens) entra só com o texto, com a pendência e o alerta de texto oculto não
+conferido, e a leitura segue na próxima página.

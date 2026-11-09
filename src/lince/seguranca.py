@@ -53,7 +53,7 @@ def alertas_injecao(txt):
     return sorted(set(out))[:20]
 
 
-def texto_oculto_pdf(fundo, itens, imgs, W, H):
+def texto_oculto_pdf(fundo, itens, imgs, W, H, tique=None):
     """Texto que a IA leria e o humano não vê: invisível fora de imagem (OCR legítimo fica),
     fonte < 2,5 pt, fora da página, ou cor de texto ≈ cor do fundo. Devolve (motivo, item): quem chama tira o item do
     corpo pela posição dele, nunca procurando o texto (um texto visível igual ao oculto fica).
@@ -63,6 +63,8 @@ def texto_oculto_pdf(fundo, itens, imgs, W, H):
     esc = escala(W, H, 0.5)
     ocultos = []
     for x in itens:
+        if tique:  # quem chama limita o tempo da análise da página (pdf.py)
+            tique()
         motivo = None
         if x.render_mode == 3 and not any(b[0] - 2 <= x.x <= b[2] + 2 and b[1] - 2 <= x.y <= b[3] + 2 for b in imgs):
             motivo = "invisível"
