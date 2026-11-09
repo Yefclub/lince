@@ -8,14 +8,15 @@ import re  # noqa: F401
 import zipfile  # noqa: F401
 from xml.etree import ElementTree as ET  # noqa: F401
 
-from .agrupamento import distribuir_lotes, tamanhos_distribuidos
+from .agrupamento import por_tarefa
 from .seguranca import alertas_injecao
 from .texto import NUM_PAGINA, sem_repeticao
 
 # Caracteres que a montagem escreve, o texto nativo junto. A leitura de uma imagem repetida entra uma vez, e as outras
 # posições levam só a referência: em 16 Mi cabem as 2.000 páginas que o PDF analisa (PAGINAS_ANALISE_MAX) com 8 mil
-# caracteres cada. Acima do teto, as leituras que não couberem ficam pendentes e o nativo sai inteiro. O teto segura o
-# resultado em JSON (até 4 bytes por caractere) em 64 MB, um quarto do que um token pode reter no servidor.
+# caracteres cada. O teto vale para as leituras: as que não couberem com o nativo ficam pendentes, e o texto nativo sai
+# inteiro mesmo que, sozinho, passe dele. O teto segura o resultado em JSON (até 4 bytes por caractere) em 64 MB, um
+# quarto do que um token pode reter no servidor.
 SAIDA_MAX = 16 * 1024 * 1024
 REPETIDA = "_(mesma imagem lida acima: {})_"  # nas outras posições da mesma imagem: a leitura está na âncora citada
 
@@ -78,15 +79,31 @@ def _limpar(t: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", t)
 
 
+def _lidas(plano, respostas, ler) -> dict:
+    """{tarefa: o que `ler(chave)` dá para ela}, na ordem de distribuir_lotes: a resposta avulsa primeiro e o lote por
+    cima, item a item."""
+    lotes = plano.get("lotes") or {}
+    R = {}
+    for chave in [k for k in respostas if k not in lotes] + [lid for lid in lotes if lid in respostas]:
+        R.update(ler(chave))
+    return R
+
+
+def _textos(plano, chave, resposta) -> dict[str, str]:
+    """O texto que a montagem escreve para cada tarefa da resposta `chave`: o item do lote tirado do JSON e a trava de
+    repetição. A mesma função para montar e para medir antes (tamanho_da_saida): a estimativa mede o texto real."""
+    return {tid: sem_repeticao(t).strip() for tid, t in por_tarefa(plano, chave, resposta).items()}
+
+
 def montar(pasta, respostas):
     plano = json.load(open(f"{pasta}/plano.json", encoding="utf-8"))
-    R = {k: sem_repeticao(v) for k, v in distribuir_lotes(plano, respostas).items()}
+    R = _lidas(plano, respostas, lambda chave: _textos(plano, chave, respostas[chave]))
     iguais = plano.get("iguais", {})  # a mesma imagem em outro lugar: a mesma leitura
     marca = os.urandom(8).hex()  # a âncora provisória que o documento não tem como imitar
 
     def lido(tid):
         leitora = iguais.get(tid, tid)
-        return R.get(leitora if leitora in R else tid, "").strip()
+        return R.get(leitora if leitora in R else tid, "")
 
     def bloco_ia(tid, rotulo):
         # provisório até o corpo estar pronto: na ordem do texto, a primeira posição recebe a leitura e as outras a
@@ -329,16 +346,24 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
     return {c for _, c in tirar.values()}
 
 
-def tamanho_da_saida(e, respostas, lotes_lidos=None) -> int:
+def tamanho_da_saida(e, respostas, medidas=None) -> int:
     """Quanto texto a montagem vai escrever, no máximo: cada marca vira a leitura (a da mesma imagem repetida entra uma
     vez, e as outras posições, a referência) ou a tabela e a fórmula nativas, e cada página leva o comentário e as
-    junções. Conta antes de montar, para a saída ter teto como a entrada tem. `lotes_lidos` guarda o tamanho dos itens
-    de cada lote entre chamadas com as mesmas respostas (a busca do que cabe)."""
+    junções. Conta antes de montar, para a saída ter teto como a entrada tem, com o texto de cada leitura medido como a
+    montagem o escreve (_textos). `medidas` guarda esse tamanho por chave de resposta entre chamadas com as mesmas
+    respostas (a busca do que cabe), para cada uma ser lida uma vez só."""
     if e.get("tipo") == "imagem":  # a imagem solta sai como as leituras das faixas, uma depois da outra
         return sum(len(respostas.get(t["id"], "")) + 2 for t in e.get("tarefas", []))
     from collections import Counter
 
-    R = tamanhos_distribuidos(e, respostas, {} if lotes_lidos is None else lotes_lidos)  # como a montagem escreve
+    medidas = {} if medidas is None else medidas
+
+    def medir(chave):
+        if chave not in medidas:
+            medidas[chave] = {tid: len(t) for tid, t in _textos(e, chave, respostas[chave]).items()}
+        return medidas[chave]
+
+    R = _lidas(e, respostas, medir)
     iguais, contadas = e.get("iguais", {}), set()
 
     def cheia(tid):  # a leitura, a âncora "<!-- lido pela IA: id -->" e as junções em volta dela
