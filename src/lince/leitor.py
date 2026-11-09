@@ -27,7 +27,7 @@ from .metadados import metadados_arquivo
 from .montagem import SAIDA_MAX, montar, tamanho_da_saida
 from .office import planejar_office
 from .pagina_html import planejar_html, planejar_svg
-from .pdf import planejar_pdf
+from .pdf import pagina_visivel, planejar_pdf
 from .provedores import LeitorVisual
 from .tipos import Cobertura, Plano, PrazoEsgotado, Resultado, Uso
 
@@ -103,9 +103,8 @@ class Leitor:
     def _planejar(self, caminho, pasta):
         os.makedirs(f"{pasta}/ia", exist_ok=True)
         ext = _extensao_lida(caminho)
-        if ext == ".pdf":
-            with PDFIUM:  # só a PDFium é serial: Office, HTML e texto de outros documentos seguem em paralelo
-                plano = planejar_pdf(caminho, pasta)
+        if ext == ".pdf":  # a trava da PDFium vai em vezes curtas: Office, HTML, texto e outros PDFs seguem em paralelo
+            plano = planejar_pdf(caminho, pasta)
         elif ext in IMAGEM:
             plano = _plano_imagem(caminho, pasta)
         elif ext in TEXTO:
@@ -120,7 +119,7 @@ class Leitor:
             plano = planejar_office(caminho, pasta, ext)
         plano["arquivo"] = os.path.basename(caminho)
         plano["meta_arquivo"] = metadados_arquivo(caminho, ext)
-        if plano.get("propriedades"):  # HTML e SVG já tiram as propriedades no mesmo parse do corpo
+        if plano.get("propriedades"):  # HTML, SVG e PDF já tiram as propriedades na leitura do corpo
             plano["meta_arquivo"]["propriedades"] = plano.pop("propriedades")
         if plano.get("ilegiveis"):
             plano["meta_arquivo"].setdefault("partes_ilegiveis", []).extend(plano["ilegiveis"])
@@ -143,7 +142,8 @@ class Leitor:
     # ------------------------------------------------------------------ leitura
     def ler(self, caminho: str | Path, prazo: float | None = None) -> Resultado:
         """`prazo`: segundos, a partir de agora, para o documento (o chat lê com prazo; a base, sem). A extração
-        nativa conta: no PDF, a página que começa depois do prazo entra só com o texto (pendência registrada).
+        nativa conta: no PDF, a página que começa depois do prazo entra só com o texto, e a faixa de páginas que não
+        cabe nele não é lida (pendências registradas; a primeira faixa sempre entra).
         Nenhuma leitura pela IA começa depois do prazo, e a que está em curso no `OpenAICompativel` é cortada (com a
         folga da rede), sem novas tentativas: o que não coube vira a pendência "prazo esgotado" e o texto nativo sai
         completo. Provedor próprio lê o que sobra em `lince.prazo_restante()`."""
@@ -159,7 +159,7 @@ class Leitor:
         with tempfile.TemporaryDirectory(prefix="lince-") as pasta:
             plano = self.planejar(caminho, pasta)
             cobertura = Cobertura(
-                paginas=len(plano.get("paginas", [])) or 1,
+                paginas=_paginas(plano),
                 rotas={p["i"] + 1: p["rota"] for p in plano.get("paginas", [])},
             )
             cobertura.pendentes += plano.get("pendentes", [])
@@ -180,7 +180,8 @@ class Leitor:
         """Fase 1: extrai o texto e devolve as leituras que a IA precisa fazer, sem chamar modelo nenhum. Quem chama
         lê cada `TarefaVisual` com o seu modelo (custo, roteamento, cache e cancelamento são dele) e passa as respostas
         para `concluir`. O teto `max_leituras` vale aqui: o que passar dele fica nas pendências. `prazo` vale para a
-        extração, como em `ler`: no PDF, a página que começa depois dele entra só com o texto."""
+        extração, como em `ler`: no PDF, a página que começa depois dele entra só com o texto, e a faixa que não cabe
+        nele não é lida."""
         if prazo is not None and not (math.isfinite(prazo) and prazo > 0):
             raise ValueError("prazo precisa ser um número de segundos maior que zero")
         token = LIMITE.set(time.monotonic() + prazo if prazo is not None else None)
@@ -234,9 +235,8 @@ class Leitor:
         ids = {t.id for t in plano.tarefas}
         respostas = {k: v for k, v in (respostas or {}).items() if k in ids and isinstance(v, str)}
         cobertura = Cobertura(
-            paginas=len(estado.get("paginas", [])) or 1,
+            paginas=_paginas(estado),
             rotas={p["i"] + 1: p["rota"] for p in estado.get("paginas", [])},
-            leituras_ia=len(respostas),
         )
         cobertura.pendentes += estado.get("pendentes", []) + list(plano.pendentes)
         cobertura.pendentes += [f"{t.id}: sem resposta" for t in plano.tarefas if t.id not in respostas]
@@ -245,7 +245,12 @@ class Leitor:
         with tempfile.TemporaryDirectory(prefix="lince-") as pasta:
             with open(f"{pasta}/plano.json", "w", encoding="utf-8") as f:
                 json.dump(estado, f, ensure_ascii=False)
-            return _resultado(pasta, estado, respostas, cobertura, [], conferir_vazias=True)
+            r = _resultado(pasta, estado, respostas, cobertura, [], conferir_vazias=True)
+        # as leituras que entraram no texto: o teto de saída tira as outras, e a resposta vazia não entra
+        fora = (": resultado grande demais", ": resposta vazia da IA")
+        cortadas = {p.split(":", 1)[0] for p in cobertura.pendentes if p.endswith(fora)}
+        cobertura.leituras_ia = len(respostas.keys() - cortadas)
+        return r
 
     def _ler_tarefas(self, plano, tarefas, pasta, cobertura):
         respostas, usos = {}, []
@@ -321,16 +326,18 @@ class Leitor:
         alvos = [t for t in plano.get("tarefas_originais", []) if "caixa" in t and _precisa_rever(R.get(t["id"], ""))]
         if not alvos:
             return []
-        usos = []
-        with PDFIUM:
+        usos, preparados = [], []
+        with PDFIUM:  # aberto uma vez só: um PDF danificado não reconstrói a tabela de referências a cada recorte
             doc = pdfium.PdfDocument(caminho)
-            preparados = []
-            try:  # fechado dentro da trava, mesmo com exceção: o finalizador da PDFium não roda fora dela
-                for t in alvos:  # renderizar em 4–8x custa: para assim que o prazo vence
-                    if _vencido():
-                        break
-                    preparados.append((t, _recortes_ampliados(doc, t, io)))
-            finally:
+        try:
+            for t in alvos:  # renderizar em 4–8x custa: para assim que o prazo vence
+                if _vencido():
+                    break
+                with PDFIUM:  # uma renderização por vez: outro PDF entra entre elas (a trava é justa)
+                    img = _ampliada(doc, t)
+                preparados.append((t, _recortes_ampliados(img, io)))  # o recorte e o PNG, fora da trava
+        finally:
+            with PDFIUM:  # fechado dentro da trava, mesmo com exceção: o finalizador da PDFium não roda fora dela
                 doc.close()
 
         def um(item):
@@ -368,15 +375,25 @@ class Leitor:
         return usos
 
 
-def _recortes_ampliados(doc, t, io):
-    """Recorte da tarefa em 2–3x a resolução da 1ª leitura, fatiado para caber no limite do provedor."""
-    page = doc[t["pagina"]]
-    W, H = page.get_size()
-    l, b, r, tp = t["caixa"]
-    l, b, r, tp = max(0, l), max(0, b), min(W, r), min(H, tp)
-    lado = max(r - l, tp - b) or 1
-    esc = min(min(8.0, max(4.0, 3000 / lado)), LADO_MAX_PX / lado)
-    img = page.render(scale=esc, crop=(l, b, W - r, H - tp)).to_pil().convert("RGB")
+def _ampliada(doc, t):
+    """A caixa da tarefa renderizada em 2–3x a resolução da 1ª leitura (no máximo LADO_MAX_PX) e convertida pelo
+    Pillow: uma cópia, que não depende mais da PDFium. Chamar com a trava; a página vale pela mesma caixa da 1ª
+    leitura e é fechada aqui."""
+    page = pagina_visivel(doc, t["pagina"])
+    try:
+        W, H = page.get_size()
+        l, b, r, tp = t["caixa"]
+        l, b, r, tp = max(0, l), max(0, b), min(W, r), min(H, tp)
+        lado = max(r - l, tp - b) or 1
+        esc = min(min(8.0, max(4.0, 3000 / lado)), LADO_MAX_PX / lado)
+        return page.render(scale=esc, crop=(l, b, W - r, H - tp)).to_pil().convert("RGB")
+    finally:
+        page.close()
+
+
+def _recortes_ampliados(img, io):
+    """O recorte ampliado (`_ampliada`) fatiado para caber no limite do provedor, em PNG. Sem a PDFium: roda fora da
+    trava."""
     partes, n = [], max(1, -(-max(img.width, img.height) // 1500))
     for k in range(n):
         if img.height >= img.width:
@@ -419,10 +436,36 @@ def _avisar_cache(e):
 def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
     """O fim da leitura, igual com a IA do Lince ou com a de quem chama: pendência de resposta vazia, montagem do
     texto e dos metadados, estrutura."""
-    if respostas and tamanho_da_saida(plano, respostas) > SAIDA_MAX:
-        # as leituras copiadas em cada lugar em que entram estourariam a memória: fica o texto nativo, com o motivo
-        cobertura.pendentes += [f"{tid}: resultado grande demais" for tid in respostas]
+
+    def montado(respostas):  # o texto e os metadados com estas respostas
+        if plano["tipo"] == "imagem":
+            md = "\n\n".join(respostas.get(t["id"], "") for t in plano["tarefas"])
+            return md, dict(plano.get("meta_arquivo") or {})
+        md = montar(pasta, respostas)
+        return md, json.loads(Path(f"{pasta}/metadados.json").read_text(encoding="utf-8"))
+
+    posicao = {t["id"]: k for k, t in enumerate(plano.get("tarefas", []))}
+    ordem = sorted(respostas, key=lambda tid: posicao.get(tid, len(posicao)))  # a ordem do plano
+    medidas = {}  # o texto de cada resposta é medido uma vez na busca do que cabe
+    if respostas and tamanho_da_saida(plano, respostas, medidas) > SAIDA_MAX:
+        # acima do teto de saída, entram as leituras que cabem, na ordem do plano; as outras ficam pendentes, com o
+        # motivo, e o texto nativo sai inteiro no lugar delas. A busca é binária: o tamanho só cresce com cada leitura
+        cabem, sobra = 0, len(ordem)
+        while cabem + 1 < sobra:
+            meio = (cabem + sobra) // 2
+            if tamanho_da_saida(plano, {tid: respostas[tid] for tid in ordem[:meio]}, medidas) <= SAIDA_MAX:
+                cabem = meio
+            else:
+                sobra = meio
+        cobertura.pendentes += [f"{tid}: resultado grande demais" for tid in ordem[cabem:]]
+        ordem = ordem[:cabem]
+        respostas = {tid: respostas[tid] for tid in ordem}
+    md, meta = montado(respostas)
+    if respostas and len(md) > SAIDA_MAX:
+        # a conta errou e as leituras passaram do teto assim mesmo: o teto vale, e sai só o texto nativo
+        cobertura.pendentes += [f"{tid}: resultado grande demais" for tid in ordem]
         respostas = {}
+        md, meta = montado(respostas)
     if conferir_vazias:  # resposta vazia não pode virar lacuna silenciosa no documento
         lidos = distribuir_lotes(plano, respostas)
         ja = {p.split(":", 1)[0] for p in cobertura.pendentes}
@@ -433,12 +476,6 @@ def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
             for t in plano.get("tarefas_originais", [])
             if t["id"] not in ja and not str(lidos.get(t["id"], "")).strip()
         ]
-    if plano["tipo"] == "imagem":
-        md = "\n\n".join(respostas.get(t["id"], "") for t in plano["tarefas"])
-        meta = dict(plano.get("meta_arquivo") or {})
-    else:
-        md = montar(pasta, respostas)
-        meta = json.loads(Path(f"{pasta}/metadados.json").read_text(encoding="utf-8"))
     r = _com_estrutura(Resultado(md, meta, cobertura, usos), plano)
     if imagens := _imagens(plano, distribuir_lotes(plano, respostas)):
         r.estrutura["imagens"] = imagens
@@ -510,6 +547,12 @@ def _com_estrutura(r: Resultado, plano) -> Resultado:
         r.estrutura["paginas"] = r.cobertura.paginas
     r.estrutura.update(secoes(r.markdown, pdf=plano["tipo"] == "pdf", apresentacao=bool(plano.get("slides"))))
     return r
+
+
+def _paginas(plano) -> int:
+    """Páginas do documento, inclusive as que o prazo ou o teto deixaram sem ler (estão nas pendências)."""
+    total = plano.get("paginas_total")
+    return total if isinstance(total, int) and total > 0 else len(plano.get("paginas", [])) or 1
 
 
 def _vencido() -> bool:

@@ -109,13 +109,20 @@ def _valor_do_item(dados: dict, n) -> str:
     return str(v or "")
 
 
+def por_tarefa(plano, chave, resposta) -> dict[str, str]:
+    """A resposta `chave` como o texto de cada tarefa: a do lote se divide nos itens, pelo JSON por número; as outras
+    são da própria tarefa."""
+    itens = (plano.get("lotes") or {}).get(chave)
+    if itens is None:
+        return {chave: resposta}
+    dados = _json_do_lote(resposta)
+    return {tid: _valor_do_item(dados, n) for n, tid in itens}
+
+
 def distribuir_lotes(plano, respostas):
     """Resposta JSON do lote → resposta de cada tarefa original."""
     R = dict(respostas)
-    for lid, itens in (plano.get("lotes") or {}).items():
-        if lid not in R:  # já distribuído (esforço máximo) ou leitura do lote falhou
-            continue
-        dados = _json_do_lote(R.pop(lid))
-        for n, tid in itens:
-            R[tid] = _valor_do_item(dados, n)
+    for lid in plano.get("lotes") or {}:
+        if lid in R:  # senão, já distribuído (esforço máximo) ou leitura do lote falhou
+            R.update(por_tarefa(plano, lid, R.pop(lid)))
     return R

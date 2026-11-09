@@ -8,11 +8,17 @@ import re  # noqa: F401
 import zipfile  # noqa: F401
 from xml.etree import ElementTree as ET  # noqa: F401
 
-from .agrupamento import distribuir_lotes
+from .agrupamento import por_tarefa
 from .seguranca import alertas_injecao
 from .texto import NUM_PAGINA, sem_repeticao
 
-SAIDA_MAX = 256 * 1024 * 1024  # caracteres que a montagem escreve (a leitura em cada lugar em que entra)
+# Caracteres que a montagem escreve, o texto nativo junto. A leitura de uma imagem repetida entra uma vez, e as outras
+# posições levam só a referência: em 16 Mi cabem as 2.000 páginas que o PDF analisa (PAGINAS_ANALISE_MAX) com 8 mil
+# caracteres cada. O teto vale para as leituras: as que não couberem com o nativo ficam pendentes, e o texto nativo sai
+# inteiro mesmo que, sozinho, passe dele. O teto segura o resultado em JSON (até 4 bytes por caractere) em 64 MB, um
+# quarto do que um token pode reter no servidor.
+SAIDA_MAX = 16 * 1024 * 1024
+REPETIDA = "_(mesma imagem lida acima: {})_"  # nas outras posições da mesma imagem: a leitura está na âncora citada
 
 
 def _metadados(pasta, plano, corpo, moveis):
@@ -73,16 +79,49 @@ def _limpar(t: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", t)
 
 
+def _lidas(plano, respostas, ler) -> dict:
+    """{tarefa: o que `ler(chave)` dá para ela}, na ordem de distribuir_lotes: a resposta avulsa primeiro e o lote por
+    cima, item a item."""
+    lotes = plano.get("lotes") or {}
+    R = {}
+    for chave in [k for k in respostas if k not in lotes] + [lid for lid in lotes if lid in respostas]:
+        R.update(ler(chave))
+    return R
+
+
+def _textos(plano, chave, resposta) -> dict[str, str]:
+    """O texto que a montagem escreve para cada tarefa da resposta `chave`: o item do lote tirado do JSON e a trava de
+    repetição. A mesma função para montar e para medir antes (tamanho_da_saida): a estimativa mede o texto real."""
+    return {tid: sem_repeticao(t).strip() for tid, t in por_tarefa(plano, chave, resposta).items()}
+
+
 def montar(pasta, respostas):
     plano = json.load(open(f"{pasta}/plano.json", encoding="utf-8"))
-    R = {k: sem_repeticao(v) for k, v in distribuir_lotes(plano, respostas).items()}
-    for repetida, leitora in plano.get("iguais", {}).items():  # a mesma imagem em outro lugar: a mesma leitura
-        if leitora in R:
-            R[repetida] = R[leitora]
+    R = _lidas(plano, respostas, lambda chave: _textos(plano, chave, respostas[chave]))
+    iguais = plano.get("iguais", {})  # a mesma imagem em outro lugar: a mesma leitura
+    marca = os.urandom(8).hex()  # a âncora provisória que o documento não tem como imitar
+
+    def lido(tid):
+        leitora = iguais.get(tid, tid)
+        return R.get(leitora if leitora in R else tid, "")
 
     def bloco_ia(tid, rotulo):
-        txt = R.get(tid, "").strip()
-        return f"<!-- lido pela IA: {tid} -->\n{txt}" if txt else f"> [{rotulo}: pendente]"
+        # provisório até o corpo estar pronto: na ordem do texto, a primeira posição recebe a leitura e as outras a
+        # referência; o texto da IA também não passa pelo corte de cabeçalho nem pelo filtro de rótulos da figura
+        return f"<!-- lido pela IA: {tid} {marca} -->" if lido(tid) else f"> [{rotulo}: pendente]"
+
+    def leituras(corpo):
+        primeira = {}
+
+        def troca(m):
+            tid = m.group(1)
+            leitora = iguais.get(tid, tid)
+            if leitora in primeira:
+                return f"<!-- lido pela IA: {tid} -->\n" + REPETIDA.format(primeira[leitora])
+            primeira[leitora] = tid
+            return f"<!-- lido pela IA: {tid} -->\n{lido(tid)}"
+
+        return re.sub(rf"<!-- lido pela IA: (\S+) {marca} -->", troca, corpo)  # numa passada: a leitura não é varrida
 
     partes = []
     if plano["tipo"] == "office":
@@ -95,7 +134,7 @@ def montar(pasta, respostas):
         )
         partes.append(md)
         partes.extend(plano["extras"])
-        corpo = "\n\n".join(partes)
+        corpo = leituras("\n\n".join(partes))
         # sem páginas não há cabeçalho corrido no corpo: o do Word vem das partes header/footer (metadados) e o leitor
         # do corpo não entrega os placeholders de rodapé, número e data do slide; a repetição no corpo é conteúdo
         return _metadados(pasta, plano, acabamento(corpo), set())
@@ -108,15 +147,11 @@ def montar(pasta, respostas):
             continue
         tabelas = p.get("tabelas", [])
         trocadas = {
-            r["substitui_tabela"]: r["tarefa"]
-            for r in p["regioes"]
-            if "substitui_tabela" in r and R.get(r["tarefa"], "").strip()
+            r["substitui_tabela"]: r["tarefa"] for r in p["regioes"] if "substitui_tabela" in r and lido(r["tarefa"])
         }
         formulas = p.get("formulas", [])
         f_lidas = {
-            r["substitui_formula"]: r["tarefa"]
-            for r in p["regioes"]
-            if "substitui_formula" in r and R.get(r["tarefa"], "").strip()
+            r["substitui_formula"]: r["tarefa"] for r in p["regioes"] if "substitui_formula" in r and lido(r["tarefa"])
         }
 
         def troca(m):  # numa passada só: o texto que entra (resposta, tabela) não é varrido de novo
@@ -168,14 +203,18 @@ def montar(pasta, respostas):
                 saida.append(b)
             saida.extend(inserir.get(k, []))
         partes.append("\n\n".join(saida))
-    return _metadados(pasta, plano, acabamento("\n\n".join(partes)), moveis)
+    return _metadados(pasta, plano, acabamento(leituras("\n\n".join(partes))), moveis)
 
 
 CABECALHO_MAX = 80  # linha de cabeçalho/rodapé corrido é curta; parágrafo que o leitor juntou numa linha, não
 FRACAO_MAX = 0.25  # se a remoção levaria mais que isso do texto nativo do documento, nada sai
+FIXA_MIN = 0.8  # linha idêntica na borda de ao menos esta fração das páginas é cabeçalho fixo ("Confidencial")
 
 
 DESLOCAMENTO_MAX = 50  # número impresso = índice da página + d (capa e páginas iniciais sem número): |d| até isto
+# o rótulo logo antes do número que diz que ele é o da página, e a linha que é só o número ("3 de 12", "3/12")
+_ROTULO_PAGINA = re.compile(r"(?<![^\W\d_])(p[aá]gina|p[aá]g|page|pg|p|folha|fls|fl)\.?:?\s*$", flags=re.I)
+_SO_O_NUMERO = re.compile(r"\W*#(\s*(de|of|/)\s*\d{1,4})?\W*", flags=re.I)
 _ROMANOS = [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
             (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")]  # fmt: skip
 
@@ -194,11 +233,15 @@ def _numero(token) -> int | None:
 def _sem_cabecalho_corrido(nativas) -> set[str]:
     """Tira das páginas nativas (índice, blocos) o cabeçalho/rodapé corrido e devolve o que saiu, para os metadados.
     Só sai a linha curta, na borda da página, igual em quase todas as páginas, em que só o número da própria página
-    varia ("Página 3 de 12", "Relatório anual — 3"), com um deslocamento constante entre o número impresso e o índice
-    da página (a capa sem número desloca todos); a linha só com o número da página, na primeira ou na última posição,
-    também sai, com o mesmo deslocamento em quase todas as páginas. Valor, data e número de documento que mudam entre
-    páginas não casam, a página escaneada e o texto lido pela IA não passam por aqui, título (linha com #) nunca sai
-    e, se o que sairia passa de FRACAO_MAX do texto nativo do documento, nada sai."""
+    varia, rotulado como página ("Página 3 de 12", "Relatório anual — fls. 3") ou sozinho ("3 de 12"), com um
+    deslocamento constante entre o número impresso e o índice da página (a capa sem número desloca todos); o número sem
+    rótulo no meio de outras palavras ("Parcela 3 de 12" num carnê) é conteúdo. A linha só com o número da página, na
+    primeira ou na última posição, também sai, com o mesmo deslocamento em quase todas as páginas, e vai para os
+    metadados como a linha com o número trocado por #. A linha curta idêntica na borda de FIXA_MIN das páginas, sem
+    número de página, é cabeçalho fixo e sai também, se couber em FRACAO_MAX junto com o resto (senão só ela fica).
+    Valor, data e número de documento que mudam entre páginas não casam, a página escaneada e o texto lido pela IA não
+    passam por aqui, título (linha com #) nunca sai e, se o que sairia passa de FRACAO_MAX do texto nativo do
+    documento, nada sai."""
     from collections import Counter
 
     def linhas(blocos):
@@ -219,18 +262,31 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
         for m in re.finditer(r"(?<![\w.,/])(\d{1,4}|[ivxlcdm]{1,8})(?![\w.,/])", t, flags=re.I):
             v = _numero(m.group())
             forma = t[: m.start()] + "#" + t[m.end() :]
-            if v is not None and abs(v - pagina) <= DESLOCAMENTO_MAX and re.search(r"[^\W\d]", forma):
+            # o número só é o da página se a linha diz que é ("Página 3", "fls. 3") ou se a linha é só ele ("3 de 12");
+            # "Parcela 3 de 12" num carnê de uma parcela por página é conteúdo
+            pagina_dita = _ROTULO_PAGINA.search(t[: m.start()]) or _SO_O_NUMERO.fullmatch(forma)
+            if v is not None and abs(v - pagina) <= DESLOCAMENTO_MAX and pagina_dita and re.search(r"[^\W\d]", forma):
                 out.add((forma, v - pagina))  # só número (sem palavra) é o caso de so_numero
         return out
 
     def so_numero(ln, pagina):
-        """Deslocamento do número de página que é a linha inteira ("3", "- 3 -", "Página 3 de 12", "iv"), ou None."""
+        """(deslocamento, forma com o número trocado por #) do número de página que é a linha inteira ("3", "- 3 -",
+        "(3)", "Página 3 de 12", "Página 3/12", "iv"), ou None."""
         t = ln.strip()
-        if not re.fullmatch(NUM_PAGINA, t, flags=re.I):
+        if not (m := re.fullmatch(NUM_PAGINA, t, flags=re.I)) or t.count("(") != t.count(")"):
+            return None  # "3)" é o item de uma lista, não o número da página: o parêntese abre e fecha, ou não há
+        g = "n" if m.group("n") else "r"  # o número depois do rótulo, nunca uma letra dele
+        v = _numero(m.group(g))
+        if v is None or abs(v - pagina) > DESLOCAMENTO_MAX:
             return None
-        m = re.search(r"\d{1,4}|[ivxlc]{1,6}", t, flags=re.I)
-        v = _numero(m.group()) if m else None
-        return v - pagina if v is not None and abs(v - pagina) <= DESLOCAMENTO_MAX else None
+        return v - pagina, t[: m.start(g)] + "#" + t[m.end(g) :]
+
+    def fixa(ln):
+        """A linha, se ela pode ser cabeçalho fixo: curta, com letra, fora de título, tabela e marca do Lince."""
+        t = ln.strip()
+        if len(t) > CABECALHO_MAX or t.startswith(("#", "|", "<!--", "> [")) or not re.search(r"[^\W\d]", t):
+            return None
+        return t
 
     bordas = {}
     for i, blocos in nativas:
@@ -240,62 +296,115 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
     minimo = max(3, 0.6 * n)
     freq = Counter(c for i, _ in nativas for c in {c for _, _, ln in bordas[i] for c in chaves(ln, i + 1)})
     moveis = {c for c, v in freq.items() if n >= 3 and v >= minimo}
+    # cabeçalho fixo: em cada posição da borda, a linha que se repete idêntica; se a parte idêntica entra no corpo
+    # além das 2 linhas da borda (3ª linha do começo ou do fim também igual), são páginas iguais, e isso é conteúdo
+    por_posicao = {}
+    for _, blocos in nativas:
+        cheias = linhas(blocos)
+        for pos in (0, 1, 2, -1, -2, -3):
+            if -len(cheias) <= pos < len(cheias):
+                por_posicao.setdefault(pos, Counter())[cheias[pos][2].strip()] += 1
+    repetidas = {
+        pos: t for pos, c in por_posicao.items() for t, v in c.most_common(1) if n >= 3 and v >= max(3, FIXA_MIN * n)
+    }
+    terceira = {0: 2, 1: 2, -1: -3, -2: -3}  # de cada posição da borda, a primeira linha do corpo
+    fixas = {(pos, t) for pos, t in repetidas.items() if pos in terceira and terceira[pos] not in repetidas and fixa(t)}
     extremos = {}
     for i, blocos in nativas:
         cheias = linhas(blocos)
         extremos[i] = [
-            (k, j, ln, d) for k, j, ln in (cheias[:1] + cheias[-1:]) if (d := so_numero(ln, i + 1)) is not None
+            (k, j, ln, *x) for k, j, ln in (cheias[:1] + cheias[-1:]) if (x := so_numero(ln, i + 1)) is not None
         ]
     desloc = Counter(d for e in extremos.values() for d in {x[3] for x in e})
     numeros = {d for d, v in desloc.items() if n >= 2 and v >= max(2, 0.6 * n)}
-    tirar, total = {}, 0
+    tirar, tirar_fixas, total = {}, {}, 0
     for i, blocos in nativas:
         cheias = linhas(blocos)
         total += sum(len(ln.strip()) for _, _, ln in cheias)
         for k, j, ln in bordas[i]:
             if achadas := [c for c in chaves(ln, i + 1) if c in moveis]:
                 tirar[(i, k, j)] = (ln, achadas[0][0])
-        for k, j, ln, d in extremos[i]:
+        for pos, t in fixas:
+            if -len(cheias) <= pos < len(cheias) and cheias[pos][2].strip() == t:
+                tirar_fixas[(i, *cheias[pos][:2])] = (cheias[pos][2], t)
+        for k, j, ln, d, forma in extremos[i]:
             if d in numeros:
-                tirar.setdefault((i, k, j), (ln, None))
-    if sum(len(ln.strip()) for ln, _ in tirar.values()) > FRACAO_MAX * total:
+                tirar.setdefault((i, k, j), (ln, forma))
+
+    def peso(x):
+        return sum(len(ln.strip()) for ln, _ in x.values())
+
+    if peso(tirar) > FRACAO_MAX * total:
         return set()  # cabeçalho que pesaria tanto assim no texto não é cabeçalho: o documento fica como está
+    fixas_fora = {c: v for c, v in tirar_fixas.items() if c not in tirar}
+    if peso(tirar) + peso(fixas_fora) <= FRACAO_MAX * total:  # o fixo só sai se não levar o resto além do teto
+        tirar |= fixas_fora
     for i, blocos in nativas:
         for k in sorted({k for (pi, k, _) in tirar if pi == i}):
             partes = blocos[k].split("\n")
             blocos[k] = "\n".join(ln for j, ln in enumerate(partes) if (i, k, j) not in tirar)
-    return {c for _, c in tirar.values() if c}
+    return {c for _, c in tirar.values()}
 
 
-def tamanho_da_saida(e, respostas) -> int:
-    """Quanto texto a montagem vai escrever: cada marca vira a leitura (a mesma imagem repetida recebe a mesma
-    leitura em cada lugar) ou a tabela e a fórmula nativas. Conta antes de montar, para a saída ter teto como a
-    entrada tem: uma resposta grande copiada em mil lugares não estoura a memória do processo."""
+def tamanho_da_saida(e, respostas, medidas=None) -> int:
+    """Quanto texto a montagem vai escrever, no máximo: cada marca vira a leitura (a da mesma imagem repetida entra uma
+    vez, e as outras posições, a referência) ou a tabela e a fórmula nativas, e cada página leva o comentário e as
+    junções. Conta antes de montar, para a saída ter teto como a entrada tem, com o texto de cada leitura medido como a
+    montagem o escreve (_textos). `medidas` guarda esse tamanho por chave de resposta entre chamadas com as mesmas
+    respostas (a busca do que cabe), para cada uma ser lida uma vez só."""
     if e.get("tipo") == "imagem":  # a imagem solta sai como as leituras das faixas, uma depois da outra
         return sum(len(respostas.get(t["id"], "")) + 2 for t in e.get("tarefas", []))
     from collections import Counter
 
-    lote_de = {tid: lid for lid, itens in (e.get("lotes") or {}).items() for _, tid in itens}
+    medidas = {} if medidas is None else medidas
 
-    def leitura(tid):
-        tid = e.get("iguais", {}).get(tid, tid)
-        # a maior entre a do item (já dividida, no esforço máximo e na releitura) e a do lote: a chave de um não
-        # esconde o outro, inclusive nas respostas de quem chama, antes do filtro por id
-        return max(len(respostas.get(tid, "")), len(respostas.get(lote_de.get(tid), ""))) + 64
+    def medir(chave):
+        if chave not in medidas:
+            medidas[chave] = {tid: len(t) for tid, t in _textos(e, chave, respostas[chave]).items()}
+        return medidas[chave]
 
-    total = len(e.get("md", "")) + sum(len(x) for x in e.get("extras", []))
-    marcas = Counter(re.findall(r"\{\{IA:(\w+)\}\}", e.get("md", "")))
-    total += sum(n * leitura(tid) for tid, n in marcas.items())
+    R = _lidas(e, respostas, medir)
+    iguais, contadas = e.get("iguais", {}), set()
+
+    def cheia(tid):  # a leitura, a âncora "<!-- lido pela IA: id -->" e as junções em volta dela
+        leitora = iguais.get(tid, tid)
+        return R.get(leitora if leitora in R else tid, 0) + len(tid) + 64
+
+    def leitura(tid):  # a primeira posição de cada leitura a traz inteira; as outras, a âncora e a referência
+        leitora = iguais.get(tid, tid)
+        if leitora in contadas:
+            return len(REPETIDA) + 2 * len(tid) + 2 * len(leitora) + 64
+        contadas.add(leitora)
+        return cheia(tid)
+
+    total = len(e.get("md", "")) + sum(len(x) + 2 for x in e.get("extras", [])) + 1  # junções e o fim de linha
+    for tid, n in Counter(re.findall(r"\{\{IA:(\w+)\}\}", e.get("md", ""))).items():
+        primeira = leitura(tid)
+        total += primeira + (n - 1) * leitura(tid)  # a segunda chamada já conta a referência
     for p in e.get("paginas", []):
-        total += len(p.get("md", "")) + sum(leitura(r.get("tarefa", "")) for r in p.get("regioes", []))
+        # o comentário "<!-- página N · rota -->" e as junções da página com a anterior e do comentário com o texto
+        total += len(f"<!-- página {p.get('i', 0) + 1} · {p.get('rota', '')} -->") + 4
+        # a região que substitui uma tabela ou fórmula entra na posição da marca, abaixo; as outras, onde a figura está
+        total += len(p.get("md", "")) + sum(
+            leitura(r.get("tarefa", ""))
+            for r in p.get("regioes", [])
+            if "substitui_tabela" not in r and "substitui_formula" not in r
+        )
         if p.get("rota") == "pagina":  # página escaneada: cada metade lida entra inteira
             total += sum(leitura(t) for t in (p.get("tarefas") or [p.get("tarefa", "")]))
-        tabelas, formulas = p.get("tabelas", []), p.get("formulas", [])
+        nativos = {"TABELA": p.get("tabelas", []), "FORMULA": p.get("formulas", [])}
+        trocam = {  # a região lida que entra no lugar de cada marca; sem ela, a marca leva o nativo
+            ("TABELA", int(r["substitui_tabela"])): r.get("tarefa", "")
+            for r in p.get("regioes", [])
+            if "substitui_tabela" in r
+        } | {
+            ("FORMULA", int(r["substitui_formula"])): r.get("tarefa", "")
+            for r in p.get("regioes", [])
+            if "substitui_formula" in r
+        }
         for tipo, k in re.findall(r"\{\{(TABELA|FORMULA):(\d+)\}\}", p.get("md", "")):
-            nativo = tabelas if tipo == "TABELA" else formulas
             k = int(k)
-            total += max(
-                len(nativo[k]) if k < len(nativo) else 0,
-                max((leitura(r.get("tarefa", "")) for r in p.get("regioes", [])), default=0),
-            )
+            nativo = nativos[tipo]
+            lida = leitura(trocam[tipo, k]) if (tipo, k) in trocam else 0
+            total += max(len(nativo[k]) if k < len(nativo) else 0, lida)
     return total

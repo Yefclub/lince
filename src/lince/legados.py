@@ -659,6 +659,11 @@ def rtf(dados: bytes, ler_rtf) -> tuple[list[str], bool]:
 _XLSB_CELULAS_MAX = 500_000  # o mesmo teto de células do documento da leitura em fluxo do .xlsx
 _XLSB_COLUNAS_MAX = 16_384  # a última coluna do Excel (XFD): coluna maior que isso é arquivo hostil
 _XLSB_LINHAS_MAX = 1_048_576  # a última linha do Excel
+# Tabela de strings compartilhadas: cada célula de texto aponta para uma, então além do dobro do teto de células elas
+# não teriam onde aparecer; e o texto delas não passa de metade da maior parte que o pacote aceita (limites.PARTE_MAX).
+# Medido na issue #40: um .xlsb de 50 MB com 11 milhões de strings de 2 caracteres ocupava 1,1 GB.
+_XLSB_STRINGS_MAX = 2 * _XLSB_CELULAS_MAX
+_XLSB_STRINGS_BYTES_MAX = 64 * 1024 * 1024
 
 
 def _registros_xlsb(b: bytes):
@@ -713,12 +718,20 @@ def xlsb_tolerante(path) -> tuple[list[tuple[str, dict[int, dict[int, object]]]]
 
     from lxml import etree
 
+    from .limites import DocumentoRecusado
+
     with zipfile.ZipFile(path) as z:
         nomes = set(z.namelist())
-        sst = []
+        sst, texto = [], 0
         if "xl/sharedStrings.bin" in nomes:
             for tipo, d in _registros_xlsb(z.read("xl/sharedStrings.bin")):
                 if tipo == 0x13 and len(d) >= 5:  # BrtSSTItem: flags (1 byte) + XLWideString
+                    texto += len(d)  # antes de decodificar: a string que passa do teto não chega a ocupar memória
+                    if len(sst) >= _XLSB_STRINGS_MAX or texto > _XLSB_STRINGS_BYTES_MAX:
+                        raise DocumentoRecusado(
+                            f"tabela de strings do .xlsb acima do teto ({_XLSB_STRINGS_MAX} strings ou"
+                            f" {_XLSB_STRINGS_BYTES_MAX // 2**20} MB de texto)"
+                        )
                     sst.append(_texto_largo(d, 1)[0])
         rels = {}
         if "xl/_rels/workbook.bin.rels" in nomes:

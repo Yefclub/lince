@@ -38,7 +38,6 @@ from . import codigo as codigo_doc
 from .cache import CacheComEscopo, CacheRedis
 from .leitor import FORMATOS, VERSAO, Leitor
 from .limites import DocumentoRecusado
-from .montagem import SAIDA_MAX, tamanho_da_saida
 from .provedores import OpenAICompativel
 
 CONTRATO = json.loads(files("lince").joinpath("openapi.json").read_text(encoding="utf-8"))
@@ -46,6 +45,10 @@ CONTRATO = json.loads(files("lince").joinpath("openapi.json").read_text(encoding
 TAMANHO_MAX = 100 * 1024 * 1024  # por envio (soma do lote): acima disso, dividir em mais sessões
 ARQUIVOS_MAX = 50  # por sessão
 DOCS_SIMULTANEOS = 16  # medido na carga: o tempo é espera da IA, não CPU
+# A montagem (POST /v1/montagens) é CPU: tem fila justa própria, para não esperar atrás de leituras presas na IA nem
+# ocupar uma vaga delas. Duas: o GIL serializa o trabalho, então mais threads só disputariam a CPU com as leituras, e a
+# segunda deixa uma montagem curta passar enquanto outra, grande, termina.
+MONTAGENS_SIMULTANEAS = 2
 ESPERA_MAX = 300  # teto do Prefer: wait, abaixo do timeout comum de proxy reverso
 ENTREGA_PRAZO = 15 * 60  # resultado não buscado em 15 min depois de concluído é descartado
 # Depois da entrega, a sessão fica 60 s para o cliente repetir o pedido se a resposta se perdeu (rede, timeout);
@@ -64,6 +67,12 @@ MODOS = {"leitura", "tarefas"}  # tarefas: o Lince não chama a IA; devolve o qu
 PLANO_VALIDADE = 24 * 3600  # plano devolvido no modo tarefas vale um dia para a montagem
 PLANO_MAX = 64 * 1024 * 1024  # plano descompactado (texto e estado do documento): acima disso é hostil
 PRAZO_MIN, PRAZO_MAX = 1, 3600  # segundos por documento; o chat usa poucos, a base não manda prazo
+# Modo tarefas: cada tarefa leva a imagem em base64 no resultado, que fica em memória até a entrega. Medido: cada metade
+# de uma página escaneada densa sai com 0,6 MB de PNG (texto limpo) a 2 MB (com ruído), e 300 das limpas já somam
+# 230 MB em base64, perto dos BYTES_RETIDOS_POR_CLIENTE de um token. O que passa do teto fica nas pendências do preparo,
+# com o motivo; `max_tarefas` só baixa o do documento.
+TAREFAS_POR_DOCUMENTO = 200
+TAREFAS_POR_SESSAO = 300
 MIDIA = {
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ".pptm": "application/vnd.ms-powerpoint.presentation.macroEnabled.12",
@@ -165,6 +174,7 @@ class Servico:
         self.retidos: dict[str, int] = {}  # bytes de resultado em memória por cliente (sessões em curso e concluídas)
         self.trava = threading.Lock()
         self.fila = Fila(self._ler, DOCS_SIMULTANEOS)
+        self.montagens = Fila(lambda trabalho: trabalho(), MONTAGENS_SIMULTANEAS)
         # segredo que assina o plano do modo tarefas: só o servidor conhece (LINCE_SEGREDO para várias réplicas)
         self.segredo_plano = os.urandom(32)
 
@@ -185,6 +195,13 @@ class Servico:
         conhece, então não assina plano nenhum; só monta o que o servidor entregou a ele."""
         return hmac.digest(self.segredo_plano, b"lince-plano\0" + cliente.encode(), "sha256")
 
+    def kid(self) -> str:
+        """Identificador da chave que sela os planos: o mesmo em todas as réplicas com o mesmo LINCE_SEGREDO e outro a
+        cada reinício sem ele. Um HMAC de rótulo fixo, truncado: não revela o segredo nem a chave de um cliente."""
+        import base64
+
+        return base64.urlsafe_b64encode(hmac.digest(self.segredo_plano, b"lince-kid", "sha256")[:9]).decode()
+
     def reservar(self, cliente, n=1) -> bool:
         """Conferir e ocupar as vagas numa só operação: envios paralelos não furam o teto."""
         with self.trava:
@@ -202,25 +219,27 @@ class Servico:
     # ---------------------------------------------------------------- leitura
     def _ler(self, doc):
         sessao = doc["sessao"]
-        estado = "falhou"
+        estado, reservadas = "falhou", 0
         try:
             if sessao.get("apagada"):
                 estado = "cancelado"
                 return
             doc["estado"], doc["inicio"] = "lendo", time.time()
             cache = CacheComEscopo(self.cache, sessao["cliente"]) if self.cache else None
-            leitor = Leitor(ia=sessao["ia"], esforco=sessao["esforco"], cache=cache)
             if sessao.get("modo") == "tarefas":
-                plano = leitor.preparar(doc["arquivo"], prazo=sessao.get("prazo"))
+                teto = min(TAREFAS_POR_DOCUMENTO, sessao.get("max_tarefas") or TAREFAS_POR_DOCUMENTO)
+                plano = Leitor(max_leituras=teto).preparar(doc["arquivo"], prazo=sessao.get("prazo"))
+                reservadas = self._teto_da_sessao(sessao, plano)
                 doc["resultado"] = {
                     "tarefas": plano.para_json()["tarefas"],  # imagem em base64
                     "pendentes": plano.estado.get("pendentes", []) + plano.pendentes,
-                    "plano": selar(sessao["segredo"], sessao["cliente"], plano),
+                    "plano": selar(sessao["segredo"], sessao["cliente"], plano, sessao["kid"]),
                 }
                 if sessao.get("codigo"):
                     doc["resultado"].update(_codigo_do_documento(doc))
                 estado = "pronto"
                 return
+            leitor = Leitor(ia=sessao["ia"], esforco=sessao["esforco"], cache=cache)
             r = leitor.ler(doc["arquivo"], prazo=sessao.get("prazo"))
             doc["resultado"] = _resultado_api(r)
             if sessao.get("codigo"):
@@ -228,6 +247,9 @@ class Servico:
             estado = "pronto"
         except Exception as e:  # noqa: BLE001 — o erro vira estado do documento, nunca derruba o serviço
             doc["erro"] = f"{type(e).__name__}: {str(e)[:300]}"
+            if reservadas:  # o documento não entregou as tarefas (plano grande demais, por exemplo): a cota volta
+                with self.trava:
+                    sessao["tarefas"] -= reservadas
         finally:
             Path(doc["arquivo"]).unlink(missing_ok=True)
             doc["fim"] = time.time()
@@ -242,6 +264,19 @@ class Servico:
                     doc["resultado"] = None  # sessão apagada no meio da leitura: o resultado não fica
                 doc["estado"] = estado  # por último: quem lê "pronto" já encontra resultado e fim
                 self._fechar_se_terminou(sessao)
+
+    def _teto_da_sessao(self, sessao, plano):
+        """Tira do plano as tarefas além do que sobra de TAREFAS_POR_SESSAO, com o motivo nas pendências. Os documentos
+        do lote são preparados em paralelo: a conta da sessão é feita sob a trava. Devolve quantas tarefas reservou,
+        para o documento que falhar depois devolver a cota."""
+        with self.trava:
+            cabem = max(0, min(len(plano.tarefas), TAREFAS_POR_SESSAO - sessao.get("tarefas", 0)))
+            sessao["tarefas"] = sessao.get("tarefas", 0) + cabem
+        if cabem < len(plano.tarefas):
+            plano.pendentes += [f"{t.id}: teto de tarefas da sessão" for t in plano.tarefas[cabem:]]
+            plano.tarefas = plano.tarefas[:cabem]
+            plano.estado["tarefas"] = plano.estado.get("tarefas", [])[:cabem]
+        return cabem
 
     def _fechar_se_terminou(self, sessao):
         """Chamar com a trava."""
@@ -320,10 +355,12 @@ class Servico:
 
 
 # -------------------------------------------------------------------- plano do modo tarefas
-def selar(segredo: bytes, cliente: str, plano) -> str:
+def selar(segredo: bytes, cliente: str, plano, kid: str = "") -> str:
     """O plano (texto e estado do documento, sem as imagens) compactado e assinado com a chave do servidor para o
     cliente: a montagem não guarda nada no servidor, só o mesmo token monta, dentro de PLANO_VALIDADE, e ninguém (nem
-    o próprio cliente) altera ou forja o plano. A forma e os tetos ainda são conferidos, como rede."""
+    o próprio cliente) altera ou forja o plano. A forma e os tetos ainda são conferidos, como rede. `kid` (de
+    `Servico.kid`) vai à parte, depois da assinatura: com ele, a montagem distingue o plano selado por outra chave
+    (reinício sem LINCE_SEGREDO, réplica com outro segredo) do plano alterado."""
     import base64
     import zlib
 
@@ -333,11 +370,14 @@ def selar(segredo: bytes, cliente: str, plano) -> str:
     if len(texto) > PLANO_MAX:  # a montagem recusaria: falha já aqui, antes de quem chama pagar as leituras
         raise ValueError(f"plano de {len(texto) // 2**20} MB, acima do teto de {PLANO_MAX // 2**20} MB da montagem")
     dados = base64.urlsafe_b64encode(zlib.compress(texto, 6)).decode()
-    return dados + "." + base64.urlsafe_b64encode(hmac.digest(segredo, dados.encode(), "sha256")).decode()
+    assinado = dados + "." + base64.urlsafe_b64encode(hmac.digest(segredo, dados.encode(), "sha256")).decode()
+    return assinado + "." + kid if kid else assinado
 
 
-def abrir(segredo: bytes, cliente: str, selado: str):
-    """O plano de `selar`, conferido: assinatura, dono, validade e tamanho. Levanta Problema."""
+def abrir(segredo: bytes, cliente: str, selado: str, kid: str = ""):
+    """O plano de `selar`, conferido: assinatura, dono, validade e tamanho. Levanta Problema. O `kid` só diz por que a
+    assinatura não conferiu (outra chave ou plano alterado); o plano sem ele (selado antes dele existir) é recusado
+    como inválido."""
     import base64
     import binascii
     import zlib
@@ -345,8 +385,18 @@ def abrir(segredo: bytes, cliente: str, selado: str):
     from .tipos import Plano, TarefaVisual
 
     dados, _, assinatura = (selado or "").partition(".")
+    assinatura, _, do_plano = assinatura.partition(".")
     esperada = base64.urlsafe_b64encode(hmac.digest(segredo, dados.encode("utf-8", "replace"), "sha256")).decode()
     if not dados or not hmac.compare_digest(assinatura.encode("utf-8", "replace"), esperada.encode()):
+        # a assinatura vem primeiro: o `kid` não é assinado e só escolhe o motivo da recusa, nunca a decide
+        if do_plano and kid and not hmac.compare_digest(do_plano.encode("utf-8", "replace"), kid.encode()):
+            raise Problema(
+                422,
+                "plano-de-outra-chave",
+                "Plano de outra chave",
+                "Selado por uma chave que este servidor não tem (reinício sem LINCE_SEGREDO ou réplica com outro"
+                " segredo): refaça a fase 1.",
+            )
         raise Problema(422, "plano-invalido", "Plano inválido", "Não foi assinado para este token, ou foi alterado.")
     try:
         d = zlib.decompressobj()
@@ -371,7 +421,7 @@ PLANO_TRABALHO_MAX = 500_000_000
 RESPOSTAS_MAX = 64 * 1024 * 1024  # caracteres somados das respostas de uma montagem
 
 
-def _montar_pedido(segredo, cliente, corpo):
+def _montar_pedido(segredo, cliente, corpo, kid=""):
     """O corpo de POST /v1/montagens até o resultado. O plano foi assinado pelo servidor; a forma e os tetos ainda são
     conferidos antes da montagem, como rede, e o que ela não entende vira 422, nunca erro interno."""
     try:
@@ -381,13 +431,16 @@ def _montar_pedido(segredo, cliente, corpo):
     respostas = pedido.get("respostas") if isinstance(pedido, dict) else None
     if not isinstance(respostas, dict) or not all(isinstance(v, str) for v in respostas.values()):
         raise Problema(400, "montagem-invalida", 'Envie {"plano": ..., "respostas": {id: texto}}')
-    if len(respostas) > PLANO_TAREFAS_MAX or sum(len(v) for v in respostas.values()) > RESPOSTAS_MAX:
+    if len(respostas) > PLANO_TAREFAS_MAX:
+        raise Problema(
+            413, "envio-grande", "Respostas grandes demais", f"Até {PLANO_TAREFAS_MAX} respostas por montagem."
+        )
+    if sum(len(v) for v in respostas.values()) > RESPOSTAS_MAX:
         raise Problema(413, "envio-grande", "Respostas grandes demais", f"Até {RESPOSTAS_MAX // 2**20} M caracteres.")
-    plano = abrir(segredo, cliente, str(pedido.get("plano") or ""))
+    plano = abrir(segredo, cliente, str(pedido.get("plano") or ""), kid)
     try:
         _conferir_estado(plano.estado)
-        if tamanho_da_saida(plano.estado, respostas) > SAIDA_MAX:
-            raise Problema(413, "saida-grande", "Resultado grande demais", f"Até {SAIDA_MAX // 2**20} M caracteres.")
+        # acima do teto de saída, a montagem sai com o texto nativo e as leituras que não couberem nas pendências
         return Leitor().concluir(plano, respostas)
     except (KeyError, TypeError, ValueError, AttributeError, IndexError) as e:
         raise Problema(422, "plano-invalido", "Plano inválido", f"{type(e).__name__}: {str(e)[:200]}") from None
@@ -614,6 +667,18 @@ def criar_app(
                 raise Problema(
                     400, "modo-invalido", "No modo tarefas a IA é de quem chama", "Sem X-IA-* e sem esforco=max."
                 )
+            max_tarefas = form.get("max_tarefas")
+            if max_tarefas is not None and max_tarefas != "":
+                digitos = str(max_tarefas).lstrip("0")
+                if not re.fullmatch(r"\d+", str(max_tarefas)) or not digitos or modo != "tarefas":
+                    raise Problema(
+                        400, "max-tarefas-invalido", "max_tarefas deve ser um inteiro maior que zero, no modo tarefas"
+                    )
+                # qualquer inteiro maior que zero, e o acima do teto vale o teto (contrato); dez algarismos já passam
+                # dele, então o resto nem é convertido (int() de milhares de algarismos é lento ou recusado)
+                max_tarefas = min(TAREFAS_POR_DOCUMENTO, int(digitos[:10]))
+            else:
+                max_tarefas = None
             pedir_codigo = str(form.get("codigo") or "nao")
             if pedir_codigo not in ("sim", "nao"):
                 raise Problema(400, "codigo-invalido", "codigo deve ser 'sim' ou 'nao'")
@@ -632,7 +697,7 @@ def criar_app(
                     )
             sessao = await _receber(
                 s, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=pedir_codigo == "sim", prazo=prazo,
-                modo=modo, segredo=s.segredo(cliente),
+                modo=modo, segredo=s.segredo(cliente), kid=s.kid(), max_tarefas=max_tarefas,
             )  # fmt: skip
         finally:
             if form is not None:
@@ -813,13 +878,19 @@ def criar_app(
             raise _limite_retencao()
         if not s.reservar(cliente, 1):  # a vaga antes do corpo: pedidos em paralelo não somam memória sem teto
             raise _limite_pendentes()
+        na_fila = False
         try:
             corpo = await request.body()
-            segredo = s.segredo(cliente)
-            # leitura do JSON, abertura do plano e montagem fora do laço de eventos: os outros clientes seguem
-            r = await asyncio.to_thread(_montar_pedido, segredo, cliente, corpo)
+            segredo, kid = s.segredo(cliente), s.kid()
+            # leitura do JSON, abertura do plano e montagem na fila justa das montagens, fora do laço de eventos; a
+            # vaga volta quando a montagem termina, mesmo que quem pediu desista antes
+            na_fila = True
+            r = await _na_fila(
+                s.montagens, cliente, lambda: _montar_pedido(segredo, cliente, corpo, kid), lambda: s.liberar(cliente)
+            )
         finally:
-            s.liberar(cliente)
+            if not na_fila:
+                s.liberar(cliente)
         return JSONResponse(_resultado_api(r))
 
     async def limpeza(app):
@@ -851,6 +922,37 @@ def criar_app(
     return app
 
 
+async def _na_fila(fila: Fila, cliente, trabalho, ao_terminar):
+    """O resultado de `trabalho()`, executado na `fila` na vez do cliente. A conexão que cai não interrompe a espera: o
+    Starlette não cancela o handler, então o trabalho roda na vez dele e a resposta se perde no envio. Só a espera
+    cancelada (a tarefa do pedido cancelada, como no desligamento do servidor) pula o que ainda não começou.
+    `ao_terminar` roda sempre, ao fim ou ao pular."""
+    laco, desistiu = asyncio.get_running_loop(), threading.Event()
+    futuro = laco.create_future()
+
+    def entregar(valor, erro):
+        if not futuro.done():  # quem desistiu já cancelou o futuro
+            futuro.set_exception(erro) if erro else futuro.set_result(valor)
+
+    def executar():
+        valor = erro = None
+        try:
+            if not desistiu.is_set():
+                valor = trabalho()
+        except Exception as e:  # noqa: BLE001 — volta para quem espera, que trata como trataria em linha
+            erro = e
+        finally:
+            ao_terminar()
+        laco.call_soon_threadsafe(entregar, valor, erro)
+
+    fila.por(cliente, executar)
+    try:
+        return await futuro
+    except asyncio.CancelledError:
+        desistiu.set()
+        raise
+
+
 async def _varrer(s: Servico, nome, arquivo):
     """Com ClamAV configurado, arquivo infectado nunca chega aos parsers; sem veredito, nada é lido."""
     if not s.clamav:
@@ -874,7 +976,7 @@ async def _varrer(s: Servico, nome, arquivo):
 
 async def _receber(
     s: Servico, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=False, prazo=None, modo="leitura",
-    segredo=b"",
+    segredo=b"", kid="", max_tarefas=None,
 ):  # fmt: skip
     """Grava o lote, calcula hash e tamanho, aplica a idempotência e põe os documentos na fila."""
     pasta = tempfile.mkdtemp(prefix="lince-api-")
@@ -905,6 +1007,8 @@ async def _receber(
             raise Problema(413, "envio-grande", "Envio grande demais", f"Teto de {TAMANHO_MAX // 2**20} MB por envio.")
         provedor = getattr(ia, "identidade", None)
         conteudo = [referencia, esforco, provedor, codigo, [(d["nome"], d["sha256"]) for d in itens], prazo, modo]
+        if max_tarefas is not None:  # só entra na impressão quando enviado: a de um envio sem ele não muda
+            conteudo.append(max_tarefas)
         impressao = hashlib.sha256(json.dumps(conteudo).encode()).hexdigest()
         s.limpar()
         if chave_idem:  # repetição ou chave reusada: responde antes de varrer (o envio aceito já foi varrido)
@@ -939,6 +1043,8 @@ async def _receber(
                 "codigo": codigo,
                 "modo": modo,
                 "segredo": segredo,
+                "kid": kid,
+                "max_tarefas": max_tarefas,
                 "ia": ia,
                 "criada_em": time.time(),
                 "concluida_em": None,

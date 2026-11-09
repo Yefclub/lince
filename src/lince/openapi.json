@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Lince",
-    "version": "1.9.0",
+    "version": "1.10.0",
     "summary": "Leitor único de documentos para bases de conhecimento e IA.",
     "description": "Cada envio (um documento ou um lote) cria uma **sessão**. Quem chama marca a sessão com uma `referencia` própria (o id do usuário ou do processo no sistema de origem) e recupera os resultados pela sessão ou pela referência.\n\nO documento não é guardado: o arquivo é apagado assim que lido. Só se o servidor tiver cache ligado, a transcrição que a IA fez de cada recorte ou página fica no Redis por alguns dias, separada por token, para não ser paga de novo. O resultado fica em memória só até ser **entregue**: a primeira resposta que traz a sessão `concluida` (o `POST` com `Prefer: wait` ou um `GET`) é a entrega. Depois dela, a sessão fica 60 s para o cliente repetir o pedido se a resposta se perdeu, e então some; `DELETE` confirma o recebimento e apaga na hora. Resultado não buscado é descartado 15 min depois de concluída. `expira_em` sempre diz até quando a sessão existe. Cada token pode ter até 256 MB de resultado esperando entrega; acima disso, novos envios recebem 429 até buscar o que é dele.\n\nO modelo de visão é de quem chama, informado em cada envio (`X-IA-URL`, `X-IA-Modelo`, `X-IA-Chave`); a chave não é guardada nem registrada.\n\nErros seguem a RFC 9457 (`application/problem+json`). Toda resposta traz `X-Request-Id`.\n\n**Documento como código.** Com `codigo=sim`, cada documento de formato editável (PPTX, DOCX, XLSX) traz também `resultado.codigo`: a estrutura do documento com ids estáveis tirados do próprio arquivo (slide, forma, parágrafo, célula, série de gráfico). Com esses ids, `POST /v1/edicoes` aplica operações nomeadas e devolve o arquivo novo, alterando só as partes tocadas; o resto do pacote sai idêntico em bytes.\n\n**Antivírus.** Se o serviço estiver configurado com ClamAV, todo arquivo é varrido antes de ser lido ou editado: arquivo infectado recusa o envio inteiro ou a edição (422 `arquivo-infectado`) e antivírus fora do ar recusa com 503 `antivirus-indisponivel` (nunca lê sem varrer).",
     "license": {
@@ -130,6 +130,11 @@
                       "tarefas"
                     ],
                     "default": "leitura"
+                  },
+                  "max_tarefas": {
+                    "description": "Só no modo `tarefas`: baixa o teto de tarefas de cada documento (200); valor acima dele vale o teto. As que passam ficam em `pendentes` do preparo (`teto de leituras`) e, depois, em `cobertura.pendentes` da montagem. Fora do modo `tarefas`, ou se não for inteiro maior que zero, 400 `max-tarefas-invalido`.",
+                    "type": "integer",
+                    "minimum": 1
                   }
                 }
               },
@@ -598,7 +603,7 @@
         ],
         "operationId": "montarDocumento",
         "summary": "Monta o resultado com as respostas da IA de quem chama",
-        "description": "Segunda fase do modo `tarefas`: recebe o `plano` e as respostas ({id da tarefa: texto}) e devolve o mesmo `Resultado` que a leitura com a IA do Lince daria. Tarefa sem resposta fica em `cobertura.pendentes` (`sem resposta`), com o texto nativo no lugar; resposta a id fora do plano é ignorada. Nada fica guardado no servidor. `uso` vem vazio: o custo foi de quem chamou a IA.",
+        "description": "Segunda fase do modo `tarefas`: recebe o `plano` e as respostas ({id da tarefa: texto}) e devolve o mesmo `Resultado` que a leitura com a IA do Lince daria. Tarefa sem resposta fica em `cobertura.pendentes` (`sem resposta`), com o texto nativo no lugar; resposta a id fora do plano é ignorada. Nada fica guardado no servidor. `uso` vem vazio: o custo foi de quem chamou a IA. As leituras entram no resultado até ele chegar a 16 Mi caracteres, contando o texto nativo: a leitura da mesma imagem repetida entra uma vez, e as outras posições trazem só a referência. As que passam desse teto, na ordem do plano, ficam em `cobertura.pendentes` (`resultado grande demais`), com o texto nativo no lugar, como na leitura com a IA do Lince. O teto vale para as leituras: o texto nativo sai sempre inteiro, mesmo que sozinho passe dele. As respostas são até 20 mil e somam até 64 Mi caracteres (413 `envio-grande`, com o detalhe do teto que passou). Plano alterado ou de outro token: 422 `plano-invalido`; selado por uma chave que o servidor não tem mais: 422 `plano-de-outra-chave` (refaça a fase 1); vencido: 422 `plano-expirado`.",
         "parameters": [
           {
             "$ref": "#/components/parameters/RequestId"
@@ -1279,7 +1284,7 @@
                     },
                     "lida_por": {
                       "type": "string",
-                      "description": "A tarefa que leu a imagem: a mesma imagem repetida no documento é lida uma vez, e todas as posições apontam para essa leitura."
+                      "description": "A tarefa que leu a imagem: a mesma imagem repetida no documento é lida uma vez, e todas as posições apontam para essa leitura. No Markdown, cada posição tem a âncora `<!-- lido pela IA: <tarefa> -->`; a leitura entra inteira só na primeira, e as outras trazem `_(mesma imagem lida acima: <tarefa da primeira>)_`."
                     },
                     "lida": {
                       "type": "boolean"
@@ -1318,7 +1323,7 @@
         "properties": {
           "type": {
             "type": "string",
-            "description": "`urn:lince:erro:<codigo>`, estável para tratar no código (ex.: nao-autorizado, limite-pendentes, sessao-nao-encontrada, idempotency-key-reutilizada, rota-inexistente, metodo-nao-permitido, interno)."
+            "description": "`urn:lince:erro:<codigo>`, estável para tratar no código (ex.: nao-autorizado, limite-pendentes, sessao-nao-encontrada, idempotency-key-reutilizada, plano-invalido, plano-de-outra-chave, rota-inexistente, metodo-nao-permitido, interno)."
           },
           "title": {
             "type": "string"
@@ -1616,11 +1621,11 @@
             "items": {
               "type": "string"
             },
-            "description": "O que já ficou de fora antes da IA (teto de leituras, EMF sem desenhista...)."
+            "description": "O que já ficou de fora antes da IA (teto de leituras, teto de tarefas da sessão, EMF sem desenhista...). Cada documento tem até 200 tarefas (`teto de leituras` nas pendências, para cada uma que passou) e cada sessão, até 300 somando o lote (`teto de tarefas da sessão`): cada tarefa leva a imagem no resultado, que fica em memória até a entrega."
           },
           "plano": {
             "type": "string",
-            "description": "O texto e o estado do documento, compactados e assinados com uma chave que só o servidor conhece: só o mesmo token monta, em até 24 h, e ninguém o altera nem o forja. Opaco: mande de volta como veio. Com várias réplicas, todas precisam do mesmo LINCE_SEGREDO; sem ele, o plano só monta na instância que o entregou. Plano acima de 64 MB descompactados faz o documento falhar já nesta fase."
+            "description": "O texto e o estado do documento, compactados e assinados com uma chave que só o servidor conhece: só o mesmo token monta, em até 24 h, e ninguém o altera nem o forja. Opaco: mande de volta como veio. Com várias réplicas, todas precisam do mesmo LINCE_SEGREDO; sem ele, o plano só monta na instância que o entregou. O plano leva o identificador da chave que o selou (não o segredo): plano de uma chave que o servidor não tem (reinício sem LINCE_SEGREDO, réplica com outro segredo) é recusado na montagem com 422 `plano-de-outra-chave`, e a saída é refazer a fase 1; 422 `plano-invalido` é o plano alterado ou de outro token. Plano acima de 64 MB descompactados faz o documento falhar já nesta fase."
           },
           "codigo": {
             "description": "Presente com `codigo=sim`. Nulo se o formato não tem código.",

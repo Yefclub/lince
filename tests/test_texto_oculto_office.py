@@ -54,7 +54,8 @@ def test_xml_que_nao_pode_ser_conferido_vira_alerta(tmp_path, monkeypatch):
 
     monkeypatch.setattr(seguranca, "_xml", falha)
     r = lince.ler(_docx(tmp_path, lambda d: d.add_paragraph("Mais texto.")))
-    assert seguranca.NAO_CONFERIDO in r.alertas_injecao
+    falha = f"{seguranca.NAO_CONFERIDO}: word/document.xml (hostil)"  # a parte e o motivo, no alerta e na cobertura
+    assert falha in r.alertas_injecao and falha in r.cobertura.pendentes
 
 
 def test_oculto_pelo_estilo(tmp_path):
@@ -168,10 +169,14 @@ def test_texto_branco_em_celula_escura_ou_de_tabela_com_estilo_e_visivel(tmp_pat
         shd.set(qn("w:val"), "clear")
         shd.set(qn("w:fill"), "1F3864")
         escura.paragraphs[0].add_run("Cabeçalho branco sobre azul").font.color.rgb = RGBColor(255, 255, 255)
+        grade = d.styles.add_style("GradeEscura", 3).element  # estilo de tabela que pinta a célula: fundo incerto
+        shd = etree.SubElement(etree.SubElement(grade, qn("w:tcPr")), qn("w:shd"))
+        shd.set(qn("w:val"), "clear")
+        shd.set(qn("w:fill"), "1F3864")
         t = d.add_table(rows=1, cols=1)
         t.cell(0, 0).paragraphs[0].add_run("Branco pintado pelo estilo").font.color.rgb = RGBColor(255, 255, 255)
         estilo = etree.SubElement(t._tbl.tblPr, qn("w:tblStyle"))
-        estilo.set(qn("w:val"), "GradeEscura")  # o estilo pode pintar a célula: o fundo é incerto
+        estilo.set(qn("w:val"), "GradeEscura")
 
     assert _visivel(_docx(tmp_path, monta), "Cabeçalho branco sobre azul", "Branco pintado pelo estilo")
 
@@ -287,8 +292,19 @@ def test_cadeia_de_estilos_enorme_nao_custa_quadratico(tmp_path):
     p = tmp_path / "cadeia.docx"
     d.save(p)
     inicio = time.monotonic()
-    seguranca.texto_oculto_docx(p)
+    seguranca.limpar_docx(p.read_bytes())
     assert time.monotonic() - inicio < 5
+
+
+# a âncora atrás do texto com uma figura desenhada (um retângulo escuro: o que ele pinta o Lince não diz)
+_FIGURA_ATRAS = (
+    '<wp:anchor xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+    'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+    'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" behindDoc="1"><a:graphic>'
+    '<a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:spPr>'
+    '<a:solidFill><a:srgbClr val="1F3864"/></a:solidFill></wps:spPr><wps:bodyPr/></wps:wsp></a:graphicData>'
+    "</a:graphic></wp:anchor>"
+)
 
 
 def _docx_com_xml(tmp_path, trecho, nome="camada.docx"):
@@ -311,9 +327,9 @@ def test_texto_branco_em_caixa_de_texto_ou_sobre_figura_atras_do_texto_e_visivel
         '<w:r><w:pict><v:shape fillcolor="#1F3864" filled="t"><v:textbox><w:txbxContent><w:p>'
         f"{branco}</w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r>"
     )
-    assert seguranca.texto_oculto_docx(_docx_com_xml(tmp_path, caixa)) == []
-    atras = f'<w:r><w:drawing><wp:anchor behindDoc="1"/></w:drawing></w:r>{branco}'  # foto atrás do texto
-    assert seguranca.texto_oculto_docx(_docx_com_xml(tmp_path, atras, "atras.docx")) == []
+    assert seguranca.limpar_docx(_docx_com_xml(tmp_path, caixa).read_bytes()).ocultos == []
+    atras = f"<w:r><w:drawing>{_FIGURA_ATRAS}</w:drawing></w:r>{branco}"  # foto atrás do texto
+    assert seguranca.limpar_docx(_docx_com_xml(tmp_path, atras, "atras.docx").read_bytes()).ocultos == []
 
 
 def test_pptx_titulo_branco_sobre_foto_ou_faixa_escura_fica(tmp_path):
@@ -364,9 +380,8 @@ def test_papel_timbrado_atras_do_texto_no_cabecalho_deixa_o_fundo_incerto(tmp_pa
     d = Document()
     d.add_paragraph().add_run("Texto branco sobre o timbrado").font.color.rgb = RGBColor(255, 255, 255)
     cab = d.sections[0].header.paragraphs[0]._p
-    ns = 'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"'
     desenho = etree.SubElement(etree.SubElement(cab, qn("w:r")), qn("w:drawing"))
-    desenho.append(etree.fromstring(f'<wp:anchor {ns} behindDoc="1"/>'))
+    desenho.append(etree.fromstring(_FIGURA_ATRAS))
     p = tmp_path / "timbrado.docx"
     d.save(p)
-    assert seguranca.texto_oculto_docx(p) == []
+    assert seguranca.limpar_docx(p.read_bytes()).ocultos == []

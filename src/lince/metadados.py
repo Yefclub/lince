@@ -16,29 +16,15 @@ from xml.etree import ElementTree as ET  # noqa: F401
 from . import legados
 from .estrutura import estrutura_arquivo
 from .limites import xml_ou_nada
+from .seguranca import bordas_sem_oculto
 
 
 def metadados_arquivo(path, ext=None):
     """Metadados que a empresa precisa e que não estão no corpo: propriedades do arquivo,
-    comentários e alterações rastreadas (DOCX), abas ocultas (XLSX), info do PDF. `ext` é o formato já decidido."""
+    comentários e alterações rastreadas (DOCX), abas ocultas (XLSX). `ext` é o formato já decidido. As propriedades do
+    PDF saem do plano (`planejar_pdf`), lidas na mesma vez da PDFium que abre o documento."""
     meta = {}
     ext = ext or os.path.splitext(path)[1].lower()
-    if ext == ".pdf":
-        import pypdfium2 as pdfium
-
-        from ._trava import PDFIUM
-
-        try:
-            with PDFIUM:
-                doc = pdfium.PdfDocument(path)
-                try:
-                    info = doc.get_metadata_dict()
-                finally:
-                    doc.close()
-            meta["propriedades"] = {k: v for k, v in info.items() if v}
-        except Exception:  # noqa: BLE001, S110 — PDF sem propriedades legíveis: segue sem elas
-            pass
-        return meta
     if ext in ODF:
         meta = _metadados_odf(path, meta, ext)
         if estrutura := estrutura_arquivo(path, ext):
@@ -71,9 +57,12 @@ def metadados_arquivo(path, ext=None):
     with zipfile.ZipFile(path) as z:
         nomes = set(z.namelist())
         ilegiveis = []
+        # o texto oculto do cabeçalho, do rodapé e dos comentários sai daqui como sai do corpo; o Word é reconhecido
+        # pelo conteúdo, como na leitura do corpo (planejar_office): gravado como .pptx, também é conferido
+        sem_oculto = bordas_sem_oculto(z) if _formato(path) == "docx" else {}
 
         def ler(parte):
-            return _ler_parte(z, parte, ilegiveis)
+            return sem_oculto[parte] if parte in sem_oculto else _ler_parte(z, parte, ilegiveis)
 
         def arvore(parte):
             dados = ler(parte)
@@ -145,6 +134,13 @@ def metadados_arquivo(path, ext=None):
         if ilegiveis:
             meta["partes_ilegiveis"] = ilegiveis  # malformadas ou hostis: ficaram de fora dos metadados
     return meta
+
+
+def _formato(path):
+    """O formato que o anydoc detecta nos bytes (docx, pptx, xlsx...), ou None."""
+    import anydoc
+
+    return anydoc.format_from_bytes(Path(path).read_bytes())
 
 
 def _metadados_ole(path, meta, ext):

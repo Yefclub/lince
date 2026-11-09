@@ -173,5 +173,6 @@ def test_svgs_do_documento_tem_teto_de_tempo(tmp_path, monkeypatch):
 
 def test_svgs_do_documento_tem_teto_de_quantidade(tmp_path):
     r, vistas = _ler(_docx_com(tmp_path, "svg", "image/svg+xml", SVG_AZUL, imagens=DESENHOS_MAX + 3))
-    assert r.markdown.count("Lido pela IA.") == DESENHOS_MAX and r.markdown.count("SVG não lida]") == 3
-    assert len(vistas) == 1  # o mesmo desenho em todos os lugares: a IA lê uma vez
+    assert r.markdown.count("SVG não lida]") == 3
+    assert len(vistas) == 1  # o mesmo desenho em todos os lugares: a IA lê uma vez, e a leitura entra uma vez
+    assert r.markdown.count("Lido pela IA.") == 1 and r.markdown.count("mesma imagem lida acima") == DESENHOS_MAX - 1

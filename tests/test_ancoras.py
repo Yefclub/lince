@@ -65,9 +65,11 @@ def test_imagem_repetida_lida_uma_vez_e_posicao_de_cada_uma(tmp_path):
     logo1, logo2, figura = imagens
     assert logo2["lida_por"] == logo1["tarefa"] and logo1["lida_por"] == logo1["tarefa"]
     blocos = dict(re.findall(r"<!-- lido pela IA: (\w+) -->\n(.+)", r.markdown))
-    assert (
-        blocos[logo1["tarefa"]] == blocos[logo2["tarefa"]] != blocos[figura["tarefa"]]
-    )  # a leitura do logo, não outra
+    assert len(blocos) == 3  # cada posição tem a sua âncora, com o id que a estrutura dá
+    leitura_logo = blocos[logo1["tarefa"]]
+    assert leitura_logo.startswith("Leitura ") and leitura_logo != blocos[figura["tarefa"]]  # a do logo, não outra
+    assert r.markdown.count(leitura_logo) == 1  # entra uma vez, na primeira posição
+    assert blocos[logo2["tarefa"]] == f"_(mesma imagem lida acima: {logo1['tarefa']})_"  # as outras apontam para ela
 
 
 def test_posicao_das_imagens_no_pdf(tmp_path):
