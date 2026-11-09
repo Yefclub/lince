@@ -48,6 +48,13 @@ comentários e as alterações rastreadas do Word e as abas ocultas do Excel.
 oculto do Word) sai do corpo e gera alerta; padrões de prompt injection em português e inglês geram alerta.
 O conteúdo das imagens é tratado como dado, nunca como instrução.
 
+**Arquivo com senha**: PDF com senha de abertura, Office (`.docx`, `.xlsx`, `.pptx` e os binários `.doc`, `.xls`,
+`.ppt`) e ODF protegidos são reconhecidos antes de qualquer leitura e recusados com `lince.DocumentoProtegido` (com o
+`formato`), sem ler nada nem chamar a IA. Com `Leitor().ler(arquivo, senha=...)` (ou `preparar`), o arquivo é
+decifrado numa cópia temporária só para a leitura; a senha errada levanta `lince.SenhaIncorreta`. A senha não é
+guardada, e as leituras do documento protegido não entram no cache. O PDF que só tem senha de permissões abre sem ela
+e é lido como sempre.
+
 ## Peças plugáveis
 
 ```python
@@ -99,8 +106,8 @@ Cada envio, de um documento ou de um lote, cria uma **sessão**. Quem chama marc
 própria, por exemplo `usuario:42`. Assim, um sistema com N usuários sabe de quem é cada resultado.
 
 **O documento não fica guardado.** O arquivo é apagado assim que lido (a exceção é o cache opcional de transcrições,
-abaixo). O resultado fica em memória só
-até ser entregue: a primeira resposta com a sessão `concluida` (o próprio envio com `Prefer: wait`, ou um `GET`) é a
+abaixo). O resultado fica em disco (arquivo
+temporário em `/tmp`) só até ser entregue: a primeira resposta com a sessão `concluida` (o próprio envio com `Prefer: wait`, ou um `GET`) é a
 entrega. Depois dela, a sessão fica 60 s para repetir o pedido caso a resposta tenha se perdido, e some; um
 `DELETE` confirma o recebimento e apaga na hora. Resultado que ninguém busca em 15 min é descartado.
 
@@ -118,7 +125,7 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
 
 | Rota | O que faz |
 | --- | --- |
-| `POST /v1/sessoes` | Envia 1 a 50 arquivos (campo `arquivo` repetido), com `referencia`, `esforco` (`padrao` ou `max`), `prazo` (1 a 3600 s por documento), `modo` (`leitura` ou `tarefas`) e `max_tarefas` (só no modo `tarefas`) opcionais. Responde `201` com a sessão e `Location`. Com `Prefer: wait=N` (até 300 s), espera terminar. |
+| `POST /v1/sessoes` | Envia 1 a 50 arquivos (campo `arquivo` repetido), com `referencia`, `esforco` (`padrao` ou `max`), `prazo` (1 a 3600 s por documento), `modo` (`leitura` ou `tarefas`), `max_tarefas` (só no modo `tarefas`) e `senha` (dos arquivos protegidos) opcionais. Responde `201` com a sessão e `Location`. Com `Prefer: wait=N` (até 300 s), espera terminar. |
 | `GET /v1/sessoes/{id}` | Estado da sessão e de cada documento; o que já terminou vem com `markdown`, `metadados`, `cobertura`, `alertas_injecao`, `uso` (tokens por leitura) e `estrutura`. Aceita `Prefer: wait=N`. |
 | `GET /v1/sessoes?referencia=…` | Sessões do token ainda não entregues, da mais nova para a mais antiga (resumo, sem o conteúdo lido). |
 | `DELETE /v1/sessoes/{id}` | Confirma o recebimento (ou cancela o que ainda não foi lido) e apaga a sessão na hora. |
@@ -131,6 +138,18 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   (`urn:lince:erro:<codigo>`) e `instance` igual ao `X-Request-Id`. O `X-Request-Id` enviado volta em toda
   resposta, o que facilita o rastreio entre os dois sistemas.
 - **Sem `X-IA-URL`**: só a extração nativa; o que precisava de IA aparece em `cobertura.pendentes`.
+- **Arquivo com senha**: sem o campo `senha`, o envio com um arquivo protegido é recusado na hora com
+  `422 arquivo-protegido` (com `formato` e `arquivo` no corpo), sem ler nada nem chamar a IA; quem chama pede a senha
+  ao usuário e envia de novo com `-F senha=...`. A senha errada dá `422 senha-incorreta`. Com a certa, o arquivo é
+  decifrado na pasta temporária da sessão, só para a leitura, e apagado com ela; a montagem, a releitura ampliada e
+  `codigo=sim` trabalham sobre ele, sem pedir a senha de novo. A senha vale nos modos `leitura` e `tarefas`, para
+  cada arquivo do envio que pede senha, e não vai para a sessão, o plano, o log, o cache nem a resposta; as leituras
+  do documento protegido também não entram no cache. Depois de 5 senhas erradas para o mesmo arquivo (ou 50 no
+  token) em 15 min, as tentativas seguintes recebem `429 tentativas-de-senha` com `Retry-After`. O decifrado também
+  passa pelo antivírus. O que o Lince não decifra (ODF cifrado com Blowfish ou AES-GCM, Word com ofuscação XOR) volta
+  como `arquivo-protegido`, com o motivo em `detail`; o arquivo que a senha certa abre, mas está corrompido, volta
+  igual, com o motivo, sem contar como senha errada. O pacote decifrado acima dos limites de leitura (zip bomb dentro
+  do ODF) volta como `422 documento-recusado`. A decifração tem fila justa própria, com poucas vagas.
 - **Modo `tarefas`** (`-F modo=tarefas`): o Lince não chama IA. Cada documento volta com `tarefas` (imagem em base64,
   instrução, onde está, `chave` de cache e `tokens_estimados`) e um `plano` opaco, assinado pelo servidor para o token
   e válido por 24 h. Quem chama lê as imagens com o próprio modelo e manda `POST /v1/montagens`; nada fica guardado
@@ -139,7 +158,7 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   reinício sem `LINCE_SEGREDO` (ou numa réplica com outro segredo), a montagem responde `422 plano-de-outra-chave`, e
   a saída é refazer a fase 1; `422 plano-invalido` é só o plano alterado ou de outro token. Cada documento devolve
   até 200 tarefas e cada sessão, 300 somando o lote (cada tarefa leva a imagem em base64 no resultado, que fica em
-  memória até a entrega); as que passam ficam nas pendências do preparo com o motivo, e `-F max_tarefas=N` baixa o
+  disco até a entrega); as que passam ficam nas pendências do preparo com o motivo, e `-F max_tarefas=N` baixa o
   teto do documento (nunca sobe).
 - **Prazo**: com `prazo=20`, cada documento tem 20 s a partir do início da leitura dele (a espera na fila não
   conta; a extração nativa conta: no PDF, a faixa de páginas que não começa a tempo não é lida, e a página que começa
@@ -149,13 +168,17 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   mandou 1. Até 16 documentos em leitura ao mesmo tempo por instância. As montagens (`POST /v1/montagens`) têm fila
   justa própria, com até 2 ao mesmo tempo: não esperam atrás de leituras presas na IA nem tomam a vaga delas.
 - **Isolamento**: um token nunca vê sessão nem referência de outro. `LINCE_TOKENS` aceita vários tokens
-  separados por vírgula, um por plataforma. Para uso local sem token: `lince-servidor --sem-autenticacao`.
+  separados por vírgula, um por plataforma; cada um pode ter o próprio teto de retenção como `nome:token:teto`
+  (`qa:abc123:2G`, `prod:def456:4G`; sem teto, vale o padrão). Para uso local sem token: `lince-servidor --sem-autenticacao`.
 - **Memória**: no Linux com glibc, o servidor (`lince-servidor`) fixa o limite de `mmap` do alocador em 16 MB, o que
   desliga o ajuste dinâmico que deixava as arenas das threads fragmentadas, e, a cada 60 s, devolve ao sistema a
   memória livre que o alocador guardou (`malloc_trim`). O processo volta perto do tamanho de repouso depois de uma carga, em vez de
   ficar no teto do contêiner. Em outra libc (Alpine/musl) nada muda.
-- **Limites**: 100 MB por envio (com `Content-Length`), 50 arquivos por sessão, 64 documentos pendentes e 256 MB
-  de resultado esperando entrega por token. Acima disso, `429` com `Retry-After`. A montagem aceita até 20 mil
+- **Limites**: 100 MB por envio (com `Content-Length`), 50 arquivos por sessão, 64 documentos pendentes e 1 GiB
+  de resultado esperando entrega por token (cerca de 6 documentos pesados de uma vez), guardado num diretório
+  temporário em disco, e não na memória do processo (veja Deploy: volume de disco em `/tmp`). O resultado deixa
+  de contar no teto assim que é entregue. Acima do teto, `429` com `Retry-After` (quando o próximo resultado não
+  buscado vence) e `em_uso_bytes` e `teto_bytes` no corpo. A montagem aceita até 20 mil
   respostas e 64 M caracteres delas (acima, `413 envio-grande`, com o teto que passou no detalhe) e põe leituras no resultado até ele chegar a 16 M caracteres,
   contando o texto nativo: a leitura da mesma imagem repetida entra uma vez, e as outras posições levam só a
   referência. As que passam desse teto ficam em `cobertura.pendentes` (`resultado grande demais`), com o texto nativo
@@ -246,7 +269,11 @@ elementos XML é recusado, e o pedido inteiro que passa de 60 s não aplica nada
 
 ## Deploy
 
-A imagem roda sem root, tem healthcheck em `/saude` e não grava nada (não precisa de volume). Tags publicadas:
+A imagem roda sem root e tem healthcheck em `/saude`. Ela só grava em `/tmp`: o documento enquanto é lido e os
+resultados esperando entrega (até o teto de cada token). Monte um volume de disco em `/tmp`, e não `tmpfs`: `tmpfs`
+é memória e conta no limite do contêiner. Reserve nele a soma dos tetos dos tokens com folga: o teto é conferido na
+entrada de cada envio, e um documento já aceito guarda o resultado inteiro, então com muitos documentos em leitura
+o uso pode passar do teto por alguns resultados. Tags publicadas:
 `X.Y.Z` e `X.Y`, para `linux/amd64` e `linux/arm64`, com atestado de procedência do GitHub.
 
 ```yaml
@@ -258,8 +285,10 @@ services:
     ports:
       - "8000:8000"
     read_only: true
-    tmpfs:
-      - /tmp # o documento só existe aqui enquanto é lido
+    volumes:
+      - lince-tmp:/tmp # disco: o documento enquanto é lido e os resultados até a entrega
+volumes:
+  lince-tmp:
 ```
 
 Coloque atrás de um proxy reverso com TLS e timeout de leitura acima de 300 s.
@@ -279,11 +308,12 @@ services:
     depends_on: [clamav]
     ports: ["8000:8000"]
     read_only: true
-    tmpfs: [/tmp]
+    volumes: [lince-tmp:/tmp]
   clamav:
     image: clamav/clamav:stable  # baixa e atualiza as assinaturas sozinho
     volumes: [clamav-db:/var/lib/clamav]
 volumes:
+  lince-tmp:
   clamav-db:
 ```
 
@@ -345,6 +375,10 @@ caminho fica registrado em `partes_ilegiveis`.
 
 E-mail (`.eml`, `.msg`) e arquivos compactados (`.zip`) ainda não são aceitos.
 
+Arquivo protegido por senha: PDF com senha de abertura (pela PDFium), Office OOXML e os binários `.doc`, `.xls` e
+`.ppt` (pelo [msoffcrypto-tool](https://github.com/nolze/msoffcrypto-tool)) e ODF no padrão ODF 1.2 (AES-256-CBC com
+PBKDF2, como grava o LibreOffice) são decifrados com a senha. Cifras fora disso ficam reconhecidas, com o motivo.
+
 ## Instalação
 
 ```bash
@@ -383,7 +417,8 @@ lince relatorio.pdf --url https://openrouter.ai/api/v1 --modelo seu/modelo --cha
 Todas com licença permissiva: [anydoc](https://github.com/firecrawl/anydoc) (MIT),
 [pdf-inspector](https://github.com/firecrawl/pdf-inspector) (MIT), [pypdfium2](https://github.com/pypdfium2-team/pypdfium2)
 (Apache-2.0/BSD-3), openpyxl (MIT), python-pptx (MIT), Pillow (MIT-CMU), lxml (BSD-3), defusedxml (PSF),
-[olefile](https://github.com/decalage2/olefile) (BSD-2), [html-to-markdown](https://github.com/xberg-io/html-to-markdown) (MIT), tinycss2 (BSD-3); na API, Starlette e Uvicorn (BSD-3) e
+[olefile](https://github.com/decalage2/olefile) (BSD-2), [msoffcrypto-tool](https://github.com/nolze/msoffcrypto-tool)
+(MIT) com cryptography (Apache-2.0/BSD-3), [html-to-markdown](https://github.com/xberg-io/html-to-markdown) (MIT), tinycss2 (BSD-3); na API, Starlette e Uvicorn (BSD-3) e
 python-multipart (Apache-2.0). Nada de GPL/AGPL. O CI e o build da imagem reprovam qualquer dependência fora
 dessa lista, e a imagem leva `THIRD_PARTY_NOTICES.md` gerado do que foi instalado.
 

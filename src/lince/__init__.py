@@ -13,12 +13,15 @@ from ._prazo import prazo_restante
 from .cache import CacheDisco, CacheMemoria, CacheRedis
 from .leitor import VERSAO as __version__
 from .leitor import FormatoNaoSuportado, Leitor, ler
+from .protecao import DocumentoProtegido, SenhaIncorreta
 from .provedores import FuncaoLeitor, LeitorVisual, OpenAICompativel
 from .tipos import Cobertura, Plano, PrazoEsgotado, RespostaIA, Resultado, TarefaVisual, Uso
 
 __all__ = [
     "Leitor",
     "FormatoNaoSuportado",
+    "DocumentoProtegido",
+    "SenhaIncorreta",
     "ler",
     "OpenAICompativel",
     "FuncaoLeitor",
