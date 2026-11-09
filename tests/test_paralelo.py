@@ -11,6 +11,7 @@ import multiprocessing
 import os
 import threading
 import time
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 
@@ -305,3 +306,67 @@ def test_pool_que_nao_pode_ser_recriado_nao_prende_ninguem(em_processos, monkeyp
     monkeypatch.setattr(paralelo.Distribuidor, "_novo_executor", sem_descritores)
     erro(em_processos.submeter("hostil", os._exit, 1))
     erro(em_processos.submeter("outro", time.sleep, 0))
+
+
+class _SoInspecao:
+    """Distribuidor que roda a inspeção da faixa aqui e devolve toda página cancelada (o prazo venceu na fila)."""
+
+    processos = 1
+
+    def submeter(self, dono, funcao, *args):
+        futuro = cf.Future()
+        if funcao is pdf._faixa_no_processo:
+            futuro.set_result(funcao(*args))
+        else:
+            futuro.cancel()
+        return futuro
+
+    def cancelar(self, dono):
+        pass
+
+    def encerradas(self):
+        return ()
+
+    def encerrada(self, leitura):
+        pass
+
+
+def test_pagina_cancelada_acima_do_teto_tem_o_motivo_do_teto(relatorio, tmp_path, monkeypatch):
+    monkeypatch.setattr(pdf, "PAGINAS_ANALISE_MAX", 5)
+    paginas, _, _, pendentes, so_texto, _ = pdf._distribuir(
+        _SoInspecao(), str(relatorio), str(tmp_path), 60, 60, time.monotonic(), defaultdict(float)
+    )
+    assert len(paginas) == 60
+    assert so_texto == [[0, 5, "prazo esgotado"], [5, 60, "teto de 5 páginas"]]
+
+
+def _docs_do_processo(espera):
+    time.sleep(espera)  # os dois processos recebem um trabalho
+    return os.getpid(), list(pdf._DOCS)
+
+
+def test_processos_fecham_o_documento_da_leitura_encerrada(relatorio, em_processos):
+    lince.Leitor().preparar(relatorio)
+    primeira = em_processos.encerradas()[-1]
+    lince.Leitor().preparar(relatorio)  # os trabalhos desta leitura fecham o documento da anterior
+    vistos = dict(f.result(timeout=60) for f in [em_processos.submeter(k, _docs_do_processo, 0.5) for k in range(2)])
+    assert len(vistos) == 2 and all(primeira not in docs for docs in vistos.values())
+
+
+def test_leitura_com_erro_espera_as_paginas_ja_despachadas(relatorio, em_processos, monkeypatch):
+    paginas, submeter = [], paralelo.Distribuidor.submeter
+
+    def guardar(self, dono, funcao, *args):
+        futuro = submeter(self, dono, funcao, *args)
+        if funcao is pdf._pagina_no_processo:
+            paginas.append(futuro)
+        return futuro
+
+    def falha(*_):
+        raise RuntimeError("erro ao juntar a página")
+
+    monkeypatch.setattr(paralelo.Distribuidor, "submeter", guardar)
+    monkeypatch.setattr(pdf, "_juntar", falha)
+    with pytest.raises(RuntimeError, match="juntar"):
+        lince.Leitor().preparar(relatorio)
+    assert paginas and all(f.done() for f in paginas)  # nenhuma ainda gravando recortes numa pasta já apagada

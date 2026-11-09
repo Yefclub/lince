@@ -395,8 +395,9 @@ def _distribuir(distribuidor, path, pasta, total, lidas, inicio, etapas):
             for i, trabalho in trabalhos:
                 if _vencido():  # o que ainda está na fila não espera a vez só para dizer "prazo esgotado"
                     distribuidor.cancelar(dono)
-                if trabalho.cancelled():
-                    r = {"i": i, "info": _so_o_texto(i, md_de.get(i, "")), "motivo": "prazo esgotado", "etapas": {}}
+                if trabalho.cancelled():  # o motivo de `_so_texto`, como na série: o teto de páginas vem antes do prazo
+                    motivo = _so_texto(i) or "prazo esgotado"
+                    r = {"i": i, "info": _so_o_texto(i, md_de.get(i, "")), "motivo": motivo, "etapas": {}}
                 else:
                     r = trabalho.result()
                 _somar(etapas, r["etapas"])
