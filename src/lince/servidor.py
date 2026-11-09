@@ -219,7 +219,7 @@ class Servico:
     # ---------------------------------------------------------------- leitura
     def _ler(self, doc):
         sessao = doc["sessao"]
-        estado = "falhou"
+        estado, reservadas = "falhou", 0
         try:
             if sessao.get("apagada"):
                 estado = "cancelado"
@@ -229,7 +229,7 @@ class Servico:
             if sessao.get("modo") == "tarefas":
                 teto = min(TAREFAS_POR_DOCUMENTO, sessao.get("max_tarefas") or TAREFAS_POR_DOCUMENTO)
                 plano = Leitor(max_leituras=teto).preparar(doc["arquivo"], prazo=sessao.get("prazo"))
-                self._teto_da_sessao(sessao, plano)
+                reservadas = self._teto_da_sessao(sessao, plano)
                 doc["resultado"] = {
                     "tarefas": plano.para_json()["tarefas"],  # imagem em base64
                     "pendentes": plano.estado.get("pendentes", []) + plano.pendentes,
@@ -247,6 +247,9 @@ class Servico:
             estado = "pronto"
         except Exception as e:  # noqa: BLE001 — o erro vira estado do documento, nunca derruba o serviço
             doc["erro"] = f"{type(e).__name__}: {str(e)[:300]}"
+            if reservadas:  # o documento não entregou as tarefas (plano grande demais, por exemplo): a cota volta
+                with self.trava:
+                    sessao["tarefas"] -= reservadas
         finally:
             Path(doc["arquivo"]).unlink(missing_ok=True)
             doc["fim"] = time.time()
@@ -264,7 +267,8 @@ class Servico:
 
     def _teto_da_sessao(self, sessao, plano):
         """Tira do plano as tarefas além do que sobra de TAREFAS_POR_SESSAO, com o motivo nas pendências. Os documentos
-        do lote são preparados em paralelo: a conta da sessão é feita sob a trava."""
+        do lote são preparados em paralelo: a conta da sessão é feita sob a trava. Devolve quantas tarefas reservou,
+        para o documento que falhar depois devolver a cota."""
         with self.trava:
             cabem = max(0, min(len(plano.tarefas), TAREFAS_POR_SESSAO - sessao.get("tarefas", 0)))
             sessao["tarefas"] = sessao.get("tarefas", 0) + cabem
@@ -272,6 +276,7 @@ class Servico:
             plano.pendentes += [f"{t.id}: teto de tarefas da sessão" for t in plano.tarefas[cabem:]]
             plano.tarefas = plano.tarefas[:cabem]
             plano.estado["tarefas"] = plano.estado.get("tarefas", [])[:cabem]
+        return cabem
 
     def _fechar_se_terminou(self, sessao):
         """Chamar com a trava."""
@@ -426,7 +431,11 @@ def _montar_pedido(segredo, cliente, corpo, kid=""):
     respostas = pedido.get("respostas") if isinstance(pedido, dict) else None
     if not isinstance(respostas, dict) or not all(isinstance(v, str) for v in respostas.values()):
         raise Problema(400, "montagem-invalida", 'Envie {"plano": ..., "respostas": {id: texto}}')
-    if len(respostas) > PLANO_TAREFAS_MAX or sum(len(v) for v in respostas.values()) > RESPOSTAS_MAX:
+    if len(respostas) > PLANO_TAREFAS_MAX:
+        raise Problema(
+            413, "envio-grande", "Respostas grandes demais", f"Até {PLANO_TAREFAS_MAX} respostas por montagem."
+        )
+    if sum(len(v) for v in respostas.values()) > RESPOSTAS_MAX:
         raise Problema(413, "envio-grande", "Respostas grandes demais", f"Até {RESPOSTAS_MAX // 2**20} M caracteres.")
     plano = abrir(segredo, cliente, str(pedido.get("plano") or ""), kid)
     try:

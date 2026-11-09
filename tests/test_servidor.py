@@ -1022,3 +1022,112 @@ def test_lince_segredo_curto_recusa_a_subida_e_o_certo_chega_ao_servico(monkeypa
     monkeypatch.setenv("LINCE_SEGREDO", "x" * 40)
     srv.main()
     assert apps[0].state.servico.segredo_plano == b"x" * 40
+
+
+def test_413_das_respostas_diz_qual_teto_foi_passado(api, monkeypatch):
+    import hashlib
+
+    import lince.servidor as srv
+    from lince.tipos import Plano
+
+    cliente = hashlib.sha256(b"token-a").hexdigest()[:16]
+    plano = srv.selar(api.app.state.servico.segredo(cliente), cliente, Plano([], {"tipo": "office", "md": "a"}, []))
+    monkeypatch.setattr(srv, "PLANO_TAREFAS_MAX", 2)
+    r = _montar(
+        api, {"plano": plano, "respostas": {"a": "x", "b": "x", "c": "x"}}
+    )  # poucos caracteres, respostas demais
+    assert r.status_code == 413 and r.json()["type"] == "urn:lince:erro:envio-grande"
+    assert "2 respostas" in r.json()["detail"] and "caracteres" not in r.json()["detail"]
+    monkeypatch.setattr(srv, "RESPOSTAS_MAX", 10)
+    r = _montar(api, {"plano": plano, "respostas": {"a": "x" * 11}})  # uma resposta, caracteres demais
+    assert r.status_code == 413 and "caracteres" in r.json()["detail"] and "respostas" not in r.json()["detail"]
+
+
+def test_documento_que_falha_ao_selar_devolve_as_tarefas_ao_teto_da_sessao(monkeypatch):
+    import lince.servidor as srv
+
+    monkeypatch.setattr(srv, "DOCS_SIMULTANEOS", 1)  # um de cada vez, na ordem do envio
+    monkeypatch.setattr(srv, "TAREFAS_POR_SESSAO", 2)  # cada documento tem duas tarefas: só um cabe
+    original, chamadas = srv.selar, []
+
+    def falha_na_primeira(*a, **k):
+        chamadas.append(1)
+        if len(chamadas) == 1:
+            raise ValueError("plano de 70 MB, acima do teto")  # o plano do 1º documento passa do PLANO_MAX
+        return original(*a, **k)
+
+    monkeypatch.setattr(srv, "selar", falha_na_primeira)
+    api = TestClient(criar_app(["token-a"]))
+    s = enviar(api, [("r.docx", _docx_com_imagens()), ("s.docx", _docx_com_imagens())], {**A, **ESPERA}, modo="tarefas")
+    primeiro, segundo = conforme(s, "/v1/sessoes", "post").json()["itens"]
+    assert primeiro["estado"] == "falhou" and "acima do teto" in primeiro["erro"]
+    # o que o 1º reservou e não entregou volta à cota da sessão: o 2º recebe as suas duas tarefas
+    assert segundo["estado"] == "pronto" and len(segundo["resultado"]["tarefas"]) == 2
+    assert not [p for p in segundo["resultado"]["pendentes"] if p.endswith("teto de tarefas da sessão")]
+
+
+def test_espera_cancelada_na_fila_nao_roda_o_trabalho_e_devolve_a_vaga():
+    import asyncio
+
+    from lince.servidor import _na_fila
+
+    s = Servico(["t"])
+    fila = Fila(lambda trabalho: trabalho(), 1)
+    ocupada, solta, rodou = threading.Event(), threading.Event(), []
+    fila.por("outro", lambda: (ocupada.set(), solta.wait(5)))  # a única vaga da fila está ocupada
+
+    async def pedir(trabalho):
+        assert s.reservar("c")
+        return await _na_fila(fila, "c", trabalho, lambda: s.liberar("c"))
+
+    async def cancelar(tarefa):
+        await asyncio.sleep(0.05)
+        tarefa.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tarefa
+
+    async def principal():
+        assert await asyncio.to_thread(ocupada.wait, 5)
+        espera = asyncio.create_task(pedir(lambda: rodou.append("pulado")))
+        await cancelar(espera)  # desiste antes de o trabalho começar
+        assert s.vagas == {"c": 1}  # a vaga fica enquanto o pedido está na fila
+        solta.set()
+        for _ in range(250):
+            if not s.vagas:
+                break
+            await asyncio.sleep(0.02)
+
+    asyncio.run(principal())
+    assert s.vagas == {} and rodou == []  # a vaga voltou e o trabalho que ninguém espera não rodou
+
+
+def test_espera_cancelada_com_o_trabalho_em_curso_deixa_ele_terminar_e_devolve_a_vaga():
+    import asyncio
+
+    from lince.servidor import _na_fila
+
+    s = Servico(["t"])
+    fila = Fila(lambda trabalho: trabalho(), 1)
+    comecou, termina, rodou = threading.Event(), threading.Event(), []
+
+    def trabalho():
+        comecou.set()
+        termina.wait(5)
+        rodou.append("terminou")
+
+    async def principal():
+        assert s.reservar("c")
+        espera = asyncio.create_task(_na_fila(fila, "c", trabalho, lambda: s.liberar("c")))
+        assert await asyncio.to_thread(comecou.wait, 5)
+        espera.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await espera
+        assert s.vagas == {"c": 1}  # o trabalho segue na vez dele, com a vaga
+        termina.set()
+        for _ in range(250):
+            if not s.vagas:
+                break
+            await asyncio.sleep(0.02)
+
+    asyncio.run(principal())
+    assert s.vagas == {} and rodou == ["terminou"]
