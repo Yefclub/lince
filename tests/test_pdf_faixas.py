@@ -3,6 +3,7 @@ segura os outros (issue #40, itens 1 e 3)."""
 
 import threading
 import time
+from collections import defaultdict
 
 import pytest
 from reportlab.lib import colors
@@ -110,8 +111,8 @@ def test_pdf_pequeno_nao_espera_o_grande(pdf_grande, tmp_path):
 
 def test_prazo_vale_desde_a_extracao_do_pdf_grande(pdf_grande):
     inicio = time.monotonic()
-    r = lince.ler(pdf_grande, prazo=3)
-    assert time.monotonic() - inicio < 4
+    r = lince.ler(pdf_grande, prazo=2)
+    assert time.monotonic() - inicio < 4  # o documento inteiro leva ~10 s
     assert "Página 1, linha 1: texto corrido" in r.markdown
     (nao_lidas,) = [p for p in r.cobertura.pendentes if "não lidas" in p]
     assert nao_lidas.endswith(f"–{GRANDE}: não lidas (prazo esgotado)")
@@ -176,8 +177,10 @@ def test_faixas_dao_o_mesmo_resultado_que_a_leitura_inteira(tmp_path, monkeypatc
     )  # a tabela atravessa a fronteira entre as páginas 5 e 6
     assert inteiro.metadados["cabeçalho/rodapé"] == ["Grupo Exemplo · Relatório Confidencial · versão 3", "Página #"]
     assert OCULTO not in inteiro.markdown and inteiro.metadados["texto_oculto_removido"][0]["pagina"] == 3
-    for faixa in (1, 3, 5):  # 1 e 5 partem a tabela; 1 e 3 deixam a página do oculto na ponta de uma faixa
-        monkeypatch.setattr(pdf_mod, "FAIXA", faixa)
+    for faixa, fundos in ((1, None), (3, None), (5, None), (50, 1)):  # 1 e 5 partem a tabela; 1 e 3 deixam a página
+        monkeypatch.setattr(pdf_mod, "FAIXA", faixa)  # do oculto na ponta de uma faixa; e uma página coletada por vez
+        if fundos:
+            monkeypatch.setattr(pdf_mod, "FUNDOS_PX_MAX", fundos)
         r = lince.ler(p)
         assert r.markdown == inteiro.markdown
         assert (r.metadados, r.cobertura, r.estrutura) == (inteiro.metadados, inteiro.cobertura, inteiro.estrutura)
@@ -267,14 +270,18 @@ def test_cropbox_fora_da_mediabox_vale_a_mediabox(tmp_path):
     assert registro["tecnicas"] == ["cor igual ao fundo"] and "alerta" not in registro  # saiu pela posição
 
 
-def _figuras(caminho, n, cropbox=None):
-    """Uma página com `n` figuras diferentes (e a CropBox dada), lida pela IA."""
+def _figuras(caminho, n, cropbox=None, oculto=False):
+    """Uma página com `n` figuras diferentes (e a CropBox dada, e um oculto branco), lida pela IA."""
     from PIL import Image, ImageDraw
 
     c = canvas.Canvas(str(caminho), pagesize=A4)
     if cropbox:
         c.setCropBox(cropbox)
     c.drawString(60, 780, "Relatório com figuras.")
+    if oculto:
+        c.setFillColorRGB(1, 1, 1)
+        c.drawString(60, 760, OCULTO)
+        c.setFillColorRGB(0, 0, 0)
     for k, cor in enumerate(["navy", "darkgreen", "maroon"][:n]):
         im = Image.new("RGB", (800, 400), "white")
         ImageDraw.Draw(im).rectangle([40, 40, 760, 360], fill=cor)
@@ -557,18 +564,17 @@ def _mapa(caminho, imagens=64, oculto=False):
     return caminho
 
 
-def test_pagina_acima_do_orcamento_entra_so_com_o_texto_sem_deixar_rastro(tmp_path, monkeypatch):
-    p = _mapa(tmp_path / "mapa.pdf", oculto=True)
-    lidas, gastos = [], []
+def test_pagina_acima_do_teto_de_objetos_entra_so_com_o_texto_sem_deixar_rastro(tmp_path, monkeypatch):
+    p = _mapa(tmp_path / "mapa.pdf", oculto=True)  # 66 objetos na 1ª página: 64 imagens e dois textos
+    lidas = []
     ia = lince.FuncaoLeitor(lambda img, instr: lidas.append(1) or "Figura.", "m")
-    gastar = pdf_mod._Orcamento.__call__
-    monkeypatch.setattr(pdf_mod._Orcamento, "__call__", lambda self, n: gastos.append((self, n)) or gastar(self, n))
+    monkeypatch.setattr(pdf_mod, "OBJETOS_MAX", 66)
     abaixo = lince.Leitor(ia=ia, agrupar=False).ler(p)
-    assert abaixo.cobertura.rotas[1] == "regioes" and lidas  # dentro do orçamento, as figuras vão para a IA
+    assert abaixo.cobertura.rotas[1] == "regioes" and lidas  # no teto, as figuras vão para a IA
     assert abaixo.metadados["texto_oculto_removido"][0]["pagina"] == 1 and OCULTO not in abaixo.markdown
-    # Um orçamento uma operação menor que o gasto da 1ª página: ela passa dele no último gasto, depois do texto oculto
-    # conferido e antes dos recortes, e entra só com o texto do pdf_inspector, sem tarefa, recorte nem registro dela.
-    monkeypatch.setattr(pdf_mod, "ORCAMENTO_PAGINA", sum(n for orc, n in gastos if orc is gastos[0][0]) - 1)
+    # Um objeto acima do teto: a coleta para nele, e a página entra só com o texto do pdf_inspector, sem tarefa,
+    # recorte nem registro dela; a seguinte é lida normalmente.
+    monkeypatch.setattr(pdf_mod, "OBJETOS_MAX", 65)
     lidas.clear()
     r = lince.Leitor(ia=ia, agrupar=False).ler(p)
     assert "Mapa de pontos de coleta." in r.markdown and "Legenda do mapa." in r.markdown
@@ -609,6 +615,26 @@ def _imagens_e_textos(caminho, imagens, textos):
     return caminho
 
 
+def _formula(caminho, itens):
+    """Uma página com `itens` linhas de igualdades em duas colunas: o pdf_inspector as junta em dois blocos de fórmula
+    de centenas de milhares de caracteres, e o recorte de cada bloco procura cada item nele (o "_" sai do bloco, e
+    nenhum item é achado: cada busca percorre o bloco inteiro). Uma imagem pequena no canto, e a legenda na 2ª
+    página."""
+    from PIL import Image
+
+    Image.new("RGB", (4, 4), "red").save(caminho.parent / "px.png")
+    altura = 20 + itens * 7 // 2
+    c = canvas.Canvas(str(caminho), pagesize=(600, altura))
+    c.setFont("Helvetica", 6)
+    c.drawImage(str(caminho.parent / "px.png"), 590, 2, width=4, height=4)
+    for k in range(itens):
+        c.drawString(20 + k % 2 * 280, altura - 11 - k // 2 * 7, " = ".join(f"{v}_{k}" for v in "abcdefg"))
+    c.showPage()
+    c.drawString(20, 780, "Legenda do mapa.")
+    c.save()
+    return caminho
+
+
 class _Invisivel:
     """O item do pdf_inspector como invisível (modo 3), o que ele entrega quando mantém a camada invisível."""
 
@@ -619,28 +645,97 @@ class _Invisivel:
         return 3 if nome == "render_mode" else getattr(self._item, nome)
 
 
-def _confere_so_texto(r, inicio):
-    assert time.monotonic() - inicio < 3  # dentro do orçamento, ~1 s com a trava
-    assert "Legenda do mapa." in r.markdown and r.cobertura.rotas[2] == "nativa"  # a página seguinte é lida
-    assert r.cobertura.rotas[1] == "nativa" and r.cobertura.pendentes == [SO_TEXTO]
-    assert NAO_CONFERIDO in r.alertas_injecao
-
-
-def test_desenhos_espacados_passam_do_orcamento_sem_segurar_a_trava(tmp_path):
-    p = _desenhos(tmp_path / "desenhos.pdf", 49_999)  # abaixo do antigo teto de 50 mil: ~75 s no agrupamento
-    inicio = time.monotonic()
-    _confere_so_texto(lince.ler(p), inicio)
-
-
-def test_invisiveis_vezes_imagens_passam_do_orcamento_sem_segurar_a_trava(tmp_path, monkeypatch):
+def _invisiveis(monkeypatch):
     import pdf_inspector
 
-    p = _imagens_e_textos(tmp_path / "invisiveis.pdf", 4_999, 10_000)
     posicoes = pdf_inspector.extract_text_with_positions_bytes
-    monkeypatch.setattr(  # cada item invisível é comparado com cada imagem: 50 milhões de comparações, ~5 s
+    monkeypatch.setattr(  # cada item invisível é comparado com cada imagem: 50 milhões de comparações
         pdf_inspector,
         "extract_text_with_positions_bytes",
         lambda dados: [_Invisivel(x) if x.text.startswith("inv") else x for x in posicoes(dados)],
     )
+
+
+@pytest.mark.parametrize(
+    "caso",
+    [
+        "fórmula",  # 24 mil itens × 2 blocos de ~700 mil caracteres: era ~8 s com a trava
+        "desenhos espaçados",  # o agrupamento compara cada desenho com cada grupo: 15 mil, ~6 s
+        "invisíveis × imagens",  # 10 mil itens invisíveis × 5 mil imagens
+    ],
+)
+def test_analise_da_pagina_hostil_nao_segura_a_trava(tmp_path, monkeypatch, caso):
+    if caso == "fórmula":
+        p = _formula(tmp_path / "formula.pdf", 24_000)
+    elif caso == "desenhos espaçados":
+        p = _desenhos(tmp_path / "desenhos.pdf", 15_000)
+    else:
+        p = _imagens_e_textos(tmp_path / "invisiveis.pdf", 4_999, 10_000)
+        _invisiveis(monkeypatch)
+    pequeno = _pdf(tmp_path / "pequeno.pdf", 1)
+    analisando, lida = threading.Event(), []
+    pagina = pdf_mod._pagina
+
+    def marca(*args, **kwargs):  # a análise da página hostil começou
+        if threading.current_thread().name == "hostil":
+            analisando.set()
+        return pagina(*args, **kwargs)
+
+    monkeypatch.setattr(pdf_mod, "_pagina", marca)
+    hostil = threading.Thread(target=lambda: lida.append(lince.ler(p)), name="hostil")
+    hostil.start()
+    assert analisando.wait(30)
     inicio = time.monotonic()
-    _confere_so_texto(lince.ler(p), inicio)
+    r = lince.ler(pequeno)
+    tempo = time.monotonic() - inicio
+    ainda_lendo = hostil.is_alive()
+    hostil.join()
+    assert "Conteúdo da página 1 do relatório anual." in r.markdown
+    assert ainda_lendo and tempo < 5  # o pequeno entrou e saiu no meio da análise da página hostil
+    (h,) = lida
+    assert "Legenda do mapa." in h.markdown and h.cobertura.rotas[2] == "nativa"  # a página seguinte é lida
+    assert not any("só o texto" in x for x in h.cobertura.pendentes)  # analisada inteira
+
+
+def _de_quem_tem_a_trava(monkeypatch, alvos):
+    """Para cada função `(módulo, nome)`, se cada chamada dela rodou com a trava da PDFium (da própria thread)."""
+    from lince._trava import PDFIUM
+
+    com_a_trava = defaultdict(list)
+    for modulo, nome in alvos:
+        original = getattr(modulo, nome)
+
+        def registra(*args, _original=original, _nome=nome, **kwargs):
+            com_a_trava[_nome].append(PDFIUM._dono == threading.get_ident())
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(modulo, nome, registra)
+    return com_a_trava
+
+
+def test_so_a_pdfium_roda_com_a_trava(tmp_path, monkeypatch):
+    import pdf_inspector
+    from PIL import Image
+
+    p = _figuras(tmp_path / "figuras.pdf", 2, oculto=True)
+    com_a_trava = _de_quem_tem_a_trava(
+        monkeypatch,
+        [
+            (pdf_inspector, "extract_pages_markdown_bytes"),
+            (pdf_inspector, "extract_text_with_positions_bytes"),
+            (pdf_mod, "texto_oculto_pdf"),
+            (pdf_mod, "_coincide"),
+            (pdf_mod, "desifenizar"),
+            (pdf_mod, "limpar_tabelas"),
+            (pdf_mod, "regioes_vetoriais"),
+            (Image.Image, "crop"),
+            (Image.Image, "save"),
+        ],
+    )
+    r = lince.Leitor(ia=_ia_que_amplia(), esforco="max", agrupar=False).ler(p)
+    assert OCULTO not in r.markdown and r.cobertura.rotas["segunda_passada"] >= 2  # o oculto saiu da cópia
+    # Com a trava, só a PDFium: o pdf_inspector (também sobre a cópia sem o oculto), a análise da página, os recortes e
+    # os PNGs da 1ª leitura e os da releitura ampliada rodam depois de soltá-la.
+    assert len(com_a_trava["extract_pages_markdown_bytes"]) == 2  # a faixa e a cópia sem o oculto
+    assert len(com_a_trava["_coincide"]) and len(com_a_trava["save"]) > 3
+    assert {nome: any(v) for nome, v in com_a_trava.items()} == dict.fromkeys(com_a_trava, False)

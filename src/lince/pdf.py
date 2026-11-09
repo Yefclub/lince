@@ -9,7 +9,7 @@ import os  # noqa: F401
 import re  # noqa: F401
 import time
 import zipfile  # noqa: F401
-from collections import defaultdict
+from collections import defaultdict, deque
 from xml.etree import ElementTree as ET  # noqa: F401
 
 import pypdfium2 as pdfium
@@ -32,41 +32,36 @@ PAGINAS_ANALISE_MAX = 2000
 PAGINAS_TEXTO_MAX = 5000
 # Páginas por chamada do pdf_inspector. Ele não usa a PDFium, mas segura a GIL e, chamado com o arquivo, analisa o
 # documento inteiro a cada vez, mesmo pedindo uma página (medido: 4 s por chamada num PDF de 2.500 páginas). Ele só lê
-# cópias de FAIXA páginas feitas pela PDFium (~0,05 s cada), nunca o arquivo: o prazo é conferido entre elas, um PDF
-# que chega no meio não espera o grande, e as páginas lidas são as que a PDFium abre, as mesmas que o leitor mostra.
+# cópias de FAIXA páginas feitas pela PDFium (~0,05 s cada), nunca o arquivo, e roda fora da trava: o prazo é
+# conferido entre elas, um PDF que chega no meio não espera o grande, e as páginas lidas são as que a PDFium abre, as
+# mesmas que o leitor mostra.
 FAIXA = 50
 # Tempo máximo com a trava da PDFium antes de dar a vez a outro PDF (a trava é justa: quem espera entra antes de
-# quem acabou de soltar). Uma página pesada (escaneada, renderizada em 1568 px) passa dele sozinha; o normal é ~10 ms.
+# quem acabou de soltar). Com a trava só rodam chamadas à PDFium, de custo limitado por ela mesma: abrir, coletar os
+# objetos, extrair o texto, copiar e renderizar (no máximo LADO_MAX_PX). Toda a análise em Python roda fora dela. Uma
+# página pesada (escaneada, renderizada em 1568 px) passa dele sozinha; a de texto corrido usa ~2 ms.
 VEZ_S = 0.5
 # O prazo é do documento inteiro, e a montagem do texto extraído vem depois: ela custa ~1/4 do tempo da extração do
 # texto corrido (medido: 0,8 s para as 650 páginas lidas em 3 s). Uma faixa nova só começa se o que resta do prazo
 # cobre essa parte; a proporção vale em máquina lenta ou rápida, porque as duas etapas são CPU em Python.
 RESERVA_MONTAGEM = 0.3
 # Teto do trabalho para tirar o texto oculto de uma página pela posição, contado em células da grade visitadas e em
-# comparações entre um item oculto e um objeto de texto (~2 µs cada, com a trava): 100 mil cabem em ~0,2 s. A grade
-# compara cada item só com os objetos cujo centro cai na caixa dele: 10 mil itens ocultos espalhados numa página
-# custam ~40 mil. O teto segura a página hostil, com milhares de itens sobrepostos no mesmo lugar (antes, ~60 s na
-# trava). Acima dele, a página não é copiada: fica com o texto como está, e o oculto, com o alerta e a pendência.
+# comparações entre um item oculto e um objeto de texto. A grade compara cada item só com os objetos cujo centro cai
+# na caixa dele: 10 mil itens ocultos espalhados numa página custam ~40 mil. O teto segura a página hostil, com
+# milhares de itens sobrepostos no mesmo lugar: acima dele, a página não é copiada (nenhum objeto sai pela PDFium)
+# e fica com o texto como está, e o oculto, com o alerta e a pendência.
 OCULTOS_COMPARACOES_MAX = 100_000
 # Lado da célula da grade dos objetos de texto, em pontos: menos que uma linha de texto corrido.
 CELULA = 8
-# Orçamento da análise visual de uma página, a parte que roda com a trava. Cada passo dela gasta do orçamento, antes
-# de rodar, o que pode custar, em operações de ~40 ns: uma comparação entre duas caixas no agrupamento de desenhos ou
-# de imagens (medido: 5 mil desenhos espaçados, 12,5 milhões de comparações, 0,42 s). Os pesos abaixo dão quantas
-# operações custa um passo de outro tipo, medidos do mesmo jeito. Os laços quadráticos (agrupamentos, fusão de
-# desenhos, item invisível × imagem, tabelas e fórmulas × itens de texto, linhas × texto lido, desifenização) gastam
-# pelo que percorrem, e não por um teto de objetos: 10 mil traços que se juntam num gráfico custam 3,4 milhões, e 5.400
-# desenhos espaçados, 18 milhões. Recortar, gravar e montar as tarefas vem depois, fora da trava. Acima do orçamento,
-# a página entra só com o texto, com a pendência e o alerta de texto oculto não conferido, e o próximo PDF não espera.
-# Medido com o pior caso de cada laço logo abaixo do orçamento, a maior vez com a trava ficou entre 0,3 e 0,95 s (de 20
-# a 50 ns por operação); uma página real gasta menos de 1 milhão (a de testPDF.pdf, 0,6 milhão).
-ORCAMENTO_PAGINA = 20_000_000
-PESO_OBJETO = 200  # um objeto da página nos percursos dela (contagem, imagens, desenhos, texto oculto): ~8 µs
-PESO_ITEM = 25  # um item de texto nas tabelas e no texto oculto (regex e conjuntos, ou um pixel do fundo): ~1 µs
-PESO_FILTRO = 3  # um item ou uma região num filtro pela posição: ~100 ns
-PESO_OCULTO = 50  # uma comparação entre um item oculto e um objeto de texto, pela PDFium: ~2 µs
-CARACTERES_POR_OPERACAO = 60  # busca de um trecho no texto da página, ou texto passado para minúsculas
-PIXELS_POR_OPERACAO = 5  # renderização da página: 0,7 s para 10 mil × 10 mil pixels
+# Teto de objetos por página (com os de dentro das formas, contados a cada vez que a forma é desenhada): coletar cada
+# um pela PDFium custa ~3 µs com a trava (medido: 200 mil desenhos em 0,5 s), e uma forma desenhada mil vezes
+# multiplica o percurso. Página real tem poucos milhares; acima do teto, ela entra só com o texto, com a pendência e o
+# alerta de texto oculto não conferido, e o próximo PDF não espera.
+OBJETOS_MAX = 100_000
+# Teto de pixels dos fundos guardados de uma vez: a coleta das páginas de uma vez fica na memória até a análise de cada
+# uma, e uma folha gigante tem um fundo de até LADO_MAX_PX × LADO_MAX_PX (300 MB em RGB). 20 milhões (~60 MB) cobrem
+# as 50 páginas A4 de uma faixa (0,13 milhão cada); passando dele, a vez acaba, e a página seguinte fica para a próxima.
+FUNDOS_PX_MAX = 20_000_000
 PESADA = "conteúdo demais para a análise visual"
 
 
@@ -75,26 +70,10 @@ def texto_pdfium(page):
     return tp.get_text_bounded()
 
 
-class _Pesada(Exception):
-    """A análise visual da página passou do orçamento: ela entra só com o texto."""
-
-
-class _Orcamento:
-    """O orçamento de uma página: chamar com o que o próximo passo pode custar, antes de rodá-lo."""
-
-    def __init__(self):
-        self.resta = ORCAMENTO_PAGINA
-
-    def __call__(self, operacoes):
-        self.resta -= operacoes
-        if self.resta < 0:
-            raise _Pesada
-
-
-def regioes_vetoriais(objs, W, H, gastar):
+def regioes_vetoriais(objs, W, H):
     """Agrupa desenhos (path) que não são régua de tabela nem faixa de linha."""
     caixas, faixas = [], []
-    for tipo, _raw, (l, b, r, t) in objs:
+    for tipo, (l, b, r, t) in objs:
         if tipo != c.FPDF_PAGEOBJ_PATH:
             continue
         w, h = r - l, t - b
@@ -121,7 +100,6 @@ def regioes_vetoriais(objs, W, H, gastar):
         mudou = True
         while mudou:
             mudou = False
-            gastar(len(grupos))
             for g in grupos:
                 if not (bx[2] + 24 < g[0] or g[2] + 24 < bx[0] or bx[3] + 24 < g[1] or g[3] + 24 < bx[1]):
                     bx = [min(bx[0], g[0]), min(bx[1], g[1]), max(bx[2], g[2]), max(bx[3], g[3])]
@@ -136,15 +114,19 @@ def planejar_pdf(path, pasta):
     """Lê o PDF em faixas de páginas, com o prazo conferido entre elas e os tetos valendo antes da leitura.
 
     A PDFium só é usada com a trava, tomada por pouco tempo e solta entre as vezes (`VEZ_S`): um PDF que chega
-    durante a leitura de um grande entra na próxima vez. O documento é aberto uma vez só, na vez que lê a contagem de
-    páginas, as propriedades e a cópia da primeira faixa (abrir um PDF com a tabela de referências danificada a
-    reconstrói, e isso não pode se repetir a cada vez), e fechado dentro da trava, mesmo com exceção: o finalizador
-    dele (e o das páginas) não pode rodar fora dela, em paralelo com outro PDF. O pdf_inspector não usa a PDFium e roda
-    fora da trava, sobre as cópias."""
+    durante a leitura de um grande entra na próxima vez. Com a trava só rodam chamadas à PDFium; cada página passa por
+    fases: a coleta (objetos, fundo renderizado, texto pela PDFium; `_coleta`, com a trava), a análise e a decisão da
+    rota e das regiões (`_pagina`, sem a trava), a cópia sem o texto oculto ou a renderização na escala da leitura
+    (com a trava, se preciso) e os recortes e os arquivos (sem a trava). O documento é aberto uma vez só, na vez que
+    lê a contagem de páginas, as propriedades e a cópia da primeira faixa (abrir um PDF com a tabela de referências
+    danificada a reconstrói, e isso não pode se repetir a cada vez), e fechado dentro da trava, mesmo com exceção: o
+    finalizador dele (e o das páginas) não pode rodar fora dela, em paralelo com outro PDF. O pdf_inspector não usa a
+    PDFium e roda fora da trava, sobre as cópias."""
     inicio = time.monotonic()
     doc = None
     try:
         with PDFIUM:
+            fim = time.monotonic() + VEZ_S
             doc = pdfium.PdfDocument(path)
             # O /Count declarado: a PDFium confia nele, e as páginas do arquivo que ficam fora dele não abrem (como num
             # visualizador). Elas não são lidas nem contadas: só a árvore de páginas inteira diria quantas são, e
@@ -152,7 +134,7 @@ def planejar_pdf(path, pasta):
             total = len(doc)
             propriedades = _propriedades(doc)
             lidas = min(total, PAGINAS_TEXTO_MAX)
-            copia = _copia_da_faixa(doc, range(min(FAIXA, lidas))) if lidas else None  # na mesma vez
+            vez = _vez_da_faixa(doc, range(min(FAIXA, lidas)), fim) if lidas else None  # na mesma vez
         paginas, tarefas, cache, seguranca, pendentes = [], [], {}, [], []
         so_texto, nao_lidas = [], []  # [início, fim, motivo]: páginas só com o texto e páginas não lidas
         parada = None  # a primeira página que a PDFium não abre
@@ -163,41 +145,48 @@ def planejar_pdf(path, pasta):
                 _marcar(nao_lidas, a, lidas, "prazo esgotado")
                 break
             faixa = range(a, min(a + FAIXA, lidas))
-            md_de, ocr, itens_de, abertas = _extrair(doc, faixa, copia if not a else None)
+            if a:
+                with PDFIUM:
+                    vez = _vez_da_faixa(doc, faixa, time.monotonic() + VEZ_S)
+            (dados, abertas), coletas = vez
+            md_de, ocr, itens_de = _extrair(dados, a)  # o pdf_inspector, fora da trava
             fila = faixa[:abertas]
             if abertas < len(faixa):
                 parada = faixa[abertas]
-            k, pesada = 0, None  # a página que passou do orçamento entra só com o texto, fora da vez
+            k = 0
             while k < len(fila):
-                if motivo := PESADA if fila[k] == pesada else _so_texto(fila[k]):
-                    _marcar(so_texto, fila[k], fila[k] + 1, motivo)
-                    paginas.append(_so_o_texto(fila[k], md_de.get(fila[k], "")))
+                i = fila[k]
+                if motivo := _so_texto(i):  # a análise não começa depois do prazo, mesmo com a página já coletada
+                    coletas.clear()  # as seguintes também entram só com o texto
+                    _marcar(so_texto, i, i + 1, motivo)
+                    paginas.append(_so_o_texto(i, md_de.get(i, "")))
                     k += 1
                     continue
-                recortar = None
-                with PDFIUM:
-                    fim = time.monotonic() + VEZ_S
-                    while True:  # a vez acaba no tempo, no fim da faixa, na página que entra só com o texto ou na
-                        i = fila[k]  # que vai para a IA (os recortes dela são feitos fora da trava, antes da próxima)
-                        try:
-                            lida = _pagina(doc, i, md_de.get(i, ""), i in ocr, itens_de.get(i, []), pasta, tarefas,
-                                           cache, seguranca, pendentes, _Orcamento())  # fmt: skip
-                        except _Pesada:
-                            pesada = i
-                            break
-                        if lida is None:  # a página não abre: a leitura para nela
-                            parada, fila = i, fila[:k]
-                            break
-                        info, recortar = lida
-                        paginas.append(info)
-                        k += 1
-                        if recortar or k == len(fila) or time.monotonic() >= fim or _so_texto(fila[k]):
-                            break
-                    if k == len(fila) and (parada is not None or faixa[-1] + 1 == lidas):
-                        doc.close()  # na última vez: um PDF curto pega a trava só duas vezes
-                        doc = None
-                if recortar:
-                    recortar()
+                if not coletas:
+                    with PDFIUM:  # a vez: a coleta desta página e das seguintes, até o fim da vez
+                        coletas = _coletas(doc, fila[k:], time.monotonic() + VEZ_S)
+                col = coletas.popleft()
+                if col is None:  # a página não abre: a leitura para nela
+                    parada, fila = i, fila[:k]
+                    break
+                if col == PESADA:
+                    _marcar(so_texto, i, i + 1, PESADA)
+                    paginas.append(_so_o_texto(i, md_de.get(i, "")))
+                    recorte = None
+                else:
+                    info, recorte = _pagina(doc, i, col, md_de.get(i, ""), i in ocr, itens_de.get(i, []), pasta,
+                                            tarefas, cache, seguranca, pendentes)  # fmt: skip
+                    paginas.append(info)
+                k += 1
+                ultima = k == len(fila) and (parada is not None or faixa[-1] + 1 == lidas)
+                if recorte or ultima:
+                    with PDFIUM:
+                        img = _renderizar(doc, i, recorte[0]) if recorte else None
+                        if ultima:
+                            doc.close()  # na mesma vez: um PDF curto pega a trava só duas vezes
+                            doc = None
+                    if recorte:
+                        recorte[1](img)  # os recortes e os arquivos, fora da trava, antes da próxima página
             if parada is not None:
                 _marcar(nao_lidas, parada, total, f"a página {parada + 1} não abre")
                 break
@@ -218,6 +207,71 @@ def planejar_pdf(path, pasta):
     if propriedades:
         plano["propriedades"] = propriedades
     return plano
+
+
+def _vez_da_faixa(doc, faixa, fim):
+    """A cópia da faixa para o pdf_inspector (`_copia_da_faixa`) e, na mesma vez, a coleta das primeiras páginas dela
+    (`_coletas`), que não depende do texto dele. Chamar com a trava."""
+    copia = _copia_da_faixa(doc, faixa)
+    abertas = copia[1]
+    coletas = _coletas(doc, faixa[:abertas], fim) if abertas and not _so_texto(faixa[0]) else deque()
+    return copia, coletas
+
+
+def _coletas(doc, paginas, fim):
+    """A coleta (`_coleta`) da primeira página e das seguintes enquanto a vez não acaba (`fim`) e os fundos cabem em
+    FUNDOS_PX_MAX, até a que entra só com o texto, que fica para quem chama, e até a que não abre, que fica no fim, como
+    None. Chamar com a trava."""
+    feitas, pixels = deque(), 0
+    for k, i in enumerate(paginas):
+        if k and (time.monotonic() >= fim or pixels >= FUNDOS_PX_MAX or _so_texto(i)):
+            break
+        feitas.append(col := _coleta(doc, i))
+        if col is None:
+            break
+        if col != PESADA:
+            pixels += col["fundo"].width * col["fundo"].height
+    return feitas
+
+
+def _coleta(doc, i):
+    """O que a análise da página `i` precisa da PDFium: o tamanho, a origem das posições, o tipo e a caixa de cada
+    objeto, a contagem dos objetos da página, o fundo renderizado (o texto oculto) e o texto pela PDFium. Só dados do
+    Python, sem nada que dependa da PDFium: a análise roda depois, fora da trava. Chamar com a trava; a página é
+    fechada aqui. None se a página não abre (o /Count declarado passa das páginas do arquivo); PESADA acima de
+    OBJETOS_MAX."""
+    try:
+        page = pagina_visivel(doc, i)
+    except pdfium.PdfiumError:
+        return None
+    try:
+        objs = []
+        for tipo, _raw, caixa in objetos(page):  # para no primeiro objeto além do teto
+            if len(objs) == OBJETOS_MAX:
+                return PESADA
+            objs.append((tipo, caixa))
+        W, H = page.get_size()
+        return {
+            "W": W,
+            "H": H,
+            "origem": _origem_visivel(page),
+            "objs": objs,
+            "n": c.FPDFPage_CountObjects(page.raw),
+            "fundo": page.render(scale=escala(W, H, 0.5)).to_pil().convert("RGB"),  # uma cópia, sem a PDFium
+            "texto": texto_pdfium(page),
+        }
+    finally:
+        page.close()
+
+
+def _renderizar(doc, i, fator):
+    """A página `i` renderizada na escala `fator` e convertida pelo Pillow: uma cópia, que não depende mais da PDFium.
+    Chamar com a trava."""
+    page = pagina_visivel(doc, i)
+    try:
+        return page.render(scale=fator).to_pil().convert("RGB")
+    finally:
+        page.close()
 
 
 def _propriedades(doc):
@@ -263,26 +317,21 @@ def _so_o_texto(i, md):
             "tabelas": [tb["md"] for tb in tabelas], "formulas": [], "regioes": []}  # fmt: skip
 
 
-def _extrair(doc, faixa, copia=None):
-    """Texto das páginas da faixa pelo pdf_inspector: markdown, páginas para OCR e itens com posição, por página do
-    documento, e quantas páginas da faixa abrem (o /Count declarado pode passar das páginas que o arquivo tem). Ele lê
-    a cópia da faixa (`copia`, de `_copia_da_faixa`, ou feita aqui), nunca o arquivo."""
+def _extrair(dados, a):
+    """Texto das páginas da cópia de uma faixa (`dados`, de `_copia_da_faixa`) pelo pdf_inspector: markdown, páginas
+    para OCR e itens com posição, pelo número da página no documento (a faixa começa na página `a`). Ele lê a cópia,
+    nunca o arquivo, e não usa a PDFium: roda fora da trava."""
     import pdf_inspector
 
-    if copia is None:
-        with PDFIUM:
-            copia = _copia_da_faixa(doc, faixa)
-    dados, abertas = copia
-    if not abertas:
-        return {}, set(), {}, 0
+    if not dados:
+        return {}, set(), {}
     res = pdf_inspector.extract_pages_markdown_bytes(dados)
     posicoes = pdf_inspector.extract_text_with_positions_bytes(dados)
-    a = faixa[0]
     itens_de = defaultdict(list)
     for t in posicoes:
         if t.text.strip():
             itens_de[a + t.page - 1].append(t)
-    return {a + pg.page: pg.markdown for pg in res.pages}, {a + p - 1 for p in res.pages_needing_ocr}, itens_de, abertas
+    return {a + pg.page: pg.markdown for pg in res.pages}, {a + p - 1 for p in res.pages_needing_ocr}, itens_de
 
 
 def _copia_da_faixa(doc, faixa):
@@ -320,18 +369,20 @@ def _copia(doc, paginas, editar=None):
         novo.close()
 
 
-def _alvos_ocultos(page, ocultos, gastar):
-    """Índices, na página, dos objetos de texto dos itens ocultos, e os itens que não saem pela posição: sem objeto de
-    texto que coincida, ou com um dentro de uma forma (Form XObject). A PDFium não regrava o conteúdo da forma, e a
-    mesma forma pode estar desenhada também num lugar visível. Chamar com a trava.
+def _alvos_ocultos(doc, i, origem, ocultos):
+    """Índices, na página `i`, dos objetos de texto dos itens ocultos, e os itens que não saem pela posição: sem objeto
+    de texto que coincida, ou com um dentro de uma forma (Form XObject). A PDFium não regrava o conteúdo da forma, e a
+    mesma forma pode estar desenhada também num lugar visível. `origem` é a da coleta (`_origem_visivel`).
 
-    Cada item só é comparado com os objetos cujo centro cai na caixa dele (quem cobre metade de um objeto cobre o
-    centro dele), achados numa grade. Acima de `OCULTOS_COMPARACOES_MAX`, nenhum item sai pela posição. O trabalho
-    feito gasta do orçamento da página."""
-    l0, b0 = _origem_visivel(page)
+    Os objetos de texto são coletados numa vez com a trava; a comparação roda fora dela. Cada item só é comparado com
+    os objetos cujo centro cai na caixa dele (quem cobre metade de um objeto cobre o centro dele), achados numa grade.
+    Acima de `OCULTOS_COMPARACOES_MAX`, nenhum item sai pela posição."""
+    with PDFIUM:
+        textos = _objetos_de_texto(doc, i)
+    l0, b0 = origem
     grade = defaultdict(list)
-    for o in _objetos_de_texto(page):
-        l, b, r, t = o[2]
+    for o in textos:
+        l, b, r, t = o[1]
         cx, cy = (l + max(r, l + 0.01)) / 2, (b + max(t, b + 0.01)) / 2
         if math.isfinite(cx) and math.isfinite(cy):
             grade[int(cx // CELULA), int(cy // CELULA)].append(o)
@@ -348,21 +399,22 @@ def _alvos_ocultos(page, ocultos, gastar):
         perto = [grade[cel] for cel in celulas if cel in grade]
         custo += (len(celulas) if n <= len(grade) else len(grade)) + sum(map(len, perto))
         if custo > OCULTOS_COMPARACOES_MAX:
-            gastar(custo * PESO_OCULTO)
             return set(), list(ocultos)
         achou = [o for objs in perto for o in objs if _coincide(o, x, l0, b0)]
-        if achou and all(k is not None for _raw, k, _caixa in achou):
-            alvos |= {k for _raw, k, _caixa in achou}
+        if achou and all(k is not None for k, *_ in achou):
+            alvos |= {k for k, *_ in achou}
         else:
             sobrou.append(x)
-    gastar(custo * PESO_OCULTO)
     return alvos, sobrou
 
 
 def _sem_ocultos(doc, i, alvos, n):
     """Markdown (pdf_inspector) e texto (PDFium) da página `i` tirados de uma cópia dela sem os objetos de texto
-    `alvos` (índices na página de `n` objetos), ou None se a cópia não tem os mesmos objetos. Chamar com a trava; o
-    documento original não muda. O oculto sai por posição, na origem: um texto visível igual a ele fica inteiro."""
+    `alvos` (índices na página de `n` objetos), ou None se a cópia não tem os mesmos objetos. O documento original não
+    muda. O oculto sai por posição, na origem: um texto visível igual a ele fica inteiro.
+
+    A cópia, a remoção dos objetos (no máximo os `n` da página, abaixo de OBJETOS_MAX), a geração do conteúdo, a
+    gravação e o texto pela PDFium pegam a trava; o pdf_inspector lê os bytes da cópia depois, fora dela."""
     import pdf_inspector
 
     texto = []
@@ -377,10 +429,11 @@ def _sem_ocultos(doc, i, alvos, n):
         page.gen_content()
         texto.append(texto_pdfium(page))
 
-    dados = _copia(doc, [i], editar)
+    with PDFIUM:
+        dados = _copia(doc, [i], editar)
     if not texto:
         return None
-    res = pdf_inspector.extract_pages_markdown_bytes(dados)  # uma página: rápido, dentro da trava mesmo
+    res = pdf_inspector.extract_pages_markdown_bytes(dados)
     return (res.pages[0].markdown if res.pages else ""), texto[0]
 
 
@@ -409,25 +462,38 @@ def _origem_visivel(page):
     return l, b
 
 
-def _objetos_de_texto(page):
-    """Gera (raw, índice na página ou None dentro de uma forma, caixa na página) de cada objeto de texto, inclusive os
-    de dentro das formas."""
+def _objetos_de_texto(doc, i):
+    """(índice na página ou None dentro de uma forma, caixa na página, modo de pintura, cor de preenchimento RGBA ou
+    None) de cada objeto de texto da página `i`, inclusive os de dentro das formas. Chamar com a trava; a página é
+    fechada aqui, e a lista não depende mais da PDFium. A coleta já conferiu o teto de objetos da página."""
+
+    def dados(raw, k, caixa):
+        rgba = [ctypes.c_uint() for _ in range(4)]
+        cor = tuple(v.value for v in rgba) if c.FPDFPageObj_GetFillColor(raw, *rgba) else None
+        return k, caixa, c.FPDFTextObj_GetTextRenderMode(raw), cor
 
     def walk(raws, m):
         for raw in raws:
             tipo = c.FPDFPageObj_GetType(raw)
             if tipo == c.FPDF_PAGEOBJ_TEXT:
-                yield raw, None, _transform(_bounds(raw), m)
+                yield dados(raw, None, _transform(_bounds(raw), m))
             elif tipo == c.FPDF_PAGEOBJ_FORM:
                 yield from walk(_filhos(raw), _compose(_matrix(raw), m))
 
-    for k in range(c.FPDFPage_CountObjects(page.raw)):
-        raw = c.FPDFPage_GetObject(page.raw, k)
-        tipo = c.FPDFPageObj_GetType(raw)
-        if tipo == c.FPDF_PAGEOBJ_TEXT:
-            yield raw, k, _bounds(raw)
-        elif tipo == c.FPDF_PAGEOBJ_FORM:
-            yield from walk(_filhos(raw), _matrix(raw))
+    def todos(page):
+        for k in range(c.FPDFPage_CountObjects(page.raw)):
+            raw = c.FPDFPage_GetObject(page.raw, k)
+            tipo = c.FPDFPageObj_GetType(raw)
+            if tipo == c.FPDF_PAGEOBJ_TEXT:
+                yield dados(raw, k, _bounds(raw))
+            elif tipo == c.FPDF_PAGEOBJ_FORM:
+                yield from walk(_filhos(raw), _matrix(raw))
+
+    page = pagina_visivel(doc, i)
+    try:
+        return list(todos(page))
+    finally:
+        page.close()
 
 
 def _filhos(forma):
@@ -441,47 +507,35 @@ def _caixa_do_item(x, l0, b0):
 
 
 def _coincide(obj, x, l0, b0):
-    """O objeto de texto é parte do item: cai quase todo na caixa dele e não tem outra cor nem outro modo de pintura
-    (um texto visível desenhado no mesmo lugar fica)."""
-    raw, _k, (l, b, r, t) = obj
+    """O objeto de texto (de `_objetos_de_texto`) é parte do item: cai quase todo na caixa dele e não tem outra cor nem
+    outro modo de pintura (um texto visível desenhado no mesmo lugar fica)."""
+    _k, (l, b, r, t), modo, cor = obj
     if _sobrepoe([l, b, max(r, l + 0.01), max(t, b + 0.01)], _caixa_do_item(x, l0, b0)) < 0.5:
         return False
-    if (c.FPDFTextObj_GetTextRenderMode(raw) == 3) != (x.render_mode == 3):
+    if (modo == 3) != (x.render_mode == 3):
         return False
-    rgba = [ctypes.c_uint() for _ in range(4)]
-    if x.fill_color and c.FPDFPageObj_GetFillColor(raw, *rgba):
-        return sum(abs(a - v.value) for a, v in zip(x.fill_color, rgba, strict=False)) < 150
+    if x.fill_color and cor is not None:
+        return sum(abs(a - v) for a, v in zip(x.fill_color, cor, strict=False)) < 150
     return True
 
 
-def _pagina(doc, i, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca, pendentes, gastar):
-    """Roteamento de uma página: texto, regiões visuais, tabela duvidosa, fórmula e texto oculto, ou None se a página
-    não abre (o /Count declarado passa das páginas do arquivo). Chamar com a trava. Devolve a página e, se ela vai
-    para a IA, a função que faz os recortes, os arquivos e as tarefas dela sem a PDFium, para rodar fora da trava.
-
-    Cada passo gasta do orçamento da página (`gastar`) antes de rodar, e `_Pesada` sai quando ele acaba. Nada do que
-    vale para o documento (texto oculto, pendências, tarefas, recortes) muda antes do último gasto: a página que passa
-    do orçamento entra só com o texto, sem deixar rastro."""
-    try:
-        page = pagina_visivel(doc, i)
-    except pdfium.PdfiumError:
-        return None
-    W, H = page.get_size()
-    objs = []
-    for o in objetos(page):  # para no primeiro objeto além do orçamento
-        gastar(PESO_OBJETO)
-        objs.append(o)
+def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca, pendentes):
+    """Roteamento de uma página: texto, regiões visuais, tabela duvidosa, fórmula e texto oculto, sobre a coleta dela
+    (`_coleta`). Roda sem a trava: a análise em Python, por mais que custe numa página hostil, não faz outro PDF
+    esperar. Só a cópia sem o texto oculto pega a trava, nas vezes dela (`_alvos_ocultos` e `_sem_ocultos`). Devolve a
+    página e, se ela vai para a IA, a escala da renderização e a função que faz os recortes, os arquivos e as tarefas
+    dela com a imagem renderizada: quem chama renderiza com a trava e recorta sem ela, antes da próxima página."""
+    W, H, objs = col["W"], col["H"], col["objs"]
     # Imagens vizinhas viram um grupo: texto fatiado em imagens ("Version 8 –
     # March 2025" da capa da Falcon são 6 fatias) e logotipo pequeno contam.
-    imgs = [list(bx) for tipo, _raw, bx in objs if tipo == c.FPDF_PAGEOBJ_IMAGE]
-    gastar(W * H * escala(W, H, 0.5) ** 2 // PIXELS_POR_OPERACAO)  # o fundo do texto oculto
-    ocultos = texto_oculto_pdf(page, [x for x in itens_pg if not x.text.startswith("[Image:")], imgs, W, H, gastar)
-    alt = texto_pdfium(page) if eh_ocr else ""
+    imgs = [list(bx) for tipo, bx in objs if tipo == c.FPDF_PAGEOBJ_IMAGE]
+    ocultos = texto_oculto_pdf(col["fundo"], [x for x in itens_pg if not x.text.startswith("[Image:")], imgs, W, H)
+    alt = col["texto"] if eh_ocr else ""
     vistos = re.sub(r"\s+", " ", " ".join(x.text for x in itens_pg)).lower()
     sobrou = []
     if ocultos:
-        alvos, sobrou = _alvos_ocultos(page, [x for _, x in ocultos], gastar)
-        if alvos and (limpo := _sem_ocultos(doc, i, alvos, c.FPDFPage_CountObjects(page.raw))):
+        alvos, sobrou = _alvos_ocultos(doc, i, col["origem"], [x for _, x in ocultos])
+        if alvos and (limpo := _sem_ocultos(doc, i, alvos, col["n"])):
             md, alt_limpo = limpo
             alt = alt_limpo if eh_ocr else ""
         elif alvos:  # a cópia não tem os mesmos objetos: nenhum item sai
@@ -492,7 +546,6 @@ def _pagina(doc, i, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca, pend
     if eh_ocr and len(alt.strip()) > 200 and lixo(alt) < 0.02:
         md, origem_texto = alt, "pdfium"  # p.ex. a p.4 do manual da Falcon
     dens = densidade_matematica(md)
-    gastar(_custo_do_texto(md))
     md, tabelas = limpar_tabelas(desifenizar(md))
     # só tabela nativa CONFIÁVEL anula um desenho; tabela duvidosa pode ser rótulo de gráfico
     palavras_tabela = set().union(*[tb["palavras"] for tb in tabelas if not tb["complexa"]]) if tabelas else set()
@@ -504,7 +557,6 @@ def _pagina(doc, i, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca, pend
         mudou = True
         while mudou:
             mudou = False
-            gastar(len(grupos))
             for g in grupos:
                 if not (bx[2] + 8 < g[0] or g[2] + 8 < bx[0] or bx[3] + 2 < g[1] or g[3] + 2 < bx[1]):
                     bx = [min(bx[0], g[0]), min(bx[1], g[1]), max(bx[2], g[2]), max(bx[3], g[3])]
@@ -520,30 +572,31 @@ def _pagina(doc, i, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca, pend
     # Texto que o extrator descartou (ex.: modo de renderização invisível) mas a camada de texto tem:
     # não vai para o corpo, mas é sinal de ataque quando a página não é um scan.
     if not imgs:
-        linhas = texto_pdfium(page).splitlines()
-        gastar(len(linhas) * (2 * len(vistos) // CARACTERES_POR_OPERACAO + 1))  # cada linha procurada no texto lido
+        linhas = col["texto"].splitlines()
         for ln in linhas:
             ln = re.sub(r"\s+", " ", ln).strip()
             if len(ln) >= 20 and ln.lower() not in vistos and ln.lower()[:20] not in vistos:
                 registro.append(("não renderizado (invisível)", ln))
-    oculto = None  # o registro do texto oculto da página e o alerta, guardados depois do último gasto
     if registro:
         # Item oculto que não saiu da cópia (sem objeto de texto, dentro de forma, acima do teto), ou texto não
         # renderizado que o extrator pôs no corpo: o corpo pode ter o oculto, e quem chama precisa saber.
         corpo = re.sub(r"\s+", " ", md).lower()
-        gastar(len(registro) * (len(corpo) // CARACTERES_POR_OPERACAO + 1))
         ficou = sobrou or any(m == "não renderizado (invisível)" and t.lower() in corpo for m, t in registro)
         alerta = f"texto oculto que pode ter ficado no corpo: página {i + 1}" if ficou else None
-        oculto = {
-            "pagina": i + 1,
-            "tecnicas": sorted({m for m, _ in registro}),
-            "texto": " ".join(t for _, t in registro)[:500],
-        } | ({"alerta": alerta} if ficou else {})
+        seguranca.append(
+            {
+                "pagina": i + 1,
+                "tecnicas": sorted({m for m, _ in registro}),
+                "texto": " ".join(t for _, t in registro)[:500],
+            }
+            | ({"alerta": alerta} if ficou else {})
+        )
+        if ficou:
+            pendentes.append(alerta)
     # Tabela nativa duvidosa: recorte da tabela vai para a IA (com o nativo como âncora).
     for k, tb in enumerate(tabelas):
         if not tb["complexa"]:
             continue
-        gastar(len(itens_pg) * PESO_ITEM)
         dentro = [
             x
             for x in itens_pg
@@ -558,8 +611,7 @@ def _pagina(doc, i, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca, pend
             caixa[0] = max(20, min(caixa[0], 60))
             tabela_de[id(caixa)] = k
             regioes.append(("tabela", caixa))
-    for g in regioes_vetoriais(objs, W, H, gastar):
-        gastar((2 * len(regioes) + 3 * len(itens_pg)) * PESO_FILTRO)
+    for g in regioes_vetoriais(objs, W, H):
         if any(_sobrepoe(g, rr) > 0.5 for tp, rr in regioes if tp == "imagem"):
             continue
         # desenho sobre "tabela duvidosa": a tabela eram os rótulos do gráfico — o desenho fica
@@ -589,7 +641,6 @@ def _pagina(doc, i, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca, pend
     while mudou:
         mudou = False
         des = [k for k, (tp, _) in enumerate(regioes) if tp == "desenho"]
-        gastar(len(regioes) + len(des) ** 2)
         for a in des:
             for b in des:
                 if a < b:
@@ -607,14 +658,12 @@ def _pagina(doc, i, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca, pend
     # Tabela nativa que cai quase toda dentro de um gráfico são os rótulos dele: sai do texto
     # (a leitura do gráfico traz os valores no lugar certo).
     for k, tb in enumerate(tabelas):
-        gastar(len(regioes) + len(itens_pg) * PESO_ITEM)
         caixas = [g for tp, g in regioes if tp in ("desenho", "imagem")]
         itens_tb = [
             x
             for x in itens_pg
             if set(re.findall(r"\w+", x.text.lower())) and set(re.findall(r"\w+", x.text.lower())) <= tb["palavras"]
         ]
-        gastar(len(itens_tb) * len(caixas) * PESO_FILTRO)
         if (
             caixas
             and itens_tb
@@ -641,7 +690,6 @@ def _pagina(doc, i, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca, pend
     if formulas and not precisa_pagina:
         itens_txt = [x for x in itens_pg if not x.text.startswith("[Image:")]
         for bloco in formulas:
-            gastar(len(itens_txt) * PESO_FILTRO + len(md) // CARACTERES_POR_OPERACAO)
             limpo = re.sub(r"</?su[bp]>|[*_]", "", bloco)
             dentro = [x for x in itens_txt if len(x.text.strip()) >= 1 and x.text.strip() in limpo]
             if not dentro:
@@ -669,21 +717,13 @@ def _pagina(doc, i, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca, pend
         "formulas": originais_formula,
         "regioes": [],
     }
-    if rota != "nativa":  # renderizar é o último passo com a PDFium; recortar e gravar vêm fora da trava
-        fator = (2 * 1568 / max(W, H) if H >= W else 1568 / max(W, H)) if rota == "pagina" else escala(W, H, 2.0)
-        gastar(W * H * fator**2 // PIXELS_POR_OPERACAO)
-    # O último gasto da página: daqui em diante, ela entra com tudo.
-    if oculto:
-        seguranca.append(oculto)
-        if "alerta" in oculto:
-            pendentes.append(oculto["alerta"])
     if rota == "nativa":
         return info, None
-    img = page.render(scale=fator).to_pil().convert("RGB")  # uma cópia: a imagem não depende mais da PDFium
+    fator = (2 * 1568 / max(W, H) if H >= W else 1568 / max(W, H)) if rota == "pagina" else escala(W, H, 2.0)
 
-    def recortar():
-        """Recortes, arquivos e tarefas da página, só com a imagem renderizada: quem chama roda fora da trava, na ordem
-        das páginas (as tarefas e o cache de recortes repetidos saem na mesma ordem de antes)."""
+    def recortar(img):
+        """Recortes, arquivos e tarefas da página, com a imagem renderizada na escala `fator`: quem chama roda fora da
+        trava, na ordem das páginas (as tarefas e o cache de recortes repetidos saem na mesma ordem de antes)."""
         if rota == "pagina":
             # Duas metades com sobreposição: o dobro de resolução por leitura (o provedor reduz acima de ~1568 px).
             metades = [(0, img.height)]
@@ -770,16 +810,7 @@ def _pagina(doc, i, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca, pend
                     }
                 )
 
-    return info, recortar
-
-
-def _custo_do_texto(md):
-    """O que custa preparar o texto da página (`desifenizar` e `limpar_tabelas`): a desifenização passa o texto inteiro
-    para minúsculas a cada quebra de linha com hífen, e a limpeza das tabelas compara cada linha de tabela com as
-    separadoras e completa cada linha até a mais larga."""
-    quebras = md.count("- ") + md.count("-\t") + md.count("-\n")
-    barras = [ln.count("|") for ln in md.splitlines() if ln.lstrip().startswith("|")]
-    return quebras * len(md) // CARACTERES_POR_OPERACAO + len(barras) * (max(barras, default=0) + len(barras) // 15)
+    return info, (fator, recortar)
 
 
 def _sobrepoe(a, b):

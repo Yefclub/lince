@@ -74,16 +74,22 @@ def limpar_tabelas(md):
 def desifenizar(txt, vocab=None):
     """Hífen de fim de linha: 'nega- tive' → 'negative', mas 'propellant- based' → 'propellant-based'.
 
-    Decide pelo vocabulário do próprio documento: se a 2ª metade existe sozinha no texto
-    (ou a forma com hífen aparece em outro lugar), é palavra composta e o hífen fica.
+    Decide pelo vocabulário do próprio documento: se a 2ª metade existe sozinha no texto, ou se o par com hífen
+    aparece em outro lugar como duas partes vizinhas de uma palavra hifenizada ('propellant-based', 'x-co-op'), é
+    palavra composta e o hífen fica. O par vale inteiro: 'co- op' junta em 'coop' mesmo com 'co-operation' no texto
+    (procurar 'co-op' como trecho de qualquer palavra custava o texto inteiro a cada quebra).
+
+    Linear no tamanho do texto: as expressões começam no início de uma palavra (`\b`). Sem a âncora, o `re` tentava
+    de novo em cada letra de uma palavra sem hífen e recuava até o começo dela a cada tentativa: uma palavra de 20 mil
+    letras levava ~7 s.
     """
-    padrao = r"(\w+)-(?:[ \t]+|[ \t]*\n[ \t]*)([a-zà-ÿ]\w*)"
+    padrao = r"\b(\w+)-(?:[ \t]+|[ \t]*\n[ \t]*)([a-zà-ÿ]\w*)"
     if vocab is None:  # vocabulário sem os próprios fragmentos hifenizados
         vocab = set(re.findall(r"\w+", re.sub(padrao, " ", txt).lower()))
 
-    # as formas com hífen que o texto já tem, num conjunto: procurar cada uma no texto inteiro deixava o texto com
+    # os pares com hífen que o texto já tem, num conjunto: procurar cada um no texto inteiro deixava o texto com
     # milhares de quebras quadrático (20 mil levavam 4 s segurando a GIL)
-    compostas = {par for p in re.findall(r"\w+(?:-\w+)+", txt.lower()) for par in _pares(p.split("-"))}
+    compostas = {par for p in re.findall(r"\b\w+(?:-\w+)+", txt.lower()) for par in _pares(p.split("-"))}
 
     def troca(m):
         a, b = m.group(1), m.group(2)

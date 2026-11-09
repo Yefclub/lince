@@ -53,19 +53,14 @@ def alertas_injecao(txt):
     return sorted(set(out))[:20]
 
 
-def texto_oculto_pdf(page, itens, imgs, W, H, gastar):
+def texto_oculto_pdf(fundo, itens, imgs, W, H):
     """Texto que a IA leria e o humano não vê: invisível fora de imagem (OCR legítimo fica),
     fonte < 2,5 pt, fora da página, ou cor de texto ≈ cor do fundo. Devolve (motivo, item): quem chama tira o item do
     corpo pela posição dele, nunca procurando o texto (um texto visível igual ao oculto fica).
 
-    `gastar(operacoes)` recebe o custo antes da conferência (o orçamento da página em pdf.py): cada item invisível é
-    comparado com cada imagem, e milhares dos dois numa página hostil prenderiam a trava da PDFium por segundos."""
-    from PIL import Image  # noqa: F401
-
-    invisiveis = sum(x.render_mode == 3 for x in itens)
-    gastar(25 * len(itens) + 2 * invisiveis * len(imgs))  # ~1 µs por item (pixel do fundo), ~80 ns por item × imagem
+    `fundo` é a página renderizada na escala `escala(W, H, 0.5)`, já convertida pelo Pillow: a conferência não usa a
+    PDFium e roda fora da trava dela (pdf.py)."""
     esc = escala(W, H, 0.5)
-    fundo = page.render(scale=esc).to_pil().convert("RGB")
     ocultos = []
     for x in itens:
         motivo = None

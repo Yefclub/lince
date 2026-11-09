@@ -3,6 +3,7 @@ e respeita o prazo, sem perder o texto (issue #33, item 7)."""
 
 import threading
 
+import pytest
 from docx import Document
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
@@ -72,7 +73,24 @@ def test_hifen_de_fim_de_linha_e_linear_e_decide_pelo_vocabulario():
         == "negative e propellant-based; propellant-based"
     )
     assert desifenizar("o propellant- based e o based") == "o propellant-based e o based"  # a 2ª metade existe sozinha
+    # o par com hífen vale inteiro, como duas partes vizinhas de uma palavra hifenizada, e não como trecho dela
+    assert desifenizar("co- op e x-co-op") == "co-op e x-co-op"
+    assert desifenizar("co- op e co-operation") == "coop e co-operation"
     hostil = " ".join(f"pala- vra{k}" for k in range(20_000))  # milhares de quebras numa página
     inicio = time.monotonic()
     desifenizar(hostil)
     assert time.monotonic() - inicio < 0.5  # era ~4 s, segurando a GIL
+
+
+@pytest.mark.parametrize("texto", ["a" * 200_000, "a" * 200_000 + "- b", "x " + "a" * 200_000 + "-a" * 3])
+def test_hifen_de_fim_de_linha_e_linear_numa_palavra_enorme(texto):
+    """Um Tj de milhares de letras: sem âncora no começo da palavra, o `re` tentava de novo em cada letra e recuava
+    até o começo a cada tentativa (20 mil letras, ~7 s; 200 mil, minutos)."""
+    import time
+
+    from lince.texto import desifenizar
+
+    inicio = time.monotonic()
+    saida = desifenizar(texto)
+    assert time.monotonic() - inicio < 0.5
+    assert saida == (texto.replace("- b", "b") if texto.endswith("- b") else texto)

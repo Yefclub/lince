@@ -5,11 +5,15 @@ titulo: PDF grande não segura os outros, respeita o prazo desde o início e o t
 
 **Um PDF grande não faz os outros esperarem.** O PDF agora é lido em faixas de páginas, e a trava da PDFium é
 tomada por pouco tempo e passada, por ordem de chegada, a quem está esperando. Um PDF de uma página que chega
-durante a leitura de um de 2.500 sai em menos de meio segundo; antes, esperava dezenas de segundos. O pdf_inspector,
-que não usa a PDFium, roda fora da trava. O documento é aberto uma vez só, e não a cada vez que pega a trava (nem a
-cada figura relida no esforço máximo): um PDF com a tabela de referências danificada não a reconstrói de novo a cada
-vez, e um PDF de uma página pega a trava duas vezes. Uma leitura interrompida (por exemplo, com Ctrl+C) em qualquer
-ponto do pedido da trava, na fila, na espera ou ao receber a vez, não deixa a trava presa.
+durante a leitura de um de 2.500 sai em menos de meio segundo; antes, esperava dezenas de segundos. Com a trava só
+rodam as chamadas à PDFium, que custam o que a própria biblioteca limita: abrir o documento e a página, coletar os
+objetos, extrair o texto, copiar páginas e renderizar. Todo o resto roda fora dela: o pdf_inspector (que não usa a
+PDFium, inclusive na cópia sem o texto oculto), a análise da página (agrupamento de figuras e desenhos, texto oculto,
+tabelas, fórmulas, hífens), os recortes e os arquivos das figuras, também na releitura ampliada do esforço máximo. O
+documento é aberto uma vez só, e não a cada vez que pega a trava (nem a cada figura relida no esforço máximo): um PDF
+com a tabela de referências danificada não a reconstrói de novo a cada vez, e um PDF de uma página pega a trava duas
+vezes. Uma leitura interrompida (por exemplo, com Ctrl+C) em qualquer ponto do pedido da trava, na fila, na espera ou
+ao receber a vez, não deixa a trava presa.
 
 **O prazo vale desde a extração.** Com `prazo`, a leitura para entre uma faixa e outra quando o tempo que resta não
 cobre a montagem do que já foi lido: o documento sai com o texto extraído, e as páginas restantes aparecem em
@@ -44,15 +48,17 @@ tirar um a um.
 derrubava a leitura do documento inteiro, e também a releitura ampliada do esforço máximo (`esforco="max"`). Agora ela
 vale pela folha inteira, como em outros leitores de PDF, nas duas leituras, e o texto oculto dela sai do mesmo jeito.
 
-**Página com conteúdo demais para a análise visual.** Cada página tem um orçamento para a análise visual, que roda com
-a vez da PDFium: o agrupamento de imagens e de desenhos, o texto oculto, as tabelas, as fórmulas e a renderização
-gastam dele pelo trabalho que fazem, e os recortes das figuras são gravados depois, fora da vez. A página que passa do
-orçamento (um mapa com dezenas de milhares de desenhos espaçados, ou um arquivo montado para travar a leitura) entra
-só com o texto, com a pendência "página N: só o texto, sem figuras nem páginas escaneadas lidas (conteúdo demais para
-a análise visual)" e o alerta de texto oculto não conferido; o resto do documento é lido normalmente. Dentro do
-orçamento, nenhuma página segura a vez por mais de cerca de um segundo: 49.999 desenhos espaçados numa página levavam
-75 s e agora entram só com o texto em menos de um segundo. Um gráfico com milhares de traços que se juntam continua
-indo para a IA.
+**Página hostil não prende os outros PDFs.** Uma página montada para pesar na análise (dezenas de milhares de
+desenhos espaçados, milhares de trechos invisíveis sobre milhares de imagens, um bloco de fórmula de centenas de
+milhares de caracteres) custa o tempo dela, mas fora da trava: um PDF de uma página que chega no meio sai em menos de
+um segundo, em vez de esperar a análise inteira. A página com objetos demais para a PDFium coletar (mais de 100 mil,
+contando os de dentro dos blocos reutilizáveis a cada vez que são desenhados) entra só com o texto, com a pendência
+"página N: só o texto, sem figuras nem páginas escaneadas lidas (conteúdo demais para a análise visual)" e o alerta
+de texto oculto não conferido; o resto do documento é lido normalmente.
 
 **Hífen de fim de linha em tempo linear.** Juntar as palavras partidas no fim da linha procurava cada forma com hífen
-no texto inteiro: uma página com 20 mil quebras levava 4 s parada. Agora leva centésimos, com a mesma decisão.
+no texto inteiro: uma página com 20 mil quebras levava 4 s parada, e uma palavra de 20 mil letras sem hífen, 7 s.
+Agora as duas levam centésimos. A decisão continua pelo vocabulário do documento: o hífen fica quando a 2ª metade
+aparece sozinha no texto ou quando o par aparece em outro lugar como duas partes de uma palavra hifenizada
+("propellant- based" com "propellant-based"). O par precisa aparecer inteiro: "co- op" vira "coop" mesmo com
+"co-operation" no texto, onde antes bastava "co-op" estar dentro de outra palavra.
