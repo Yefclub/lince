@@ -15,7 +15,7 @@ from lxml import etree
 from . import legados, perfil_tabular
 from .limites import DocumentoRecusado, xml_ou_nada
 from .metadados import BINARIOS_OLE, ERROS_DE_PARTE, ODF
-from .seguranca import NAO_CONFERIDO, XMLIlegivel, _xml, limpar_docx, limpar_pptx
+from .seguranca import NAO_CONFERIDO, XMLIlegivel, _xml, fora_da_conferencia, limpar_docx, limpar_pptx
 
 NS = {
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
@@ -346,14 +346,17 @@ def planejar_office(path, pasta, ext=None):
         doc = None
     else:
         dados = open(path, "rb").read()
-        if ext in (".docx", ".docm"):
+        # a limpeza segue o formato que o anydoc vai ler, pelo conteúdo (um Word gravado como .doc, ou uma apresentação
+        # como .docx, é conferido), e o anydoc recebe esse formato explícito
+        formato = "csv" if ext in (".csv", ".tsv") else anydoc.format_from_bytes(dados)
+        if formato == "docx":
             dados = (limpeza := limpar_docx(dados)).dados
-        elif ext in PPTX:
+        elif formato == "pptx":
             dados = (limpeza := limpar_pptx(dados)).dados
         if ext in PPTX:
             dados = _com_marcas_de_slide(dados, marca)
         try:
-            doc = anydoc.to_document(dados, format="csv" if ext in (".csv", ".tsv") else None)
+            doc = anydoc.to_document(dados, format=formato if formato in ("csv", "docx", "pptx") else None)
         except anydoc.ConvertError as recusa:
             if ext != ".xlsb":
                 raise
@@ -394,6 +397,10 @@ def planejar_office(path, pasta, ext=None):
     else:
         md = serializar(doc, ler_imagem)[0]
         perfis = _perfis(doc) if ext in PLANILHAS else []
+        if limpeza is not None:  # a rede de segurança: o que o anydoc leu e a conferência não viu é falha
+            lido = re.sub(rf"{marca}\d+X", " ", texto_lido(doc))
+            if falha := fora_da_conferencia(limpeza.vistas, lido):
+                limpeza.falhas.append(falha)
         if ext in PPTX:  # o texto do slide que imita a marca não vira marca: só a do Lince numera os slides
             md = re.sub(r"(?m)^(<!-- slide \d+ -->)$", r"\\\1", md)
             md = re.sub(rf"(?m)^{marca}(\d+)X$", r"<!-- slide \1 -->", md)
@@ -876,8 +883,9 @@ def _slides_pptx(z, nomes) -> list[str]:
     except (KeyError, XMLIlegivel):
         return []
     rels = _alvos(z, "ppt/presentation.xml", nomes)
-    lista = raiz.find(f"{_P}sldIdLst")
-    return [rels[s.get(f"{_REL}id")] for s in (lista if lista is not None else []) if s.get(f"{_REL}id") in rels]
+    lista = next(raiz.iter(f"{_P}sldIdLst"), None)  # o primeiro, em qualquer profundidade, como o anydoc acha
+    ids = lista.iterfind(f"{_P}sldId") if lista is not None else ()
+    return [rels[s.get(f"{_REL}id")] for s in ids if s.get(f"{_REL}id") in rels]
 
 
 def _com_marcas_de_slide(dados: bytes, marca: str) -> bytes:
@@ -1032,6 +1040,52 @@ def _tam(data):
         return Image.open(io.BytesIO(data)).size
     except Exception:  # noqa: BLE001 — formato que o Pillow não abre conta como imagem grande (não é descartada)
         return (999, 999)
+
+
+_TEX = re.compile(r"\\(?:begin|end)\{[^}]*\}|\\[A-Za-z]+")  # comandos e ambientes que o anydoc escreve na fórmula
+
+
+def texto_lido(doc) -> str:
+    """O texto que o anydoc extraiu do documento, para a rede de segurança da limpeza: o texto dos parágrafos,
+    títulos, listas, tabelas, citações e notas, e o da fórmula sem os comandos do TeX. O texto alternativo das imagens
+    fica de fora (a conferência não o confere: não tem como ser escondido por estilo), e o que o Lince acrescenta
+    (marcas de imagem e de slide) não está no documento do anydoc."""
+    out = []
+
+    def inl(xs):
+        for x in xs or []:
+            if x.kind == "text":
+                out.append(x.text or "")
+            elif x.kind == "link":
+                inl(x.content)
+            elif x.kind == "math":
+                out.append(f" {_TEX.sub(' ', x.text or '')} ")
+            else:  # imagem, quebra, âncora, nota, caixa: separam o texto
+                out.append(" ")
+
+    def blocos(bs):
+        for b in bs or []:
+            if b.kind in ("heading", "paragraph"):
+                inl(b.content)
+            elif b.kind == "list":
+                for it in b.list.items:
+                    blocos(it.blocks)
+            elif b.kind == "table":
+                for linha in b.table.grid:
+                    for s in linha:
+                        if s.kind == "origin" and s.cell:
+                            blocos(s.cell.blocks)
+                            out.append("\n")
+            elif b.kind == "block_quote":
+                blocos(b.blocks)
+            elif b.kind in ("code_block", "math"):
+                out.append(_TEX.sub(" ", b.text or "") if b.kind == "math" else b.text or "")
+            out.append("\n")
+
+    blocos(doc.blocks)
+    for nota in doc.notes:
+        blocos(nota.blocks)
+    return "".join(out)
 
 
 def serializar(doc, ler_imagem):

@@ -1,6 +1,7 @@
 """Segurança: texto oculto (branco, minúsculo, invisível, vanish) e padrões de prompt injection."""
 
 import bisect
+import functools
 import hashlib  # noqa: F401
 import io  # noqa: F401
 import json  # noqa: F401
@@ -121,11 +122,86 @@ class XMLIlegivel(Exception):
 
 class Limpeza(NamedTuple):
     """O texto oculto achado e o pacote sem ele (`dados` é o original quando nada saiu). `falhas` são as partes que
-    não puderam ser conferidas, com o motivo: ficam como estão e quem chama as mostra no resultado."""
+    não puderam ser conferidas, com o motivo: ficam como estão e quem chama as mostra no resultado. `vistas` são as
+    palavras do que a conferência examinou no que o anydoc lê (e das fontes que não escondem texto por estilo), para a
+    rede de segurança (`fora_da_conferencia`)."""
 
     ocultos: list
     dados: bytes
     falhas: list
+    vistas: frozenset = frozenset()
+
+
+# A rede de segurança da limpeza. Espelhar o percurso do anydoc em Python não fecha a classe de rotas para esconder
+# texto: cada rodada de revisão achava outra (parte por outro nome, Id repetido, OOXML estrito, sldIdLst aninhado). A
+# rede compara o resultado: o texto que o anydoc extrai do pacote limpo contra o texto que a conferência examinou. A
+# palavra lida que não está em nada conferido é texto que nenhuma regra de oculto viu: vira falha, nunca "nada
+# oculto". Palavras de 3 letras ou mais, sem número nem pontuação; o custo é linear (um conjunto de cada lado).
+_PALAVRA = re.compile(r"[^\W\d_]{3,}")
+_INVISIVEIS = re.compile("[\xad\u200b\ufeff\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")  # o que o anydoc tira (clean_text)
+_AMOSTRA = 8  # palavras de amostra na falha
+
+
+def palavras(texto) -> set:
+    """As palavras do texto como a rede compara: minúsculas, sem os caracteres que o anydoc tira."""
+    return set(_PALAVRA.findall(_INVISIVEIS.sub("", texto).casefold()))
+
+
+def fora_da_conferencia(vistas, lido) -> str | None:
+    """A falha da rede de segurança, ou None: as palavras de `lido` (o texto que o anydoc extraiu do pacote limpo, sem
+    o que o Lince acrescenta) que não estão em `vistas`, com a contagem e uma amostra na ordem em que aparecem."""
+    fora = list(dict.fromkeys(p for p in _PALAVRA.findall(_INVISIVEIS.sub("", lido).casefold()) if p not in vistas))
+    if not fora:
+        return None
+    amostra = ", ".join(fora[:_AMOSTRA]) + (", …" if len(fora) > _AMOSTRA else "")
+    return f"texto lido fora da conferência, {len(fora)} palavra{'s' if len(fora) > 1 else ''} ({amostra})"
+
+
+_C = "{http://schemas.openxmlformats.org/drawingml/2006/chart}"
+_DGM = "{http://schemas.openxmlformats.org/drawingml/2006/diagram}"
+_SEPARA = {f"{_W}br", f"{_W}cr", f"{_W}tab", f"{_W}ptab", f"{_A}br"}
+_PARAGRAFOS = {f"{_W}p", f"{_A}p"}
+_ENVOLVE = {f"{_W}drawing", f"{_W}pict", f"{_W}object", f"{_M}oMath", f"{_M}oMathPara", f"{_A14}m"}
+_RISCADO = {f"{_W}del", f"{_W}moveFrom"}
+
+
+def _juntar(el, lidos, saida):
+    """O texto dos `lidos` (w:t, a:t, m:t conferidos) do parágrafo, emendado como o anydoc emenda os runs: quebra,
+    tabulação, desenho, fórmula e parágrafo de dentro (caixa de texto) separam; o texto riscado (w:del, w:moveFrom),
+    que o anydoc não lê, não."""
+    for f in el:
+        if f in lidos:
+            saida.append("".join(f.itertext()))
+        elif f.tag in _SEPARA or f.tag in _PARAGRAFOS:
+            saida.append(" ")
+        elif f.tag in _ENVOLVE:
+            saida.append(" ")
+            _juntar(f, lidos, saida)
+            saida.append(" ")
+        elif f.tag not in _RISCADO:
+            _juntar(f, lidos, saida)
+
+
+def _registrar(paragrafos, lidos, vistas):
+    """As palavras do texto conferido: cada texto sozinho e cada parágrafo emendado (a palavra que o Word partiu em
+    dois runs, como "Contr" e "ato", o anydoc lê inteira)."""
+    saida = []
+    for par in paragrafos:
+        _juntar(par, lidos, saida)
+        saida.append("\n")
+    saida += ("".join(t.itertext()) + "\n" for t in lidos)
+    vistas |= palavras("".join(saida))
+
+
+def _fontes_sem_estilo(pac, parte, raiz, vistas):
+    """O texto dos gráficos e dos SmartArt citados pela parte, que o anydoc lê das partes deles: conta como conferido,
+    como a numeração e o texto alternativo, porque não tem como ser escondido por estilo."""
+    for el in raiz.iter(f"{_C}chart", f"{_DGM}relIds"):
+        alvo = pac.alvo(parte, el.get(f"{_R}id" if el.tag == f"{_C}chart" else f"{_R}dm"))
+        if alvo and alvo not in pac.fontes:
+            pac.fontes.add(alvo)
+            if (arvore := pac.arvore(alvo)) is not None:
+                vistas |= palavras(" ".join(arvore.itertext()))
 
 
 def _xml(dados):
@@ -205,9 +281,10 @@ def _esvaziar(t):
         t.remove(filho)
 
 
-def _resolver(base, alvo) -> str:
+def _resolver(base, alvo) -> str | None:
     """A parte para onde a relação aponta, como o anydoc resolve (package/path.rs): relativa à pasta da parte de
-    origem, ou absoluta a partir da raiz; "..", fragmento e consulta como no OPC."""
+    origem, ou absoluta a partir da raiz; "..", fragmento e consulta como no OPC. O segmento que, decodificado, tem
+    barra ou é "." ou ".." (`%2E%2E`, `a%2Fb`) não resolve: None, como o anydoc, que pula a relação."""
     from urllib.parse import unquote
 
     alvo = alvo.split("#", 1)[0].split("?", 1)[0]
@@ -219,8 +296,56 @@ def _resolver(base, alvo) -> str:
             if partes:
                 partes.pop()
         elif seg not in ("", "."):
-            partes.append(unquote(seg))
+            seg = unquote(seg, errors="replace")
+            if "/" in seg or "\\" in seg or seg in (".", ".."):
+                return None
+            partes.append(seg)
     return "/".join(partes)
+
+
+_ESTRITO = "http://purl.oclc.org/ooxml/"
+_RELACAO = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/"
+
+
+def _transicional(uri):
+    """O namespace (ou o tipo de relação) do OOXML estrito no de transição, como o anydoc lê (normalize_ooxml_uri em
+    package/xml.rs): http://purl.oclc.org/ooxml/<família>/<resto> vira
+    http://schemas.openxmlformats.org/<família>/2006/<resto>."""
+    if uri and uri.startswith(_ESTRITO) and "/" in (resto := uri[len(_ESTRITO) :]):
+        familia, _, cauda = resto.partition("/")
+        return f"http://schemas.openxmlformats.org/{familia}/2006/{cauda}"
+    return uri
+
+
+def _normalizar(raiz, dados):
+    """A árvore com os elementos e atributos do OOXML estrito nos namespaces de transição, para a conferência ler o
+    arquivo estrito como o anydoc lê. Só percorre a parte que cita o namespace estrito (UTF-8 ou UTF-16)."""
+    if not any(m in dados for m in _MARCAS_ESTRITO):
+        return raiz
+    for el in raiz.iter():
+        if not isinstance(el.tag, str):
+            continue
+        if el.tag.startswith("{" + _ESTRITO):
+            uri, _, local = el.tag[1:].partition("}")
+            el.tag = f"{{{_transicional(uri)}}}{local}"
+        for chave in [k for k in el.attrib if k.startswith("{" + _ESTRITO)]:
+            uri, _, local = chave[1:].partition("}")
+            el.attrib[f"{{{_transicional(uri)}}}{local}"] = el.attrib.pop(chave)
+    return raiz
+
+
+_MARCAS_ESTRITO = (_ESTRITO.encode(), _ESTRITO.encode("utf-16-le"), _ESTRITO.encode("utf-16-be"))
+
+
+def _attr(el, ns, local):
+    """O atributo como o anydoc lê (Element::attr): o do namespace `ns`, senão o sem namespace."""
+    valor = el.get(f"{{{ns}}}{local}")
+    return el.get(local) if valor is None else valor
+
+
+def _qualquer(el, local):
+    """O primeiro atributo com o nome local `local`, em qualquer namespace (Element::attr_any do anydoc)."""
+    return next((v for k, v in el.attrib.items() if k.rpartition("}")[2] == local), None)
 
 
 class _Pacote:
@@ -228,6 +353,7 @@ class _Pacote:
 
     def __init__(self, z):
         self.z, self.nomes, self.falhas, self._arvores, self._rels = z, set(z.namelist()), [], {}, {}
+        self.fontes = set()  # partes de gráfico e de SmartArt já contadas na rede
 
     def falhou(self, nome, e):
         self.falhas.append(f"{nome} ({_motivo(e)})")
@@ -238,35 +364,43 @@ class _Pacote:
             self._arvores[nome] = None
             if nome in self.nomes:
                 try:
-                    self._arvores[nome] = _xml(self.z.read(nome))
+                    dados = self.z.read(nome)
+                    self._arvores[nome] = _normalizar(_xml(dados), dados)
                 except MemoryError:
                     raise
                 except Exception as e:  # noqa: BLE001 — XML hostil ou CRC errado: a parte fica como está
                     self.falhou(nome, e)
         return self._arvores[nome]
 
-    def relacoes(self, parte) -> list:
-        """(Id, tipo, alvo) das relações internas da parte, na ordem do Id: a primeira de cada tipo é a que o anydoc
-        usa. O tipo é o fim do URI, igual no OOXML de transição e no estrito."""
+    def relacoes(self, parte) -> dict:
+        """Id -> (tipo, alvo) das relações da parte, como o anydoc lê (package/relationships.rs): Id repetido vale
+        pela última; Id, Target, Type e TargetMode valem com qualquer namespace; o tipo é o URI inteiro (o do OOXML
+        estrito no de transição); a relação externa fica sem alvo, e a que não resolve também (None)."""
         if parte not in self._rels:
             pasta, _, arquivo = parte.rpartition("/")
             nome = f"{pasta}/_rels/{arquivo}.rels" if pasta else f"_rels/{arquivo}.rels"
-            raiz, out = self.arvore(nome), []
+            raiz, out = self.arvore(nome), {}
             for rel in raiz.iter(f"{_PKG}Relationship") if raiz is not None else ():
-                rid, alvo = rel.get("Id"), rel.get("Target")
-                if rid is not None and alvo is not None and (rel.get("TargetMode") or "").lower() != "external":
-                    out.append((rid, (rel.get("Type") or "").rsplit("/", 1)[-1], _resolver(parte, alvo)))
-            self._rels[parte] = sorted(out)
+                rid, alvo = _qualquer(rel, "Id"), _qualquer(rel, "Target")
+                if rid is None or alvo is None:
+                    continue
+                externa = (_qualquer(rel, "TargetMode") or "").lower() == "external"
+                tipo = _transicional(_qualquer(rel, "Type") or "")
+                out[rid] = (None, None) if externa else (tipo, _resolver(parte, alvo))
+            self._rels[parte] = out
         return self._rels[parte]
 
     def do_tipo(self, parte, tipo):
-        return next((alvo for _, t, alvo in self.relacoes(parte) if t == tipo), None)
+        """O alvo da relação interna do tipo com o menor Id (first_of_type do anydoc), ou None."""
+        rels = self.relacoes(parte)
+        rid = min((i for i, (t, _) in rels.items() if t == _RELACAO + tipo), default=None)
+        return rels[rid][1] if rid is not None else None
 
     def de_todos(self, parte, tipo) -> list:
-        return [alvo for _, t, alvo in self.relacoes(parte) if t == tipo]
+        return [a for i, (t, a) in sorted(self.relacoes(parte).items()) if t == _RELACAO + tipo and a]
 
     def alvo(self, parte, rid):
-        return next((alvo for i, _, alvo in self.relacoes(parte) if i == rid), None)
+        return self.relacoes(parte).get(rid, (None, None))[1]
 
     def principal(self, padrao):
         return self.do_tipo("", "officeDocument") or padrao
@@ -277,8 +411,8 @@ def _ramo_lido(alt, suportados):
     namespaces que ele entende, ou o Fallback."""
     for ramo in alt:
         if ramo.tag == f"{_MC}Choice":
-            exige = (ramo.get("Requires") or "").split()
-            if all(ramo.nsmap.get(p) in suportados for p in exige):
+            exige = (_attr(ramo, _MC[1:-1], "Requires") or "").split()
+            if all(_transicional(ramo.nsmap.get(p)) in suportados for p in exige):
                 return ramo
     return alt.find(f"{_MC}Fallback")
 
@@ -924,8 +1058,8 @@ def limpar_docx(dados: bytes) -> Limpeza:
     ser lida vai para `falhas` e fica como estava."""
     try:
         with zipfile.ZipFile(io.BytesIO(dados)) as z:
-            ocultos, limpas, falhas = _conferir_word(z)
-            return Limpeza(ocultos, _regravar(z, limpas) if limpas else dados, falhas)
+            ocultos, limpas, falhas, vistas = _conferir_word(z)
+            return Limpeza(ocultos, _regravar(z, limpas) if limpas else dados, falhas, frozenset(vistas))
     except MemoryError:
         raise
     except Exception as e:  # noqa: BLE001 — zip que não abre ou parte cifrada: nada conferido, nada muda
@@ -982,18 +1116,41 @@ def _conferir_word(z, so_metadados=False) -> tuple:
                 pagina = _INCERTO  # o papel timbrado fica atrás de tudo o que está na página
             elif faixa is not None:
                 faixas.append(faixa)
-    ocultos, limpas = [], {}
+    ocultos, limpas, vistas = [], {}, set()
     for nome, raiz in partes.items():
         if raiz is None:
             continue
         papel = papeis[nome]
         atras = (255, 255, 255) if papel == "comentario" else pagina  # o comentário fica no balão, fora da página
         cobre = faixas if papel == "corpo" else [(-1, 1 << 62)] if faixas and papel == "nota" else ()
-        achados, mudou = _conferir_parte(raiz, estilos, tema, atras, geometria, cobre, papel)
+        lida = papel in ("corpo", "nota")  # o anydoc lê o corpo e as notas; o resto, só os metadados
+        achados, mudou = _conferir_parte(raiz, estilos, tema, atras, geometria, cobre, papel, vistas if lida else None)
         ocultos += achados
         if mudou:
             limpas[nome] = _serializar(raiz, z.read(nome))
-    return ocultos, limpas, pac.falhas
+        if lida:
+            _fontes_sem_estilo(pac, nome, raiz, vistas)
+    if not so_metadados and (numeracao := pac.arvore(tipo("numbering", "numbering.xml"))) is not None:
+        # o rótulo do título numerado ("Cláusula 1.", "IV.") vem do lvlText e do formato da numeração
+        vistas |= palavras(" ".join(_attr(el, _W[1:-1], "val") or "" for el in numeracao.iter(f"{_W}lvlText")))
+        if any(_attr(f, _W[1:-1], "val") in ("lowerRoman", "upperRoman") for f in numeracao.iter(f"{_W}numFmt")):
+            vistas |= _romanos()
+    return ocultos, limpas, pac.falhas, vistas
+
+
+@functools.cache
+def _romanos() -> frozenset:
+    """Os números romanos de 1 a 3999 (o anydoc escreve os maiores em algarismos), em minúsculas."""
+    valores = ((1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
+               (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"))  # fmt: skip
+    out = set()
+    for n in range(1, 4000):
+        romano = ""
+        for valor, letras in valores:
+            while n >= valor:
+                romano, n = romano + letras, n - valor
+        out.add(romano)
+    return frozenset(out)
 
 
 class _Paragrafo(NamedTuple):
@@ -1036,9 +1193,10 @@ def _lido(r, papel, ramos) -> bool:
     return True
 
 
-def _conferir_parte(raiz, estilos, tema, pagina, geometria, faixas, papel) -> tuple:
+def _conferir_parte(raiz, estilos, tema, pagina, geometria, faixas, papel, vistas=None) -> tuple:
     """Esvazia o texto dos runs ocultos da parte (w:t do run, em todos os ramos de mc:AlternateContent dele, e m:t da
-    fórmula); devolve o que saiu do que é lido e se a parte mudou."""
+    fórmula); devolve o que saiu do que é lido e se a parte mudou. Com `vistas`, junta nele as palavras do que foi
+    conferido e é lido, depois da limpeza."""
     cobertos = _cobertos(raiz, estilos, geometria, faixas)
     runs = {}
     for t in raiz.iter(f"{_W}t", f"{_M}t"):  # o texto de uma caixa dentro do run é do run de dentro
@@ -1058,6 +1216,9 @@ def _conferir_parte(raiz, estilos, tema, pagina, geometria, faixas, papel) -> tu
             mudou = True
             if _lido(r, papel, ramos):
                 achados.append((motivo, txt))
+    if vistas is not None:
+        lidos = {t for r, textos in runs.items() if _lido(r, papel, ramos) for t in textos}
+        _registrar(raiz.iter(f"{_W}p"), lidos, vistas)
     return achados, mudou
 
 
@@ -1197,14 +1358,16 @@ class _Apresentacao:
             raise XMLIlegivel("a apresentação não abre") if self.nome in pac.nomes else KeyError(self.nome)
         tam = self.raiz.find(f"{_P}sldSz")
         self.W, self.H = (_num(tam.get("cx")) or 0, _num(tam.get("cy")) or 0) if tam is not None else (0, 0)
-        self.padrao = self.raiz.find(f"{_P}defaultTextStyle")
+        self.padrao = next(self.raiz.iter(f"{_P}defaultTextStyle"), None)
         estilos = pac.arvore(pac.do_tipo(self.nome, "tableStyles") or "")
         self.tabela_padrao = estilos.get("def") if estilos is not None else None
 
     def slides(self) -> list:
-        lista = self.raiz.find(f"{_P}sldIdLst")
-        alvos = [self.pac.alvo(self.nome, s.get(f"{_R}id")) for s in (lista if lista is not None else [])]
-        return [a for a in alvos if a]
+        """Os slides como o anydoc acha: o primeiro sldIdLst da apresentação, em qualquer profundidade, e os sldId
+        dele, pelo r:id."""
+        lista = next(self.raiz.iter(f"{_P}sldIdLst"), None)
+        ids = lista.iterfind(f"{_P}sldId") if lista is not None else ()
+        return [a for s in ids if (a := self.pac.alvo(self.nome, s.get(f"{_R}id")))]
 
     def camada(self, nome, tipo_pai):
         """O layout (ou o mestre) `nome`, com o pai dele (`tipo_pai`: slideMaster, notesMaster ou None)."""
@@ -1242,8 +1405,8 @@ def limpar_pptx(dados: bytes) -> Limpeza:
     conferida fica como estava e vai para `falhas`."""
     try:
         with zipfile.ZipFile(io.BytesIO(dados)) as z:
-            ocultos, limpas, falhas = _conferir_pptx(z)
-            return Limpeza(ocultos, _regravar(z, limpas) if limpas else dados, falhas)
+            ocultos, limpas, falhas, vistas = _conferir_pptx(z)
+            return Limpeza(ocultos, _regravar(z, limpas) if limpas else dados, falhas, frozenset(vistas))
     except MemoryError:
         raise
     except Exception as e:  # noqa: BLE001 — zip que não abre, apresentação sem presentation.xml: nada conferido
@@ -1255,8 +1418,8 @@ def _conferir_pptx(z) -> tuple:
     try:
         ap = _Apresentacao(pac)
     except XMLIlegivel:  # a falha da parte já está em pac.falhas
-        return [], {}, pac.falhas
-    ocultos, limpas = [], {}
+        return [], {}, pac.falhas, set()
+    ocultos, limpas, vistas = [], {}, set()
     for nome in ap.slides():
         if ap.comparacoes > _COMPARACOES_MAX:
             pac.falhou(nome, _Teto(f"sobreposição de formas acima do teto de {_COMPARACOES_MAX} comparações"))
@@ -1265,8 +1428,9 @@ def _conferir_pptx(z) -> tuple:
         if slide is None:
             continue
         layout = ap.camada(pac.do_tipo(nome, "slideLayout"), "slideMaster")
+        registro = []  # os corpos de texto que o anydoc lê, conferidos
         try:
-            achados, mudou = _conferir_slide(ap, _Camada(nome, slide, None, layout))
+            achados, mudou = _conferir_slide(ap, _Camada(nome, slide, None, layout), registro)
         except MemoryError:
             raise
         except Exception as e:  # noqa: BLE001 — teto de custo ou XML forjado que o percurso não previu: o slide
@@ -1275,12 +1439,29 @@ def _conferir_pptx(z) -> tuple:
             ocultos += achados
             if mudou:  # também quando só a cópia que o anydoc não lê saiu
                 limpas[nome] = _serializar(slide, z.read(nome))
+            _registrar_corpos(registro, vistas)
+            _fontes_sem_estilo(pac, nome, slide, vistas)
         if (notas := pac.do_tipo(nome, "notesSlide")) and (raiz := pac.arvore(notas)) is not None:
-            mestre = ap.camada(pac.do_tipo(notas, "notesMaster"), None)
-            if achados := _conferir_anotacoes(ap, _Camada(notas, raiz, None, mestre)):
-                ocultos += achados
+            mestre, registro = ap.camada(pac.do_tipo(notas, "notesMaster"), None), []
+            achados, mudou = _conferir_anotacoes(ap, _Camada(notas, raiz, None, mestre), registro)
+            ocultos += achados
+            if mudou:
                 limpas[notas] = _serializar(raiz, z.read(notas))
-    return ocultos, limpas, pac.falhas
+            _registrar_corpos(registro, vistas)
+    return ocultos, limpas, pac.falhas, vistas
+
+
+def _registrar_corpos(corpos, vistas):
+    for corpo in corpos:
+        lidos = {t for r, *_ in _runs_do_corpo(corpo) for t in _textos(r)}
+        _registrar(corpo.iterfind(f"{_A}p"), lidos, vistas)
+
+
+def _lida(el) -> bool:
+    """O anydoc lê o texto da forma: ele só pula o placeholder de número, data e rodapé, e decide pelo primeiro p:ph
+    de dentro da forma, onde quer que esteja (parse_shape). A conferência confere a forma de qualquer jeito."""
+    ph = next(el.iter(f"{_P}ph"), None)
+    return ph is None or (_attr(ph, _P[1:-1], "type") or "body") not in ("sldNum", "dt", "ftr")
 
 
 def _mestre(camada):
@@ -1483,9 +1664,12 @@ def _textos(el):
     return [t for t in el.iter(f"{_A}t", f"{_M}t")]
 
 
-def _conferir_corpo(corpo, texto, fundos, tema, mapa, todo=None) -> list:
+def _conferir_corpo(corpo, texto, fundos, tema, mapa, todo=None, registro=None) -> list:
     """(motivo, texto, [a:t]) do que está oculto no corpo de texto. `todo` é o motivo que vale para o texto inteiro
-    (forma oculta ou fora do slide); senão, run a run: fonte minúscula, ou cor igual à de todos os `fundos`."""
+    (forma oculta ou fora do slide); senão, run a run: fonte minúscula, ou cor igual à de todos os `fundos`. O corpo
+    entra em `registro` (o que o anydoc lê) quando há registro."""
+    if registro is not None:
+        registro.append(corpo)
     out = []
     escala = _escala(corpo)
     certos = not any(f is _INCERTO for f in fundos)
@@ -1507,7 +1691,7 @@ def _conferir_corpo(corpo, texto, fundos, tema, mapa, todo=None) -> list:
     return out
 
 
-def _conferir_slide(ap, slide) -> tuple:
+def _conferir_slide(ap, slide, registro) -> tuple:
     """O texto oculto do slide que o anydoc lê e se a árvore mudou (o texto sai de todos os ramos): forma oculta, caixa
     fora do slide, fonte minúscula (com a autoajuste) e cor igual ao fundo (preenchimento da forma ou da célula, formas
     embaixo, fundo do slide, do layout ou do mestre, com o tema e o mapa de cores do mestre). Só conclui "cor igual ao
@@ -1546,16 +1730,17 @@ def _conferir_slide(ap, slide) -> tuple:
         if el.tag == f"{_P}grpSp":  # no grupo, posição e camadas são do grupo: só o preenchimento certo decide
             for f, lido_f, oculta in _no_grupo(el, lido, _oculta(el)):
                 achados = _conferir_forma(ap, f, slide, [], None, [_INCERTO], tema, mapa, imagem,
-                                          "forma oculta" if oculta else None)  # fmt: skip
-                out += [(m, t, ts, lido_f) for m, t, ts in achados]
-        elif next(el.iter(f"{_A}t"), None) is not None:
+                                          "forma oculta" if oculta else None, registro if lido_f else None)  # fmt: skip
+                out += [(m, t, ts, lido_f and lida) for m, t, ts, lida in achados]
+        elif next(el.iter(f"{_A}t", f"{_M}t"), None) is not None:  # texto ou só fórmula (a14:m)
             todo = "forma oculta" if _oculta(el) else None
             if todo is None and caixa is not None and ap.W and ap.H:
                 if caixa[2] <= 0 or caixa[3] <= 0 or caixa[0] >= ap.W or caixa[1] >= ap.H:
                     todo = "fora do slide"
             fundos = _embaixo(ap, caixa, fundo, desenhadas) if todo is None else [_INCERTO]
-            achados = _conferir_forma(ap, el, slide, herdadas, caixa, fundos, tema, mapa, imagem, todo)
-            out += [(m, t, ts, lido) for m, t, ts in achados]
+            achados = _conferir_forma(ap, el, slide, herdadas, caixa, fundos, tema, mapa, imagem, todo,
+                                      registro if lido else None)  # fmt: skip
+            out += [(m, t, ts, lido and lida) for m, t, ts, lida in achados]
         if desenhado and (cor := _pintura(el, herdadas, tema, mapa, imagem)) is not None:
             desenhadas.append((caixa, cor))
     for _, _, textos, _ in out:
@@ -1573,18 +1758,21 @@ def _no_grupo(grupo, lido, oculta):
             yield f, lido_f, oculta or _oculta(f)
 
 
-def _conferir_forma(ap, el, camada, herdadas, caixa, fundos, tema, mapa, imagem, todo) -> list:
-    """O oculto do texto da forma (sp, cxnSp) ou das células da tabela (graphicFrame) que o anydoc lê."""
+def _conferir_forma(ap, el, camada, herdadas, caixa, fundos, tema, mapa, imagem, todo, registro) -> list:
+    """(motivo, texto, [a:t], lido pelo anydoc) do oculto do texto da forma (sp, cxnSp) ou das células da tabela
+    (graphicFrame). Confere também o que o anydoc pula (placeholder de rodapé, célula mesclada): esvaziar não custa
+    nada, e o critério do anydoc só decide o que entra no registro."""
     mestre = _mestre(camada)
     if el.tag in (f"{_P}sp", f"{_P}cxnSp"):
-        if (ph := _ph(el)) is not None and ph[0] in ("sldNum", "dt", "ftr"):  # o anydoc não lê
-            return []
         corpo = el.find(f"{_P}txBody")
         if corpo is None:
             return []
         atras = _preenchimento_da_forma(el, herdadas, tema, mapa, imagem)
         texto = _cadeia_de_texto(ap, el, herdadas, mestre)
-        return _conferir_corpo(corpo, texto, fundos if atras is None else [atras], tema, mapa, todo)
+        lida = _lida(el)
+        achados = _conferir_corpo(corpo, texto, fundos if atras is None else [atras], tema, mapa, todo,
+                                  registro if lida else None)  # fmt: skip
+        return [(*a, lida) for a in achados]
     if el.tag != f"{_P}graphicFrame" or (tbl := next(el.iter(f"{_A}tbl"), None)) is None:
         return []
     estilo = tbl.find(f"{_A}tblPr/{_A}tableStyleId")
@@ -1597,8 +1785,7 @@ def _conferir_forma(ap, el, camada, herdadas, caixa, fundos, tema, mapa, imagem,
     out = []
     for tr in tbl.iterfind(f"{_A}tr"):
         for tc in tr.iterfind(f"{_A}tc"):
-            if (tc.get("hMerge") or tc.get("vMerge") or "").lower() in ("1", "true"):  # o anydoc pula a coberta
-                continue
+            lida = not any(_attr(tc, _A[1:-1], m) in ("1", "true") for m in ("hMerge", "vMerge"))  # a coberta não
             corpo = tc.find(f"{_A}txBody")
             if corpo is None:
                 continue
@@ -1615,29 +1802,33 @@ def _conferir_forma(ap, el, camada, herdadas, caixa, fundos, tema, mapa, imagem,
             else:
                 atras = [_INCERTO] if pinta else debaixo
             texto = _Texto([corpo.find(f"{_A}lstStyle")] + ([] if pinta else [outro, ap.padrao]), None, pinta)
-            out += _conferir_corpo(corpo, texto, atras, tema, mapa, todo)
+            achados = _conferir_corpo(corpo, texto, atras, tema, mapa, todo, registro if lida else None)
+            out += [(*a, lida) for a in achados]
     return out
 
 
-def _conferir_anotacoes(ap, notas) -> list:
-    """O oculto das anotações do orador, que o anydoc lê depois do slide: todo p:sp da página (menos imagem do
-    slide, número, cabeçalho, rodapé e data), com o fundo da página e a cadeia do mestre de anotações."""
+def _conferir_anotacoes(ap, notas, registro) -> tuple:
+    """O oculto das anotações do orador, que o anydoc lê depois do slide, e se a árvore mudou: todo p:sp da página,
+    com o fundo da página e a cadeia do mestre de anotações. A imagem do slide, o número, o cabeçalho, o rodapé e a
+    data, que o anydoc pula (pelo primeiro p:ph de dentro da forma), são conferidos, mas não entram no registro."""
     mestre = notas.pai
     tema, mapa = ap.tema(mestre)
     fundo = _fundo_da_camada(ap, [notas, mestre], tema, mapa)
     imagem, out = ap.imagem(notas.nome), []
     for sp in notas.raiz.iter(f"{_P}sp"):
-        if (ph := _ph(sp)) is not None and ph[0] in ("sldImg", "sldNum", "hdr", "ftr", "dt"):
-            continue
         corpo = sp.find(f"{_P}txBody")
         if corpo is None:
             continue
+        lido = next(sp.iter(f"{_P}ph"), None)
+        lido = lido is None or (_attr(lido, _P[1:-1], "type") or "body") not in ("sldImg", "sldNum", "hdr", "ftr", "dt")
+        ph = _ph(sp)
         herdadas = [mestre.phs.casar(*ph)] if ph is not None and mestre is not None else []
         atras = _preenchimento_da_forma(sp, herdadas, tema, mapa, imagem)
         texto = _cadeia_de_texto(ap, sp, herdadas, mestre, notas=True)
-        out += _conferir_corpo(corpo, texto, [fundo] if atras is None else [atras], tema, mapa,
-                               "forma oculta" if _oculta(sp) else None)  # fmt: skip
-    for _, _, textos in out:
+        achados = _conferir_corpo(corpo, texto, [fundo] if atras is None else [atras], tema, mapa,
+                                  "forma oculta" if _oculta(sp) else None, registro if lido else None)  # fmt: skip
+        out += [(*a, lido) for a in achados]
+    for _, _, textos, _ in out:
         for t in textos:
             _esvaziar(t)
-    return [(m, t) for m, t, _ in out]
+    return [(m, t) for m, t, _, lido in out if lido], bool(out)
