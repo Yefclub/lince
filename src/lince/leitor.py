@@ -419,7 +419,8 @@ def _avisar_cache(e):
 def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
     """O fim da leitura, igual com a IA do Lince ou com a de quem chama: pendência de resposta vazia, montagem do
     texto e dos metadados, estrutura."""
-    if respostas and tamanho_da_saida(plano, respostas) > SAIDA_MAX:
+    lotes_lidos = {}  # o JSON de cada lote é lido uma vez na busca do que cabe
+    if respostas and tamanho_da_saida(plano, respostas, lotes_lidos) > SAIDA_MAX:
         # acima do teto de saída, entram as leituras que cabem, na ordem do plano; as outras ficam pendentes, com o
         # motivo, e o texto nativo sai inteiro no lugar delas. A busca é binária: o tamanho só cresce com cada leitura
         posicao = {t["id"]: k for k, t in enumerate(plano.get("tarefas", []))}
@@ -427,7 +428,7 @@ def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
         cabem, sobra = 0, len(ordem)
         while cabem + 1 < sobra:
             meio = (cabem + sobra) // 2
-            if tamanho_da_saida(plano, {tid: respostas[tid] for tid in ordem[:meio]}) <= SAIDA_MAX:
+            if tamanho_da_saida(plano, {tid: respostas[tid] for tid in ordem[:meio]}, lotes_lidos) <= SAIDA_MAX:
                 cabem = meio
             else:
                 sobra = meio

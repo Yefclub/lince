@@ -3,6 +3,7 @@ que faz parte do documento ficam no texto (issue #33, itens 1 e 2)."""
 
 import io
 
+import pytest
 from docx import Document
 from PIL import Image, ImageDraw
 from pptx import Presentation
@@ -14,11 +15,17 @@ import lince
 from lince.montagem import _sem_cabecalho_corrido
 
 
-def test_lote_de_faturas_do_mesmo_modelo_fica_inteiro(tmp_path):
+@pytest.mark.parametrize(
+    ("fonte_da_marca", "rodape"),
+    [(("Helvetica-Bold", 14), True), (("Helvetica", 9), True), (("Helvetica", 9), False)],
+    ids=["marca-em-titulo", "marca-em-linha-comum", "marca-em-linha-comum-sem-rodape"],
+)
+def test_lote_de_faturas_do_mesmo_modelo_fica_inteiro(tmp_path, fonte_da_marca, rodape):
+    # em Helvetica 9 a marca chega à regra como linha comum, sem a proteção de título que o negrito 14 ganha do leitor
     p = tmp_path / "faturas.pdf"
     c = canvas.Canvas(str(p), pagesize=A4)
     for n in range(12):
-        c.setFont("Helvetica-Bold", 14)
+        c.setFont(*fonte_da_marca)
         c.drawString(60, 800, "Empresa X - Fatura de serviço")
         c.setFont("Helvetica", 11)
         for k, ln in enumerate(
@@ -26,16 +33,61 @@ def test_lote_de_faturas_do_mesmo_modelo_fica_inteiro(tmp_path):
              f"Valor total: R$ {1500 + 37 * n},00", f"Pedido de compra {7700 + n} referente ao frete {n + 3}"]
         ):  # fmt: skip
             c.drawString(60, 770 - k * 18, ln)
-        c.setFont("Helvetica", 8)
-        c.drawString(60, 40, f"Documento emitido eletronicamente - folha {n + 1}")
+        if rodape:
+            c.setFont("Helvetica", 8)
+            c.drawString(60, 40, f"Documento emitido eletronicamente - folha {n + 1}")
         c.showPage()
     c.save()
     r = lince.ler(p)
-    assert r.markdown.count("Valor total") == 12 and r.markdown.count("Empresa X") == 12
-    assert "R$ 1907,00" in r.markdown  # o valor que muda entre páginas não é cabeçalho
+    for conteudo in ("Fatura nº", "Cliente: Transportadora", "Vencimento", "Valor total", "Pedido de compra"):
+        assert r.markdown.count(conteudo) == 12  # o conteúdo de cada uma das 12 faturas fica
+    assert "R$ 1907,00" in r.markdown and "Transportadora 12 Ltda" in r.markdown  # o que muda não é cabeçalho
     assert r.markdown.count("emitido eletronicamente") == 0  # o rodapé com o número da folha, sim
-    (rodape,) = r.metadados["cabeçalho/rodapé"]
-    assert rodape.startswith("Documento emitido") and rodape.endswith("folha #")
+    bordas = r.metadados.get("cabeçalho/rodapé", [])
+    if rodape:
+        (rodape_lido,) = bordas  # com o rodapé, a marca fixa levaria a remoção além de FRACAO_MAX: ela fica
+        assert rodape_lido.startswith("Documento emitido") and rodape_lido.endswith("folha #")
+        assert r.markdown.count("Empresa X") == 12
+    else:  # sem ele, a marca é o cabeçalho fixo da regra (curta, idêntica na borda de todas): vai para os metadados
+        assert bordas == ["Empresa X-Fatura de serviço"] and "Empresa X" not in r.markdown
+
+
+def test_faturas_linha_a_linha_so_perdem_a_marca_e_o_rodape():
+    # cada linha da fatura separada, como sai de um leitor que não junta o parágrafo: o número do cliente coincide com
+    # o da página, mas não está rotulado como página, então a linha é conteúdo
+    descricao = "Descrição: frete rodoviário de carga seca entre o armazém de Paranaguá e a unidade de Ponta Grossa."
+    nativas = _paginas(
+        *(
+            ["Empresa X - Fatura de serviço", f"Cliente: Transportadora {n + 1} Ltda", f"Fatura nº {1000 + n}",
+             descricao, descricao.replace("seca", "a granel"), f"Valor total: R$ {1500 + 37 * n},00",
+             f"Vencimento: {10 + n}/12/2026", f"Documento emitido eletronicamente - folha {n + 1}"]
+            for n in range(12)
+        )
+    )  # fmt: skip
+    saiu = _sem_cabecalho_corrido(nativas)
+    assert saiu == {"Empresa X - Fatura de serviço", "Documento emitido eletronicamente - folha #"}
+    for n, (_, blocos) in enumerate(nativas):
+        assert blocos[1] == f"Cliente: Transportadora {n + 1} Ltda" and blocos[2] == f"Fatura nº {1000 + n}"
+        assert blocos[5].startswith("Valor total") and blocos[6].startswith("Vencimento")
+
+
+def test_carne_com_uma_parcela_por_pagina_fica_inteiro(tmp_path):
+    p = tmp_path / "carne.pdf"
+    c = canvas.Canvas(str(p), pagesize=A4)
+    for n in range(12):
+        c.setFont("Helvetica", 9)
+        c.drawString(60, 800, f"Parcela {n + 1} de 12")  # o número da parcela é o da página, sem rótulo de página
+        c.setFont("Helvetica", 11)
+        for k, ln in enumerate(
+            [f"Vencimento: 10/{n + 1:02d}/2027", f"Valor da parcela: R$ {250 + n},00 com desconto até o vencimento",
+             f"Nosso número {93100 + 7 * n} - carnê do financiamento 4512"]
+        ):  # fmt: skip
+            c.drawString(60, 770 - k * 18, ln)
+        c.showPage()
+    c.save()
+    r = lince.ler(p)
+    assert all(f"Parcela {n} de 12" in r.markdown for n in range(1, 13))
+    assert "cabeçalho/rodapé" not in r.metadados
 
 
 def test_pdf_longo_com_linhas_numeradas_por_pagina_fica_inteiro(tmp_path):
@@ -138,8 +190,8 @@ def test_numero_sozinho_so_sai_se_for_o_da_pagina():
 def test_numero_impresso_deslocado_do_indice_ainda_e_cabecalho():
     corpo = "\n".join(f"Cláusula {k}: o texto de verdade do contrato de fornecimento de grãos." for k in range(8))
     # capa e sumário sem número: a página física 3 é a "1" impressa
-    nativas = _paginas(*([f"Relatório anual — {n - 1}", corpo, str(n - 1)] for n in range(2, 7)))
-    assert _sem_cabecalho_corrido(nativas) == {"Relatório anual — #", "#"}  # o número sozinho também é registrado
+    nativas = _paginas(*([f"Relatório anual — pág. {n - 1}", corpo, str(n - 1)] for n in range(2, 7)))
+    assert _sem_cabecalho_corrido(nativas) == {"Relatório anual — pág. #", "#"}  # o número sozinho também
     assert all(b[0] == "" and b[2] == "" for _, b in nativas)
 
 

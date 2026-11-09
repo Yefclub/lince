@@ -8,7 +8,7 @@ import re  # noqa: F401
 import zipfile  # noqa: F401
 from xml.etree import ElementTree as ET  # noqa: F401
 
-from .agrupamento import distribuir_lotes
+from .agrupamento import distribuir_lotes, tamanhos_distribuidos
 from .seguranca import alertas_injecao
 from .texto import NUM_PAGINA, sem_repeticao
 
@@ -195,6 +195,9 @@ FIXA_MIN = 0.8  # linha idêntica na borda de ao menos esta fração das página
 
 
 DESLOCAMENTO_MAX = 50  # número impresso = índice da página + d (capa e páginas iniciais sem número): |d| até isto
+# o rótulo logo antes do número que diz que ele é o da página, e a linha que é só o número ("3 de 12", "3/12")
+_ROTULO_PAGINA = re.compile(r"(?<![^\W\d_])(p[aá]gina|p[aá]g|page|pg|p|folha|fls|fl)\.?:?\s*$", flags=re.I)
+_SO_O_NUMERO = re.compile(r"\W*#(\s*(de|of|/)\s*\d{1,4})?\W*", flags=re.I)
 _ROMANOS = [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
             (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")]  # fmt: skip
 
@@ -213,13 +216,15 @@ def _numero(token) -> int | None:
 def _sem_cabecalho_corrido(nativas) -> set[str]:
     """Tira das páginas nativas (índice, blocos) o cabeçalho/rodapé corrido e devolve o que saiu, para os metadados.
     Só sai a linha curta, na borda da página, igual em quase todas as páginas, em que só o número da própria página
-    varia ("Página 3 de 12", "Relatório anual — 3"), com um deslocamento constante entre o número impresso e o índice
-    da página (a capa sem número desloca todos); a linha só com o número da página, na primeira ou na última posição,
-    também sai, com o mesmo deslocamento em quase todas as páginas, e vai para os metadados como a linha com o número
-    trocado por #. A linha curta idêntica na borda de FIXA_MIN das páginas, sem número de página, é cabeçalho fixo e
-    sai também, se couber em FRACAO_MAX junto com o resto (senão só ela fica). Valor, data e número de documento que
-    mudam entre páginas não casam, a página escaneada e o texto lido pela IA não passam por aqui, título (linha com #)
-    nunca sai e, se o que sairia passa de FRACAO_MAX do texto nativo do documento, nada sai."""
+    varia, rotulado como página ("Página 3 de 12", "Relatório anual — fls. 3") ou sozinho ("3 de 12"), com um
+    deslocamento constante entre o número impresso e o índice da página (a capa sem número desloca todos); o número sem
+    rótulo no meio de outras palavras ("Parcela 3 de 12" num carnê) é conteúdo. A linha só com o número da página, na
+    primeira ou na última posição, também sai, com o mesmo deslocamento em quase todas as páginas, e vai para os
+    metadados como a linha com o número trocado por #. A linha curta idêntica na borda de FIXA_MIN das páginas, sem
+    número de página, é cabeçalho fixo e sai também, se couber em FRACAO_MAX junto com o resto (senão só ela fica).
+    Valor, data e número de documento que mudam entre páginas não casam, a página escaneada e o texto lido pela IA não
+    passam por aqui, título (linha com #) nunca sai e, se o que sairia passa de FRACAO_MAX do texto nativo do
+    documento, nada sai."""
     from collections import Counter
 
     def linhas(blocos):
@@ -240,7 +245,10 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
         for m in re.finditer(r"(?<![\w.,/])(\d{1,4}|[ivxlcdm]{1,8})(?![\w.,/])", t, flags=re.I):
             v = _numero(m.group())
             forma = t[: m.start()] + "#" + t[m.end() :]
-            if v is not None and abs(v - pagina) <= DESLOCAMENTO_MAX and re.search(r"[^\W\d]", forma):
+            # o número só é o da página se a linha diz que é ("Página 3", "fls. 3") ou se a linha é só ele ("3 de 12");
+            # "Parcela 3 de 12" num carnê de uma parcela por página é conteúdo
+            pagina_dita = _ROTULO_PAGINA.search(t[: m.start()]) or _SO_O_NUMERO.fullmatch(forma)
+            if v is not None and abs(v - pagina) <= DESLOCAMENTO_MAX and pagina_dita and re.search(r"[^\W\d]", forma):
                 out.add((forma, v - pagina))  # só número (sem palavra) é o caso de so_numero
         return out
 
@@ -321,22 +329,21 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
     return {c for _, c in tirar.values()}
 
 
-def tamanho_da_saida(e, respostas) -> int:
+def tamanho_da_saida(e, respostas, lotes_lidos=None) -> int:
     """Quanto texto a montagem vai escrever, no máximo: cada marca vira a leitura (a da mesma imagem repetida entra uma
-    vez, e as outras posições, a referência) ou a tabela e a fórmula nativas. Conta antes de montar, para a saída ter
-    teto como a entrada tem."""
+    vez, e as outras posições, a referência) ou a tabela e a fórmula nativas, e cada página leva o comentário e as
+    junções. Conta antes de montar, para a saída ter teto como a entrada tem. `lotes_lidos` guarda o tamanho dos itens
+    de cada lote entre chamadas com as mesmas respostas (a busca do que cabe)."""
     if e.get("tipo") == "imagem":  # a imagem solta sai como as leituras das faixas, uma depois da outra
         return sum(len(respostas.get(t["id"], "")) + 2 for t in e.get("tarefas", []))
     from collections import Counter
 
-    lote_de = {tid: lid for lid, itens in (e.get("lotes") or {}).items() for _, tid in itens}
+    R = tamanhos_distribuidos(e, respostas, {} if lotes_lidos is None else lotes_lidos)  # como a montagem escreve
     iguais, contadas = e.get("iguais", {}), set()
 
-    def cheia(tid):
-        tid = iguais.get(tid, tid)
-        # a maior entre a do item (já dividida, no esforço máximo e na releitura) e a do lote: a chave de um não
-        # esconde o outro
-        return max(len(respostas.get(tid, "")), len(respostas.get(lote_de.get(tid), ""))) + 64
+    def cheia(tid):  # a leitura, a âncora "<!-- lido pela IA: id -->" e as junções em volta dela
+        leitora = iguais.get(tid, tid)
+        return R.get(leitora if leitora in R else tid, 0) + len(tid) + 64
 
     def leitura(tid):  # a primeira posição de cada leitura a traz inteira; as outras, a âncora e a referência
         leitora = iguais.get(tid, tid)
@@ -345,11 +352,13 @@ def tamanho_da_saida(e, respostas) -> int:
         contadas.add(leitora)
         return cheia(tid)
 
-    total = len(e.get("md", "")) + sum(len(x) for x in e.get("extras", []))
+    total = len(e.get("md", "")) + sum(len(x) + 2 for x in e.get("extras", [])) + 1  # junções e o fim de linha
     for tid, n in Counter(re.findall(r"\{\{IA:(\w+)\}\}", e.get("md", ""))).items():
         primeira = leitura(tid)
         total += primeira + (n - 1) * leitura(tid)  # a segunda chamada já conta a referência
     for p in e.get("paginas", []):
+        # o comentário "<!-- página N · rota -->" e as junções da página com a anterior e do comentário com o texto
+        total += len(f"<!-- página {p.get('i', 0) + 1} · {p.get('rota', '')} -->") + 4
         total += len(p.get("md", "")) + sum(leitura(r.get("tarefa", "")) for r in p.get("regioes", []))
         if p.get("rota") == "pagina":  # página escaneada: cada metade lida entra inteira
             total += sum(leitura(t) for t in (p.get("tarefas") or [p.get("tarefa", "")]))
