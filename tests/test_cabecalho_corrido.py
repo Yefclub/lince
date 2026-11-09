@@ -263,3 +263,11 @@ def test_numero_entre_tracos_ou_parenteses_sai(forma):
     assert all(b[1] == "" for _, b in nativas)
     carne = _paginas(*([corpo, forma.format(40 + 3 * n)] for n in range(4)))  # muda, mas não com a página: fica
     assert _sem_cabecalho_corrido(carne) == set() and carne[1][1][1] == forma.format(43)
+
+
+@pytest.mark.parametrize("forma", ["{})", "({}"])
+def test_numero_com_parentese_so_de_um_lado_e_item_de_lista_e_fica(forma):
+    corpo = "\n".join(f"Cláusula {k}: o texto de verdade do contrato de fornecimento de grãos." for k in range(8))
+    nativas = _paginas(*([corpo, forma.format(n + 1)] for n in range(4)))  # "1)", "2)"...: bate com a página, mas não é
+    assert _sem_cabecalho_corrido(nativas) == set()
+    assert [b[1] for _, b in nativas] == [forma.format(n + 1) for n in range(4)]

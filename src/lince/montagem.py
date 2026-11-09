@@ -273,8 +273,8 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
         """(deslocamento, forma com o número trocado por #) do número de página que é a linha inteira ("3", "- 3 -",
         "(3)", "Página 3 de 12", "Página 3/12", "iv"), ou None."""
         t = ln.strip()
-        if not (m := re.fullmatch(NUM_PAGINA, t, flags=re.I)):
-            return None
+        if not (m := re.fullmatch(NUM_PAGINA, t, flags=re.I)) or t.count("(") != t.count(")"):
+            return None  # "3)" é o item de uma lista, não o número da página: o parêntese abre e fecha, ou não há
         g = "n" if m.group("n") else "r"  # o número depois do rótulo, nunca uma letra dele
         v = _numero(m.group(g))
         if v is None or abs(v - pagina) > DESLOCAMENTO_MAX:
@@ -384,15 +384,27 @@ def tamanho_da_saida(e, respostas, medidas=None) -> int:
     for p in e.get("paginas", []):
         # o comentário "<!-- página N · rota -->" e as junções da página com a anterior e do comentário com o texto
         total += len(f"<!-- página {p.get('i', 0) + 1} · {p.get('rota', '')} -->") + 4
-        total += len(p.get("md", "")) + sum(leitura(r.get("tarefa", "")) for r in p.get("regioes", []))
+        # a região que substitui uma tabela ou fórmula entra na posição da marca, abaixo; as outras, onde a figura está
+        total += len(p.get("md", "")) + sum(
+            leitura(r.get("tarefa", ""))
+            for r in p.get("regioes", [])
+            if "substitui_tabela" not in r and "substitui_formula" not in r
+        )
         if p.get("rota") == "pagina":  # página escaneada: cada metade lida entra inteira
             total += sum(leitura(t) for t in (p.get("tarefas") or [p.get("tarefa", "")]))
-        tabelas, formulas = p.get("tabelas", []), p.get("formulas", [])
+        nativos = {"TABELA": p.get("tabelas", []), "FORMULA": p.get("formulas", [])}
+        trocam = {  # a região lida que entra no lugar de cada marca; sem ela, a marca leva o nativo
+            ("TABELA", int(r["substitui_tabela"])): r.get("tarefa", "")
+            for r in p.get("regioes", [])
+            if "substitui_tabela" in r
+        } | {
+            ("FORMULA", int(r["substitui_formula"])): r.get("tarefa", "")
+            for r in p.get("regioes", [])
+            if "substitui_formula" in r
+        }
         for tipo, k in re.findall(r"\{\{(TABELA|FORMULA):(\d+)\}\}", p.get("md", "")):
-            nativo = tabelas if tipo == "TABELA" else formulas
             k = int(k)
-            total += max(
-                len(nativo[k]) if k < len(nativo) else 0,
-                max((cheia(r.get("tarefa", "")) for r in p.get("regioes", [])), default=0),
-            )
+            nativo = nativos[tipo]
+            lida = leitura(trocam[tipo, k]) if (tipo, k) in trocam else 0
+            total += max(len(nativo[k]) if k < len(nativo) else 0, lida)
     return total
