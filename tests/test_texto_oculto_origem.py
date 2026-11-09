@@ -524,7 +524,8 @@ def test_caixas_sobre_desenhos_tem_teto_somado_de_comparacoes(tmp_path, monkeypa
     arq = _salvar(d, tmp_path)
     r = lince.ler(arq)
     assert "CAIXA BRANCA 0" in _removidos(r) and not any("teto" in p for p in r.cobertura.pendentes)  # confere
-    monkeypatch.setattr(seguranca, "_COMPARACOES_MAX", 3)
+    monkeypatch.setattr(seguranca, "_COMPARACOES_MAX", 10)  # a 1ª caixa é conferida e esvaziada, a 2ª estoura
     r = lince.ler(arq)
     assert any("caixas de texto acima do teto" in p for p in r.cobertura.pendentes)
-    assert "CAIXA BRANCA 0" in r.markdown  # a parte ficou como está, com a falha visível
+    for k in range(6):  # a parte ficou como estava, sem a limpeza pela metade, com a falha visível
+        assert f"CAIXA BRANCA {k}" in r.markdown, k

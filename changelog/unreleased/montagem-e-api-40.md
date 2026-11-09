@@ -23,13 +23,13 @@ reinício sem `LINCE_SEGREDO`, a montagem responde `422 plano-de-outra-chave`, c
 passam ficam nas pendências do preparo, com o motivo, e o novo campo opcional `max_tarefas` baixa o teto do
 documento. Um documento que falha antes de entregar as tarefas não gasta a cota da sessão.
 
-**Cabeçalho fixo no PDF.** Uma linha curta idêntica na borda de ao menos 80% das páginas, como
-"Contrato 123/2026 - Confidencial", sai do corpo e vai para `metadados["cabeçalho/rodapé"]`. O número de página
-tirado do corpo também passa a ser registrado ali. Um número só conta como o da página quando a linha diz isso
-("Página 3 de 12", "Página 3/12", "fls. 3") ou é só ele ("3 de 12", "- 3 -", "(3)"; "3)" sem a abertura é item de
-lista): no carnê com uma parcela por página, "Parcela 3 de 12" fica no texto, e "Cliente: Transportadora 3 Ltda" na
-terceira fatura também. Faturas do mesmo modelo, linhas numeradas e páginas inteiras iguais continuam no texto; das faturas, só a linha de marca idêntica em todas pode ir para os
-metadados, como cabeçalho fixo.
+**Cabeçalho fixo no PDF.** Uma linha curta idêntica na borda de ao menos 80% das páginas, como "Contrato 123/2026 -
+Confidencial", sai do corpo e vai para `metadados["cabeçalho/rodapé"]`. O número de página tirado do corpo também passa
+a ser registrado ali. Um número só conta como o da página quando a linha diz isso ("Página 3 de 12", "Página 3/12",
+"fls. 3") ou é só ele ("3 de 12", "- 3 -", "(3)"; "3)" sem a abertura é item de lista): no carnê com uma parcela por
+página, "Parcela 3 de 12" fica no texto, e "Cliente: Transportadora 3 Ltda" na terceira fatura também. Faturas do mesmo
+modelo, linhas numeradas e páginas inteiras iguais continuam no texto; das faturas, só a linha de marca idêntica em
+todas pode ir para os metadados, como cabeçalho fixo.
 
 **Planilha `.xlsb` hostil.** No `.xlsb` que só o leitor tolerante abre, a tabela de strings compartilhadas tem teto
 de 1 milhão de strings e 64 MB de texto. Acima disso, o arquivo é recusado antes de ocupar memória.

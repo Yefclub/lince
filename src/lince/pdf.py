@@ -59,12 +59,13 @@ CELULA = 8
 # multiplica o percurso. Página real tem poucos milhares; acima do teto, ela entra só com o texto, com a pendência e o
 # alerta de texto oculto não conferido, e o próximo PDF não espera.
 OBJETOS_MAX = 100_000
-# Tempo de CPU da análise em Python de uma página, que roda fora da trava: página real leva dezenas de milissegundos; a
-# hostil (dezenas de milhares de desenhos espaçados, milhares de invisíveis sobre milhares de imagens, fórmula enorme)
-# levaria de segundos a minutos, prendendo o worker e dividindo a GIL com os outros documentos. Passou dele, a página
-# entra só com o texto, com a pendência e o alerta de texto oculto não conferido, e a leitura segue na próxima. É tempo
-# de CPU da própria thread (`time.thread_time`), não de relógio: a espera pela trava e pela GIL, que depende de quantos
-# outros documentos estão sendo lidos, não conta, e a mesma página sai igual com o servidor cheio ou vazio.
+# Tempo de CPU da análise de uma página (o Python fora da trava e, nas vezes dela, a cópia sem o oculto e o
+# pdf_inspector): página real leva dezenas de milissegundos; a hostil (dezenas de milhares de desenhos espaçados,
+# milhares de invisíveis sobre milhares de imagens, fórmula enorme) levaria de segundos a minutos, prendendo o worker e
+# dividindo a GIL com os outros documentos. Passou dele, a página entra só com o texto, com a pendência e o alerta de
+# texto oculto não conferido, e a leitura segue na próxima. É tempo de CPU da própria thread (`time.thread_time`), não
+# de relógio: a espera pela trava e pela GIL, que depende de quantos outros documentos estão sendo lidos, não conta, e a
+# mesma página sai igual com o servidor cheio ou vazio.
 ANALISE_PAGINA_S = 3.0
 _ANALISE = threading.local()
 

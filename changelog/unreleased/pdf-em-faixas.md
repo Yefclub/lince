@@ -48,13 +48,13 @@ tirar um a um.
 derrubava a leitura do documento inteiro, e também a releitura ampliada do esforço máximo (`esforco="max"`). Agora ela
 vale pela folha inteira, como em outros leitores de PDF, nas duas leituras, e o texto oculto dela sai do mesmo jeito.
 
-**Página hostil não prende os outros PDFs.** Uma página montada para pesar na análise (dezenas de milhares de
-desenhos espaçados, milhares de trechos invisíveis sobre milhares de imagens, um bloco de fórmula de centenas de
-milhares de caracteres) é analisada fora da trava, com teto de tempo (abaixo): um PDF de uma página que chega no meio sai em menos de
-um segundo, em vez de esperar a análise inteira. A página com objetos demais para a PDFium coletar (mais de 100 mil,
+**Página hostil não prende os outros PDFs.** Uma página montada para pesar na análise (dezenas de milhares de desenhos
+espaçados, milhares de trechos invisíveis sobre milhares de imagens, um bloco de fórmula de centenas de milhares de
+caracteres) é analisada fora da trava, com teto de tempo (abaixo): um PDF de uma página que chega no meio sai em menos
+de um segundo, em vez de esperar a análise inteira. A página com objetos demais para a PDFium coletar (mais de 100 mil,
 contando os de dentro dos blocos reutilizáveis a cada vez que são desenhados) entra só com o texto, com a pendência
-"página N: só o texto, sem figuras nem páginas escaneadas lidas (conteúdo demais para a análise visual)" e o alerta
-de texto oculto não conferido; o resto do documento é lido normalmente.
+"página N: só o texto, sem figuras nem páginas escaneadas lidas (conteúdo demais para a análise visual)" e o alerta de
+texto oculto não conferido; o resto do documento é lido normalmente.
 
 **Hífen de fim de linha em tempo linear.** Juntar as palavras partidas no fim da linha procurava cada forma com hífen
 no texto inteiro: uma página com 20 mil quebras levava 4 s parada, e uma palavra de 20 mil letras sem hífen, 7 s.
@@ -63,8 +63,8 @@ aparece sozinha no texto ou quando o par aparece em outro lugar como duas partes
 ("propellant- based" com "propellant-based"). O par precisa aparecer inteiro: "co- op" vira "coop" mesmo com
 "co-operation" no texto, onde antes bastava "co-op" estar dentro de outra palavra.
 
-**Página que levaria tempo demais para analisar.** A análise da página, que agora roda fora da vez da PDFium, tem
-3 s de processamento por página (o tempo da própria leitura, sem contar a espera pelos outros documentos, então a
-mesma página sai igual com o servidor cheio ou vazio): uma página montada para travar a leitura (dezenas de milhares de desenhos espaçados, milhares de
-textos invisíveis sobre milhares de imagens) entra só com o texto, com a pendência e o alerta de texto oculto não
-conferido, e a leitura segue na próxima página.
+**Página que levaria tempo demais para analisar.** A análise da página, que agora roda fora da vez da PDFium, tem 3 s de
+processamento por página (o tempo da própria leitura, sem contar a espera pelos outros documentos, então a mesma página
+sai igual com o servidor cheio ou vazio): uma página montada para travar a leitura (dezenas de milhares de desenhos
+espaçados, milhares de textos invisíveis sobre milhares de imagens) entra só com o texto, com a pendência e o alerta de
+texto oculto não conferido, e a leitura segue na próxima página.
