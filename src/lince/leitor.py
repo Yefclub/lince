@@ -22,7 +22,7 @@ from .agrupamento import agrupar, distribuir_lotes, resposta_aproveitavel
 from .cache import Cache, chave
 from .estrutura import secoes
 from .instrucoes import PROMPT_PADRAO, VERSAO_PROMPT, instrucao
-from .limites import LADO_MAX_PX, conferir_zip
+from .limites import LADO_MAX_PX, com_barras_normais, conferir_zip
 from .metadados import metadados_arquivo
 from .montagem import SAIDA_MAX, montar, tamanho_da_saida
 from .office import planejar_office
@@ -102,6 +102,10 @@ class Leitor:
 
     def _planejar(self, caminho, pasta):
         os.makedirs(f"{pasta}/ia", exist_ok=True)
+        nome_diz = os.path.splitext(caminho)[1].lower()
+        if nome_diz not in (".pdf", *IMAGEM, *TEXTO, *HTML, *SVG) and zipfile.is_zipfile(caminho):
+            conferir_zip(caminho)  # o pacote, antes de descompactar; `\\` nos nomes internos vira `/` numa cópia
+            caminho = com_barras_normais(caminho, pasta)
         ext = _extensao_lida(caminho)
         if ext == ".pdf":  # a trava da PDFium vai em vezes curtas: Office, HTML, texto e outros PDFs seguem em paralelo
             plano = planejar_pdf(caminho, pasta)
@@ -113,9 +117,7 @@ class Leitor:
             plano = planejar_html(caminho, pasta)
         elif ext in SVG:
             plano = planejar_svg(caminho, pasta)
-        else:
-            if zipfile.is_zipfile(caminho):  # Office, ODF, EPUB: conferido antes de qualquer descompactação
-                conferir_zip(caminho)
+        else:  # Office, ODF, EPUB: o pacote já foi conferido no começo
             plano = planejar_office(caminho, pasta, ext)
         plano["arquivo"] = os.path.basename(caminho)
         plano["meta_arquivo"] = metadados_arquivo(caminho, ext)
