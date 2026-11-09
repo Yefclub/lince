@@ -813,7 +813,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
         """Recortes, arquivos e tarefas da página, com a imagem renderizada na escala `fator`: quem chama roda fora da
         trava, na ordem das páginas (as tarefas e o cache de recortes repetidos saem na mesma ordem de antes)."""
         if rota == "pagina":
-            # a página inteira vai para a IA como é exibida; a caixa de cada metade só sai certa sem rotação
+            # a página inteira vai para a IA como é exibida
             img = de_pe(img, rotacao)
             # Duas metades com sobreposição: o dobro de resolução por leitura (o provedor reduz acima de ~1568 px).
             metades = [(0, img.height)]
