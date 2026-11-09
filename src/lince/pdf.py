@@ -206,6 +206,12 @@ def planejar_pdf(path, pasta):
                         del seguranca[marcas[0] :], pendentes[marcas[1] :]
                         info, recorte = _so_o_texto(i, md_de.get(i, "")), None
                         _marcar(so_texto, i, i + 1, f"análise da página passou de {ANALISE_PAGINA_S:g} s")
+                    except MemoryError:
+                        raise
+                    except Exception as e:  # noqa: BLE001 — uma página com defeito não derruba o documento
+                        del seguranca[marcas[0] :], pendentes[marcas[1] :]
+                        info, recorte = _so_o_texto(i, md_de.get(i, "")), None
+                        _marcar(so_texto, i, i + 1, _erro_da_pagina(e))
                     finally:
                         _ANALISE.fim = None
                     paginas.append(info)
@@ -218,7 +224,17 @@ def planejar_pdf(path, pasta):
                             doc.close()  # na mesma vez: um PDF curto pega a trava só duas vezes
                             doc = None
                     if recorte:
-                        recorte[1](img)  # os recortes e os arquivos, fora da trava, antes da próxima página
+                        feitas, vistas = len(tarefas), set(cache)
+                        try:
+                            recorte[1](img)  # os recortes e os arquivos, fora da trava, antes da próxima página
+                        except MemoryError:
+                            raise
+                        except Exception as e:  # noqa: BLE001 — a página sai só com o texto, sem rastro do recorte
+                            del tarefas[feitas:], seguranca[marcas[0] :], pendentes[marcas[1] :]
+                            for chave in set(cache) - vistas:
+                                del cache[chave]
+                            paginas[-1] = _so_o_texto(i, md_de.get(i, ""))
+                            _marcar(so_texto, i, i + 1, _erro_da_pagina(e))
             if parada is not None:
                 _marcar(nao_lidas, parada, total, f"a página {parada + 1} não abre")
                 break
@@ -239,6 +255,11 @@ def planejar_pdf(path, pasta):
     if propriedades:
         plano["propriedades"] = propriedades
     return plano
+
+
+def _erro_da_pagina(e):
+    """O motivo da pendência da página que deu erro na análise ou nos recortes."""
+    return f"erro na página: {type(e).__name__}: {str(e)[:120]}"
 
 
 def _vez_da_faixa(doc, faixa, fim):
@@ -277,16 +298,18 @@ def _coleta(doc, i):
     except pdfium.PdfiumError:
         return None
     try:
-        objs = []
-        for tipo, _raw, caixa in objetos(page):  # para no primeiro objeto além do teto
+        objs, (ox, oy) = [], _origem_visivel(page)
+        for tipo, _raw, (l, b, r, t) in objetos(page):  # para no primeiro objeto além do teto
             if len(objs) == OBJETOS_MAX:
                 return PESADA
-            objs.append((tipo, caixa))
+            # na origem da área visível, como as posições do pdf_inspector e a página renderizada (MediaBox ou CropBox
+            # com a origem fora do zero, comum em desenho exportado de CAD)
+            objs.append((tipo, (l - ox, b - oy, r - ox, t - oy)))
         W, H = page.get_size()
         return {
             "W": W,
             "H": H,
-            "origem": _origem_visivel(page),
+            "origem": (ox, oy),
             "objs": objs,
             "n": c.FPDFPage_CountObjects(page.raw),
             "fundo": page.render(scale=escala(W, H, 0.5)).to_pil().convert("RGB"),  # uma cópia, sem a PDFium
@@ -745,6 +768,8 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
             md = md.replace(bloco, f"{{{{FORMULA:{k}}}}}", 1)
             formula_de[id(caixa)] = k
             regioes.append(("formula", caixa))
+    # região toda fora da área visível (objeto fora da folha, comum em desenho de CAD) não tem o que recortar
+    regioes = [(tp, g) for tp, g in regioes if g[0] < W and g[2] > 0 and g[1] < H and g[3] > 0]
     rota = "pagina" if precisa_pagina else ("regioes" if regioes else "nativa")
     info = {
         "i": i,
@@ -812,6 +837,8 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                     min(full.width, int((r + m) * fator)),
                     min(full.height, int((H - b + m) * fator)),
                 )
+                if box[2] <= box[0] or box[3] <= box[1]:  # nada visível desta região na imagem renderizada
+                    continue
                 tid = f"p{i + 1:03d}-r{j}"
                 recorte = full.crop(box)
                 chave = hashlib.sha256(recorte.tobytes()).hexdigest()

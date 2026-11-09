@@ -8,7 +8,9 @@ O tamanho conferido é o declarado no zip. Uma parte que descompacte mais do que
 Python para no tamanho declarado e acusa CRC errado, e o anydoc tem teto próprio por parte.
 """
 
+import os
 import pyexpat
+import shutil
 import zipfile
 
 from PIL import Image
@@ -54,6 +56,29 @@ def conferir_zip(caminho) -> None:
         raise DocumentoRecusado(f"pacote descompacta {total} bytes (máximo {DESCOMPACTADO_MAX})")
     if total > RAZAO_A_PARTIR and total / max(compactado, 1) > RAZAO_MAX:  # muitas partes pequenas comprimidas demais
         raise DocumentoRecusado("pacote comprimido demais no conjunto (padrão de zip bomb)")
+
+
+def com_barras_normais(caminho, pasta) -> str:
+    """O pacote com `\\` nos nomes internos (`xl\\workbook.xml`, gravado por alguns exportadores de ERP; o Excel e o
+    LibreOffice abrem) regravado com `/` numa cópia em `pasta`, com o mesmo nome do arquivo; sem `\\`, o próprio
+    caminho. Chamar depois de `conferir_zip`, que já recusa caminho absoluto, `..` e os tetos com os nomes trocados;
+    aqui ainda é recusado o nome que fica repetido depois da troca."""
+    with zipfile.ZipFile(caminho) as z:
+        itens = z.infolist()
+        if not any("\\" in i.filename for i in itens):
+            return caminho
+        nomes = [i.filename.replace("\\", "/") for i in itens]
+        if len(set(nomes)) != len(nomes):
+            raise DocumentoRecusado("parte repetida no pacote depois de trocar \\ por /")
+        os.makedirs(destino := os.path.join(pasta, "pacote"), exist_ok=True)
+        novo = os.path.join(destino, os.path.basename(caminho))
+        with zipfile.ZipFile(novo, "w") as saida:
+            for item, nome in zip(itens, nomes, strict=True):
+                copia = zipfile.ZipInfo(nome, date_time=item.date_time)
+                copia.compress_type, copia.external_attr = item.compress_type, item.external_attr
+                with z.open(item) as origem, saida.open(copia, "w") as alvo:
+                    shutil.copyfileobj(origem, alvo)
+    return novo
 
 
 def escala(largura_pt: float, altura_pt: float, desejada: float) -> float:
