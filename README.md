@@ -149,13 +149,17 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   mandou 1. Até 16 documentos em leitura ao mesmo tempo por instância. As montagens (`POST /v1/montagens`) têm fila
   justa própria, com até 2 ao mesmo tempo: não esperam atrás de leituras presas na IA nem tomam a vaga delas.
 - **Isolamento**: um token nunca vê sessão nem referência de outro. `LINCE_TOKENS` aceita vários tokens
-  separados por vírgula, um por plataforma. Para uso local sem token: `lince-servidor --sem-autenticacao`.
+  separados por vírgula, um por plataforma; cada um pode ter o próprio teto de retenção como `nome:token:teto`
+  (`qa:abc123:2G`, `prod:def456:4G`; sem teto, vale o padrão). Para uso local sem token: `lince-servidor --sem-autenticacao`.
 - **Memória**: no Linux com glibc, o servidor (`lince-servidor`) fixa o limite de `mmap` do alocador em 16 MB, o que
   desliga o ajuste dinâmico que deixava as arenas das threads fragmentadas, e, a cada 60 s, devolve ao sistema a
   memória livre que o alocador guardou (`malloc_trim`). O processo volta perto do tamanho de repouso depois de uma carga, em vez de
   ficar no teto do contêiner. Em outra libc (Alpine/musl) nada muda.
-- **Limites**: 100 MB por envio (com `Content-Length`), 50 arquivos por sessão, 64 documentos pendentes e 256 MB
-  de resultado esperando entrega por token. Acima disso, `429` com `Retry-After`. A montagem aceita até 20 mil
+- **Limites**: 100 MB por envio (com `Content-Length`), 50 arquivos por sessão, 64 documentos pendentes e 1 GiB
+  de resultado esperando entrega por token (cerca de 6 documentos pesados de uma vez), guardado num diretório
+  temporário em disco, e não na memória do processo: reserve no disco a soma dos tetos dos tokens. O resultado deixa
+  de contar no teto assim que é entregue. Acima do teto, `429` com `Retry-After` (quando o próximo resultado não
+  buscado vence) e `em_uso_bytes` e `teto_bytes` no corpo. A montagem aceita até 20 mil
   respostas e 64 M caracteres delas (acima, `413 envio-grande`, com o teto que passou no detalhe) e põe leituras no resultado até ele chegar a 16 M caracteres,
   contando o texto nativo: a leitura da mesma imagem repetida entra uma vez, e as outras posições levam só a
   referência. As que passam desse teto ficam em `cobertura.pendentes` (`resultado grande demais`), com o texto nativo

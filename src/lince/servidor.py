@@ -2,10 +2,11 @@
 
 Cada envio (um documento ou um lote) cria uma sessão, marcada pela `referencia` de quem chama, para o sistema de
 origem saber de quem é cada resultado. O documento não é guardado: o arquivo é apagado assim que lido, e o resultado
-fica em memória só até ser entregue (a primeira resposta com a sessão concluída, mais REENTREGA para repetir se a
-resposta se perder) ou até ENTREGA_PRAZO. Só com LINCE_REDIS, a transcrição que a IA fez de cada recorte ou página
-fica no Redis por LINCE_CACHE_DIAS, separada por token. O modelo de visão vem
-em cada envio (X-IA-URL, X-IA-Modelo, X-IA-Chave): o servidor não guarda chave de provedor. Fila justa entre tokens.
+fica num arquivo temporário (fora da memória do processo) só até ser entregue (a primeira resposta com a sessão
+concluída, mais REENTREGA para repetir se a resposta se perder) ou até ENTREGA_PRAZO. Só com LINCE_REDIS, a
+transcrição que a IA fez de cada recorte ou página fica no Redis por LINCE_CACHE_DIAS, separada por token. O modelo
+de visão vem em cada envio (X-IA-URL, X-IA-Modelo, X-IA-Chave): o servidor não guarda chave de provedor. Fila justa
+entre tokens.
 """
 
 import argparse
@@ -14,6 +15,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -37,7 +39,7 @@ from . import antivirus, memoria
 from . import codigo as codigo_doc
 from .cache import CacheComEscopo, CacheRedis
 from .leitor import FORMATOS, VERSAO, Leitor
-from .limites import DocumentoRecusado
+from .limites import RETIDOS_POR_TOKEN, DocumentoRecusado
 from .provedores import OpenAICompativel
 
 CONTRATO = json.loads(files("lince").joinpath("openapi.json").read_text(encoding="utf-8"))
@@ -55,9 +57,9 @@ ENTREGA_PRAZO = 15 * 60  # resultado não buscado em 15 min depois de concluído
 # DELETE confirma o recebimento e apaga na hora.
 REENTREGA = 60
 PENDENTES_POR_CLIENTE = 64  # documentos na fila ou lendo por token; acima disso 429
-# Resultado esperando entrega por token: acima disso, novos envios recebem 429 até o token buscar o que é dele.
-# Protege a memória da instância sem deixar um token derrubar os outros.
-BYTES_RETIDOS_POR_CLIENTE = 256 * 1024 * 1024
+# Resultado esperando entrega por token (padrão; o porquê em limites.py): acima disso, novos envios recebem 429 até o
+# token buscar o que é dele. Um token não derruba os outros nem enche o disco da instância.
+BYTES_RETIDOS_POR_CLIENTE = RETIDOS_POR_TOKEN
 LIMPEZA_INTERVALO = 60
 CABECALHOS_MAX = {"x-ia-url": 2048, "x-ia-modelo": 200, "x-ia-chave": 4096}
 ERROS_HTTP = {400: "requisicao-invalida", 404: "rota-inexistente", 405: "metodo-nao-permitido"}
@@ -67,10 +69,10 @@ MODOS = {"leitura", "tarefas"}  # tarefas: o Lince não chama a IA; devolve o qu
 PLANO_VALIDADE = 24 * 3600  # plano devolvido no modo tarefas vale um dia para a montagem
 PLANO_MAX = 64 * 1024 * 1024  # plano descompactado (texto e estado do documento): acima disso é hostil
 PRAZO_MIN, PRAZO_MAX = 1, 3600  # segundos por documento; o chat usa poucos, a base não manda prazo
-# Modo tarefas: cada tarefa leva a imagem em base64 no resultado, que fica em memória até a entrega. Medido: cada metade
+# Modo tarefas: cada tarefa leva a imagem em base64 no resultado, que fica guardado até a entrega. Medido: cada metade
 # de uma página escaneada densa sai com 0,6 MB de PNG (texto limpo) a 2 MB (com ruído), e 300 das limpas já somam
-# 230 MB em base64, perto dos BYTES_RETIDOS_POR_CLIENTE de um token. O que passa do teto fica nas pendências do preparo,
-# com o motivo; `max_tarefas` só baixa o do documento.
+# 230 MB em base64, perto de um quarto dos BYTES_RETIDOS_POR_CLIENTE de um token. O que passa do teto fica nas
+# pendências do preparo, com o motivo; `max_tarefas` só baixa o do documento.
 TAREFAS_POR_DOCUMENTO = 200
 TAREFAS_POR_SESSAO = 300
 MIDIA = {
@@ -148,13 +150,14 @@ def _vida(gerador):
     return asynccontextmanager(gerador)
 
 
-def _limite_retencao():
+def _limite_retencao(em_uso, teto, espera):
     return Problema(
         429,
         "limite-retencao",
-        "Limite de resultados em memória",
-        f"Até {BYTES_RETIDOS_POR_CLIENTE // 2**20} MB por token; busque ou apague sessões e tente de novo.",
-        {"Retry-After": "60"},
+        "Limite de resultados esperando entrega",
+        f"Até {teto // 2**20} MB por token, com {em_uso // 2**20} MB em uso; busque ou apague sessões e tente de novo.",
+        {"Retry-After": str(espera)},
+        extras={"em_uso_bytes": em_uso, "teto_bytes": teto},
     )
 
 
@@ -163,8 +166,12 @@ def _iso(t):
 
 
 class Servico:
-    def __init__(self, tokens: list[str]):
+    def __init__(self, tokens: list[str], tetos: dict[str, int] | None = None):
         self.tokens = [t for t in tokens if t]
+        # teto de retenção de cada token que tem o seu (LINCE_TOKENS `nome:token:teto`), pela identidade do cliente
+        self.tetos = {_identidade(t): n for t, n in (tetos or {}).items()}
+        # o resultado de cada documento pronto fica aqui até ser entregue: a memória do processo é das leituras
+        self.guardados = tempfile.mkdtemp(prefix="lince-resultados-")
         self.sessoes: dict[str, dict] = {}
         self.idempotencia: dict[tuple[str, str], str] = {}
         self.clamav: tuple[str, int] | None = None  # LINCE_CLAMAV: todo arquivo recebido passa pelo antivírus
@@ -187,7 +194,7 @@ class Servico:
         if m:
             dado = m.group(1).strip().encode()
             if any(hmac.compare_digest(dado, t.encode()) for t in self.tokens):
-                return hashlib.sha256(dado).hexdigest()[:16]
+                return _identidade(m.group(1).strip())
         raise Problema(401, "nao-autorizado", "Token ausente ou inválido", cabecalhos={"WWW-Authenticate": "Bearer"})
 
     def segredo(self, cliente: str) -> bytes:
@@ -254,14 +261,19 @@ class Servico:
             Path(doc["arquivo"]).unlink(missing_ok=True)
             doc["fim"] = time.time()
             self.liberar(sessao["cliente"])
+            guardado, real = None, 0
+            if doc.get("resultado") is not None:  # para o disco, fora da trava: a memória fica para as leituras
+                dados = json.dumps(doc.pop("resultado"), ensure_ascii=False).encode()
+                guardado, real = os.path.join(self.guardados, f"{doc['id']}.json"), len(dados)
+                Path(guardado).write_bytes(dados)
+                del dados
             with self.trava:
                 if sessao["id"] in self.sessoes:
                     # troca a reserva feita na entrada (bytes do arquivo) pelo tamanho real do resultado
-                    real = len(json.dumps(doc["resultado"], ensure_ascii=False)) if doc.get("resultado") else 0
                     self._reter(sessao["cliente"], real - doc.get("bytes_retidos", 0))
-                    doc["bytes_retidos"] = real
-                else:
-                    doc["resultado"] = None  # sessão apagada no meio da leitura: o resultado não fica
+                    doc["bytes_retidos"], doc["guardado"] = real, guardado
+                elif guardado:  # sessão apagada no meio da leitura: o resultado não fica
+                    Path(guardado).unlink(missing_ok=True)
                 doc["estado"] = estado  # por último: quem lê "pronto" já encontra resultado e fim
                 self._fechar_se_terminou(sessao)
 
@@ -295,7 +307,11 @@ class Servico:
             corpo = _sessao(sessao)
             if marcar and corpo["estado"] == "concluida" and not sessao.get("entregue_em"):
                 sessao["entregue_em"] = time.time()
-        return corpo
+                # entregue: os bytes deixam de contar no teto já; o arquivo fica só os REENTREGA segundos de repetição
+                for d in sessao["itens"]:
+                    self._reter(sessao["cliente"], -d.get("bytes_retidos", 0))
+                    d["bytes_retidos"] = 0
+        return _com_resultados(corpo)
 
     def _reter(self, cliente, delta):
         """Chamar com a trava."""
@@ -303,8 +319,24 @@ class Servico:
         if not self.retidos[cliente]:
             del self.retidos[cliente]
 
-    def acima_do_teto(self, cliente) -> bool:
-        return self.retidos.get(cliente, 0) > BYTES_RETIDOS_POR_CLIENTE
+    def teto(self, cliente) -> int:
+        return self.tetos.get(cliente, BYTES_RETIDOS_POR_CLIENTE)
+
+    def sem_espaco(self, cliente, entrada=0):
+        """O 429 de retenção se `entrada` bytes a mais passam do teto do cliente, ou None. Chamar com a trava.
+        Retry-After é quando o próximo resultado dele que ninguém buscou vence (a limpeza o descarta); com tudo ainda
+        em leitura, 30 s."""
+        em_uso, teto = self.retidos.get(cliente, 0), self.teto(cliente)
+        if em_uso + entrada <= teto:
+            return None
+        agora = time.time()
+        vencem = [
+            x["concluida_em"] + ENTREGA_PRAZO - agora
+            for x in [*self.sessoes.values(), *self.edicoes.values()]
+            if x["cliente"] == cliente and x.get("concluida_em") and not x.get("entregue_em")
+        ]
+        espera = max(1, math.ceil(min(vencem))) if vencem else 30
+        return _limite_retencao(em_uso, teto, min(espera, ENTREGA_PRAZO))
 
     def limpar(self):
         agora = time.time()
@@ -318,7 +350,7 @@ class Servico:
     def _remover_edicao(self, eid):
         """Chamar com a trava."""
         x = self.edicoes.pop(eid)
-        self._reter(x["cliente"], -len(x["dados"]))
+        self._reter(x["cliente"], -x.get("bytes_retidos", 0))
 
     def da_edicao(self, cliente, eid) -> dict:
         """Chamar com a trava."""
@@ -338,6 +370,9 @@ class Servico:
         liberados = sum(d.get("bytes_retidos", 0) for d in x["itens"])
         if liberados:
             self._reter(x["cliente"], -liberados)
+        for d in x["itens"]:
+            if d.get("guardado"):
+                Path(d["guardado"]).unlink(missing_ok=True)
         if x.get("idempotencia"):
             self.idempotencia.pop((x["cliente"], x["idempotencia"]), None)
 
@@ -532,6 +567,53 @@ def _resumo(x):
     }
 
 
+_TAMANHO = re.compile(r"(\d+)([KMGT]?)(i?B)?", re.I)
+
+
+def tokens_do_ambiente(valor: str) -> tuple[list[str], dict[str, int]]:
+    """LINCE_TOKENS: tokens separados por vírgula. Cada um é só o token (teto padrão) ou `nome:token:teto`, com o teto
+    em bytes ou com K, M, G ou T (base 1024: `2G`, `512M`, `1536MiB`). O nome só ajuda quem lê a configuração. Um token
+    com `:` no meio continua valendo sozinho, desde que o último pedaço não seja um tamanho."""
+    tokens, tetos = [], {}
+    for entrada in (e.strip() for e in valor.split(",")):
+        if not entrada:
+            continue
+        partes = entrada.split(":")
+        if len(partes) >= 3 and (m := _TAMANHO.fullmatch(partes[-1].strip())):
+            token = ":".join(partes[1:-1]).strip()
+            teto = int(m[1]) * 1024 ** " KMGT".index(m[2].upper() or " ")
+            if not token or teto <= 0:
+                raise ValueError(f"LINCE_TOKENS: entrada inválida (nome:token:teto) para {partes[0].strip()!r}")
+            tokens.append(token)
+            tetos[token] = teto
+        else:
+            tokens.append(entrada)
+    return tokens, tetos
+
+
+def _identidade(token: str) -> str:
+    """O cliente de um token: um hash curto, que é o que fica em memória e nos logs, nunca o token."""
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+
+class _Guardado:
+    """O resultado de um documento no disco, lido só na resposta (`_com_resultados`), fora da trava."""
+
+    def __init__(self, caminho):
+        self.caminho = caminho
+
+
+def _com_resultados(corpo):
+    """A representação da sessão com o resultado de cada documento lido do disco. Chamar fora da trava."""
+    for item in corpo["itens"]:
+        if isinstance(guardado := item["resultado"], _Guardado):
+            try:
+                item["resultado"] = json.loads(Path(guardado.caminho).read_bytes())
+            except FileNotFoundError:  # apagada (DELETE ou prazo) entre a trava e a leitura
+                raise Problema(404, "sessao-nao-encontrada", "Sessão não encontrada", "Foi apagada.") from None
+    return corpo
+
+
 def _sessao(x):
     itens = [
         {
@@ -542,7 +624,7 @@ def _sessao(x):
             "estado": d["estado"],
             "segundos": round(d["fim"] - d["inicio"], 2) if d.get("fim") and d.get("inicio") else None,
             "erro": d.get("erro"),
-            "resultado": d.get("resultado") if d["estado"] == "pronto" else None,
+            "resultado": _Guardado(d["guardado"]) if d["estado"] == "pronto" and d.get("guardado") else None,
         }
         for d in x["itens"]
     ]
@@ -593,9 +675,14 @@ class _Envelope:
 
 # -------------------------------------------------------------------- rotas
 def criar_app(
-    tokens: list[str], clamav: tuple[str, int] | None = None, cache=None, segredo: bytes | None = None
+    tokens: list[str],
+    clamav: tuple[str, int] | None = None,
+    cache=None,
+    segredo: bytes | None = None,
+    tetos: dict[str, int] | None = None,
 ) -> Starlette:
-    s = Servico(tokens)
+    """`tetos`: o teto de retenção dos tokens que têm um próprio ({token: bytes}); os outros ficam no padrão."""
+    s = Servico(tokens, tetos)
     s.clamav, s.cache = clamav, cache
     if segredo:  # o mesmo em todas as réplicas: o plano de uma monta em qualquer outra
         s.segredo_plano = segredo
@@ -631,9 +718,9 @@ def criar_app(
             raise Problema(400, "provedor-invalido", "URL do provedor inválida", str(e)) from None
         # uma vaga antes do upload (envios paralelos não furam o teto); as do resto do lote, depois de ler o form
         with s.trava:
-            cheio = s.acima_do_teto(cliente)
-        if cheio and chave_idem is None:  # a repetição idempotente passa: ela entrega e libera memória
-            raise _limite_retencao()
+            cheio = s.sem_espaco(cliente)
+        if cheio and chave_idem is None:  # a repetição idempotente passa: ela entrega e libera o teto
+            raise cheio
         if not s.reservar(cliente, 1):
             raise _limite_pendentes()
         reservadas, sessao, form = 1, None, None
@@ -743,7 +830,9 @@ def criar_app(
         if (t := _espera(request)) > 0:
             await _aguardar(sessao["pronta"], t)
         if request.method == "HEAD":  # HEAD não leva corpo, então não conta como entrega
-            return JSONResponse(_sessao(sessao))
+            with s.trava:
+                corpo = _sessao(sessao)
+            return JSONResponse(_com_resultados(corpo))
         return JSONResponse(s.entregar(sessao, marcar=not await request.is_disconnected()))
 
     async def apagar(request: Request):
@@ -791,9 +880,9 @@ def criar_app(
         if int(tamanho) > TAMANHO_MAX + 1024 * 1024:
             raise Problema(413, "envio-grande", "Envio grande demais", f"Teto de {TAMANHO_MAX // 2**20} MB por envio.")
         with s.trava:
-            cheio = s.acima_do_teto(cliente)
+            cheio = s.sem_espaco(cliente)
         if cheio:
-            raise _limite_retencao()
+            raise cheio
         if not s.reservar(cliente, 1):  # edição em andamento conta como documento pendente
             raise _limite_pendentes()
         form = None
@@ -831,10 +920,11 @@ def criar_app(
             s.liberar(cliente)
         eid = uuid.uuid4().hex
         agora = time.time()
-        edicao = {"id": eid, "cliente": cliente, "nome": nome, "dados": novo, "criada_em": agora, "concluida_em": agora}
+        edicao = {"id": eid, "cliente": cliente, "nome": nome, "dados": novo, "criada_em": agora, "concluida_em": agora,
+                  "bytes_retidos": len(novo)}  # fmt: skip
         with s.trava:
-            if s.retidos.get(cliente, 0) + len(novo) > BYTES_RETIDOS_POR_CLIENTE:
-                raise _limite_retencao()
+            if cheio := s.sem_espaco(cliente, len(novo)):
+                raise cheio
             s._reter(cliente, len(novo))
             s.edicoes[eid] = edicao
         url = str(request.url_for("edicao_arquivo", id=eid))
@@ -847,6 +937,8 @@ def criar_app(
             x = s.da_edicao(cliente, request.path_params["id"])
             if request.method == "GET" and not x.get("entregue_em"):
                 x["entregue_em"] = time.time()  # entregue: some depois de REENTREGA (ou no DELETE)
+                s._reter(cliente, -x["bytes_retidos"])  # e deixa de contar no teto já
+                x["bytes_retidos"] = 0
         tipo = MIDIA.get(Path(x["nome"]).suffix.lower(), "application/octet-stream")
         nome_seguro = re.sub(r"[^A-Za-z0-9._-]", "_", x["nome"]) or "documento"
         return Response(
@@ -876,9 +968,9 @@ def criar_app(
         if int(tamanho) > TAMANHO_MAX:
             raise Problema(413, "envio-grande", "Envio grande demais", f"Teto de {TAMANHO_MAX // 2**20} MB por envio.")
         with s.trava:
-            cheio = s.acima_do_teto(cliente)
+            cheio = s.sem_espaco(cliente)
         if cheio:
-            raise _limite_retencao()
+            raise cheio
         if not s.reservar(cliente, 1):  # a vaga antes do corpo: pedidos em paralelo não somam memória sem teto
             raise _limite_pendentes()
         na_fila = False
@@ -907,6 +999,7 @@ def criar_app(
         tarefa = asyncio.create_task(laco())
         yield
         tarefa.cancel()
+        shutil.rmtree(s.guardados, ignore_errors=True)  # os resultados guardados não sobrevivem ao serviço
 
     app = Starlette(
         routes=[
@@ -1036,9 +1129,9 @@ async def _receber(
                 shutil.rmtree(pasta, ignore_errors=True)
                 return {"repetida": True, "original": original}
             entrada = sum(d["bytes"] for d in itens)
-            if s.retidos.get(cliente, 0) + entrada > BYTES_RETIDOS_POR_CLIENTE:
+            if cheio := s.sem_espaco(cliente, entrada):
                 # conferido de novo sob a trava, junto com a reserva: envios simultâneos não furam o teto
-                raise _limite_retencao()
+                raise cheio
             sessao = {
                 "id": uuid.uuid4().hex,
                 "cliente": cliente,
@@ -1080,7 +1173,10 @@ def main():
     ap.add_argument("--porta", type=int, default=8000)
     ap.add_argument("--sem-autenticacao", action="store_true", help="só para uso local: aceita pedido sem token")
     a = ap.parse_args()
-    tokens = [t.strip() for t in os.environ.get("LINCE_TOKENS", "").split(",") if t.strip()]
+    try:
+        tokens, tetos = tokens_do_ambiente(os.environ.get("LINCE_TOKENS", ""))
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
     try:
         clamav = antivirus.endereco(os.environ.get("LINCE_CLAMAV"))
     except ValueError as e:
@@ -1097,7 +1193,7 @@ def main():
     import uvicorn
 
     memoria.ajustar_alocador()  # uma vez, antes das threads do serviço (memoria.py); quem embute o app decide o seu
-    app = criar_app(tokens, clamav, cache, segredo.encode() or None)
+    app = criar_app(tokens, clamav, cache, segredo.encode() or None, tetos)
     uvicorn.run(app, host=a.host, port=a.porta, proxy_headers=True, log_level="info")
 
 
