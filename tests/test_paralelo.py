@@ -80,6 +80,14 @@ def _despejo(plano):
     return tarefas, json.dumps(plano.estado, sort_keys=True, ensure_ascii=False), plano.pendentes
 
 
+@pytest.fixture(autouse=True)
+def sem_documentos_abertos_aqui():
+    """Os testes que rodam o trabalho dos processos aqui deixam o documento em `pdf._DOCS` deste processo."""
+    yield
+    while pdf._DOCS:
+        pdf._DOCS.popitem()[1].close()
+
+
 @pytest.fixture
 def em_processos():
     assert paralelo.ativar(2)
@@ -238,13 +246,9 @@ def test_documento_da_leitura_que_terminou_e_fechado_no_processo(relatorio, em_p
     lince.Leitor().preparar(relatorio)
     (leitura,) = em_processos.encerradas()[-1:]
     assert len(leitura) == 16
-    try:
-        pdf._doc_do_processo(str(relatorio), "a", ())
-        pdf._doc_do_processo(str(relatorio), "b", ("a",))  # o próximo trabalho fecha o da leitura encerrada
-        assert list(pdf._DOCS) == ["b"]
-    finally:
-        while pdf._DOCS:
-            pdf._DOCS.popitem()[1].close()
+    pdf._doc_do_processo(str(relatorio), "a", ())
+    pdf._doc_do_processo(str(relatorio), "b", ("a",))  # o próximo trabalho fecha o da leitura encerrada
+    assert list(pdf._DOCS) == ["b"]
 
 
 def test_tempo_de_cada_etapa_no_log(relatorio, em_processos, caplog):
