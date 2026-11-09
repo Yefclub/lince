@@ -1042,7 +1042,9 @@ def _tam(data):
         return (999, 999)
 
 
-_TEX = re.compile(r"\\(?:begin|end)\{[^}]*\}|\\[A-Za-z]+")  # comandos e ambientes que o anydoc escreve na fórmula
+# comandos e ambientes que o anydoc escreve na fórmula (shared/math/tex.rs), e o símbolo que ele escreve com uma
+# palavra dentro (≝)
+_TEX = re.compile(r"\\overset\{\\mathrm\{def\}\}|\\(?:begin|end)\{[^}]*\}|\\[A-Za-z]+")
 
 
 def texto_lido(doc) -> str:

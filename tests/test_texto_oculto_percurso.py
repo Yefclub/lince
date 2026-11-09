@@ -84,12 +84,16 @@ def _trocar_partes(p, trocas: dict, conteudo: dict | None = None):
 
 
 def _ancora(cx, cy, relativo="page", y=0):
+    """Retângulo azul-escuro flutuante atrás do texto."""
+    a, wps = "http://schemas.openxmlformats.org/drawingml/2006/main", "http://schemas.microsoft.com/office/word/2010"
     return etree.fromstring(
-        f'<wp:anchor {_NS} behindDoc="1" simplePos="0" relativeHeight="1" locked="0" layoutInCell="1" '
-        f'allowOverlap="1" distT="0" distB="0" distL="0" distR="0"><wp:simplePos x="0" y="0"/>'
-        f'<wp:positionH relativeFrom="{relativo}"><wp:posOffset>0</wp:posOffset></wp:positionH>'
-        f'<wp:positionV relativeFrom="{relativo}"><wp:posOffset>{y}</wp:posOffset></wp:positionV>'
-        f'<wp:extent cx="{cx}" cy="{cy}"/><wp:wrapNone/><wp:docPr id="9" name="figura"/></wp:anchor>'
+        f'<wp:anchor {_NS} xmlns:a="{a}" xmlns:wps="{wps}/wordprocessingShape" behindDoc="1" simplePos="0" '
+        'relativeHeight="1" locked="0" layoutInCell="1" allowOverlap="1" distT="0" distB="0" distL="0" distR="0">'
+        f'<wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="{relativo}"><wp:posOffset>0</wp:posOffset>'
+        f'</wp:positionH><wp:positionV relativeFrom="{relativo}"><wp:posOffset>{y}</wp:posOffset></wp:positionV>'
+        f'<wp:extent cx="{cx}" cy="{cy}"/><wp:wrapNone/><wp:docPr id="9" name="figura"/><a:graphic><a:graphicData '
+        f'uri="{wps}/wordprocessingShape"><wps:wsp><wps:spPr><a:solidFill><a:srgbClr val="1F3864"/></a:solidFill>'
+        "</wps:spPr><wps:bodyPr/></wps:wsp></a:graphicData></a:graphic></wp:anchor>"
     )
 
 
@@ -725,3 +729,138 @@ def test_rede_sem_alarme_nas_fontes_que_nao_escondem_por_estilo(tmp_path):
     s.shapes.add_picture(str(imagem), Inches(1), Inches(5))._element.nvPicPr.cNvPr.set("descr", "Logotipo vermelho")
     r = lince.ler(_pptx(prs, tmp_path))
     assert "Janeiro" in r.markdown and "Receita líquida" in r.markdown and _sem_falha(r) and not r.alertas_injecao
+
+
+# --- rodada 3: texto sem tinta, caixa flutuante, figura que não desenha, metadados pelo conteúdo e a rede mais estreita
+
+
+def _run_pptx(s, texto, y, rpr):
+    """Caixa de texto com um run de `rPr` escrito em XML."""
+    par = s.shapes.add_textbox(Inches(1), Inches(y), Inches(6), Inches(0.5)).text_frame.paragraphs[0]._p
+    par.append(etree.fromstring(f'<a:r {_PNS}><a:rPr lang="pt-BR">{rpr}</a:rPr><a:t>{texto}</a:t></a:r>'))
+
+
+def _solido(alfa):
+    return f'<a:solidFill><a:srgbClr val="000000"><a:alpha val="{alfa}"/></a:srgbClr></a:solidFill>'
+
+
+def _w14(alfa):
+    return f'<w14:solidFill><w14:srgbClr w14:val="000000"><w14:alpha w14:val="{alfa}"/></w14:srgbClr></w14:solidFill>'
+
+
+def test_texto_sem_preenchimento_ou_transparente_e_invisivel(tmp_path):
+    """Bloqueio 1: a letra sem tinta (noFill, ou opacidade de até 8%) é invisível sobre qualquer fundo, a menos que o
+    contorno dela pinte; a meia transparência se lê."""
+    contorno = '<a:ln w="12700"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln>'
+    prs = Presentation()
+    s = prs.slides.add_slide(prs.slide_layouts[5])
+    s.shapes.title.text = "Resultados do trimestre"
+    for k, (texto, rpr) in enumerate((("SEM PREENCHIMENTO", "<a:noFill/>"), ("ALFA ZERO", _solido(0)),
+                                      ("Contorno visível", f"{contorno}<a:noFill/>"), ("Meia transparência",
+                                                                                        _solido(50000)))):  # fmt: skip
+        _run_pptx(s, texto, 2 + k, rpr)
+    r = lince.ler(_pptx(prs, tmp_path))
+    for oculto in ("SEM PREENCHIMENTO", "ALFA ZERO"):
+        assert oculto not in r.markdown and oculto in _removidos(r), oculto
+    assert "Contorno visível" in r.markdown and "Meia transparência" in r.markdown
+    assert r.metadados["texto_oculto_removido"][0]["tecnicas"] == ["invisível"] and _sem_falha(r)
+
+    contorno = (
+        '<w14:textOutline w14:w="9525"><w14:solidFill><w14:srgbClr w14:val="000000"/></w14:solidFill></w14:textOutline>'
+    )
+    d = Document()
+    d.add_paragraph("Texto visível do contrato de fornecimento.")
+    for texto, rpr in (("SEM PREENCHIMENTO", "<w14:textFill><w14:noFill/></w14:textFill>"),
+                       ("ALFA CEM", f"<w14:textFill>{_w14(100000)}</w14:textFill>"),
+                       ("Contorno visível", f"{contorno}<w14:textFill><w14:noFill/></w14:textFill>"),
+                       ("Meia transparência", f"<w14:textFill>{_w14(50000)}</w14:textFill>")):  # fmt: skip
+        _paragrafo(d, f"<w:r><w:rPr>{rpr}</w:rPr><w:t>{texto}</w:t></w:r>")
+    r = lince.ler(_salvar(d, tmp_path))
+    for oculto in ("SEM PREENCHIMENTO", "ALFA CEM"):
+        assert oculto not in r.markdown and oculto in _removidos(r), oculto
+    assert "Contorno visível" in r.markdown and "Meia transparência" in r.markdown and _sem_falha(r)
+
+
+def test_metadados_do_word_pelo_conteudo(tmp_path):
+    """Bloqueio 3: o Word gravado como .pptx tem cabeçalho, rodapé e comentários conferidos nos metadados, como no
+    corpo."""
+    d = Document()
+    d.add_paragraph("Texto visível do contrato de fornecimento.")
+    rod = d.sections[0].footer.paragraphs[0]
+    rod.add_run("Contrato 123/2026 ")
+    rod.add_run("OCULTO NO RODAPÉ").font.hidden = True
+    r = lince.ler(_salvar(d, tmp_path, "contrato.pptx"))
+    assert r.metadados["cabeçalho/rodapé"] == ["Contrato 123/2026"] and "OCULTO NO RODAPÉ" in _removidos(r)
+
+
+def _mascara(limpeza, isca):
+    """A rede diante da `isca`, uma palavra que só existe num lugar que o anydoc não escreve: ela não pode estar entre
+    as palavras conferidas (senão um oculto com ela, lido por uma rota que a conferência não conhece, passaria calado),
+    e o que o anydoc de fato lê não alarma."""
+    lido = office.texto_lido(anydoc.to_document(limpeza.dados))
+    assert isca.casefold() not in lido.casefold(), isca  # o anydoc não a escreve
+    assert seguranca.fora_da_conferencia(limpeza.vistas, lido) is None
+    return seguranca.fora_da_conferencia(limpeza.vistas, isca) is not None
+
+
+def test_rede_so_conta_o_que_o_anydoc_escreve(tmp_path):
+    """Observação da rodada 2: o w:t da instrução de campo, o w:moveFrom, a célula coberta pela mesclagem vertical, o
+    lvlText de nível que nenhum parágrafo usa, o que o gráfico tem além do que o anydoc escreve e o segundo a:t de um
+    a:r não contam como conferidos; o hiperlink, o campo simples, o controle de conteúdo e o resultado do campo
+    contam."""
+    d = Document()
+    _numeracao_de_titulos(d, "decimal", "Cláusula %1.")
+    numeracao = d.part.numbering_part.element.find(qn("w:abstractNum"))
+    numeracao.append(etree.fromstring(f'<w:lvl xmlns:w="{_W}" w:ilvl="1"><w:numFmt w:val="decimal"/>'
+                                      '<w:lvlText w:val="Nivelsobrando %2."/></w:lvl>'))  # fmt: skip
+    d.add_heading("Objeto do contrato", 1)
+    _paragrafo(d, '<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:t>Campoinstrucao</w:t></w:r><w:r>'
+                  '<w:instrText> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r>'
+                  '<w:t>Resultado do campo</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>')  # fmt: skip
+    _paragrafo(d, '<w:moveFrom w:id="1" w:author="R"><w:r><w:t>Movidodaqui</w:t></w:r></w:moveFrom>'
+                  '<w:moveTo w:id="2" w:author="R"><w:r><w:t>Texto movido</w:t></w:r></w:moveTo>'
+                  '<w:hyperlink w:anchor="x"><w:r><w:t> Ligação interna</w:t></w:r></w:hyperlink>'
+                  '<w:fldSimple w:instr=" PAGE "><w:r><w:t> Página simples</w:t></w:r></w:fldSimple>'
+                  "<w:sdt><w:sdtContent><w:r><w:t> Controle de conteúdo</w:t></w:r></w:sdtContent>"
+                  "</w:sdt>")  # fmt: skip
+    d.element.body.insert(len(d.element.body) - 1, etree.fromstring(
+        f'<w:tbl xmlns:w="{_W}"><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:vMerge '
+        'w:val="restart"/></w:tcPr><w:p><w:r><w:t>Célula mesclada</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc>'
+        "<w:tcPr><w:vMerge/></w:tcPr><w:p><w:r><w:t>Celulacoberta</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"
+    ))  # fmt: skip
+    limpeza = seguranca.limpar_docx(_salvar(d, tmp_path).read_bytes())
+    for isca in ("Campoinstrucao", "Movidodaqui", "Nivelsobrando", "Celulacoberta"):
+        assert _mascara(limpeza, isca), isca
+    assert {"resultado", "ligação", "página", "controle", "movido", "cláusula", "mesclada"} <= limpeza.vistas
+
+    from pptx.chart.data import CategoryChartData
+
+    prs = Presentation()
+    s = prs.slides.add_slide(prs.slide_layouts[5])
+    s.shapes.title.text = "Resultados do trimestre"
+    dados = CategoryChartData()
+    dados.categories = ["Janeiro", "Fevereiro"]
+    dados.add_series("Receita líquida", (10, 20))
+    s.shapes.add_chart(51, Inches(1), Inches(2), Inches(6), Inches(3), dados)
+    par = s.shapes.add_textbox(Inches(1), Inches(6), Inches(6), Inches(1)).text_frame.paragraphs[0]._p
+    par.append(etree.fromstring(f'<a:r {_PNS}><a:rPr lang="pt-BR"/><a:t>Primeiro texto</a:t><a:t>Segundotexto</a:t>'
+                                "</a:r>"))  # fmt: skip
+    p = _pptx(prs, tmp_path)
+    with zipfile.ZipFile(p) as z:
+        grafico = next(n for n in z.namelist() if n.startswith("ppt/charts/chart"))
+        parte = z.read(grafico).replace(b"<c:f>Sheet1!", b"<c:f>Formulagrafico!")
+    assert b"Formulagrafico" in parte
+    limpeza = seguranca.limpar_pptx(_com_partes(p, {grafico: parte}).read_bytes())
+    for isca in ("Segundotexto", "Formulagrafico"):
+        assert _mascara(limpeza, isca), isca
+    assert {"primeiro", "janeiro", "receita"} <= limpeza.vistas
+
+
+def test_formula_com_simbolo_de_definicao_nao_alarma(tmp_path):
+    """O ≝ o anydoc escreve \\overset{\\mathrm{def}}{=}: o "def" é comando dele, não texto do documento."""
+    d = Document()
+    d.add_paragraph("Texto visível do contrato de fornecimento.")
+    m = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+    _paragrafo(d, f'<m:oMath xmlns:m="{m}"><m:r><m:t>a≝b</m:t></m:r></m:oMath>')
+    r = lince.ler(_salvar(d, tmp_path))
+    assert not r.alertas_injecao and not r.cobertura.pendentes
