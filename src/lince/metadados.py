@@ -57,8 +57,9 @@ def metadados_arquivo(path, ext=None):
     with zipfile.ZipFile(path) as z:
         nomes = set(z.namelist())
         ilegiveis = []
-        # o texto oculto do cabeçalho, do rodapé e dos comentários sai daqui como sai do corpo
-        sem_oculto = bordas_sem_oculto(z) if ext in (".docx", ".docm") else {}
+        # o texto oculto do cabeçalho, do rodapé e dos comentários sai daqui como sai do corpo; o Word é reconhecido
+        # pelo conteúdo, como na leitura do corpo (planejar_office): gravado como .pptx, também é conferido
+        sem_oculto = bordas_sem_oculto(z) if _formato(path) == "docx" else {}
 
         def ler(parte):
             return sem_oculto[parte] if parte in sem_oculto else _ler_parte(z, parte, ilegiveis)
@@ -133,6 +134,13 @@ def metadados_arquivo(path, ext=None):
         if ilegiveis:
             meta["partes_ilegiveis"] = ilegiveis  # malformadas ou hostis: ficaram de fora dos metadados
     return meta
+
+
+def _formato(path):
+    """O formato que o anydoc detecta nos bytes (docx, pptx, xlsx...), ou None."""
+    import anydoc
+
+    return anydoc.format_from_bytes(Path(path).read_bytes())
 
 
 def _metadados_ole(path, meta, ext):

@@ -296,6 +296,17 @@ def test_cadeia_de_estilos_enorme_nao_custa_quadratico(tmp_path):
     assert time.monotonic() - inicio < 5
 
 
+# a âncora atrás do texto com uma figura desenhada (um retângulo escuro: o que ele pinta o Lince não diz)
+_FIGURA_ATRAS = (
+    '<wp:anchor xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+    'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+    'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" behindDoc="1"><a:graphic>'
+    '<a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:spPr>'
+    '<a:solidFill><a:srgbClr val="1F3864"/></a:solidFill></wps:spPr><wps:bodyPr/></wps:wsp></a:graphicData>'
+    "</a:graphic></wp:anchor>"
+)
+
+
 def _docx_com_xml(tmp_path, trecho, nome="camada.docx"):
     d = Document()
     d.add_paragraph("Texto visível do contrato de fornecimento.")
@@ -317,7 +328,7 @@ def test_texto_branco_em_caixa_de_texto_ou_sobre_figura_atras_do_texto_e_visivel
         f"{branco}</w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r>"
     )
     assert seguranca.limpar_docx(_docx_com_xml(tmp_path, caixa).read_bytes()).ocultos == []
-    atras = f'<w:r><w:drawing><wp:anchor behindDoc="1"/></w:drawing></w:r>{branco}'  # foto atrás do texto
+    atras = f"<w:r><w:drawing>{_FIGURA_ATRAS}</w:drawing></w:r>{branco}"  # foto atrás do texto
     assert seguranca.limpar_docx(_docx_com_xml(tmp_path, atras, "atras.docx").read_bytes()).ocultos == []
 
 
@@ -369,9 +380,8 @@ def test_papel_timbrado_atras_do_texto_no_cabecalho_deixa_o_fundo_incerto(tmp_pa
     d = Document()
     d.add_paragraph().add_run("Texto branco sobre o timbrado").font.color.rgb = RGBColor(255, 255, 255)
     cab = d.sections[0].header.paragraphs[0]._p
-    ns = 'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"'
     desenho = etree.SubElement(etree.SubElement(cab, qn("w:r")), qn("w:drawing"))
-    desenho.append(etree.fromstring(f'<wp:anchor {ns} behindDoc="1"/>'))
+    desenho.append(etree.fromstring(_FIGURA_ATRAS))
     p = tmp_path / "timbrado.docx"
     d.save(p)
     assert seguranca.limpar_docx(p.read_bytes()).ocultos == []

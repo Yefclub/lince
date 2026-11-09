@@ -76,14 +76,22 @@ def test_oculto_sai_na_origem_e_o_visivel_igual_fica(tmp_path):
     assert "no prazo" in _removidos(r) and "<!-- slide 1 -->" in r.markdown  # as marcas de slide vêm depois
 
 
-def _ancora(cx, cy, relativo="page", y=0, atras=True):
-    """Imagem flutuante (sem a figura: só a posição e o tamanho importam aqui)."""
+# um retângulo azul-escuro desenhado (a forma, não a imagem: o Lince não diz o que ela pinta embaixo do texto)
+FIGURA = (
+    '<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp>'
+    '<wps:spPr><a:solidFill><a:srgbClr val="1F3864"/></a:solidFill></wps:spPr><wps:bodyPr/></wps:wsp></a:graphicData>'
+    "</a:graphic>"
+)
+
+
+def _ancora(cx, cy, relativo="page", y=0, atras=True, figura=FIGURA):
+    """Figura flutuante: a posição, o tamanho e o que ela desenha."""
     return etree.fromstring(
         f'<wp:anchor {_NS} behindDoc="{int(atras)}" simplePos="0" relativeHeight="1" locked="0" layoutInCell="1" '
         f'allowOverlap="1" distT="0" distB="0" distL="0" distR="0"><wp:simplePos x="0" y="0"/>'
         f'<wp:positionH relativeFrom="{relativo}"><wp:posOffset>0</wp:posOffset></wp:positionH>'
         f'<wp:positionV relativeFrom="{relativo}"><wp:posOffset>{y}</wp:posOffset></wp:positionV>'
-        f'<wp:extent cx="{cx}" cy="{cy}"/><wp:wrapNone/><wp:docPr id="9" name="figura"/></wp:anchor>'
+        f'<wp:extent cx="{cx}" cy="{cy}"/><wp:wrapNone/><wp:docPr id="9" name="figura"/>{figura}</wp:anchor>'
     )
 
 
@@ -340,6 +348,110 @@ def _timbrado_no_cabecalho(d, foto):
     inline.getparent().remove(inline)
 
 
+def _caixa_flutuante(x, y, texto, preenche="<a:noFill/>"):
+    """Caixa de texto flutuante com o texto em branco, como o Word grava: wps:wsp em wp:anchor presa à página, na
+    frente do texto, e a cópia em VML no mc:Fallback."""
+    texto = f'<w:txbxContent><w:p><w:r><w:rPr><w:color w:val="FFFFFF"/><w:sz w:val="56"/></w:rPr><w:t>{texto}</w:t>'
+    texto += "</w:r></w:p></w:txbxContent>"
+    vml = (
+        f"position:absolute;margin-left:{x // 12700}pt;margin-top:{y // 12700}pt;width:432pt;height:72pt;"
+        "z-index:251659264;mso-position-horizontal-relative:page;mso-position-vertical-relative:page"
+    )
+    return (
+        '<w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><wp:anchor behindDoc="0" simplePos="0" '
+        'relativeHeight="5" locked="0" layoutInCell="1" allowOverlap="1" distT="0" distB="0" distL="0" distR="0">'
+        f'<wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="page"><wp:posOffset>{x}</wp:posOffset>'
+        f'</wp:positionH><wp:positionV relativeFrom="page"><wp:posOffset>{y}</wp:posOffset></wp:positionV>'
+        '<wp:extent cx="5486400" cy="914400"/><wp:wrapNone/><wp:docPr id="11" name="caixa"/><a:graphic>'
+        '<a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:spPr>'
+        f"{preenche}</wps:spPr><wps:txbx>{texto}</wps:txbx><wps:bodyPr/></wps:wsp></a:graphicData></a:graphic>"
+        f'</wp:anchor></w:drawing></mc:Choice><mc:Fallback><w:pict><v:shape style="{vml}" filled="f" stroked="f">'
+        f"<v:textbox>{texto}</v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r>"
+    )
+
+
+def _flutuante(par, foto, atras=False, cx=7772400, cy=3200400, relativo="page"):
+    """A foto presa à página, no canto de cima (na frente do texto, se não for `atras`), como o Word grava."""
+    par.add_run().add_picture(foto, width=Inches(1))
+    inline = par._p.findall(".//" + qn("wp:inline"))[-1]
+    ancora = _ancora(cx, cy, relativo, atras=atras, figura="")
+    for filho in list(inline):
+        if filho.tag in (qn("wp:cNvGraphicFramePr"), qn("a:graphic")):
+            ancora.append(filho)
+    inline.addnext(ancora)
+    inline.getparent().remove(inline)
+
+
+def _foto() -> io.BytesIO:
+    foto = io.BytesIO()
+    Image.radial_gradient("L").convert("RGB").save(foto, "PNG")
+    foto.seek(0)
+    return foto
+
+
+def test_caixa_flutuante_sem_preenchimento_vale_o_que_esta_embaixo(tmp_path):
+    """Bloqueio 2: a caixa que não pinta fica incerta só sobre outro desenho; longe dele, o branco no branco sai."""
+    d = Document()
+    d.add_paragraph("Texto visível do contrato de fornecimento.")
+    capa = d.add_paragraph()
+    _flutuante(capa, _foto())
+    capa._p.append(etree.fromstring(f"<w:p {_NS}>{_caixa_flutuante(914400, 914400, 'Título na capa')}</w:p>")[0])
+    longe = etree.fromstring(f"<w:p {_NS}>{_caixa_flutuante(914400, 7315200, 'BRANCO LONGE DA FOTO')}</w:p>")
+    capa._p.addnext(longe)
+    r = lince.ler(_salvar(d, tmp_path))
+    assert "Título na capa" in r.markdown and "Título" not in _removidos(r)
+    assert "BRANCO LONGE" not in r.markdown and "BRANCO LONGE DA FOTO" in _removidos(r)
+
+
+def test_figura_que_nao_desenha_nao_deixa_o_fundo_incerto(tmp_path):
+    """A âncora atrás do texto sem figura, de extensão 0 ou com uma imagem toda transparente não desliga a conferência
+    (um PNG transparente de 1 EMU no cabeçalho, sem posição certa, deixava o documento inteiro incerto); a imagem de
+    uma cor só igual à página é a página, e a de outra cor deixa incerto o texto perto dela."""
+    d = Document()
+    transparente = io.BytesIO()
+    Image.new("RGBA", (8, 8), (0, 0, 0, 0)).save(transparente, "PNG")
+    _flutuante(d.sections[0].header.paragraphs[0], transparente, atras=True, cx=1, cy=1, relativo="paragraph")
+    cab = d.sections[0].header.paragraphs[0]._p
+    deslocamento = cab.find(f".//{qn('wp:positionV')}/{qn('wp:posOffset')}")
+    deslocamento.getparent().replace(deslocamento, etree.fromstring(f"<wp:align {_NS}>top</wp:align>"))
+    d.add_paragraph("Texto visível do contrato de fornecimento.")
+    for cor in ("navy", "white"):
+        par = d.add_paragraph()
+        _branco(par.add_run(f"Branco sobre a imagem {cor}"))
+        _flutuante(par, _png(cor), atras=True, cx=914400, cy=914400, relativo="paragraph")
+        for k in range(10):  # o que vem depois fica longe da imagem
+            d.add_paragraph(f"Parágrafo {k} do contrato.")
+    for k, ancora in enumerate((_ancora(914400, 914400, "paragraph", figura=""), _ancora(0, 0, "paragraph"))):
+        par = d.add_paragraph()
+        _branco(par.add_run(f"BRANCO JUNTO DA ÂNCORA VAZIA {k}"))
+        _com_ancora(par, ancora)
+    _branco(d.add_paragraph().add_run(INJECAO))
+    r = lince.ler(_salvar(d, tmp_path))
+    assert "IGNORE TODAS" not in r.markdown and "IGNORE TODAS" in _removidos(r)
+    for k in range(2):
+        assert f"BRANCO JUNTO DA ÂNCORA VAZIA {k}" in _removidos(r), k
+    assert "Branco sobre a imagem white" in _removidos(r) and "Branco sobre a imagem navy" in r.markdown
+
+
+def test_teto_de_pixels_por_documento(tmp_path, monkeypatch):
+    """Passado o teto somado de pixels decodificados, a imagem seguinte fica incerta, como foto, sem ser aberta: a
+    letra branca sobre ela fica."""
+    prs = Presentation()
+    for k, cinza in enumerate((255, 254)):  # duas imagens brancas, cada uma de 64 x 64
+        s = prs.slides.add_slide(prs.slide_layouts[5])
+        s.shapes.title.text = f"Resultados do trimestre {k}"
+        s.shapes.add_picture(_png((cinza, cinza, cinza)), Inches(0), Inches(2), Inches(10), Inches(3))
+        run = s.shapes.add_textbox(Inches(1), Inches(3), Inches(6), Inches(1)).text_frame.paragraphs[0].add_run()
+        run.text, run.font.color.rgb = f"BRANCO NA IMAGEM {k}", PRGB(0xFF, 0xFF, 0xFF)
+    p = tmp_path / "duas.pptx"
+    prs.save(p)
+    monkeypatch.setattr(seguranca, "_PIXELS_MAX", 64 * 64 + 1)
+    r = lince.ler(p)
+    assert "BRANCO NA IMAGEM 0" in _removidos(r) and "BRANCO NA IMAGEM 1" in r.markdown
+    monkeypatch.undo()
+    assert "BRANCO NA IMAGEM 1" in _removidos(lince.ler(p))
+
+
 def test_documentos_normais_sem_alarme_falso(tmp_path):
     timbrado = Document()
     _timbrado_no_cabecalho(timbrado, _png((20, 40, 90), (85, 110)))
@@ -375,3 +487,21 @@ def test_documentos_normais_sem_alarme_falso(tmp_path):
                    "Faixa azul com letra branca", "Trecho em destaque", "Cor do tema"):  # fmt: skip
         assert trecho in r.markdown, trecho
     assert "texto_oculto_removido" not in r.metadados and not r.alertas_injecao
+
+    def retangulo(par, _):
+        _com_ancora(par, _ancora(7772400, 3200400, atras=False))
+
+    for nome, embaixo in (("foto", _flutuante), ("retangulo", retangulo)):
+        capa = Document()  # a capa: foto ou retângulo escuro na frente do texto e o título branco numa caixa por cima
+        par = capa.add_paragraph()
+        embaixo(par, _foto())
+        caixa = etree.fromstring(f"<w:p {_NS}>{_caixa_flutuante(914400, 914400, 'Relatório anual da capa')}</w:p>")
+        par._p.append(caixa[0])
+        semposicao = _caixa_flutuante(914400, 914400, "Subtítulo sem posição").replace(
+            "<wp:posOffset>914400</wp:posOffset></wp:positionV>", "<wp:align>center</wp:align></wp:positionV>"
+        )
+        par._p.append(etree.fromstring(f"<w:p {_NS}>{semposicao}</w:p>")[0])
+        capa.add_paragraph("Texto do relatório em preto.")
+        r = lince.ler(_salvar(capa, tmp_path, f"capa-{nome}.docx"))
+        assert "Relatório anual da capa" in r.markdown and "Subtítulo sem posição" in r.markdown, nome
+        assert "texto_oculto_removido" not in r.metadados and not r.alertas_injecao, nome
