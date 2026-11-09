@@ -914,8 +914,10 @@ def criar_app(
 
 
 async def _na_fila(fila: Fila, cliente, trabalho, ao_terminar):
-    """O resultado de `trabalho()`, executado na `fila` na vez do cliente. Quem desiste da espera (conexão caída) não
-    gasta a montagem: o que ainda não começou é pulado. `ao_terminar` roda sempre, ao fim ou ao pular."""
+    """O resultado de `trabalho()`, executado na `fila` na vez do cliente. A conexão que cai não interrompe a espera: o
+    Starlette não cancela o handler, então o trabalho roda na vez dele e a resposta se perde no envio. Só a espera
+    cancelada (a tarefa do pedido cancelada, como no desligamento do servidor) pula o que ainda não começou.
+    `ao_terminar` roda sempre, ao fim ou ao pular."""
     laco, desistiu = asyncio.get_running_loop(), threading.Event()
     futuro = laco.create_future()
 
