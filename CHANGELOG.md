@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.5.0 — 2026-11-09
+
+### Novidades
+
+**Arquivos protegidos por senha são reconhecidos e lidos com a senha, sem que ela fique guardada**
+
+**Erro próprio para arquivo com senha.** Antes, um PDF com senha de abertura falhava como "arquivo não pôde ser
+aberto", igual a um arquivo corrompido, e quem enviava não tinha como saber que bastava a senha. Agora PDF com senha de
+abertura, Word, Excel e PowerPoint protegidos (`.docx`, `.xlsx`, `.pptx`, `.doc`, `.xls`, `.ppt`) e documentos do
+LibreOffice com senha (`.odt`, `.ods`, `.odp`) são reconhecidos antes de qualquer leitura: a API recusa o envio na hora
+com `422 arquivo-protegido`, dizendo o formato e o nome do arquivo, sem ler nada nem chamar a IA. Na biblioteca, a
+leitura levanta `lince.DocumentoProtegido`. O PDF que só tem senha de permissões (abre sem senha, mas não deixa
+imprimir ou editar) continua sendo lido como sempre.
+
+**Senha no envio.** O `POST /v1/sessoes` aceita o campo opcional `senha`, nos modos `leitura` e `tarefas`. Com a senha
+certa, o arquivo é decifrado numa cópia temporária, só para a leitura, e apagado junto com a sessão; a montagem do
+modo tarefas, a releitura ampliada e o código editável (`codigo=sim`) usam essa cópia, sem pedir a senha de novo. A
+senha errada responde `422 senha-incorreta`, para o sistema pedir de novo à pessoa. Na biblioteca, é o parâmetro
+`senha` de `Leitor.ler` e `Leitor.preparar`, e a senha errada levanta `lince.SenhaIncorreta`.
+
+**A senha não fica em lugar nenhum.** Ela só abre o arquivo e é descartada: não vai para a sessão, o plano assinado,
+os logs, os metadados, a resposta nem as mensagens de erro. As leituras do documento protegido também não entram no
+cache de transcrições, para ninguém receber o conteúdo sem ter a senha. A cópia decifrada passa pelo antivírus, como o
+arquivo enviado.
+
+**Contra tentativa e erro.** Depois de 5 senhas erradas para o mesmo arquivo, ou 50 no mesmo token, em 15 minutos, as
+tentativas seguintes são recusadas com `429 tentativas-de-senha` e `Retry-After`, até a senha errada mais antiga sair
+da janela.
+
+**O que fica só reconhecido.** Documentos do OpenOffice antigo (cifra Blowfish), do formato ODF 1.4 (AES-GCM) e Word
+com ofuscação XOR são reconhecidos como protegidos, mas não decifrados; voltam como `arquivo-protegido`, com o motivo. O
+arquivo que a senha certa abre, mas que está corrompido, também volta como `arquivo-protegido`, com o motivo,
+sem contar como senha errada. O arquivo que, decifrado, passa dos limites de leitura (um "zip bomb" escondido dentro
+do documento cifrado) é recusado com `422 documento-recusado`.
+
+Contrato 1.13.0: o campo `senha` e os códigos `arquivo-protegido`, `senha-incorreta`, `tentativas-de-senha` e
+`senha-invalida` (senha acima de 1024 caracteres) são novos e opcionais; nada muda para quem já usa a `/v1`.
+
+### Correções
+
+**Resultados esperando entrega vão para o disco, com teto de 1 GiB por token configurável**
+
+**Teto maior e fora da memória.** Cada token podia ter até 256 MB de resultado esperando entrega, e dois documentos
+pesados ao mesmo tempo (um PDF escaneado com as imagens da 1ª fase do modo tarefas) já lotavam o token, que vale para
+todos os usuários de um ambiente. Agora o teto padrão é 1 GiB, cerca de 6 documentos pesados de uma vez, e o
+resultado de cada documento, assim como o arquivo de cada edição, fica num arquivo temporário em `/tmp` até ser
+entregue, e não na memória do serviço. Monte um volume de disco em `/tmp` (não `tmpfs`, que é memória) com a soma
+dos tetos dos tokens e folga: o teto é conferido na entrada de cada envio, e um documento já aceito guarda o
+resultado inteiro. Se o disco encher, o documento falha com o motivo, e a sessão termina normalmente.
+
+**Teto por token.** Cada token pode ter o próprio teto na `LINCE_TOKENS`, como `nome:token:teto` (`qa:abc123:2G`),
+para um ambiente com mais usuários receber mais. Token sem teto segue no padrão, e a configuração de antes continua
+valendo.
+
+**Libera na entrega.** O resultado entregue (a primeira resposta com a sessão concluída) deixa de contar no teto na
+hora, e não só no `DELETE` ou quando a sessão vence.
+
+**429 que diz quanto esperar.** O `429 limite-retencao` traz `Retry-After` com o tempo até o próximo resultado que o
+token não buscou vencer, e `em_uso_bytes` e `teto_bytes` no corpo (contrato 1.12.0, campos novos e opcionais).
+
 ## 0.4.3 — 2026-11-09
 
 ### Correções
