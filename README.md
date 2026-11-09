@@ -106,8 +106,8 @@ Cada envio, de um documento ou de um lote, cria uma **sessão**. Quem chama marc
 própria, por exemplo `usuario:42`. Assim, um sistema com N usuários sabe de quem é cada resultado.
 
 **O documento não fica guardado.** O arquivo é apagado assim que lido (a exceção é o cache opcional de transcrições,
-abaixo). O resultado fica em memória só
-até ser entregue: a primeira resposta com a sessão `concluida` (o próprio envio com `Prefer: wait`, ou um `GET`) é a
+abaixo). O resultado fica em disco (arquivo
+temporário em `/tmp`) só até ser entregue: a primeira resposta com a sessão `concluida` (o próprio envio com `Prefer: wait`, ou um `GET`) é a
 entrega. Depois dela, a sessão fica 60 s para repetir o pedido caso a resposta tenha se perdido, e some; um
 `DELETE` confirma o recebimento e apaga na hora. Resultado que ninguém busca em 15 min é descartado.
 
@@ -148,7 +148,8 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   token) em 15 min, as tentativas seguintes recebem `429 tentativas-de-senha` com `Retry-After`. O decifrado também
   passa pelo antivírus. O que o Lince não decifra (ODF cifrado com Blowfish ou AES-GCM, Word com ofuscação XOR) volta
   como `arquivo-protegido`, com o motivo em `detail`; o arquivo que a senha certa abre, mas está corrompido, também
-  (`arquivo corrompido`), sem contar como senha errada. A decifração tem fila justa própria, com poucas vagas.
+  (`arquivo corrompido`), sem contar como senha errada. O pacote decifrado acima dos limites de leitura (zip bomb dentro
+  do ODF) volta como `422 documento-recusado`. A decifração tem fila justa própria, com poucas vagas.
 - **Modo `tarefas`** (`-F modo=tarefas`): o Lince não chama IA. Cada documento volta com `tarefas` (imagem em base64,
   instrução, onde está, `chave` de cache e `tokens_estimados`) e um `plano` opaco, assinado pelo servidor para o token
   e válido por 24 h. Quem chama lê as imagens com o próprio modelo e manda `POST /v1/montagens`; nada fica guardado
@@ -157,7 +158,7 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   reinício sem `LINCE_SEGREDO` (ou numa réplica com outro segredo), a montagem responde `422 plano-de-outra-chave`, e
   a saída é refazer a fase 1; `422 plano-invalido` é só o plano alterado ou de outro token. Cada documento devolve
   até 200 tarefas e cada sessão, 300 somando o lote (cada tarefa leva a imagem em base64 no resultado, que fica em
-  memória até a entrega); as que passam ficam nas pendências do preparo com o motivo, e `-F max_tarefas=N` baixa o
+  disco até a entrega); as que passam ficam nas pendências do preparo com o motivo, e `-F max_tarefas=N` baixa o
   teto do documento (nunca sobe).
 - **Prazo**: com `prazo=20`, cada documento tem 20 s a partir do início da leitura dele (a espera na fila não
   conta; a extração nativa conta: no PDF, a faixa de páginas que não começa a tempo não é lida, e a página que começa

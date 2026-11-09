@@ -186,7 +186,7 @@ class Servico:
         self.tetos = {_identidade(t): n for t, n in (tetos or {}).items()}
         # o resultado de cada documento pronto fica aqui até ser entregue: a memória do processo é das leituras
         self.guardados = tempfile.mkdtemp(prefix="lince-resultados-")
-        weakref.finalize(self, shutil.rmtree, self.guardados, True)  # sai com o serviço, com ou sem o lifespan
+        weakref.finalize(self, shutil.rmtree, self.guardados, True)  # sem o lifespan, sai na saída do processo
         self.sessoes: dict[str, dict] = {}
         self.idempotencia: dict[tuple[str, str], str] = {}
         self.clamav: tuple[str, int] | None = None  # LINCE_CLAMAV: todo arquivo recebido passa pelo antivírus
@@ -330,6 +330,9 @@ class Servico:
                     Path(guardado).unlink(missing_ok=True)
                     guardado, estado = None, "falhou"
                     doc["erro"] = f"o resultado não pôde ser guardado: {type(e).__name__}: {str(e)[:200]}"
+                    if reservadas:  # as tarefas não foram entregues: a cota da sessão volta
+                        with self.trava:
+                            sessao["tarefas"] -= reservadas
             with self.trava:
                 if sessao["id"] in self.sessoes:
                     # troca a reserva feita na entrada (bytes do arquivo) pelo tamanho real do resultado
@@ -394,10 +397,10 @@ class Servico:
         em_uso, teto = self.retidos.get(cliente, 0), self.teto(cliente)
         if em_uso + entrada <= teto:
             return None
-        vencem = [
+        vencem = [  # só o que libera bytes ao vencer: a sessão em que tudo falhou não retém nada
             x["concluida_em"] + ENTREGA_PRAZO - agora
             for x in [*self.sessoes.values(), *self.edicoes.values()]
-            if x["cliente"] == cliente and x.get("concluida_em") and not x.get("entregue_em")
+            if x["cliente"] == cliente and x.get("concluida_em") and not x.get("entregue_em") and _retem(x)
         ]
         espera = max(1, math.ceil(min(vencem))) if vencem else 30
         return _limite_retencao(em_uso, teto, min(espera, ENTREGA_PRAZO))
@@ -610,6 +613,11 @@ def _codigo_do_documento(doc) -> dict:
         return {"codigo": None, "codigo_motivo": str(e)}
     except Exception as e:  # noqa: BLE001 — a leitura já saiu; o código é um extra
         return {"codigo": None, "codigo_motivo": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+def _retem(x) -> bool:
+    """Se a sessão ou a edição ainda ocupa bytes do teto do cliente."""
+    return x.get("bytes_retidos", 0) > 0 or any(d.get("bytes_retidos", 0) > 0 for d in x.get("itens", ()))
 
 
 def _vencida(x, agora):

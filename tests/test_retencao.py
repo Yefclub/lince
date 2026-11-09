@@ -4,6 +4,7 @@ disco, liberado na entrega e com um 429 que diz quanto esperar."""
 import json
 import os
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -98,9 +99,8 @@ def test_resultado_some_do_disco_quando_a_sessao_some(monkeypatch):
     assert not os.path.exists(pasta)  # o serviço parou: a pasta dos resultados sai junto
 
 
-def test_disco_que_falha_ao_guardar_falha_o_documento_e_nao_prende_o_teto(monkeypatch):
-    monkeypatch.setattr(srv, "Leitor", _Pesado)
-    monkeypatch.setattr(_Pesado, "tamanho", 1000)
+@pytest.fixture
+def disco_cheio(monkeypatch):
     gravar = Path.write_bytes
 
     def cheio(self, dados):
@@ -109,6 +109,11 @@ def test_disco_que_falha_ao_guardar_falha_o_documento_e_nao_prende_o_teto(monkey
         return gravar(self, dados)
 
     monkeypatch.setattr(Path, "write_bytes", cheio)
+
+
+def test_disco_que_falha_ao_guardar_falha_o_documento_e_nao_prende_o_teto(monkeypatch, disco_cheio):
+    monkeypatch.setattr(srv, "Leitor", _Pesado)
+    monkeypatch.setattr(_Pesado, "tamanho", 1000)
     with TestClient(srv.criar_app(["token-a"])) as api:
         s = api.app.state.servico
         sid = enviar(api, ("a.txt", b"a"), A).json()["id"]
@@ -116,6 +121,16 @@ def test_disco_que_falha_ao_guardar_falha_o_documento_e_nao_prende_o_teto(monkey
         item = api.get(f"/v1/sessoes/{sid}", headers=A).json()["itens"][0]
         assert item["estado"] == "falhou" and "não pôde ser guardado" in item["erro"]
         assert s.retidos == {} and os.listdir(s.guardados) == []
+
+
+def test_tarefas_que_nao_puderam_ser_guardadas_devolvem_a_cota_da_sessao(disco_cheio):
+    from test_senha import _pdf
+
+    with TestClient(srv.criar_app(["token-a"])) as api:
+        sid = enviar(api, ("a.pdf", _pdf(figura=True)), A, modo="tarefas").json()["id"]
+        _pronta(api, sid)
+        sessao = api.app.state.servico.sessoes[sid]
+        assert sessao["itens"][0]["estado"] == "falhou" and sessao["tarefas"] == 0
 
 
 def test_sessao_vencida_nao_conta_nem_vira_retry_after_no_passado(monkeypatch):
@@ -142,6 +157,13 @@ def test_com_tudo_ainda_em_leitura_o_retry_after_e_30(monkeypatch):
     with TestClient(srv.criar_app(["token-a"], tetos={"token-a": 3 * MB})) as api:
         try:
             assert enviar(api, ("a.txt", b"a" * (2 * MB)), A).status_code == 201  # o envio reserva os bytes dele
+            r = enviar(api, ("b.txt", b"b" * (2 * MB)), A)
+            assert r.status_code == 429 and r.headers["Retry-After"] == "30"
+            # uma sessão concluída em que tudo falhou não retém nada: o vencimento dela não é o Retry-After
+            s = api.app.state.servico
+            falha = {"cliente": next(iter(s.retidos)), "concluida_em": time.time(), "itens": [{"bytes_retidos": 0}]}
+            with s.trava:
+                s.sessoes["so-falhas"] = falha
             r = enviar(api, ("b.txt", b"b" * (2 * MB)), A)
             assert r.status_code == 429 and r.headers["Retry-After"] == "30"
         finally:
