@@ -16,10 +16,15 @@ cópias do visível, no Word (`.docx`, `.docm`) e no PowerPoint. O que saiu cont
 
 #### Menos rotas para esconder texto
 
-- **Tudo o que o leitor lê é conferido**: as partes do Word são achadas pelas relações do pacote, como o leitor do
-  corpo as acha (um corpo gravado com outro nome não escapa mais), e o texto sai de todos os ramos de conteúdo
-  alternativo (`mc:AlternateContent`). O que estava oculto só no ramo que o leitor usa também entra em
+- **Tudo o que o leitor lê é conferido**: as partes do Word e os slides são achados pelas relações do pacote com as
+  mesmas regras do leitor do corpo (a relação repetida vale pela última, o tipo vale pelo endereço inteiro, o
+  atributo vale com ou sem prefixo e o caminho com `%2E%2E` ou `%2F` não resolve), e o texto sai de todos os ramos de
+  conteúdo alternativo (`mc:AlternateContent`). O que estava oculto só no ramo que o leitor usa também entra em
   `texto_oculto_removido`.
+- **Formato pelo conteúdo**: a conferência segue o formato que o leitor detecta no arquivo, não a extensão. Um Word
+  gravado como `.doc` e uma apresentação gravada como `.docx` são conferidos.
+- **OOXML estrito**: o Word e o PowerPoint gravados no formato estrito (`http://purl.oclc.org/ooxml/...`) são
+  conferidos como os de transição.
 - **Herança completa no Word**: o estilo da tabela (inclusive a formatação da primeira linha, da última e das faixas)
   entra na cadeia de cor, tamanho e `vanish`; o `vanish` segue a regra do Word, em que ligado no estilo de parágrafo
   e de novo no de caractere se anula; e o texto em árabe, hebraico ou marcado como escrita complexa vale pelo tamanho
@@ -42,7 +47,18 @@ cópias do visível, no Word (`.docx`, `.docm`) e no PowerPoint. O que saiu cont
   a cor vêm da herança toda (estilo da caixa, placeholder do layout e do mestre, estilos de texto do mestre) e do
   ajuste automático do texto; o texto da forma oculta pelo painel de seleção sai. Letra branca sobre uma imagem toda
   branca (como fundo da caixa ou como figura embaixo) conta como oculta; sobre foto, continua no texto. Apresentações
-  de exibição (`.ppsx`, `.ppsm`), que antes ficavam sem conferir, agora são conferidas.
+  de exibição (`.ppsx`, `.ppsm`), que antes ficavam sem conferir, agora são conferidas. A forma que só tem uma fórmula,
+  o placeholder de número, data ou rodapé (antes pulado, mesmo quando o leitor o lia) e a lista de slides guardada
+  dentro de outro elemento também são conferidos.
+
+#### Rede de segurança: o que o leitor leu e a conferência não viu aparece no resultado
+
+Depois da limpeza, o texto que o leitor extrai do arquivo é comparado com o texto que a conferência examinou. Se uma
+palavra lida (de 3 letras ou mais, sem contar números e pontuação) não estiver em nada conferido, o alerta "texto
+oculto não conferido: texto lido fora da conferência" sai com a contagem e uma amostra das palavras, e a mesma linha
+entra em `cobertura.pendentes`. Assim, uma rota para esconder texto que a conferência ainda não conhece não passa
+calada. A numeração dos títulos, os gráficos, os SmartArt e o texto alternativo das imagens contam como conferidos:
+não têm como ser escondidos por cor ou tamanho, e continuam fora da remoção. Documentos normais não geram o alerta.
 
 #### Parte que não dá para conferir aparece no resultado
 
