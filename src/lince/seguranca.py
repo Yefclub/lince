@@ -52,18 +52,22 @@ def alertas_injecao(txt):
     return sorted(set(out))[:20]
 
 
-def texto_oculto_pdf(page, itens, imgs, W, H):
+def texto_oculto_pdf(page, itens, imgs, W, H, gastar):
     """Texto que a IA leria e o humano não vê: invisível fora de imagem (OCR legítimo fica),
     fonte < 2,5 pt, fora da página, ou cor de texto ≈ cor do fundo. Devolve (motivo, item): quem chama tira o item do
-    corpo pela posição dele, nunca procurando o texto (um texto visível igual ao oculto fica)."""
+    corpo pela posição dele, nunca procurando o texto (um texto visível igual ao oculto fica).
+
+    `gastar(operacoes)` recebe o custo antes da conferência (o orçamento da página em pdf.py): cada item invisível é
+    comparado com cada imagem, e milhares dos dois numa página hostil prenderiam a trava da PDFium por segundos."""
     from PIL import Image  # noqa: F401
 
+    invisiveis = sum(x.render_mode == 3 for x in itens)
+    gastar(25 * len(itens) + 2 * invisiveis * len(imgs))  # ~1 µs por item (pixel do fundo), ~80 ns por item × imagem
     esc = escala(W, H, 0.5)
     fundo = page.render(scale=esc).to_pil().convert("RGB")
     ocultos = []
     for x in itens:
         motivo = None
-        # só o invisível olha as imagens: comparar cada item com cada imagem prende a trava numa página hostil
         if x.render_mode == 3 and not any(b[0] - 2 <= x.x <= b[2] + 2 and b[1] - 2 <= x.y <= b[3] + 2 for b in imgs):
             motivo = "invisível"
         elif 0 < x.font_size < 2.5:

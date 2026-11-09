@@ -27,7 +27,7 @@ from .metadados import metadados_arquivo
 from .montagem import SAIDA_MAX, montar, tamanho_da_saida
 from .office import planejar_office
 from .pagina_html import planejar_html, planejar_svg
-from .pdf import planejar_pdf
+from .pdf import pagina_visivel, planejar_pdf
 from .provedores import LeitorVisual
 from .tipos import Cobertura, Plano, PrazoEsgotado, Resultado, Uso
 
@@ -323,15 +323,17 @@ class Leitor:
         if not alvos:
             return []
         usos, preparados = [], []
-        for t in alvos:  # renderizar em 4–8x custa: para assim que o prazo vence
-            if _vencido():
-                break
-            with PDFIUM:  # um recorte por vez: outro PDF entra entre eles (a trava é justa)
-                doc = pdfium.PdfDocument(caminho)
-                try:  # fechado dentro da trava, mesmo com exceção: o finalizador da PDFium não roda fora dela
+        with PDFIUM:  # aberto uma vez só: um PDF danificado não reconstrói a tabela de referências a cada recorte
+            doc = pdfium.PdfDocument(caminho)
+        try:
+            for t in alvos:  # renderizar em 4–8x custa: para assim que o prazo vence
+                if _vencido():
+                    break
+                with PDFIUM:  # um recorte por vez: outro PDF entra entre eles (a trava é justa)
                     preparados.append((t, _recortes_ampliados(doc, t, io)))
-                finally:
-                    doc.close()
+        finally:
+            with PDFIUM:  # fechado dentro da trava, mesmo com exceção: o finalizador da PDFium não roda fora dela
+                doc.close()
 
         def um(item):
             if _vencido():
@@ -369,8 +371,9 @@ class Leitor:
 
 
 def _recortes_ampliados(doc, t, io):
-    """Recorte da tarefa em 2–3x a resolução da 1ª leitura, fatiado para caber no limite do provedor."""
-    page = doc[t["pagina"]]
+    """Recorte da tarefa em 2–3x a resolução da 1ª leitura, fatiado para caber no limite do provedor. Chamar com a
+    trava; a página vale pela mesma caixa da 1ª leitura."""
+    page = pagina_visivel(doc, t["pagina"])
     W, H = page.get_size()
     l, b, r, tp = t["caixa"]
     l, b, r, tp = max(0, l), max(0, b), min(W, r), min(H, tp)

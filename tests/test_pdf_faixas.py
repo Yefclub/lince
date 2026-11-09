@@ -267,15 +267,75 @@ def test_cropbox_fora_da_mediabox_vale_a_mediabox(tmp_path):
     assert registro["tecnicas"] == ["cor igual ao fundo"] and "alerta" not in registro  # saiu pela posição
 
 
+def _figuras(caminho, n, cropbox=None):
+    """Uma página com `n` figuras diferentes (e a CropBox dada), lida pela IA."""
+    from PIL import Image, ImageDraw
+
+    c = canvas.Canvas(str(caminho), pagesize=A4)
+    if cropbox:
+        c.setCropBox(cropbox)
+    c.drawString(60, 780, "Relatório com figuras.")
+    for k, cor in enumerate(["navy", "darkgreen", "maroon"][:n]):
+        im = Image.new("RGB", (800, 400), "white")
+        ImageDraw.Draw(im).rectangle([40, 40, 760, 360], fill=cor)
+        im.save(caminho.parent / f"figura{k}.png")
+        c.drawImage(str(caminho.parent / f"figura{k}.png"), 60, 500 - k * 250, width=400, height=200)
+    c.showPage()
+    c.save()
+    return caminho
+
+
+def _ia_que_amplia():
+    """A 1ª leitura de cada figura sai ilegível; a 2ª, ampliada, lê o valor se recebeu a figura (a maior parte da
+    imagem pintada, e não a página em branco)."""
+    import io
+
+    from PIL import Image
+
+    def ler(img, instr):
+        if "SEGUNDA LEITURA" not in instr:
+            return "Valor [ilegível]."
+        cinza = Image.open(io.BytesIO(img)).convert("L").resize((50, 50))
+        pintado = sum(v < 200 for v in cinza.tobytes()) / 2500
+        return "Valor 42." if pintado > 0.5 else "Valor [ilegível]."
+
+    return lince.FuncaoLeitor(ler, "m")
+
+
+def test_segunda_passada_le_a_pagina_com_cropbox_fora_da_mediabox(tmp_path):
+    p = _figuras(tmp_path / "recortada.pdf", 1, cropbox=(1000, 1000, 1200, 1200))  # a PDFium dava tamanho 0
+    inicio = time.monotonic()
+    r = lince.Leitor(ia=_ia_que_amplia(), esforco="max", agrupar=False).ler(p)
+    assert time.monotonic() - inicio < 5  # com a página de tamanho 0, a escala saía negativa: ~20 s
+    assert "Relatório com figuras." in r.markdown and "Valor 42." in r.markdown
+    assert r.cobertura.rotas["segunda_passada"] == 1 and not r.cobertura.pendentes
+
+
+def test_segunda_passada_abre_o_documento_uma_vez(tmp_path, monkeypatch):
+    import pypdfium2
+
+    aberturas = []
+
+    class Contado(pypdfium2.PdfDocument):
+        def __init__(self, entrada, *args, **kwargs):
+            if isinstance(entrada, str):
+                aberturas.append(entrada)
+            super().__init__(entrada, *args, **kwargs)
+
+    monkeypatch.setattr(pypdfium2, "PdfDocument", Contado)
+    r = lince.Leitor(ia=_ia_que_amplia(), esforco="max", agrupar=False).ler(_figuras(tmp_path / "figuras.pdf", 3))
+    assert r.markdown.count("Valor 42.") == 3 and r.cobertura.rotas["segunda_passada"] == 3
+    assert len(aberturas) == 2  # a leitura e a 2ª passada; antes, a 2ª passada abria uma vez por figura
+
+
 @pytest.mark.parametrize(
-    ("declaradas", "lidas", "pendencia"),
+    ("declaradas", "pendencia"),
     [
-        (1_000_000, 3, "páginas 4–1000000: não lidas (a página 4 não abre)"),  # vai em faixas
-        (7, 3, "páginas 4–7: não lidas (a página 4 não abre)"),  # cabe numa faixa
-        (1, 1, "páginas 2–3: não lidas (fora da contagem de páginas do PDF)"),
+        (1_000_000, "páginas 4–1000000: não lidas (a página 4 não abre)"),  # vai em faixas
+        (7, "páginas 4–7: não lidas (a página 4 não abre)"),  # cabe numa faixa
     ],
 )
-def test_count_que_nao_bate_com_as_paginas_vira_pendencia(tmp_path, declaradas, lidas, pendencia):
+def test_count_maior_que_as_paginas_vira_pendencia(tmp_path, declaradas, pendencia):
     dados = _pdf(tmp_path / "tres.pdf", 3).read_bytes()
     assert dados.count(b"/Count 3") == 1
     p = tmp_path / "contagem.pdf"
@@ -283,10 +343,52 @@ def test_count_que_nao_bate_com_as_paginas_vira_pendencia(tmp_path, declaradas, 
     inicio = time.monotonic()
     r = lince.ler(p)
     assert time.monotonic() - inicio < 2
-    assert all(f"página {n} do relatório" in r.markdown for n in range(1, lidas + 1))
-    assert f"página {lidas + 1} do relatório" not in r.markdown
+    assert all(f"página {n} do relatório" in r.markdown for n in (1, 2, 3))
     assert r.cobertura.pendentes == [pendencia]  # um intervalo, não uma entrada por página
-    assert r.cobertura.paginas == max(declaradas, 3)
+    assert r.cobertura.paginas == declaradas
+
+
+@pytest.mark.parametrize(("reais", "declaradas"), [(3, 1), (200, 60)])  # cabe numa faixa, e vai em faixas
+def test_count_menor_que_as_paginas_le_as_da_contagem_como_um_visualizador(tmp_path, reais, declaradas):
+    dados = _pdf(tmp_path / "real.pdf", reais).read_bytes()
+    p = tmp_path / "contagem.pdf"
+    p.write_bytes(dados.replace(b"/Count %d" % reais, b"/Count %d" % declaradas))
+    r = lince.ler(p)
+    # As páginas lidas são as que a PDFium abre e mostra, num documento curto ou longo: o pdf_inspector lê só a cópia
+    # delas, nunca o arquivo (antes, o curto lia também as de fora da contagem, e o longo, não).
+    assert all(f"página {n} do relatório" in r.markdown for n in range(1, declaradas + 1))
+    assert f"página {declaradas + 1} do relatório" not in r.markdown
+    assert r.cobertura.paginas == r.estrutura["paginas"] == declaradas and not r.cobertura.pendentes
+
+
+def test_count_menor_que_cem_mil_paginas_nao_le_o_arquivo_inteiro(tmp_path):
+    """Cem mil páginas e /Count 1: o pdf_inspector, chamado com o arquivo, percorria as cem mil sem teto nem prazo."""
+    n, corpo, posicoes = 100_000, [b"%PDF-1.7\n"], [9]
+
+    def objeto(texto):
+        corpo.append(b"%d 0 obj\n%s\nendobj\n" % (len(posicoes), texto))
+        posicoes.append(posicoes[-1] + len(corpo[-1]))
+
+    conteudo = b"BT /F1 12 Tf 20 100 Td (Conteudo da pagina do arquivo grande.) Tj ET"
+    objeto(b"<< /Type /Catalog /Pages 2 0 R >>")
+    kids = b" ".join(b"%d 0 R" % (5 + k) for k in range(n))
+    objeto(b"<< /Type /Pages /Count 1 /Kids [%s] >>" % kids)
+    objeto(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    objeto(b"<< /Length %d >>\nstream\n%s\nendstream" % (len(conteudo), conteudo))
+    for _ in range(n):
+        objeto(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R"
+               b" /Resources << /Font << /F1 3 0 R >> >> >>")  # fmt: skip
+    xref = posicoes.pop()  # o fim do último objeto
+    corpo.append(b"xref\n0 %d\n0000000000 65535 f \n" % (n + 5))
+    corpo += [b"%010d 00000 n \n" % pos for pos in posicoes]
+    corpo.append(b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (n + 5, xref))
+    p = tmp_path / "cem-mil.pdf"
+    p.write_bytes(b"".join(corpo))
+    inicio = time.monotonic()
+    r = lince.ler(p)
+    assert time.monotonic() - inicio < 2
+    assert r.markdown.count("Conteudo da pagina do arquivo grande.") == 1
+    assert r.cobertura.paginas == 1 and not r.cobertura.pendentes
 
 
 def test_pdf_abre_uma_vez_e_o_curto_pega_a_trava_duas_vezes(tmp_path, monkeypatch):
@@ -298,9 +400,9 @@ def test_pdf_abre_uma_vez_e_o_curto_pega_a_trava_duas_vezes(tmp_path, monkeypatc
                 aberturas.append(entrada)
             super().__init__(entrada, *args, **kwargs)
 
-    pega = TravaJusta.acquire
+    pega = TravaJusta.__enter__
     monkeypatch.setattr(pdf_mod.pdfium, "PdfDocument", Contado)
-    monkeypatch.setattr(TravaJusta, "acquire", lambda self, *a, **k: vezes.append(1) or pega(self, *a, **k))
+    monkeypatch.setattr(TravaJusta, "__enter__", lambda self: vezes.append(1) or pega(self))
     monkeypatch.setattr(pdf_mod, "FAIXA", 3)
     longo = lince.ler(_pdf(tmp_path / "longo.pdf", 7))  # três faixas, com cópia de cada uma
     assert "página 7 do relatório" in longo.markdown
@@ -345,6 +447,65 @@ def test_trava_interrompida_na_espera_nao_fica_presa(monkeypatch, quando):
     assert pegou == [True]  # a trava não ficou com a thread interrompida
 
 
+class _Estado:
+    """O `_estado` da trava, que levanta KeyboardInterrupt na `n`-ésima saída da thread "interrompida": uma interrupção
+    entre dois passos da `acquire`, sem depender de quando o sinal chega."""
+
+    def __init__(self, n):
+        self.trava, self.n = threading.Lock(), n
+
+    def __enter__(self):
+        self.trava.acquire()
+
+    def __exit__(self, *_):
+        self.trava.release()
+        if threading.current_thread().name == "interrompida":
+            self.n -= 1
+            if not self.n:
+                raise KeyboardInterrupt
+
+
+@pytest.mark.parametrize(
+    ("momento", "saida", "ocupada"),
+    [
+        ("pegou a trava livre", 1, False),
+        ("entrou na fila", 1, True),  # entre a entrada na fila e a espera
+        ("recebeu a vez", 2, True),  # entre o fim da espera e o retorno
+        ("pegou de novo a trava que já era dela", 2, False),
+    ],
+)
+def test_trava_interrompida_em_qualquer_ponto_da_acquire_nao_fica_presa(momento, saida, ocupada):
+    trava, interrompida, pegou, fim = TravaJusta(), threading.Event(), [], threading.Event()
+    trava._estado = _Estado(saida)
+    reentrante = momento.startswith("pegou de novo")
+
+    def pede():
+        if reentrante:
+            trava.acquire()
+        try:
+            trava.acquire()
+        except KeyboardInterrupt:
+            interrompida.set()
+        if reentrante:
+            trava.release()  # solta a vez que pegou: a interrompida não conta
+        fim.wait(5)  # continua viva: outra thread não herda o id dela (e, com ele, a trava)
+
+    if ocupada:
+        trava.acquire()
+    t = threading.Thread(target=pede, name="interrompida", daemon=True)
+    t.start()
+    time.sleep(0.2)  # já está na fila, ou já foi interrompida
+    if ocupada:
+        trava.release()
+    assert interrompida.wait(5)
+    outra = threading.Thread(target=lambda: pegou.append(trava.acquire(timeout=1)), daemon=True)
+    outra.start()
+    outra.join(5)
+    fim.set()
+    t.join(5)
+    assert pegou == [True]  # a trava não ficou com a thread interrompida
+
+
 def test_trava_atende_por_ordem_de_chegada():
     trava, ordem = TravaJusta(), []
     trava.acquire()
@@ -374,23 +535,112 @@ def test_trava_atende_por_ordem_de_chegada():
     trava.release()
 
 
-def test_pagina_com_imagens_demais_entra_so_com_o_texto(tmp_path, monkeypatch):
+SO_TEXTO = f"página 1: só o texto, sem figuras nem páginas escaneadas lidas ({pdf_mod.PESADA})"
+NAO_CONFERIDO = f"texto oculto não conferido: página 1 ({pdf_mod.PESADA})"
+
+
+def _mapa(caminho, imagens=64, oculto=False):
+    """Duas páginas: a 1ª com `imagens` imagens espaçadas (e um oculto branco), a 2ª só com a legenda."""
     from PIL import Image
 
-    Image.new("RGB", (40, 40), "red").save(tmp_path / "px.png")
-    p = tmp_path / "mapa.pdf"
-    c = canvas.Canvas(str(p), pagesize=(1240, 1240))
+    Image.new("RGB", (40, 40), "red").save(caminho.parent / "px.png")
+    c = canvas.Canvas(str(caminho), pagesize=(1240, 1240))
     c.drawString(20, 1220, "Mapa de pontos de coleta.")
-    for i in range(8):  # 64 imagens espaçadas: a análise visual agruparia cada uma, com a trava
-        for j in range(8):
-            c.drawImage(str(tmp_path / "px.png"), 20 + 150 * i, 20 + 150 * j, width=100, height=100)
+    for k in range(imagens):
+        c.drawImage(str(caminho.parent / "px.png"), 20 + 150 * (k % 8), 20 + 150 * (k // 8), width=100, height=100)
+    if oculto:
+        c.setFillColorRGB(1, 1, 1)
+        c.drawString(20, 1200, OCULTO)
     c.showPage()
     c.drawString(20, 1220, "Legenda do mapa.")
     c.save()
-    assert lince.Leitor().ler(p).cobertura.rotas[1] == "regioes"  # abaixo do teto, as figuras vão para a IA
-    monkeypatch.setattr(pdf_mod, "IMAGENS_POR_PAGINA_MAX", 50)
-    r = lince.Leitor().ler(p)
+    return caminho
+
+
+def test_pagina_acima_do_orcamento_entra_so_com_o_texto_sem_deixar_rastro(tmp_path, monkeypatch):
+    p = _mapa(tmp_path / "mapa.pdf", oculto=True)
+    lidas, gastos = [], []
+    ia = lince.FuncaoLeitor(lambda img, instr: lidas.append(1) or "Figura.", "m")
+    gastar = pdf_mod._Orcamento.__call__
+    monkeypatch.setattr(pdf_mod._Orcamento, "__call__", lambda self, n: gastos.append((self, n)) or gastar(self, n))
+    abaixo = lince.Leitor(ia=ia, agrupar=False).ler(p)
+    assert abaixo.cobertura.rotas[1] == "regioes" and lidas  # dentro do orçamento, as figuras vão para a IA
+    assert abaixo.metadados["texto_oculto_removido"][0]["pagina"] == 1 and OCULTO not in abaixo.markdown
+    # Um orçamento uma operação menor que o gasto da 1ª página: ela passa dele no último gasto, depois do texto oculto
+    # conferido e antes dos recortes, e entra só com o texto do pdf_inspector, sem tarefa, recorte nem registro dela.
+    monkeypatch.setattr(pdf_mod, "ORCAMENTO_PAGINA", sum(n for orc, n in gastos if orc is gastos[0][0]) - 1)
+    lidas.clear()
+    r = lince.Leitor(ia=ia, agrupar=False).ler(p)
     assert "Mapa de pontos de coleta." in r.markdown and "Legenda do mapa." in r.markdown
-    assert r.cobertura.rotas[1] == "nativa"  # a página pesada não vai para a análise visual
-    assert any("página 1: só o texto" in x and "imagens" in x for x in r.cobertura.pendentes)
-    assert any(a.startswith("texto oculto não conferido: página 1") for a in r.metadados.get("alertas_injecao", []))
+    assert r.cobertura.rotas[1] == "nativa" and not lidas and r.cobertura.leituras_ia == 0
+    assert r.cobertura.pendentes == [SO_TEXTO]
+    assert [x.get("alerta") for x in r.metadados["texto_oculto_removido"]] == [NAO_CONFERIDO]
+    assert NAO_CONFERIDO in r.alertas_injecao
+
+
+def _desenhos(caminho, n):
+    """n desenhos de 3×3 pt espaçados 30 pt numa folha de 7000 pt (nenhum se junta a outro no agrupamento), e a
+    legenda na 2ª página."""
+    c = canvas.Canvas(str(caminho), pagesize=(7000, 7000))
+    c.drawString(20, 6980, "Mapa vetorial.")
+    for k in range(n):
+        c.rect(20 + k % 232 * 30, 20 + k // 232 * 30, 3, 3, stroke=0, fill=1)
+    c.showPage()
+    c.drawString(20, 6980, "Legenda do mapa.")
+    c.save()
+    return caminho
+
+
+def _imagens_e_textos(caminho, imagens, textos):
+    """Imagens de 4 pt espaçadas 14 pt e trechos de texto fora delas, e a legenda na 2ª página."""
+    from PIL import Image
+
+    Image.new("RGB", (4, 4), "red").save(caminho.parent / "px.png")
+    c = canvas.Canvas(str(caminho), pagesize=(7000, 7000))
+    c.drawString(20, 6980, "Mapa de pontos.")
+    for k in range(imagens):
+        c.drawImage(str(caminho.parent / "px.png"), 20 + k % 497 * 14, 20 + k // 497 * 14, width=4, height=4)
+    c.setFont("Helvetica", 6)
+    for k in range(textos):
+        c.drawString(20 + k % 60 * 110, 6900 - k // 60 * 7, f"inv{k}")
+    c.showPage()
+    c.drawString(20, 6980, "Legenda do mapa.")
+    c.save()
+    return caminho
+
+
+class _Invisivel:
+    """O item do pdf_inspector como invisível (modo 3), o que ele entrega quando mantém a camada invisível."""
+
+    def __init__(self, item):
+        self._item = item
+
+    def __getattr__(self, nome):
+        return 3 if nome == "render_mode" else getattr(self._item, nome)
+
+
+def _confere_so_texto(r, inicio):
+    assert time.monotonic() - inicio < 3  # dentro do orçamento, ~1 s com a trava
+    assert "Legenda do mapa." in r.markdown and r.cobertura.rotas[2] == "nativa"  # a página seguinte é lida
+    assert r.cobertura.rotas[1] == "nativa" and r.cobertura.pendentes == [SO_TEXTO]
+    assert NAO_CONFERIDO in r.alertas_injecao
+
+
+def test_desenhos_espacados_passam_do_orcamento_sem_segurar_a_trava(tmp_path):
+    p = _desenhos(tmp_path / "desenhos.pdf", 49_999)  # abaixo do antigo teto de 50 mil: ~75 s no agrupamento
+    inicio = time.monotonic()
+    _confere_so_texto(lince.ler(p), inicio)
+
+
+def test_invisiveis_vezes_imagens_passam_do_orcamento_sem_segurar_a_trava(tmp_path, monkeypatch):
+    import pdf_inspector
+
+    p = _imagens_e_textos(tmp_path / "invisiveis.pdf", 4_999, 10_000)
+    posicoes = pdf_inspector.extract_text_with_positions_bytes
+    monkeypatch.setattr(  # cada item invisível é comparado com cada imagem: 50 milhões de comparações, ~5 s
+        pdf_inspector,
+        "extract_text_with_positions_bytes",
+        lambda dados: [_Invisivel(x) if x.text.startswith("inv") else x for x in posicoes(dados)],
+    )
+    inicio = time.monotonic()
+    _confere_so_texto(lince.ler(p), inicio)
