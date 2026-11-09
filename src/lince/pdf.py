@@ -50,6 +50,12 @@ RESERVA_MONTAGEM = 0.3
 OCULTOS_COMPARACOES_MAX = 100_000
 # Lado da célula da grade dos objetos de texto, em pontos: menos que uma linha de texto corrido.
 CELULA = 8
+# Teto de imagens e de desenhos por página na análise visual: o agrupamento de imagens vizinhas e o de desenhos são
+# quadráticos e rodam com a trava (medido: 10 mil imagens espaçadas numa página custam ~3 s, 20 mil, ~12 s). Página
+# real tem dezenas de imagens e poucos milhares de desenhos; acima do teto, ela entra só com o texto, com a pendência,
+# e o próximo PDF não espera.
+IMAGENS_POR_PAGINA_MAX = 5000
+DESENHOS_POR_PAGINA_MAX = 50_000
 
 
 def texto_pdfium(page):
@@ -142,8 +148,15 @@ def planejar_pdf(path, pasta):
                     fim = time.monotonic() + VEZ_S
                     while True:  # a vez acaba no tempo, no fim da faixa ou na página que entra só com o texto
                         i = fila[k]
-                        info = _pagina(doc, i, md_de.get(i, ""), i in ocr, itens_de.get(i, []), pasta, tarefas, cache,
-                                       seguranca, pendentes)  # fmt: skip
+                        if motivo := _pesada(doc, i):  # imagens ou desenhos demais: só o texto, como no teto
+                            _marcar(so_texto, i, i + 1, motivo)
+                            md, tabelas = limpar_tabelas(desifenizar(md_de.get(i, "")))
+                            info = {"i": i, "rota": "nativa", "densidade_mat": 0, "origem_texto": "pdf-inspector",
+                                    "md": md, "tabelas": [tb["md"] for tb in tabelas], "formulas": [],
+                                    "regioes": []}  # fmt: skip
+                        else:
+                            info = _pagina(doc, i, md_de.get(i, ""), i in ocr, itens_de.get(i, []), pasta, tarefas,
+                                           cache, seguranca, pendentes)  # fmt: skip
                         if info is None:  # a página não abre: a leitura para nela
                             parada, fila = i, fila[:k]
                             break
@@ -205,6 +218,26 @@ def _faixas(intervalos):
 
 def _vencido():
     return (resta := prazo_restante()) is not None and resta <= 0
+
+
+def _pesada(doc, i):
+    """O motivo de a página entrar só com o texto quando ela tem imagens ou desenhos demais para a análise visual, ou
+    None. Conta até passar do teto, sem percorrer o resto; a página que não abre fica para `_pagina`. Chamar com a
+    trava: a página é fechada aqui dentro."""
+    try:
+        page = doc[i]
+    except pdfium.PdfiumError:
+        return None
+    try:
+        imagens = desenhos = 0
+        for tipo, _raw, _caixa in objetos(page):
+            imagens += tipo == c.FPDF_PAGEOBJ_IMAGE
+            desenhos += tipo == c.FPDF_PAGEOBJ_PATH
+            if imagens > IMAGENS_POR_PAGINA_MAX or desenhos > DESENHOS_POR_PAGINA_MAX:
+                return f"mais de {IMAGENS_POR_PAGINA_MAX} imagens ou {DESENHOS_POR_PAGINA_MAX} desenhos na página"
+        return None
+    finally:
+        page.close()
 
 
 def _so_texto(i):

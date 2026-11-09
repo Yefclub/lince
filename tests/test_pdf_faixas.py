@@ -372,3 +372,25 @@ def test_trava_atende_por_ordem_de_chegada():
     assert trava.acquire(blocking=False)
     trava.release()
     trava.release()
+
+
+def test_pagina_com_imagens_demais_entra_so_com_o_texto(tmp_path, monkeypatch):
+    from PIL import Image
+
+    Image.new("RGB", (40, 40), "red").save(tmp_path / "px.png")
+    p = tmp_path / "mapa.pdf"
+    c = canvas.Canvas(str(p), pagesize=(1240, 1240))
+    c.drawString(20, 1220, "Mapa de pontos de coleta.")
+    for i in range(8):  # 64 imagens espaçadas: a análise visual agruparia cada uma, com a trava
+        for j in range(8):
+            c.drawImage(str(tmp_path / "px.png"), 20 + 150 * i, 20 + 150 * j, width=100, height=100)
+    c.showPage()
+    c.drawString(20, 1220, "Legenda do mapa.")
+    c.save()
+    assert lince.Leitor().ler(p).cobertura.rotas[1] == "regioes"  # abaixo do teto, as figuras vão para a IA
+    monkeypatch.setattr(pdf_mod, "IMAGENS_POR_PAGINA_MAX", 50)
+    r = lince.Leitor().ler(p)
+    assert "Mapa de pontos de coleta." in r.markdown and "Legenda do mapa." in r.markdown
+    assert r.cobertura.rotas[1] == "nativa"  # a página pesada não vai para a análise visual
+    assert any("página 1: só o texto" in x and "imagens" in x for x in r.cobertura.pendentes)
+    assert any(a.startswith("texto oculto não conferido: página 1") for a in r.metadados.get("alertas_injecao", []))

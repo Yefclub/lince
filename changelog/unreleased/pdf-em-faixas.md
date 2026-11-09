@@ -40,3 +40,7 @@ tirar um a um.
 **Página com recorte fora da folha.** A página cuja área de recorte (CropBox) não cai sobre a folha (MediaBox)
 derrubava a leitura do documento inteiro. Agora ela vale pela folha inteira, como em outros leitores de PDF, e o texto
 oculto dela sai do mesmo jeito.
+
+**Página com imagens ou desenhos demais.** Uma página com mais de 5 mil imagens ou 50 mil desenhos (um mapa ou
+arquivo montado para travar a leitura) entra só com o texto, com a pendência e o alerta de texto oculto não conferido.
+A análise visual dela custaria segundos com a vez da PDFium, e os outros PDFs não esperam mais por isso.
