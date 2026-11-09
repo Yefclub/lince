@@ -28,7 +28,7 @@ da janela.
 
 **O que fica só reconhecido.** Documentos do OpenOffice antigo (cifra Blowfish), do formato ODF 1.4 (AES-GCM) e Word
 com ofuscação XOR são reconhecidos como protegidos, mas não decifrados; voltam como `arquivo-protegido`, com o motivo. O
-arquivo que a senha certa abre, mas que está corrompido, também volta como `arquivo-protegido` ("arquivo corrompido"),
+arquivo que a senha certa abre, mas que está corrompido, também volta como `arquivo-protegido`, com o motivo,
 sem contar como senha errada. O arquivo que, decifrado, passa dos limites de leitura (um "zip bomb" escondido dentro
 do documento cifrado) é recusado com `422 documento-recusado`.
 

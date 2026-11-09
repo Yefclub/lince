@@ -314,6 +314,7 @@ class Servico:
             if reservadas:  # o documento não entregou as tarefas (plano grande demais, por exemplo): a cota volta
                 with self.trava:
                     sessao["tarefas"] -= reservadas
+                reservadas = 0  # devolvida: o finally não devolve de novo
         finally:
             Path(doc["arquivo"]).unlink(missing_ok=True)
             doc["fim"] = time.time()

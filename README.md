@@ -147,8 +147,8 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   do documento protegido também não entram no cache. Depois de 5 senhas erradas para o mesmo arquivo (ou 50 no
   token) em 15 min, as tentativas seguintes recebem `429 tentativas-de-senha` com `Retry-After`. O decifrado também
   passa pelo antivírus. O que o Lince não decifra (ODF cifrado com Blowfish ou AES-GCM, Word com ofuscação XOR) volta
-  como `arquivo-protegido`, com o motivo em `detail`; o arquivo que a senha certa abre, mas está corrompido, também
-  (`arquivo corrompido`), sem contar como senha errada. O pacote decifrado acima dos limites de leitura (zip bomb dentro
+  como `arquivo-protegido`, com o motivo em `detail`; o arquivo que a senha certa abre, mas está corrompido, volta
+  igual, com o motivo, sem contar como senha errada. O pacote decifrado acima dos limites de leitura (zip bomb dentro
   do ODF) volta como `422 documento-recusado`. A decifração tem fila justa própria, com poucas vagas.
 - **Modo `tarefas`** (`-F modo=tarefas`): o Lince não chama IA. Cada documento volta com `tarefas` (imagem em base64,
   instrução, onde está, `chave` de cache e `tokens_estimados`) e um `plano` opaco, assinado pelo servidor para o token
