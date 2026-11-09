@@ -237,7 +237,6 @@ class Leitor:
         cobertura = Cobertura(
             paginas=_paginas(estado),
             rotas={p["i"] + 1: p["rota"] for p in estado.get("paginas", [])},
-            leituras_ia=len(respostas),
         )
         cobertura.pendentes += estado.get("pendentes", []) + list(plano.pendentes)
         cobertura.pendentes += [f"{t.id}: sem resposta" for t in plano.tarefas if t.id not in respostas]
@@ -246,7 +245,11 @@ class Leitor:
         with tempfile.TemporaryDirectory(prefix="lince-") as pasta:
             with open(f"{pasta}/plano.json", "w", encoding="utf-8") as f:
                 json.dump(estado, f, ensure_ascii=False)
-            return _resultado(pasta, estado, respostas, cobertura, [], conferir_vazias=True)
+            r = _resultado(pasta, estado, respostas, cobertura, [], conferir_vazias=True)
+        # as leituras que entraram no texto: o teto de saída tira as outras e as registra como pendência
+        cortadas = {p.split(":", 1)[0] for p in cobertura.pendentes if p.endswith(": resultado grande demais")}
+        cobertura.leituras_ia = len(respostas.keys() - cortadas)
+        return r
 
     def _ler_tarefas(self, plano, tarefas, pasta, cobertura):
         respostas, usos = {}, []

@@ -692,3 +692,64 @@ def test_teto_de_saida_vale_mesmo_quando_a_conta_erra(tmp_path, monkeypatch):
     pendentes = [p for p in r.cobertura.pendentes if "grande demais" in p]
     assert pendentes == [f"{primeira}: resultado grande demais", f"{segunda}: resultado grande demais"]
     assert not any("resposta vazia" in p for p in r.cobertura.pendentes)  # o que saiu pelo teto não é "vazia"
+
+
+def _plano_de_pagina_com_tabelas(tabelas=50, figura=100_000):
+    """Uma página com a figura lida e `tabelas` marcas {{TABELA:k}} do nativo; a tabela 0 e a fórmula 0 são lidas."""
+    md = "Abertura.\n\n" + "\n\n".join(f"{{{{TABELA:{k}}}}}" for k in range(tabelas)) + "\n\n{{FORMULA:0}}"
+    pagina = {
+        "i": 0, "rota": "regioes", "md": md, "formulas": ["$a+b$"],
+        "tabelas": [f"| célula {k} |" for k in range(tabelas)],
+        "regioes": [
+            {"tarefa": "fig", "depois_de": "Abertura.", "texto_dentro": ""},
+            {"tarefa": "tab", "substitui_tabela": 0, "depois_de": "", "texto_dentro": ""},
+            {"tarefa": "fml", "substitui_formula": 0, "depois_de": "", "texto_dentro": ""},
+        ],
+    }  # fmt: skip
+    estado = {
+        "tipo": "pdf", "paginas": [pagina],
+        "tarefas_originais": [{"id": t, "modo": "figura"} for t in ("fig", "tab", "fml")],
+    }  # fmt: skip
+    tarefas = [lince.TarefaVisual(t, "figura", b"", "", "", 0) for t in ("fig", "tab", "fml")]
+    respostas = {"fig": " ".join(f"palavra{k}" for k in range(figura // 10)), "tab": "| lida | ok |", "fml": "$c+d$"}
+    return lince.Plano(tarefas, estado, []), respostas
+
+
+def test_teto_de_saida_soma_a_leitura_so_da_regiao_que_substitui_cada_tabela(monkeypatch):
+    import lince.leitor as leitor_mod
+    from lince.montagem import tamanho_da_saida
+
+    plano, respostas = _plano_de_pagina_com_tabelas()
+    real = len(lince.Leitor().concluir(plano, respostas).markdown)
+    assert real > 50_000  # a figura lida está no texto, e as 49 tabelas nativas são pequenas perto dela
+    # a conta é do que a montagem escreve: uma leitura grande não se soma a cada tabela nativa da página
+    assert real <= tamanho_da_saida(plano.estado, respostas) < real + 2_000
+    monkeypatch.setattr(
+        leitor_mod, "SAIDA_MAX", real + 2_000
+    )  # cabe o texto real; a conta antiga dava 50 vezes a figura
+    r = lince.Leitor().concluir(plano, respostas)
+    assert not any("resultado grande demais" in p for p in r.cobertura.pendentes)
+    assert "palavra0 " in r.markdown and "| lida | ok |" in r.markdown and "$c+d$" in r.markdown
+    assert "| célula 49 |" in r.markdown
+
+
+def test_leituras_ia_da_segunda_fase_conta_so_as_que_entraram_no_texto(monkeypatch):
+    import lince.leitor as leitor_mod
+
+    ids = ("a", "b", "c")
+    pagina = {
+        "i": 0, "rota": "regioes", "md": "Abertura.", "tabelas": [], "formulas": [],
+        "regioes": [{"tarefa": t, "depois_de": "Abertura.", "texto_dentro": ""} for t in ids],
+    }  # fmt: skip
+    estado = {"tipo": "pdf", "paginas": [pagina], "tarefas_originais": [{"id": t, "modo": "figura"} for t in ids]}
+    plano = lince.Plano([lince.TarefaVisual(t, "figura", b"", "", "", 0) for t in ids], estado, [])
+    respostas = {t: f"Figura {t} " + " ".join(f"p{k}" for k in range(1000)) for t in ids}  # ~4 mil caracteres cada
+    assert lince.Leitor().concluir(plano, respostas).cobertura.leituras_ia == 3  # todas cabem
+    uma = len(lince.Leitor().concluir(plano, {"a": respostas["a"]}).markdown)
+    monkeypatch.setattr(leitor_mod, "SAIDA_MAX", uma + 500)  # cabe uma leitura, não duas
+    r = lince.Leitor().concluir(plano, respostas)
+    assert sorted(p for p in r.cobertura.pendentes if "grande demais" in p) == [
+        "b: resultado grande demais",
+        "c: resultado grande demais",
+    ]
+    assert "Figura a " in r.markdown and r.cobertura.leituras_ia == 1  # as duas que o teto tirou não contam
