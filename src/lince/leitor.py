@@ -27,7 +27,7 @@ from .metadados import metadados_arquivo
 from .montagem import SAIDA_MAX, montar, tamanho_da_saida
 from .office import planejar_office
 from .pagina_html import planejar_html, planejar_svg
-from .pdf import pagina_visivel, planejar_pdf
+from .pdf import de_pe, pagina_visivel, planejar_pdf
 from .provedores import LeitorVisual
 from .tipos import Cobertura, Plano, PrazoEsgotado, Resultado, Uso
 
@@ -388,7 +388,8 @@ def _ampliada(doc, t):
         l, b, r, tp = max(0, l), max(0, b), min(W, r), min(H, tp)
         lado = max(r - l, tp - b) or 1
         esc = min(min(8.0, max(4.0, 3000 / lado)), LADO_MAX_PX / lado)
-        return page.render(scale=esc, crop=(l, b, W - r, H - tp)).to_pil().convert("RGB")
+        img = page.render(scale=esc, crop=(l, b, W - r, H - tp)).to_pil().convert("RGB")
+        return de_pe(img, page.rotacao_exibida)  # de pé, como a página é exibida
     finally:
         page.close()
 

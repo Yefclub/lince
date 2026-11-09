@@ -309,6 +309,7 @@ def _coleta(doc, i):
         return {
             "W": W,
             "H": H,
+            "rotacao": page.rotacao_exibida,
             "origem": (ox, oy),
             "objs": objs,
             "n": c.FPDFPage_CountObjects(page.raw),
@@ -493,28 +494,42 @@ def _sem_ocultos(doc, i, alvos, n):
 
 
 def pagina_visivel(doc, i):
-    """A página `i` (chamar com a trava). A CropBox que não sobrepõe a MediaBox vale a MediaBox, só na memória: a PDFium
-    daria tamanho zero à página, e o pdf_inspector, como outros leitores, a ignora."""
+    """A página `i` no referencial em que a análise trabalha (chamar com a trava). No documento aberto, nunca no
+    arquivo (e o que muda aqui vale para as próximas cargas da página enquanto ele estiver aberto):
+    - a CropBox que não sobrepõe a MediaBox dá caixa vazia; aí vale a MediaBox, herdada ou não, como no pdf_inspector
+      (a decisão é pela caixa da PDFium, que normaliza e herda do /Pages, e não pelas caixas gravadas na página);
+    - a rotação de exibição (/Rotate) é desligada: os objetos da PDFium e as posições do pdf_inspector vêm sem ela, e
+      a renderização e o tamanho passam a vir também. A rotação fica em `rotacao_exibida`, para pôr de pé o recorte
+      que vai para a IA (`de_pe`)."""
     page = doc[i]
-    caixa, cropbox_valeu = _caixa_visivel(page)
-    if not cropbox_valeu:
-        page.set_cropbox(*caixa)
+    l, b, r, t = page.get_bbox()
+    if not (l < r and b < t):
+        page.set_cropbox(-_SEM_LIMITE, -_SEM_LIMITE, _SEM_LIMITE, _SEM_LIMITE)  # a interseção com ela é a MediaBox
+    # a rotação original, guardada no documento na primeira carga: desligada, ela não volta na carga seguinte
+    originais = doc.__dict__.setdefault("lince_rotacoes", {})
+    page.rotacao_exibida = originais.setdefault(i, page.get_rotation())
+    if page.get_rotation():
+        page.set_rotation(0)
     return page
 
 
-def _caixa_visivel(page):
-    """A caixa visível da página, como o pdf_inspector mede as posições: CropBox ∩ MediaBox, ou a MediaBox quando a
-    CropBox não a sobrepõe (ela é ignorada). Devolve a caixa e se a CropBox valeu."""
-    ml, mb, mr, mt = _normal(page.get_mediabox())
-    cl, cb, cr, ct = _normal(page.get_cropbox())
-    l, b, r, t = max(ml, cl), max(mb, cb), min(mr, cr), min(mt, ct)
-    return ((l, b, r, t), True) if l < r and b < t else ((ml, mb, mr, mt), False)
+_SEM_LIMITE = 1e7  # pontos: maior que qualquer MediaBox (o PDF limita a 14.400 por lado)
 
 
-def _normal(caixa):
-    """(l, b, r, t) da caixa gravada com os dois cantos opostos em qualquer ordem, como o PDF permite."""
-    x0, y0, x1, y1 = caixa
-    return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
+def _caixa_da_faixa(frac, W, H, rotacao):
+    """A faixa horizontal (de cima para baixo, frações f0 a f1) da página como é exibida, no referencial sem rotação."""
+    f0, f1 = frac
+    return {
+        0: [0, H * (1 - f1), W, H * (1 - f0)],
+        90: [W * f0, 0, W * f1, H],
+        180: [0, H * f0, W, H * f1],
+        270: [W * (1 - f1), 0, W * (1 - f0), H],
+    }[rotacao % 360]
+
+
+def de_pe(img, rotacao):
+    """O recorte (no referencial sem rotação) girado como a página é exibida: /Rotate é no sentido horário."""
+    return img.rotate(-rotacao, expand=True) if rotacao else img
 
 
 def _origem_visivel(page):
@@ -588,7 +603,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     esperar. Só a cópia sem o texto oculto pega a trava, nas vezes dela (`_alvos_ocultos` e `_sem_ocultos`). Devolve a
     página e, se ela vai para a IA, a escala da renderização e a função que faz os recortes, os arquivos e as tarefas
     dela com a imagem renderizada: quem chama renderiza com a trava e recorta sem ela, antes da próxima página."""
-    W, H, objs = col["W"], col["H"], col["objs"]
+    W, H, objs, rotacao = col["W"], col["H"], col["objs"], col["rotacao"]
     # Imagens vizinhas viram um grupo: texto fatiado em imagens ("Version 8 –
     # March 2025" da capa da Falcon são 6 fatias) e logotipo pequeno contam.
     imgs = [list(bx) for tipo, bx in objs if tipo == c.FPDF_PAGEOBJ_IMAGE]
@@ -791,15 +806,18 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     }
     if rota == "nativa":
         return info, None
-    fator = (2 * 1568 / max(W, H) if H >= W else 1568 / max(W, H)) if rota == "pagina" else escala(W, H, 2.0)
+    retrato = (H >= W) if rotacao in (0, 180) else (W >= H)  # como é exibida: a de pé ganha o dobro e é dividida
+    fator = (2 * 1568 / max(W, H) if retrato else 1568 / max(W, H)) if rota == "pagina" else escala(W, H, 2.0)
 
     def recortar(img):
         """Recortes, arquivos e tarefas da página, com a imagem renderizada na escala `fator`: quem chama roda fora da
         trava, na ordem das páginas (as tarefas e o cache de recortes repetidos saem na mesma ordem de antes)."""
         if rota == "pagina":
+            # a página inteira vai para a IA como é exibida
+            img = de_pe(img, rotacao)
             # Duas metades com sobreposição: o dobro de resolução por leitura (o provedor reduz acima de ~1568 px).
             metades = [(0, img.height)]
-            if H >= W:
+            if img.height >= img.width:
                 # Linhas de texto pela projeção horizontal; só divide página densa, numa faixa sem tinta.
                 cinza = img.convert("L").resize((img.width // 4, img.height // 4))
                 larg, alt = cinza.size
@@ -829,7 +847,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                         "motivo": motivo,
                         "ancora": md[:6000],
                         "pagina": i,
-                        "caixa": [0, H * (1 - frac[1]), W, H * (1 - frac[0])],
+                        "caixa": _caixa_da_faixa(frac, W, H, rotacao),
                     }
                 )
                 info["tarefas"].append(tid)
@@ -848,7 +866,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                 if box[2] <= box[0] or box[3] <= box[1]:  # nada visível desta região na imagem renderizada
                     continue
                 tid = f"p{i + 1:03d}-r{j}"
-                recorte = full.crop(box)
+                recorte = de_pe(full.crop(box), rotacao)  # de pé, como a página é exibida
                 chave = hashlib.sha256(recorte.tobytes()).hexdigest()
                 if chave in cache:  # mesma imagem já lida (logo do cabeçalho etc.)
                     info["regioes"].append(
