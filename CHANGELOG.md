@@ -1,5 +1,199 @@
 # Changelog
 
+## 0.4.0 — 2026-11-09
+
+### Correções
+
+**Imagem repetida lida uma vez no texto, montagem que nunca volta vazia e plano que diz quando refazer a leitura**
+
+**Imagem repetida.** O mesmo logo em centenas de páginas ou slides agora entra no texto uma vez só, inteiro, na
+primeira posição. Nas outras fica a âncora `<!-- lido pela IA: id -->` com a referência curta
+`_(mesma imagem lida acima: id)_`, coerente com `estrutura.imagens`. Antes, a leitura era copiada em cada lugar: um
+DOCX com o mesmo logo 2.000 vezes gerava 240 milhões de caracteres e levava minutos para montar.
+
+**Montagem sem 413 vazio.** As leituras entram no resultado até ele chegar a 16 milhões de caracteres, teto
+documentado no contrato. Acima dele, `POST /v1/montagens` responde 200 com o texto nativo e as leituras que couberem;
+as outras aparecem em `cobertura.pendentes` como `resultado grande demais`, como já acontecia na leitura com a IA do
+Lince. O teto vale só para as leituras: o texto nativo do documento sai sempre inteiro, mesmo que sozinho passe dele.
+As montagens ganharam fila justa própria, com até duas ao mesmo tempo: não esperam atrás de leituras presas na IA nem
+tiram a vaga delas.
+
+**Plano depois de reiniciar.** O plano do modo `tarefas` leva o identificador da chave que o selou. Depois de um
+reinício sem `LINCE_SEGREDO`, a montagem responde `422 plano-de-outra-chave`, com a orientação de refazer a fase 1;
+`422 plano-invalido` fica só para o plano alterado ou de outro token. O contrato foi para a versão 1.10.0.
+
+**Teto de tarefas na API.** No modo `tarefas`, cada documento devolve até 200 tarefas e cada sessão, 300. As que
+passam ficam nas pendências do preparo, com o motivo, e o novo campo opcional `max_tarefas` baixa o teto do
+documento. Um documento que falha antes de entregar as tarefas não gasta a cota da sessão.
+
+**Cabeçalho fixo no PDF.** Uma linha curta idêntica na borda de ao menos 80% das páginas, como "Contrato 123/2026 -
+Confidencial", sai do corpo e vai para `metadados["cabeçalho/rodapé"]`. O número de página tirado do corpo também passa
+a ser registrado ali. Um número só conta como o da página quando a linha diz isso ("Página 3 de 12", "Página 3/12",
+"fls. 3") ou é só ele ("3 de 12", "- 3 -", "(3)"; "3)" sem a abertura é item de lista): no carnê com uma parcela por
+página, "Parcela 3 de 12" fica no texto, e "Cliente: Transportadora 3 Ltda" na terceira fatura também. Faturas do mesmo
+modelo, linhas numeradas e páginas inteiras iguais continuam no texto; das faturas, só a linha de marca idêntica em
+todas pode ir para os metadados, como cabeçalho fixo.
+
+**Planilha `.xlsb` hostil.** No `.xlsb` que só o leitor tolerante abre, a tabela de strings compartilhadas tem teto
+de 1 milhão de strings e 64 MB de texto. Acima disso, o arquivo é recusado antes de ocupar memória.
+
+**Alpine.** O README traz a receita que funciona (Rust estável pelo `rustup` com `build-base`, e o `git` para
+instalar do GitHub; cerca de 16 min de compilação) e recomenda usar a imagem Debian do Lince como serviço.
+
+**PDF grande não segura os outros, respeita o prazo desde o início e o texto oculto não apaga o visível**
+
+**Um PDF grande não faz os outros esperarem.** O PDF agora é lido em faixas de páginas, e a trava da PDFium é
+tomada por pouco tempo e passada, por ordem de chegada, a quem está esperando. Um PDF de uma página que chega
+durante a leitura de um de 2.500 sai em menos de meio segundo; antes, esperava dezenas de segundos. Com a trava só
+rodam as chamadas à PDFium, que custam o que a própria biblioteca limita: abrir o documento e a página, coletar os
+objetos, extrair o texto, copiar páginas e renderizar. Todo o resto roda fora dela: o pdf_inspector (que não usa a
+PDFium, inclusive na cópia sem o texto oculto), a análise da página (agrupamento de figuras e desenhos, texto oculto,
+tabelas, fórmulas, hífens), os recortes e os arquivos das figuras, também na releitura ampliada do esforço máximo. O
+documento é aberto uma vez só, e não a cada vez que pega a trava (nem a cada figura relida no esforço máximo): um PDF
+com a tabela de referências danificada não a reconstrói de novo a cada vez, e um PDF de uma página pega a trava duas
+vezes. Uma leitura interrompida (por exemplo, com Ctrl+C) em qualquer ponto do pedido da trava, na fila, na espera ou
+ao receber a vez, não deixa a trava presa.
+
+**O prazo vale desde a extração.** Com `prazo`, a leitura para entre uma faixa e outra quando o tempo que resta não
+cobre a montagem do que já foi lido: o documento sai com o texto extraído, e as páginas restantes aparecem em
+`cobertura.pendentes` como "páginas N–M: não lidas (prazo esgotado)". Num PDF de 2.500 páginas, `prazo=3` termina em
+cerca de 3 s; antes, levava mais de 10 s. A primeira faixa sempre é lida, para o documento nunca sair sem texto, e
+`cobertura.paginas` continua contando o documento inteiro.
+
+**Teto de páginas de texto.** Além do teto de 2.000 páginas da análise visual, um PDF tem no máximo 5.000 páginas de
+texto lidas. As seguintes não são lidas e entram nas pendências ("não lidas (teto de 5000 páginas de texto)").
+
+**Contagem de páginas que não bate.** Um PDF que declara mais páginas do que tem (por exemplo, um milhão) não derruba
+mais a leitura: as páginas que existem são lidas, e o resto entra numa pendência só, como "páginas 4–1000000: não
+lidas (a página 4 não abre)". Um PDF que declara menos páginas do que tem é lido como um visualizador de PDF o mostra:
+só as páginas da contagem são lidas e contadas, curto ou longo, e as de fora não entram no resultado nem nas
+pendências. O texto vem sempre de uma cópia das páginas que o leitor abre, e não mais do arquivo inteiro: um PDF com
+cem mil páginas e a contagem 1 sai em menos de um segundo, em vez de prender a leitura por minutos.
+
+**Texto oculto sai pela posição.** O texto branco, minúsculo, invisível ou fora da página é tirado de uma cópia da
+página, objeto por objeto, antes de o texto dela ser gerado; o documento original não muda. Antes, o trecho oculto
+era procurado no texto pronto e apagava também as cópias visíveis iguais a ele: um "não se responsabiliza" branco
+cortava a frase visível "O fornecedor não se responsabiliza por atrasos na entrega.". Agora a frase visível fica
+inteira e o oculto continua registrado em `texto_oculto_removido`. Uma página com milhares de trechos ocultos é
+conferida em menos de um segundo, sem segurar os outros PDFs.
+
+**Oculto que não sai vira alerta e pendência.** Quando um trecho oculto não pode ser tirado da cópia, ele fica no
+corpo e a página ganha o alerta "texto oculto que pode ter ficado no corpo: página N", em `alertas_injecao` e em
+`cobertura.pendentes`. Isso vale para o texto dentro de um bloco reutilizável do PDF (Form XObject), que pode estar
+desenhado também num lugar visível e não é regravado, e para a página com trechos ocultos sobrepostos demais para
+tirar um a um.
+
+**Página com recorte fora da folha.** A página cuja área de recorte (CropBox) não cai sobre a folha (MediaBox)
+derrubava a leitura do documento inteiro, e também a releitura ampliada do esforço máximo (`esforco="max"`). Agora ela
+vale pela folha inteira, como em outros leitores de PDF, nas duas leituras, e o texto oculto dela sai do mesmo jeito.
+
+**Página hostil não prende os outros PDFs.** Uma página montada para pesar na análise (dezenas de milhares de desenhos
+espaçados, milhares de trechos invisíveis sobre milhares de imagens, um bloco de fórmula de centenas de milhares de
+caracteres) é analisada fora da trava, com teto de tempo (abaixo): um PDF de uma página que chega no meio sai em menos
+de um segundo, em vez de esperar a análise inteira. A página com objetos demais para a PDFium coletar (mais de 100 mil,
+contando os de dentro dos blocos reutilizáveis a cada vez que são desenhados) entra só com o texto, com a pendência
+"página N: só o texto, sem figuras nem páginas escaneadas lidas (conteúdo demais para a análise visual)" e o alerta de
+texto oculto não conferido; o resto do documento é lido normalmente.
+
+**Hífen de fim de linha em tempo linear.** Juntar as palavras partidas no fim da linha procurava cada forma com hífen
+no texto inteiro: uma página com 20 mil quebras levava 4 s parada, e uma palavra de 20 mil letras sem hífen, 7 s.
+Agora as duas levam centésimos. A decisão continua pelo vocabulário do documento: o hífen fica quando a 2ª metade
+aparece sozinha no texto ou quando o par aparece em outro lugar como duas partes de uma palavra hifenizada
+("propellant- based" com "propellant-based"). O par precisa aparecer inteiro: "co- op" vira "coop" mesmo com
+"co-operation" no texto, onde antes bastava "co-op" estar dentro de outra palavra.
+
+**Página que levaria tempo demais para analisar.** A análise da página, que agora roda fora da vez da PDFium, tem 3 s de
+processamento por página (o tempo da própria leitura, sem contar a espera pelos outros documentos, então a mesma página
+sai igual com o servidor cheio ou vazio): uma página montada para travar a leitura (dezenas de milhares de desenhos
+espaçados, milhares de textos invisíveis sobre milhares de imagens) entra só com o texto, com a pendência e o alerta de
+texto oculto não conferido, e a leitura segue na próxima página.
+
+### Segurança
+
+**Texto oculto do Word e do PowerPoint sai sem levar junto o texto visível igual a ele**
+
+O texto que a IA leria e quem abre o documento não vê (branco no branco, `vanish`, fonte minúscula, letra sem
+preenchimento) agora sai do próprio arquivo, antes da leitura, e não mais por busca no texto já extraído.
+
+#### O texto visível fica intacto
+
+Antes, um trecho oculto que repetia um texto visível apagava as duas cópias: um "não se responsabiliza" escondido
+tirava a frase "O fornecedor não se responsabiliza por atrasos na entrega." do contrato, e um "Cliente" em branco
+virava "Clientes atendidos: 40" em "s atendidos: 40". Agora só o trecho escondido sai, em qualquer quantidade de
+cópias do visível, no Word (`.docx`, `.docm`) e no PowerPoint. O que saiu continua listado em
+`texto_oculto_removido`, com o alerta.
+
+#### Menos rotas para esconder texto
+
+- **Tudo o que o leitor lê é conferido**: as partes do Word e os slides são achados pelas relações do pacote com as
+  mesmas regras do leitor do corpo (a relação repetida vale pela última, o tipo vale pelo endereço inteiro, o
+  atributo vale com ou sem prefixo e o caminho com `%2E%2E` ou `%2F` não resolve), e o texto sai de todos os ramos de
+  conteúdo alternativo (`mc:AlternateContent`). O que estava oculto só no ramo que o leitor usa também entra em
+  `texto_oculto_removido`.
+- **Formato pelo conteúdo**: a conferência segue o formato que o leitor detecta no arquivo, não a extensão. Um Word
+  gravado como `.doc` e uma apresentação gravada como `.docx` são conferidos, e o Word gravado como `.pptx` ou `.xlsx`
+  também tem o cabeçalho, o rodapé e os comentários conferidos nos metadados.
+- **OOXML estrito**: o Word e o PowerPoint gravados no formato estrito (`http://purl.oclc.org/ooxml/...`) são
+  conferidos como os de transição.
+- **Herança completa no Word**: o estilo da tabela (inclusive a formatação da primeira linha, da última e das faixas)
+  entra na cadeia de cor, tamanho e `vanish`; o `vanish` segue a regra do Word, em que ligado no estilo de parágrafo
+  e de novo no de caractere se anula; e o texto em árabe, hebraico ou marcado como escrita complexa vale pelo tamanho
+  de escrita complexa (`szCs`).
+- **Imagem atrás do texto**: uma imagem pequena "atrás do texto" deixava de conferir a cor do documento inteiro.
+  Agora ela só deixa incerto o texto que pode cobrir, perto do parágrafo em que está presa. O papel timbrado de
+  página inteira continua valendo para a página toda, e a faixa do cabeçalho ou do rodapé que entra na área do texto
+  deixa incerto só o texto embaixo dela (o título branco sobre a faixa azul do cabeçalho fica). A forma antiga (VML)
+  atrás do texto conta do mesmo jeito. A âncora que não desenha nada (sem figura, de tamanho zero ou com uma imagem
+  toda transparente) não deixa mais nada incerto: um PNG transparente de 1 EMU no cabeçalho bastava para desligar a
+  conferência do documento inteiro. A imagem de uma cor só igual à página conta como a própria página.
+- **Caixa de texto sobre foto**: a caixa de texto flutuante sem preenchimento mostra o que está embaixo dela. Sobre a
+  foto ou o retângulo escuro da capa, o título branco fica; longe de qualquer outro desenho (pela posição na página,
+  quando o arquivo diz), o branco no branco sai.
+- **Letra sem preenchimento**: o texto sem preenchimento (`noFill`) ou quase transparente (até 8% de opacidade), no
+  PowerPoint e no Word (`w14:textFill`), conta como oculto, sobre qualquer fundo. Com contorno visível, ou com meia
+  transparência, continua no texto.
+- **Tabela com estilo**: a tabela com o estilo mais comum (Grade da Tabela) e os estilos só de borda passam a ter o
+  fundo da página; só o estilo que pinta a célula deixa o fundo incerto.
+- **Mais partes conferidas**: caixa de texto (pela cor declarada da forma), notas de rodapé e de fim, comentários,
+  cabeçalho e rodapé. O texto oculto do cabeçalho, do rodapé e dos comentários também não aparece mais nos
+  metadados.
+- **Contraste quase nulo**: cinza quase branco sobre branco (como E8E8E8) conta como oculto; cinza claro legível e
+  letra branca numa faixa escura, não.
+- **Letra espremida**: escala horizontal de até 10% com fonte de até 4 pt conta como oculto.
+- **PowerPoint**: a conferência percorre o slide inteiro, como o leitor: conteúdo alternativo, grupos, campos (como o
+  número do slide), células de tabela (com o preenchimento da célula como fundo) e as anotações do orador. O tamanho e
+  a cor vêm da herança toda (estilo da caixa, placeholder do layout e do mestre, estilos de texto do mestre) e do
+  ajuste automático do texto; o texto da forma oculta pelo painel de seleção sai. Letra branca sobre uma imagem toda
+  branca (como fundo da caixa ou como figura embaixo) conta como oculta; sobre foto, continua no texto. Apresentações
+  de exibição (`.ppsx`, `.ppsm`), que antes ficavam sem conferir, agora são conferidas. A cor de imagem é conferida até
+  50 milhões de pixels por documento; depois disso, a imagem conta como foto, para a leitura não travar. A forma que só tem uma fórmula,
+  o placeholder de número, data ou rodapé (antes pulado, mesmo quando o leitor o lia) e a lista de slides guardada
+  dentro de outro elemento também são conferidos.
+
+#### Rede de segurança: o que o leitor leu e a conferência não viu aparece no resultado
+
+Depois da limpeza, o texto que o leitor extrai do arquivo é comparado com o texto que a conferência examinou. Se uma
+palavra lida (de 3 letras ou mais, sem contar números e pontuação) não estiver em nada conferido, o alerta "texto
+oculto não conferido: texto lido fora da conferência" sai com a contagem e uma amostra das palavras, e a mesma linha
+entra em `cobertura.pendentes`. Assim, uma rota para esconder texto que a conferência ainda não conhece não passa
+calada. A numeração dos títulos, os gráficos, os SmartArt e o texto alternativo das imagens contam como conferidos:
+não têm como ser escondidos por cor ou tamanho, e continuam fora da remoção. Só conta o que o leitor de fato escreve:
+o texto da instrução de um campo, o texto movido de lugar (`w:moveFrom`), a célula coberta por mesclagem, o rótulo de
+um nível de numeração que nenhum parágrafo usa, a parte do gráfico que o leitor não escreve e o segundo texto de um
+mesmo trecho do slide não servem mais para mascarar uma palavra oculta. Documentos normais não geram o alerta,
+inclusive com o símbolo ≝ numa fórmula.
+
+#### Parte que não dá para conferir aparece no resultado
+
+Quando uma parte do arquivo não pode ser conferida (por exemplo, XML com entidade sem definição), ela fica como está,
+o alerta diz qual parte falhou e por quê, e a mesma linha entra em `cobertura.pendentes`
+("texto oculto não conferido: word/document.xml (motivo)"), para quem chama poder decidir. O mesmo vale para o slide
+forjado com formas demais (mais de 500), para a apresentação cuja conferência passaria do teto de custo e para o
+Word com caixas de texto demais sobre desenhos: esses slides e partes ficam como estão, com o motivo, em vez de travar
+a leitura.
+
+O que sai do arquivo é só o texto oculto: declaração, `DOCTYPE`, namespaces e o resto da parte ficam como estavam.
+
 ## 0.3.1 — 2026-11-08
 
 ### Segurança
