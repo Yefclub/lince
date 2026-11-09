@@ -36,11 +36,12 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from . import antivirus, memoria, protecao
+from . import antivirus, memoria, paralelo, protecao
 from . import codigo as codigo_doc
 from .cache import CacheComEscopo, CacheRedis
 from .leitor import FORMATOS, VERSAO, Leitor
 from .limites import RETIDOS_POR_TOKEN, DocumentoRecusado
+from .pdf import ROTULO
 from .provedores import OpenAICompativel
 
 CONTRATO = json.loads(files("lince").joinpath("openapi.json").read_text(encoding="utf-8"))
@@ -282,6 +283,7 @@ class Servico:
     def _ler(self, doc):
         sessao = doc["sessao"]
         estado, reservadas = "falhou", 0
+        rotulo = ROTULO.set(f" (sessão {sessao['id']}, documento {doc['id']})")  # na linha de log da fase 1 do PDF
         try:
             if sessao.get("apagada"):
                 estado = "cancelado"
@@ -316,6 +318,7 @@ class Servico:
                     sessao["tarefas"] -= reservadas
                 reservadas = 0  # devolvida: o finally não devolve de novo
         finally:
+            ROTULO.reset(rotulo)
             Path(doc["arquivo"]).unlink(missing_ok=True)
             doc["fim"] = time.time()
             self.liberar(sessao["cliente"])
@@ -1355,6 +1358,13 @@ def main():
     import uvicorn
 
     memoria.ajustar_alocador()  # uma vez, antes das threads do serviço (memoria.py); quem embute o app decide o seu
+    # a linha de cada fase 1 de PDF, com o tempo de cada etapa, no log do serviço (o uvicorn só configura os dele)
+    saida = logging.StreamHandler()
+    saida.setFormatter(logging.Formatter("%(levelname)s:     %(message)s"))
+    log.addHandler(saida)
+    log.setLevel(logging.INFO)
+    log.propagate = False
+    paralelo.ativar()  # a fase 1 do PDF em processos, um por CPU (sem processos, segue em série)
     app = criar_app(tokens, clamav, cache, segredo.encode() or None, tetos)
     uvicorn.run(app, host=a.host, port=a.porta, proxy_headers=True, log_level="info")
 
