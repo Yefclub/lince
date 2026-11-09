@@ -33,7 +33,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from . import antivirus
+from . import antivirus, memoria
 from . import codigo as codigo_doc
 from .cache import CacheComEscopo, CacheRedis
 from .leitor import FORMATOS, VERSAO, Leitor
@@ -601,7 +601,10 @@ def criar_app(
         s.segredo_plano = segredo
 
     async def saude(request):
-        return JSONResponse({"status": "ok", "versao": VERSAO, "contrato": CONTRATO["info"]["version"]})
+        corpo = {"status": "ok", "versao": VERSAO, "contrato": CONTRATO["info"]["version"]}
+        if (residente := memoria.rss()) is not None:
+            corpo["memoria"] = {"rss_bytes": residente}
+        return JSONResponse(corpo)
 
     async def contrato(request):
         return JSONResponse(CONTRATO)
@@ -898,6 +901,8 @@ def criar_app(
             while True:
                 await asyncio.sleep(LIMPEZA_INTERVALO)
                 s.limpar()
+                # a memória que as leituras liberaram volta ao sistema: uma vez por intervalo, fora de trava e do laço
+                await asyncio.to_thread(memoria.devolver)
 
         tarefa = asyncio.create_task(laco())
         yield
@@ -1091,6 +1096,7 @@ def main():
         raise SystemExit("LINCE_SEGREDO precisa de pelo menos 32 caracteres aleatórios.")
     import uvicorn
 
+    memoria.ajustar_alocador()  # uma vez, antes das threads do serviço (memoria.py); quem embute o app decide o seu
     app = criar_app(tokens, clamav, cache, segredo.encode() or None)
     uvicorn.run(app, host=a.host, port=a.porta, proxy_headers=True, log_level="info")
 

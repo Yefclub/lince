@@ -123,7 +123,7 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
 | `GET /v1/sessoes?referencia=…` | Sessões do token ainda não entregues, da mais nova para a mais antiga (resumo, sem o conteúdo lido). |
 | `DELETE /v1/sessoes/{id}` | Confirma o recebimento (ou cancela o que ainda não foi lido) e apaga a sessão na hora. |
 | `POST /v1/montagens` | Segunda fase do modo `tarefas`: recebe `{"plano", "respostas": {id: texto}}` e devolve o resultado montado. |
-| `GET /v1/openapi.json`, `GET /saude` | Contrato; serviço no ar e versões. |
+| `GET /v1/openapi.json`, `GET /saude` | Contrato; serviço no ar, versões e a memória residente do processo (`memoria.rss_bytes`, no Linux). |
 
 - **Idempotência**: repetir o envio com a mesma `Idempotency-Key` antes da entrega devolve a mesma sessão (`200`),
   sem ler nem cobrar de novo. Reusar a chave com outro conteúdo dá `422`.
@@ -150,6 +150,10 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   justa própria, com até 2 ao mesmo tempo: não esperam atrás de leituras presas na IA nem tomam a vaga delas.
 - **Isolamento**: um token nunca vê sessão nem referência de outro. `LINCE_TOKENS` aceita vários tokens
   separados por vírgula, um por plataforma. Para uso local sem token: `lince-servidor --sem-autenticacao`.
+- **Memória**: no Linux com glibc, o servidor (`lince-servidor`) fixa o limite de `mmap` do alocador em 16 MB, o que
+  desliga o ajuste dinâmico que deixava as arenas das threads fragmentadas, e, a cada 60 s, devolve ao sistema a
+  memória livre que o alocador guardou (`malloc_trim`). O processo volta perto do tamanho de repouso depois de uma carga, em vez de
+  ficar no teto do contêiner. Em outra libc (Alpine/musl) nada muda.
 - **Limites**: 100 MB por envio (com `Content-Length`), 50 arquivos por sessão, 64 documentos pendentes e 256 MB
   de resultado esperando entrega por token. Acima disso, `429` com `Retry-After`. A montagem aceita até 20 mil
   respostas e 64 M caracteres delas (acima, `413 envio-grande`, com o teto que passou no detalhe) e põe leituras no resultado até ele chegar a 16 M caracteres,
