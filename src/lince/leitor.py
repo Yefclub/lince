@@ -110,7 +110,7 @@ class Leitor:
             conferir_zip(caminho)  # o pacote, antes de descompactar; `\\` nos nomes internos vira `/` numa cópia
             caminho = com_barras_normais(caminho, pasta)
         ext = _extensao_lida(caminho)
-        if ext == ".pdf":  # a trava da PDFium vai em vezes curtas: Office, HTML, texto e outros PDFs seguem em paralelo
+        if ext == ".pdf":  # nos processos de paralelo.py, ou em série com a trava da PDFium em vezes curtas
             plano = planejar_pdf(caminho, pasta)
         elif ext in IMAGEM:
             plano = _plano_imagem(caminho, pasta)
