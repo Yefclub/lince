@@ -53,3 +53,6 @@ a análise visual)" e o alerta de texto oculto não conferido; o resto do docume
 orçamento, nenhuma página segura a vez por mais de cerca de um segundo: 49.999 desenhos espaçados numa página levavam
 75 s e agora entram só com o texto em menos de um segundo. Um gráfico com milhares de traços que se juntam continua
 indo para a IA.
+
+**Hífen de fim de linha em tempo linear.** Juntar as palavras partidas no fim da linha procurava cada forma com hífen
+no texto inteiro: uma página com 20 mil quebras levava 4 s parada. Agora leva centésimos, com a mesma decisão.

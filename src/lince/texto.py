@@ -81,13 +81,21 @@ def desifenizar(txt, vocab=None):
     if vocab is None:  # vocabulário sem os próprios fragmentos hifenizados
         vocab = set(re.findall(r"\w+", re.sub(padrao, " ", txt).lower()))
 
+    # as formas com hífen que o texto já tem, num conjunto: procurar cada uma no texto inteiro deixava o texto com
+    # milhares de quebras quadrático (20 mil levavam 4 s segurando a GIL)
+    compostas = {par for p in re.findall(r"\w+(?:-\w+)+", txt.lower()) for par in _pares(p.split("-"))}
+
     def troca(m):
         a, b = m.group(1), m.group(2)
-        if b.lower() in vocab or f"{a}-{b}".lower() in txt.lower():
+        if b.lower() in vocab or f"{a}-{b}".lower() in compostas:
             return f"{a}-{b}"
         return a + b
 
     return re.sub(padrao, troca, txt)
+
+
+def _pares(partes):
+    return (f"{x}-{y}" for x, y in zip(partes, partes[1:], strict=False))
 
 
 def lixo(txt):

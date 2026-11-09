@@ -60,3 +60,19 @@ def test_prazo_vencido_na_extracao_mantem_o_texto(tmp_path):
     r = lince.ler(_pdf(tmp_path), prazo=1e-9)
     assert all(f"página {n} do relatório" in r.markdown for n in range(1, 5))
     assert any("(prazo esgotado)" in p for p in r.cobertura.pendentes)
+
+
+def test_hifen_de_fim_de_linha_e_linear_e_decide_pelo_vocabulario():
+    import time
+
+    from lince.texto import desifenizar
+
+    assert (
+        desifenizar("nega- tive e propellant- based; propellant-based")
+        == "negative e propellant-based; propellant-based"
+    )
+    assert desifenizar("o propellant- based e o based") == "o propellant-based e o based"  # a 2ª metade existe sozinha
+    hostil = " ".join(f"pala- vra{k}" for k in range(20_000))  # milhares de quebras numa página
+    inicio = time.monotonic()
+    desifenizar(hostil)
+    assert time.monotonic() - inicio < 0.5  # era ~4 s, segurando a GIL
