@@ -422,21 +422,36 @@ def _avisar_cache(e):
 def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
     """O fim da leitura, igual com a IA do Lince ou com a de quem chama: pendência de resposta vazia, montagem do
     texto e dos metadados, estrutura."""
-    lotes_lidos = {}  # o JSON de cada lote é lido uma vez na busca do que cabe
-    if respostas and tamanho_da_saida(plano, respostas, lotes_lidos) > SAIDA_MAX:
+
+    def montado(respostas):  # o texto e os metadados com estas respostas
+        if plano["tipo"] == "imagem":
+            md = "\n\n".join(respostas.get(t["id"], "") for t in plano["tarefas"])
+            return md, dict(plano.get("meta_arquivo") or {})
+        md = montar(pasta, respostas)
+        return md, json.loads(Path(f"{pasta}/metadados.json").read_text(encoding="utf-8"))
+
+    posicao = {t["id"]: k for k, t in enumerate(plano.get("tarefas", []))}
+    ordem = sorted(respostas, key=lambda tid: posicao.get(tid, len(posicao)))  # a ordem do plano
+    medidas = {}  # o texto de cada resposta é medido uma vez na busca do que cabe
+    if respostas and tamanho_da_saida(plano, respostas, medidas) > SAIDA_MAX:
         # acima do teto de saída, entram as leituras que cabem, na ordem do plano; as outras ficam pendentes, com o
         # motivo, e o texto nativo sai inteiro no lugar delas. A busca é binária: o tamanho só cresce com cada leitura
-        posicao = {t["id"]: k for k, t in enumerate(plano.get("tarefas", []))}
-        ordem = sorted(respostas, key=lambda tid: posicao.get(tid, len(posicao)))
         cabem, sobra = 0, len(ordem)
         while cabem + 1 < sobra:
             meio = (cabem + sobra) // 2
-            if tamanho_da_saida(plano, {tid: respostas[tid] for tid in ordem[:meio]}, lotes_lidos) <= SAIDA_MAX:
+            if tamanho_da_saida(plano, {tid: respostas[tid] for tid in ordem[:meio]}, medidas) <= SAIDA_MAX:
                 cabem = meio
             else:
                 sobra = meio
         cobertura.pendentes += [f"{tid}: resultado grande demais" for tid in ordem[cabem:]]
-        respostas = {tid: respostas[tid] for tid in ordem[:cabem]}
+        ordem = ordem[:cabem]
+        respostas = {tid: respostas[tid] for tid in ordem}
+    md, meta = montado(respostas)
+    if respostas and len(md) > SAIDA_MAX:
+        # a conta errou e as leituras passaram do teto assim mesmo: o teto vale, e sai só o texto nativo
+        cobertura.pendentes += [f"{tid}: resultado grande demais" for tid in ordem]
+        respostas = {}
+        md, meta = montado(respostas)
     if conferir_vazias:  # resposta vazia não pode virar lacuna silenciosa no documento
         lidos = distribuir_lotes(plano, respostas)
         ja = {p.split(":", 1)[0] for p in cobertura.pendentes}
@@ -447,12 +462,6 @@ def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
             for t in plano.get("tarefas_originais", [])
             if t["id"] not in ja and not str(lidos.get(t["id"], "")).strip()
         ]
-    if plano["tipo"] == "imagem":
-        md = "\n\n".join(respostas.get(t["id"], "") for t in plano["tarefas"])
-        meta = dict(plano.get("meta_arquivo") or {})
-    else:
-        md = montar(pasta, respostas)
-        meta = json.loads(Path(f"{pasta}/metadados.json").read_text(encoding="utf-8"))
     r = _com_estrutura(Resultado(md, meta, cobertura, usos), plano)
     if imagens := _imagens(plano, distribuir_lotes(plano, respostas)):
         r.estrutura["imagens"] = imagens

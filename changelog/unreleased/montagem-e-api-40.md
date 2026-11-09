@@ -8,11 +8,12 @@ primeira posição. Nas outras fica a âncora `<!-- lido pela IA: id -->` com a 
 `_(mesma imagem lida acima: id)_`, coerente com `estrutura.imagens`. Antes, a leitura era copiada em cada lugar: um
 DOCX com o mesmo logo 2.000 vezes gerava 240 milhões de caracteres e levava minutos para montar.
 
-**Montagem sem 413 vazio.** O resultado tem teto de 16 milhões de caracteres, documentado no contrato. Acima dele,
-`POST /v1/montagens` responde 200 com o texto nativo e as leituras que couberem; as outras aparecem em
-`cobertura.pendentes` como `resultado grande demais`, como já acontecia na leitura com a IA do Lince. As montagens
-ganharam fila justa própria, com até duas ao mesmo tempo: não esperam atrás de leituras presas na IA nem tiram a vaga
-delas.
+**Montagem sem 413 vazio.** As leituras entram no resultado até ele chegar a 16 milhões de caracteres, teto
+documentado no contrato. Acima dele, `POST /v1/montagens` responde 200 com o texto nativo e as leituras que couberem;
+as outras aparecem em `cobertura.pendentes` como `resultado grande demais`, como já acontecia na leitura com a IA do
+Lince. O teto vale só para as leituras: o texto nativo do documento sai sempre inteiro, mesmo que sozinho passe dele.
+As montagens ganharam fila justa própria, com até duas ao mesmo tempo: não esperam atrás de leituras presas na IA nem
+tiram a vaga delas.
 
 **Plano depois de reiniciar.** O plano do modo `tarefas` leva o identificador da chave que o selou. Depois de um
 reinício sem `LINCE_SEGREDO`, a montagem responde `422 plano-de-outra-chave`, com a orientação de refazer a fase 1;
@@ -25,8 +26,8 @@ documento.
 **Cabeçalho fixo no PDF.** Uma linha curta idêntica na borda de ao menos 80% das páginas, como
 "Contrato 123/2026 - Confidencial", sai do corpo e vai para `metadados["cabeçalho/rodapé"]`. O número de página
 tirado do corpo também passa a ser registrado ali. Um número só conta como o da página quando a linha diz isso
-("Página 3 de 12", "fls. 3") ou é só ele ("3 de 12"): no carnê com uma parcela por página, "Parcela 3 de 12" fica no
-texto, e "Cliente: Transportadora 3 Ltda" na terceira fatura também. Faturas do mesmo modelo, linhas numeradas e
+("Página 3 de 12", "Página 3/12", "fls. 3") ou é só ele ("3 de 12", "- 3 -", "(3)"): no carnê com uma parcela por
+página, "Parcela 3 de 12" fica no texto, e "Cliente: Transportadora 3 Ltda" na terceira fatura também. Faturas do mesmo modelo, linhas numeradas e
 páginas inteiras iguais continuam no texto; das faturas, só a linha de marca idêntica em todas pode ir para os
 metadados, como cabeçalho fixo.
 

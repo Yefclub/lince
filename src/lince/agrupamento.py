@@ -109,30 +109,20 @@ def _valor_do_item(dados: dict, n) -> str:
     return str(v or "")
 
 
+def por_tarefa(plano, chave, resposta) -> dict[str, str]:
+    """A resposta `chave` como o texto de cada tarefa: a do lote se divide nos itens, pelo JSON por número; as outras
+    são da própria tarefa."""
+    itens = (plano.get("lotes") or {}).get(chave)
+    if itens is None:
+        return {chave: resposta}
+    dados = _json_do_lote(resposta)
+    return {tid: _valor_do_item(dados, n) for n, tid in itens}
+
+
 def distribuir_lotes(plano, respostas):
     """Resposta JSON do lote → resposta de cada tarefa original."""
     R = dict(respostas)
-    for lid, itens in (plano.get("lotes") or {}).items():
-        if lid not in R:  # já distribuído (esforço máximo) ou leitura do lote falhou
-            continue
-        dados = _json_do_lote(R.pop(lid))
-        for n, tid in itens:
-            R[tid] = _valor_do_item(dados, n)
-    return R
-
-
-def tamanhos_distribuidos(plano, respostas, memo: dict) -> dict:
-    """O tamanho do texto de cada tarefa depois de distribuir_lotes, pelo mesmo critério: o item do lote sai do JSON da
-    resposta, e o valor que é lista ou objeto volta a texto com os espaços do json.dumps, maior que o compacto que veio.
-    `memo` guarda os tamanhos de cada lote entre chamadas com as mesmas respostas, para o JSON ser lido uma vez só."""
-    R = {k: len(v) for k, v in respostas.items()}
-    for lid, itens in (plano.get("lotes") or {}).items():
-        if lid not in R:
-            continue
-        del R[lid]
-        if lid not in memo:
-            dados = _json_do_lote(respostas[lid])
-            memo[lid] = [len(_valor_do_item(dados, n)) for n, _ in itens]
-        for (_, tid), tamanho in zip(itens, memo[lid], strict=True):
-            R[tid] = tamanho
+    for lid in plano.get("lotes") or {}:
+        if lid in R:  # senão, já distribuído (esforço máximo) ou leitura do lote falhou
+            R.update(por_tarefa(plano, lid, R.pop(lid)))
     return R

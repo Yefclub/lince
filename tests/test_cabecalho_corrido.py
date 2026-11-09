@@ -228,3 +228,38 @@ def test_paginas_iguais_e_linha_que_muda_nao_sao_cabecalho_fixo():
     carne = _paginas(*([f"Vencimento: 10/{n + 1:02d}/2026", f"Valor: R$ {100 + n},00", corpo] for n in range(12)))
     assert _sem_cabecalho_corrido(carne) == set()  # o que muda não é fixo, e o igual que segue no corpo também não
     assert all(b[0].startswith("Vencimento") and b[1].startswith("Valor") for _, b in carne)
+
+
+def test_pagina_n_barra_m_sozinha_na_ultima_linha_sai():
+    # o "i" de "Página" não é o número romano 1: o número da página é o que vem depois do rótulo
+    corpo = "\n".join(f"Cláusula {k}: o texto de verdade do contrato de fornecimento de grãos." for k in range(8))
+    nativas = _paginas(*([corpo, f"Página {n + 1}/4"] for n in range(4)))
+    assert _sem_cabecalho_corrido(nativas) == {"Página #/4"}
+    assert all(b[1] == "" and b[0] == corpo for _, b in nativas)
+
+
+def test_pdf_de_duas_paginas_perde_o_rodape_pagina_n_de_2(tmp_path):
+    # duas páginas bastam para o número sozinho na última linha (a forma rotulada no meio da linha pede três)
+    p = tmp_path / "parecer.pdf"
+    c = canvas.Canvas(str(p), pagesize=A4)
+    for n in range(2):
+        c.setFont("Helvetica", 11)
+        for k in range(6):
+            c.drawString(60, 780 - k * 18, f"Item {n + 1}.{k + 1}: o parecer recomenda a compra de {k + 3} silos.")
+        c.setFont("Helvetica", 8)
+        c.drawString(270, 40, f"Página {n + 1} de 2")
+        c.showPage()
+    c.save()
+    r = lince.ler(p)
+    assert "Página" not in r.markdown and r.markdown.count("o parecer recomenda") == 12
+    assert r.metadados["cabeçalho/rodapé"] == ["Página # de 2"]
+
+
+@pytest.mark.parametrize("forma", ["- {} -", "— {} —", "({})"])
+def test_numero_entre_tracos_ou_parenteses_sai(forma):
+    corpo = "\n".join(f"Cláusula {k}: o texto de verdade do contrato de fornecimento de grãos." for k in range(8))
+    nativas = _paginas(*([corpo, forma.format(n + 1)] for n in range(4)))
+    assert _sem_cabecalho_corrido(nativas) == {forma.format("#")}
+    assert all(b[1] == "" for _, b in nativas)
+    carne = _paginas(*([corpo, forma.format(40 + 3 * n)] for n in range(4)))  # muda, mas não com a página: fica
+    assert _sem_cabecalho_corrido(carne) == set() and carne[1][1][1] == forma.format(43)

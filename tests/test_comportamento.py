@@ -640,3 +640,55 @@ def test_teto_de_saida_conta_o_comentario_e_as_juncoes_de_cada_pagina(tmp_path, 
     assert len(r.markdown) <= tamanho - 1 and "Gráfico de barras" not in r.markdown
     assert any(p.endswith("resultado grande demais") for p in r.cobertura.pendentes)
     assert r.markdown.count("do relatório.") == 300  # o texto nativo sai inteiro
+
+
+def _pdf_com_duas_figuras(tmp_path):
+    from PIL import Image
+
+    c = canvas.Canvas(str(tmp_path / "duas.pdf"), pagesize=A4)
+    for k, cor in enumerate(("navy", "darkred")):  # cores diferentes: duas leituras, não a mesma imagem repetida
+        Image.new("RGB", (800, 400), cor).save(tmp_path / f"f{k}.png")
+        c.drawString(60, 780, f"Seção {k + 1} do relatório de moagem.")
+        c.drawImage(str(tmp_path / f"f{k}.png"), 60, 400, width=400, height=200)
+        c.showPage()
+    c.save()
+    return tmp_path / "duas.pdf"
+
+
+# a trava de repetição escreve cada bloco de dez linhas iguais com a linha e o aviso: o texto dobra de tamanho
+REPETITIVA = ("x\n" * 10 + "y\n" * 10) * 500
+
+
+def test_teto_de_saida_mede_a_leitura_como_a_montagem_a_escreve(tmp_path, monkeypatch):
+    import lince.leitor as leitor_mod
+
+    plano = lince.Leitor(agrupar=False).preparar(_pdf_com_duas_figuras(tmp_path))
+    primeira, segunda = (t.id for t in plano.tarefas)
+    respostas = {primeira: "Primeira\n" + REPETITIVA, segunda: "Segunda\n" + REPETITIVA}
+    nativo = len(lince.Leitor().concluir(plano, {}).markdown)
+    uma = len(lince.Leitor().concluir(plano, {primeira: respostas[primeira]}).markdown)
+    assert uma - nativo > 1.5 * len(REPETITIVA)  # escrita, a leitura é bem maior que a resposta
+    # cabe uma leitura escrita; as duas respostas como vieram também caberiam, mas não o que a montagem escreve
+    monkeypatch.setattr(leitor_mod, "SAIDA_MAX", uma + len(REPETITIVA))
+    r = lince.Leitor().concluir(plano, respostas)
+    assert len(r.markdown) <= uma + len(REPETITIVA)
+    assert "Primeira" in r.markdown and "Segunda" not in r.markdown  # a que cabe entra, e só a outra fica de fora
+    assert [p for p in r.cobertura.pendentes if "grande demais" in p] == [f"{segunda}: resultado grande demais"]
+    assert r.markdown.count("do relatório de moagem.") == 2
+
+
+def test_teto_de_saida_vale_mesmo_quando_a_conta_erra(tmp_path, monkeypatch):
+    import lince.leitor as leitor_mod
+
+    plano = lince.Leitor(agrupar=False).preparar(_pdf_com_duas_figuras(tmp_path))
+    primeira, segunda = (t.id for t in plano.tarefas)
+    respostas = {primeira: "Primeira\n" + REPETITIVA, segunda: "Segunda\n" + REPETITIVA}
+    nativo = len(lince.Leitor().concluir(plano, {}).markdown)
+    monkeypatch.setattr(leitor_mod, "tamanho_da_saida", lambda *a, **k: 0)  # a estimativa diz que tudo cabe
+    monkeypatch.setattr(leitor_mod, "SAIDA_MAX", nativo + 1000)
+    r = lince.Leitor().concluir(plano, respostas)
+    assert len(r.markdown) <= nativo + 1000 and "Primeira" not in r.markdown and "Segunda" not in r.markdown
+    assert r.markdown.count("do relatório de moagem.") == 2  # o texto nativo sai inteiro
+    pendentes = [p for p in r.cobertura.pendentes if "grande demais" in p]
+    assert pendentes == [f"{primeira}: resultado grande demais", f"{segunda}: resultado grande demais"]
+    assert not any("resposta vazia" in p for p in r.cobertura.pendentes)  # o que saiu pelo teto não é "vazia"
