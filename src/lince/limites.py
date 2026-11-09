@@ -65,9 +65,10 @@ def com_barras_normais(caminho, pasta) -> str:
     aqui ainda é recusado o nome que fica repetido depois da troca."""
     with zipfile.ZipFile(caminho) as z:
         itens = z.infolist()
-        if not any("\\" in i.filename for i in itens):
+        # o nome gravado: no Windows, o zipfile já troca `\\` por `/` em `filename`, e o anydoc lê os bytes crus
+        if not any("\\" in i.orig_filename for i in itens):
             return caminho
-        nomes = [i.filename.replace("\\", "/") for i in itens]
+        nomes = [i.orig_filename.replace("\\", "/") for i in itens]
         if len(set(nomes)) != len(nomes):
             raise DocumentoRecusado("parte repetida no pacote depois de trocar \\ por /")
         os.makedirs(destino := os.path.join(pasta, "pacote"), exist_ok=True)

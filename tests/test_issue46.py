@@ -12,7 +12,7 @@ from lince.limites import DocumentoRecusado
 TEXTO = "BT /F1 12 Tf 72 700 Td (Texto nativo visivel: codigo ABC-123 e valor 4.567) Tj ET "
 
 
-def _pdf(p, mediabox, conteudo, cropbox=None, img_w=200, img_h=150):
+def _pdf(p, mediabox, conteudo, cropbox=None, img_w=200, img_h=150, herdada=False):
     """PDF de uma página com uma imagem RGB (o roteiro da issue)."""
     raw = bytearray()
     for y in range(img_h):
@@ -22,10 +22,11 @@ def _pdf(p, mediabox, conteudo, cropbox=None, img_w=200, img_h=150):
     img = zlib.compress(bytes(raw))
     cb = (b" /CropBox [" + b" ".join(str(v).encode() for v in cropbox) + b"]") if cropbox else b""
     c = conteudo.encode()
+    caixa = b" /MediaBox [" + b" ".join(str(v).encode() for v in mediabox) + b"]"
     objs = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [" + b" ".join(str(v).encode() for v in mediabox) + b"]" + cb
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1" + (caixa if herdada else b"") + b" >>",
+        b"<< /Type /Page /Parent 2 0 R" + (b"" if herdada else caixa) + cb
         + b" /Resources << /Font << /F1 5 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 4 0 R >>",
         b"<< /Length " + str(len(c)).encode() + b" >>\nstream\n" + c + b"\nendstream",
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
@@ -197,3 +198,78 @@ def test_barra_invertida_nao_abre_caminho_fora_nem_nome_repetido(tmp_path):
         zo.writestr("xl/workbook.xml", "<a/>")  # o mesmo nome, com / e com \
     with pytest.raises(DocumentoRecusado, match="repetida"):
         lince.ler(repetido)
+
+
+@pytest.mark.parametrize(
+    ("mediabox", "herdada"),
+    [([0, 792, 612, 0], False), ([-612, -792, 0, 0], True)],
+    ids=["mediabox-invertida", "mediabox-herdada-do-pages"],
+)
+def test_caixa_da_pagina_invertida_ou_herdada_le_a_imagem(tmp_path, mediabox, herdada):
+    x0, y0 = min(mediabox[0], mediabox[2]), min(mediabox[1], mediabox[3])
+    conteudo = (
+        f"BT /F1 12 Tf {x0 + 72} {y0 + 700} Td (Texto nativo visivel) Tj ET q 200 0 0 150 {x0 + 100} {y0 + 300} cm"
+    )
+    r = lince.Leitor().ler(_pdf(tmp_path / "f.pdf", mediabox, conteudo + " /Im1 Do Q", herdada=herdada))
+    assert "Texto nativo visivel" in r.markdown and len(_tarefas(r)) == 1
+
+
+def test_erro_no_recorte_desfaz_as_tarefas_e_o_cache_da_pagina(tmp_path, monkeypatch):
+    from PIL import Image
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+
+    from lince import pdf as pdf_mod
+
+    Image.new("RGB", (400, 300), "navy").save(tmp_path / "logo.png")
+    p = tmp_path / "logos.pdf"
+    c = canvas.Canvas(str(p), pagesize=A4)
+    for k in (1, 2):  # a mesma figura nas duas páginas: a 2ª seria "repetida" da 1ª
+        c.drawString(60, 780, f"Texto da página {k}.")
+        c.drawImage(str(tmp_path / "logo.png"), 60, 400, width=300, height=200)
+        c.showPage()
+    c.save()
+    original = pdf_mod._pagina
+
+    def recorte_falha_na_primeira(doc, i, *a, **k):
+        info, recorte = original(doc, i, *a, **k)
+        if i == 0 and recorte:
+            fator, recortar = recorte
+
+            def quebra(img):
+                recortar(img)  # as tarefas e o cache já foram gravados quando o erro vem
+                raise ValueError("falha depois do recorte")
+
+            recorte = (fator, quebra)
+        return info, recorte
+
+    monkeypatch.setattr(pdf_mod, "_pagina", recorte_falha_na_primeira)
+    pasta = tmp_path / "plano"
+    plano = lince.Leitor().planejar(p, pasta)
+    assert [t["id"] for t in plano["tarefas"]] == ["p002-r1"]  # nada da 1ª; a 2ª é lida, não "repetida"
+    assert plano["paginas"][0]["rota"] == "nativa" and not plano["paginas"][1]["regioes"][0].get("repetida")
+    assert any(x.startswith("página 1: só o texto") and "ValueError" in x for x in plano["pendentes"])
+
+
+def test_pdf_com_zip_anexado_continua_lido_como_pdf(tmp_path):
+    p = _pdf(tmp_path / "f.pdf", [0, 0, 612, 792], TEXTO)
+    anexo = io.BytesIO()
+    with zipfile.ZipFile(anexo, "w") as z:
+        z.writestr("xl\\workbook.xml", "<a/>")
+    p.write_bytes(p.read_bytes() + anexo.getvalue())  # poliglota: o fim do arquivo é um zip com \\ nos nomes
+    assert zipfile.is_zipfile(p)
+    assert "ABC-123" in lince.ler(p).markdown
+
+
+def test_barra_invertida_tambem_no_windows(tmp_path, monkeypatch):
+    """No Windows o zipfile já troca `\\` por `/` em `filename`; a cópia ainda é feita, porque o anydoc lê os bytes."""
+    invertido = _com_barras(_xlsx(), tmp_path / "invertido.xlsx")
+    monkeypatch.setattr(zipfile.os, "sep", "\\")  # como o zipfile se comporta no Windows ao ler os nomes
+    assert "/" in zipfile.ZipFile(invertido).namelist()[0]
+    monkeypatch.undo()
+    from lince.limites import com_barras_normais
+
+    monkeypatch.setattr(zipfile.os, "sep", "\\")
+    copia = com_barras_normais(str(invertido), str(tmp_path))
+    monkeypatch.undo()
+    assert copia != str(invertido) and not any("\\" in n for n in zipfile.ZipFile(copia).namelist())

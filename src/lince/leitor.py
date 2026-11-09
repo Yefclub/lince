@@ -102,8 +102,9 @@ class Leitor:
 
     def _planejar(self, caminho, pasta):
         os.makedirs(f"{pasta}/ia", exist_ok=True)
-        if zipfile.is_zipfile(caminho):  # conferido antes de descompactar; `\\` nos nomes vira `/` numa cópia
-            conferir_zip(caminho)
+        nome_diz = os.path.splitext(caminho)[1].lower()
+        if nome_diz not in (".pdf", *IMAGEM, *TEXTO, *HTML, *SVG) and zipfile.is_zipfile(caminho):
+            conferir_zip(caminho)  # o pacote, antes de descompactar; `\\` nos nomes internos vira `/` numa cópia
             caminho = com_barras_normais(caminho, pasta)
         ext = _extensao_lida(caminho)
         if ext == ".pdf":  # a trava da PDFium vai em vezes curtas: Office, HTML, texto e outros PDFs seguem em paralelo

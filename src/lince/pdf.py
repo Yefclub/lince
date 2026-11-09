@@ -505,15 +505,23 @@ def pagina_visivel(doc, i):
 def _caixa_visivel(page):
     """A caixa visível da página, como o pdf_inspector mede as posições: CropBox ∩ MediaBox, ou a MediaBox quando a
     CropBox não a sobrepõe (ela é ignorada). Devolve a caixa e se a CropBox valeu."""
-    ml, mb, mr, mt = page.get_mediabox()
-    cl, cb, cr, ct = page.get_cropbox()
+    ml, mb, mr, mt = _normal(page.get_mediabox())
+    cl, cb, cr, ct = _normal(page.get_cropbox())
     l, b, r, t = max(ml, cl), max(mb, cb), min(mr, cr), min(mt, ct)
     return ((l, b, r, t), True) if l < r and b < t else ((ml, mb, mr, mt), False)
 
 
+def _normal(caixa):
+    """(l, b, r, t) da caixa gravada com os dois cantos opostos em qualquer ordem, como o PDF permite."""
+    x0, y0, x1, y1 = caixa
+    return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
+
+
 def _origem_visivel(page):
-    """Canto inferior esquerdo da caixa visível, a origem das posições do pdf_inspector."""
-    (l, b, _r, _t), _ = _caixa_visivel(page)
+    """Canto inferior esquerdo da caixa visível, a origem das posições do pdf_inspector e da página renderizada. Chamar
+    depois de `pagina_visivel`. Vem da PDFium (`get_bbox`), que normaliza a caixa e a herda do nó /Pages, como na
+    renderização: as caixas gravadas na página, lidas cruas, não trazem a herança."""
+    l, b, _r, _t = page.get_bbox()
     return l, b
 
 
