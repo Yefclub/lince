@@ -13,9 +13,9 @@ from xml.etree import ElementTree as ET  # noqa: F401
 from lxml import etree
 
 from . import legados, perfil_tabular
-from .limites import xml_ou_nada
+from .limites import DocumentoRecusado, xml_ou_nada
 from .metadados import BINARIOS_OLE, ERROS_DE_PARTE, ODF
-from .seguranca import NAO_CONFERIDO, XMLIlegivel, _xml, remover_ocultos, texto_oculto_docx, texto_oculto_pptx
+from .seguranca import NAO_CONFERIDO, XMLIlegivel, _xml, fora_da_conferencia, limpar_docx, limpar_pptx
 
 NS = {
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
@@ -341,21 +341,29 @@ def planejar_office(path, pasta, ext=None):
     grande = ext in (".xlsx", ".xlsm") and _celulas_declaradas(path) > _CELULAS_ANYDOC_MAX
     # planilha grande não passa pelo anydoc, que monta o documento inteiro na memória (1,2 GB para 100 mil linhas)
     marca = f"LINCE{secrets.token_hex(8)}D"  # início de cada slide, trocado por <!-- slide N --> depois da leitura
+    limpeza = None  # o texto oculto sai do próprio XML, antes da conversão: nunca por busca no Markdown montado
     if grande:
         doc = None
     else:
         dados = open(path, "rb").read()
+        # a limpeza segue o formato que o anydoc vai ler, pelo conteúdo (um Word gravado como .doc, ou uma apresentação
+        # como .docx, é conferido), e o anydoc recebe esse formato explícito
+        formato = "csv" if ext in (".csv", ".tsv") else anydoc.format_from_bytes(dados)
+        if formato == "docx":
+            dados = (limpeza := limpar_docx(dados)).dados
+        elif formato == "pptx":
+            dados = (limpeza := limpar_pptx(dados)).dados
         if ext in PPTX:
             dados = _com_marcas_de_slide(dados, marca)
         try:
-            doc = anydoc.to_document(dados, format="csv" if ext in (".csv", ".tsv") else None)
+            doc = anydoc.to_document(dados, format=formato if formato in ("csv", "docx", "pptx") else None)
         except anydoc.ConvertError as recusa:
             if ext != ".xlsb":
                 raise
             doc = None  # .xlsb fora da especificação (gravadores antigos): lido registro a registro
             try:
                 md_xlsb = _xlsb_tolerante(path, ilegiveis_xlsb := [])
-            except MemoryError:
+            except (MemoryError, DocumentoRecusado):  # o teto do leitor tolerante diz o motivo a quem chama
                 raise
             except Exception:  # noqa: BLE001 — o leitor tolerante também não abre: vale o erro do leitor do corpo
                 raise recusa from None
@@ -389,6 +397,10 @@ def planejar_office(path, pasta, ext=None):
     else:
         md = serializar(doc, ler_imagem)[0]
         perfis = _perfis(doc) if ext in PLANILHAS else []
+        if limpeza is not None:  # a rede de segurança: o que o anydoc leu e a conferência não viu é falha
+            lido = re.sub(rf"{marca}\d+X", " ", texto_lido(doc))
+            if falha := fora_da_conferencia(limpeza.vistas, lido):
+                limpeza.falhas.append(falha)
         if ext in PPTX:  # o texto do slide que imita a marca não vira marca: só a do Lince numera os slides
             md = re.sub(r"(?m)^(<!-- slide \d+ -->)$", r"\\\1", md)
             md = re.sub(rf"(?m)^{marca}(\d+)X$", r"<!-- slide \1 -->", md)
@@ -427,17 +439,11 @@ def planejar_office(path, pasta, ext=None):
 
         _complemento(imagens_bordas, "imagens do cabeçalho e do rodapé", ilegiveis)
     seguranca = []
-    conferir = texto_oculto_docx if ext in (".docx", ".docm") else texto_oculto_pptx if ext in PPTX else None
-    if conferir:
-        try:
-            ocultos = conferir(path)
-        except MemoryError:
-            raise
-        except Exception:  # noqa: BLE001 — XML hostil, parte cifrada ou CRC errado: não conferido é suspeita, vira alerta
-            ocultos = []
-            seguranca.append({"tecnicas": ["não conferido"], "texto": "", "alerta": NAO_CONFERIDO})
-        if ocultos:
-            md, _ = remover_ocultos(md, ocultos)
+    if limpeza is not None:
+        for falha in limpeza.falhas:  # parte que não pôde ser conferida: suspeita, com a parte e o motivo à vista
+            pendentes.append(f"{NAO_CONFERIDO}: {falha}")
+            seguranca.append({"tecnicas": ["não conferido"], "texto": "", "alerta": f"{NAO_CONFERIDO}: {falha}"})
+        if ocultos := limpeza.ocultos:
             seguranca.append(
                 {"tecnicas": sorted({m for m, _ in ocultos}), "texto": " ".join(t for _, t in ocultos)[:500]}
             )
@@ -488,7 +494,7 @@ def planejar_office(path, pasta, ext=None):
         por_slide = {}  # n -> o que entra no fim do slide (ou logo depois da tabela do gráfico)
 
         def diagramas():
-            for n, arestas in fluxos_pptx(path).items():
+            for n, arestas in fluxos_pptx(io.BytesIO(limpeza.dados)).items():  # o rótulo oculto não vira aresta
                 por_slide.setdefault(n, []).append(
                     (
                         None,
@@ -877,8 +883,9 @@ def _slides_pptx(z, nomes) -> list[str]:
     except (KeyError, XMLIlegivel):
         return []
     rels = _alvos(z, "ppt/presentation.xml", nomes)
-    lista = raiz.find(f"{_P}sldIdLst")
-    return [rels[s.get(f"{_REL}id")] for s in (lista if lista is not None else []) if s.get(f"{_REL}id") in rels]
+    lista = next(raiz.iter(f"{_P}sldIdLst"), None)  # o primeiro, em qualquer profundidade, como o anydoc acha
+    ids = lista.iterfind(f"{_P}sldId") if lista is not None else ()
+    return [rels[s.get(f"{_REL}id")] for s in ids if s.get(f"{_REL}id") in rels]
 
 
 def _com_marcas_de_slide(dados: bytes, marca: str) -> bytes:
@@ -1033,6 +1040,54 @@ def _tam(data):
         return Image.open(io.BytesIO(data)).size
     except Exception:  # noqa: BLE001 — formato que o Pillow não abre conta como imagem grande (não é descartada)
         return (999, 999)
+
+
+# comandos e ambientes que o anydoc escreve na fórmula (shared/math/tex.rs), e o símbolo que ele escreve com uma
+# palavra dentro (≝)
+_TEX = re.compile(r"\\overset\{\\mathrm\{def\}\}|\\(?:begin|end)\{[^}]*\}|\\[A-Za-z]+")
+
+
+def texto_lido(doc) -> str:
+    """O texto que o anydoc extraiu do documento, para a rede de segurança da limpeza: o texto dos parágrafos,
+    títulos, listas, tabelas, citações e notas, e o da fórmula sem os comandos do TeX. O texto alternativo das imagens
+    fica de fora (a conferência não o confere: não tem como ser escondido por estilo), e o que o Lince acrescenta
+    (marcas de imagem e de slide) não está no documento do anydoc."""
+    out = []
+
+    def inl(xs):
+        for x in xs or []:
+            if x.kind == "text":
+                out.append(x.text or "")
+            elif x.kind == "link":
+                inl(x.content)
+            elif x.kind == "math":
+                out.append(f" {_TEX.sub(' ', x.text or '')} ")
+            else:  # imagem, quebra, âncora, nota, caixa: separam o texto
+                out.append(" ")
+
+    def blocos(bs):
+        for b in bs or []:
+            if b.kind in ("heading", "paragraph"):
+                inl(b.content)
+            elif b.kind == "list":
+                for it in b.list.items:
+                    blocos(it.blocks)
+            elif b.kind == "table":
+                for linha in b.table.grid:
+                    for s in linha:
+                        if s.kind == "origin" and s.cell:
+                            blocos(s.cell.blocks)
+                            out.append("\n")
+            elif b.kind == "block_quote":
+                blocos(b.blocks)
+            elif b.kind in ("code_block", "math"):
+                out.append(_TEX.sub(" ", b.text or "") if b.kind == "math" else b.text or "")
+            out.append("\n")
+
+    blocos(doc.blocks)
+    for nota in doc.notes:
+        blocos(nota.blocks)
+    return "".join(out)
 
 
 def serializar(doc, ler_imagem):
