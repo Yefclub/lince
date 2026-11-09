@@ -16,6 +16,7 @@ e `NOTICE-Apache-Tika.txt`). Arquivos tirados dos conjuntos de teste públicos d
 | `poi_SimpleWithImages.xls` | apache/poi `test-data/spreadsheet/SimpleWithImages.xls` |
 | `poi_pictures.ppt` | apache/poi `test-data/slideshow/pictures.ppt` |
 | `poi_WithTwoCharts.xls` | apache/poi `test-data/spreadsheet/WithTwoCharts.xls` |
+| `poi_Password_Protected-hello.ppt` | apache/poi `test-data/slideshow/Password_Protected-hello.ppt` (PowerPoint com senha `hello`, RC4 CryptoAPI; não modificado: a troca de bytes quebraria a cifra, e o conteúdo é só texto de teste do próprio POI) |
 | `poi_SampleShow.pptx`, `poi_SampleShow.ppt`, `poi_SimpleMacro.pptm`, `poi_SimpleMacro.ppt`, `poi_headers_footers.ppt`, `poi_slide_master.ppt` | apache/poi `test-data/slideshow/` (mesmo nome, sem o prefixo `poi_`) |
 | `test*.*` (PDF, Word, Excel, PowerPoint, ODF, RTF, EPUB, HTML, SVG, CSV, imagens) | apache/tika, pastas `test-documents/` dos módulos de parser, mesmo nome |
 
@@ -64,3 +65,9 @@ montada com openpyxl e convertida pelo LibreOffice. Sem dado de pessoa ou empres
 
 `lince_grafico.xls`: a mesma planilha de `lince_grafico.ods` (dados fictícios e gráfico "Vendas por região"),
 convertida para Excel 97-2003 pelo LibreOffice.
+
+`lince_protegido.odt`, `lince_protegido.ods`, `lince_protegido.doc` e `lince_protegido.xls`: um texto fictício
+("Relatório protegido do Lince: a leitura só sai com a senha.", e na planilha com o valor 42) gravado com a senha
+`Girafa-Azul-26` pelo LibreOffice 24.2, com perfil de usuário vazio (sem autor). O ODF sai cifrado no padrão ODF 1.2
+(AES-256-CBC, PBKDF2 com 100 mil voltas sobre o SHA-256 da senha); o `.doc` e o `.xls`, em RC4 (Office 97). Servem
+para provar a detecção e a decifração com arquivos de um programa de verdade, o que não dá para gerar dentro do teste.
