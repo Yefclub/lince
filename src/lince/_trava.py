@@ -24,31 +24,34 @@ class TravaJusta:
 
     def acquire(self, blocking=True, timeout=-1):
         eu = threading.get_ident()
-        with self._estado:
-            if self._dono == eu:
-                self._nivel += 1
-                return True
-            if self._dono is None and not self._fila:
-                self._dono, self._nivel = eu, 1
-                return True
-            if not blocking:
-                return False
-            vez = (eu, threading.Event())
-            self._fila.append(vez)
+        ja_era, nivel, vez = self._dono == eu, self._nivel, None  # só esta thread muda o nível da trava que é dela
         try:
-            vez[1].wait(None if timeout is None or timeout < 0 else timeout)
-        except BaseException:  # interrompida na espera (KeyboardInterrupt, alarme): nunca deixa a trava presa
             with self._estado:
-                if self._dono == eu:  # a vez chegou junto com a interrupção: passa para o próximo
+                if ja_era:
+                    self._nivel += 1
+                    return True
+                if self._dono is None and not self._fila:
+                    self._dono, self._nivel = eu, 1
+                    return True
+                if not blocking:
+                    return False
+                vez = (eu, threading.Event())
+                self._fila.append(vez)
+            vez[1].wait(None if timeout is None or timeout < 0 else timeout)
+            with self._estado:
+                if self._dono == eu:  # recebeu a trava, mesmo que no limite do timeout
+                    return True
+                self._fila.remove(vez)
+                return False
+        except BaseException:  # interrompida (KeyboardInterrupt, alarme) em qualquer ponto: nunca deixa a trava presa
+            with self._estado:
+                if ja_era:  # devolve só o nível que esta chamada somou
+                    self._nivel = nivel
+                elif self._dono == eu:  # a vez chegou junto com a interrupção: passa para o próximo
                     self._passar()
-                else:
+                elif vez in self._fila:
                     self._fila.remove(vez)
             raise
-        with self._estado:
-            if self._dono == eu:  # recebeu a trava, mesmo que no limite do timeout
-                return True
-            self._fila.remove(vez)
-            return False
 
     def release(self):
         with self._estado:
@@ -67,9 +70,9 @@ class TravaJusta:
         else:
             self._dono, self._nivel = None, 0
 
-    def __enter__(self):
-        self.acquire()
-        return self
+    # Como em `threading.Lock`, a entrada do `with` é a própria `acquire`: nenhuma interrupção cai entre pegar a trava
+    # e o `with` saber que precisa soltá-la.
+    __enter__ = acquire
 
     def __exit__(self, *_):
         self.release()
