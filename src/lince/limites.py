@@ -26,6 +26,10 @@ RAZAO_A_PARTIR = 1024 * 1024  # XML pequeno e repetitivo comprime muito e é leg
 # token pode ter o seu na LINCE_TOKENS (`nome:token:teto`).
 RETIDOS_POR_TOKEN = 1024 * 1024 * 1024
 LADO_MAX_PX = 10_000  # renderização de página de PDF: MediaBox gigante não vira imagem de gigabytes
+# Processos da fase 1 do PDF (paralelo.py), no máximo: um por CPU disponível até este teto. Cada processo tem o
+# documento aberto e uma página renderizada por vez (~100 a ~300 MB numa página pesada): 8 cabem em ~2,5 GB, e acima
+# disso a fase 1 de um documento passa a esperar mais o pdf_inspector de cada faixa (em série) do que as páginas.
+PROCESSOS_PDF_MAX = 8
 Image.MAX_IMAGE_PIXELS = 40_000_000  # o Pillow recusa acima do dobro (80 Mpx, ~240 MB em RGB)
 
 # expat < 2.4.1 é vulnerável a expansão exponencial de entidades ("billion laughs"); xml.etree usa o expat do sistema

@@ -1,28 +1,38 @@
 """PDF: texto nativo por página, regiões visuais (raster e vetor), tabela duvidosa e roteamento."""
 
+import contextvars
 import ctypes
 import hashlib  # noqa: F401
 import io
 import json  # noqa: F401
+import logging
 import math
 import os  # noqa: F401
 import re  # noqa: F401
 import threading
 import time
 import zipfile  # noqa: F401
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
+from concurrent.futures.process import BrokenProcessPool
+from pathlib import Path
+from types import SimpleNamespace
 from xml.etree import ElementTree as ET  # noqa: F401
 
 import pypdfium2 as pdfium
 import pypdfium2.raw as c  # noqa: F401
 
-from ._prazo import prazo_restante
+from . import paralelo
+from ._prazo import LIMITE, prazo_restante
 from ._trava import PDFIUM
 from .limites import escala
 from .seguranca import NAO_CONFERIDO, texto_oculto_pdf
 from .texto import densidade_matematica, desifenizar, limpar_tabelas, lixo
 
 PROMPT_VERSAO = "leitura-ia-v1"
+log = logging.getLogger("lince")
+# Quem é o documento na linha de log da fase 1 (o servidor põe a sessão e o documento), nunca o nome do arquivo.
+ROTULO: contextvars.ContextVar[str] = contextvars.ContextVar("lince_rotulo_pdf", default="")
+ETAPAS = ("abrir", "inspecionar", "coletar", "regioes", "renderizar", "recortar")
 # Teto da análise visual (desenho da página, figuras, texto oculto) por documento: medido em ~15 ms por página de
 # texto, 2000 páginas cabem em ~30 s. Acima dele, e depois do prazo do documento, a página entra só com o texto.
 PAGINAS_ANALISE_MAX = 2000
@@ -136,6 +146,11 @@ def regioes_vetoriais(objs, W, H):
 def planejar_pdf(path, pasta):
     """Lê o PDF em faixas de páginas, com o prazo conferido entre elas e os tetos valendo antes da leitura.
 
+    Com o pool de processos ligado (`paralelo.ativar`), o pdf_inspector de cada faixa e cada página (coleta, análise,
+    renderização e recortes) vão para os processos, um trabalho por página; o processo principal junta as páginas na
+    ordem delas e tira as imagens repetidas entre páginas, e o plano sai igual ao da leitura em série
+    (`_em_processos`). Sem o pool, a leitura é em série, neste processo:
+
     A PDFium só é usada com a trava, tomada por pouco tempo e solta entre as vezes (`VEZ_S`): um PDF que chega
     durante a leitura de um grande entra na próxima vez. Com a trava só rodam chamadas à PDFium; cada página passa por
     fases: a coleta (objetos, fundo renderizado, texto pela PDFium; `_coleta`, com a trava), a análise e a decisão da
@@ -144,8 +159,13 @@ def planejar_pdf(path, pasta):
     lê a contagem de páginas, as propriedades e a cópia da primeira faixa (abrir um PDF com a tabela de referências
     danificada a reconstrói, e isso não pode se repetir a cada vez), e fechado dentro da trava, mesmo com exceção: o
     finalizador dele (e o das páginas) não pode rodar fora dela, em paralelo com outro PDF. O pdf_inspector não usa a
-    PDFium e roda fora da trava, sobre as cópias."""
+    PDFium e roda fora da trava, sobre as cópias.
+
+    O tempo de cada etapa (abrir, inspecionar, coletar, regiões, renderizar, recortar; nos processos, a soma deles)
+    vai para o log `lince`."""
     inicio = time.monotonic()
+    etapas = defaultdict(float)
+    distribuidor = paralelo.pool()
     doc = None
     try:
         with PDFIUM:
@@ -157,89 +177,90 @@ def planejar_pdf(path, pasta):
             total = len(doc)
             propriedades = _propriedades(doc)
             lidas = min(total, PAGINAS_TEXTO_MAX)
-            vez = _vez_da_faixa(doc, range(min(FAIXA, lidas)), fim) if lidas else None  # na mesma vez
-        paginas, tarefas, cache, seguranca, pendentes = [], [], {}, [], []
-        so_texto, nao_lidas = [], []  # [início, fim, motivo]: páginas só com o texto e páginas não lidas
-        parada = None  # a primeira página que a PDFium não abre
-        for a in range(0, lidas, FAIXA):
-            # a primeira faixa sempre entra: o documento nunca sai sem texto por causa do prazo
-            resta = prazo_restante()
-            if a and resta is not None and resta <= RESERVA_MONTAGEM * (time.monotonic() - inicio):
-                _marcar(nao_lidas, a, lidas, "prazo esgotado")
-                break
-            faixa = range(a, min(a + FAIXA, lidas))
-            if a:
-                with PDFIUM:
-                    vez = _vez_da_faixa(doc, faixa, time.monotonic() + VEZ_S)
-            (dados, abertas), coletas = vez
-            md_de, ocr, itens_de = _extrair(dados, a)  # o pdf_inspector, fora da trava
-            fila = faixa[:abertas]
-            if abertas < len(faixa):
-                parada = faixa[abertas]
-            k = 0
-            while k < len(fila):
-                i = fila[k]
-                if motivo := _so_texto(i):  # a análise não começa depois do prazo, mesmo com a página já coletada
-                    coletas.clear()  # as seguintes também entram só com o texto
-                    _marcar(so_texto, i, i + 1, motivo)
-                    paginas.append(_so_o_texto(i, md_de.get(i, "")))
-                    k += 1
-                    continue
-                if not coletas:
-                    with PDFIUM:  # a vez: a coleta desta página e das seguintes, até o fim da vez
-                        coletas = _coletas(doc, fila[k:], time.monotonic() + VEZ_S)
-                col = coletas.popleft()
-                if col is None:  # a página não abre: a leitura para nela
-                    parada, fila = i, fila[:k]
+            etapas["abrir"] += time.monotonic() - inicio
+            if distribuidor is not None:  # cada processo abre o dele
+                doc.close()
+                doc = None
+            elif lidas:  # na mesma vez
+                vez = _vez_da_faixa(doc, range(min(FAIXA, lidas)), fim, etapas)
+        if distribuidor is not None:
+            paginas, tarefas, seguranca, pendentes, so_texto, nao_lidas = _em_processos(
+                distribuidor, path, pasta, total, lidas, inicio, etapas
+            )
+        else:
+            paginas, tarefas, cache, seguranca, pendentes = [], [], {}, [], []
+            so_texto, nao_lidas = [], []  # [início, fim, motivo]: páginas só com o texto e páginas não lidas
+            parada = None  # a primeira página que a PDFium não abre
+            for a in range(0, lidas, FAIXA):
+                # a primeira faixa sempre entra: o documento nunca sai sem texto por causa do prazo
+                resta = prazo_restante()
+                if a and resta is not None and resta <= RESERVA_MONTAGEM * (time.monotonic() - inicio):
+                    _marcar(nao_lidas, a, lidas, "prazo esgotado")
                     break
-                if col == PESADA:
-                    _marcar(so_texto, i, i + 1, PESADA)
-                    paginas.append(_so_o_texto(i, md_de.get(i, "")))
-                    recorte = None
-                else:
-                    marcas = len(seguranca), len(pendentes)  # tarefas e cache só mudam em `recortar`, depois
-                    _ANALISE.fim = time.thread_time() + ANALISE_PAGINA_S
-                    try:
-                        info, recorte = _pagina(doc, i, col, md_de.get(i, ""), i in ocr, itens_de.get(i, []), pasta,
-                                                tarefas, cache, seguranca, pendentes)  # fmt: skip
-                    except _AnaliseLonga:  # a página não deixa rastro: entra só com o texto, como no teto
-                        del seguranca[marcas[0] :], pendentes[marcas[1] :]
-                        info, recorte = _so_o_texto(i, md_de.get(i, "")), None
-                        _marcar(so_texto, i, i + 1, f"análise da página passou de {ANALISE_PAGINA_S:g} s")
-                    except MemoryError:
-                        raise
-                    except Exception as e:  # noqa: BLE001 — uma página com defeito não derruba o documento
-                        del seguranca[marcas[0] :], pendentes[marcas[1] :]
-                        info, recorte = _so_o_texto(i, md_de.get(i, "")), None
-                        _marcar(so_texto, i, i + 1, _erro_da_pagina(e))
-                    finally:
-                        _ANALISE.fim = None
-                    paginas.append(info)
-                k += 1
-                ultima = k == len(fila) and (parada is not None or faixa[-1] + 1 == lidas)
-                if recorte or ultima:
+                faixa = range(a, min(a + FAIXA, lidas))
+                if a:
                     with PDFIUM:
-                        img = _renderizar(doc, i, recorte[0]) if recorte else None
-                        if ultima:
-                            doc.close()  # na mesma vez: um PDF curto pega a trava só duas vezes
-                            doc = None
+                        vez = _vez_da_faixa(doc, faixa, time.monotonic() + VEZ_S, etapas)
+                (dados, abertas), coletas = vez
+                t = time.monotonic()
+                md_de, ocr, itens_de = _extrair(dados, a)  # o pdf_inspector, fora da trava
+                etapas["inspecionar"] += time.monotonic() - t
+                fila = faixa[:abertas]
+                if abertas < len(faixa):
+                    parada = faixa[abertas]
+                k = 0
+                while k < len(fila):
+                    i = fila[k]
+                    if motivo := _so_texto(i):  # a análise não começa depois do prazo, mesmo com a página já coletada
+                        coletas.clear()  # as seguintes também entram só com o texto
+                        _marcar(so_texto, i, i + 1, motivo)
+                        paginas.append(_so_o_texto(i, md_de.get(i, "")))
+                        k += 1
+                        continue
+                    if not coletas:
+                        t = time.monotonic()
+                        with PDFIUM:  # a vez: a coleta desta página e das seguintes, até o fim da vez
+                            coletas = _coletas(doc, fila[k:], time.monotonic() + VEZ_S)
+                        etapas["coletar"] += time.monotonic() - t
+                    col = coletas.popleft()
+                    if col is None:  # a página não abre: a leitura para nela
+                        parada, fila = i, fila[:k]
+                        break
+                    if col == PESADA:
+                        _marcar(so_texto, i, i + 1, PESADA)
+                        paginas.append(_so_o_texto(i, md_de.get(i, "")))
+                        recorte = None
+                    else:
+                        marcas = len(seguranca), len(pendentes)  # tarefas e cache só mudam em `recortar`, depois
+                        t = time.monotonic()
+                        info, recorte, motivo = _analisar(doc, i, col, md_de.get(i, ""), i in ocr, itens_de.get(i, []),
+                                                          pasta, tarefas, cache, seguranca, pendentes)  # fmt: skip
+                        etapas["regioes"] += time.monotonic() - t
+                        if motivo:
+                            _marcar(so_texto, i, i + 1, motivo)
+                        paginas.append(info)
+                    k += 1
+                    ultima = k == len(fila) and (parada is not None or faixa[-1] + 1 == lidas)
+                    if recorte or ultima:
+                        t = time.monotonic()
+                        with PDFIUM:
+                            img = _renderizar(doc, i, recorte[0]) if recorte else None
+                            if ultima:
+                                doc.close()  # na mesma vez: um PDF curto pega a trava só duas vezes
+                                doc = None
+                        etapas["renderizar"] += time.monotonic() - t
                     if recorte:
-                        feitas, vistas = len(tarefas), set(cache)
-                        try:
-                            recorte[1](img)  # os recortes e os arquivos, fora da trava, antes da próxima página
-                        except MemoryError:
-                            raise
-                        except Exception as e:  # noqa: BLE001 — a página sai só com o texto, sem rastro do recorte
-                            del tarefas[feitas:], seguranca[marcas[0] :], pendentes[marcas[1] :]
-                            for chave in set(cache) - vistas:
-                                del cache[chave]
+                        t = time.monotonic()
+                        # os recortes e os arquivos, fora da trava, antes da próxima página
+                        if motivo := _aplicar_recorte(recorte, img, tarefas, cache, seguranca, pendentes, marcas):
                             paginas[-1] = _so_o_texto(i, md_de.get(i, ""))
-                            _marcar(so_texto, i, i + 1, _erro_da_pagina(e))
-            if parada is not None:
-                _marcar(nao_lidas, parada, total, f"a página {parada + 1} não abre")
-                break
-        if parada is None:
-            _marcar(nao_lidas, lidas, total, f"teto de {PAGINAS_TEXTO_MAX} páginas de texto")
+                            _marcar(so_texto, i, i + 1, motivo)
+                        etapas["recortar"] += time.monotonic() - t
+                if parada is not None:
+                    _marcar(nao_lidas, parada, total, f"a página {parada + 1} não abre")
+                    break
+            if parada is None:
+                _marcar(nao_lidas, lidas, total, f"teto de {PAGINAS_TEXTO_MAX} páginas de texto")
     finally:
         if doc is not None:
             with PDFIUM:
@@ -254,7 +275,234 @@ def planejar_pdf(path, pasta):
              "pendentes": pendentes}  # fmt: skip
     if propriedades:
         plano["propriedades"] = propriedades
+    _registrar(etapas, total, len(tarefas), time.monotonic() - inicio, distribuidor)
     return plano
+
+
+def _registrar(etapas, paginas, tarefas, duracao, distribuidor):
+    """Uma linha no log `lince` com o tempo da fase 1 e de cada etapa, para quem opera ver onde vai o tempo."""
+    onde = f"{distribuidor.processos} processos" if distribuidor is not None else "em série"
+    partes = ", ".join(f"{nome} {etapas[nome]:.2f} s" for nome in ETAPAS if etapas.get(nome))
+    log.info("fase 1 do PDF%s: %d páginas, %d tarefas em %.2f s (%s; %s)", ROTULO.get(), paginas, tarefas, duracao,
+             onde, partes)  # fmt: skip
+
+
+def _analisar(doc, i, col, md, eh_ocr, itens, pasta, tarefas, cache, seguranca, pendentes):
+    """A análise da página coletada (`_pagina`), com o teto de tempo dela: (página, recorte, motivo). Com motivo (a
+    análise passou de ANALISE_PAGINA_S ou deu erro), a página entra só com o texto e não deixa rastro."""
+    marcas = len(seguranca), len(pendentes)
+    _ANALISE.fim = time.thread_time() + ANALISE_PAGINA_S
+    try:
+        info, recorte = _pagina(doc, i, col, md, eh_ocr, itens, pasta, tarefas, cache, seguranca, pendentes)
+        return info, recorte, None
+    except _AnaliseLonga:
+        motivo = f"análise da página passou de {ANALISE_PAGINA_S:g} s"
+    except MemoryError:
+        raise
+    except Exception as e:  # noqa: BLE001 — uma página com defeito não derruba o documento
+        motivo = _erro_da_pagina(e)
+    finally:
+        _ANALISE.fim = None
+    del seguranca[marcas[0] :], pendentes[marcas[1] :]
+    return _so_o_texto(i, md), None, motivo
+
+
+def _aplicar_recorte(recorte, img, tarefas, cache, seguranca, pendentes, marcas):
+    """Os recortes, os arquivos e as tarefas da página (`recortar` de `_pagina`), fora da trava. Com erro, a página
+    não deixa rastro (`marcas`: o tamanho de `seguranca` e `pendentes` antes da análise dela) e volta o motivo."""
+    feitas, vistas = len(tarefas), set(cache)
+    try:
+        recorte[1](img)
+    except MemoryError:
+        raise
+    except Exception as e:  # noqa: BLE001 — a página sai só com o texto, sem rastro do recorte
+        del tarefas[feitas:], seguranca[marcas[0] :], pendentes[marcas[1] :]
+        for chave in set(cache) - vistas:
+            del cache[chave]
+        return _erro_da_pagina(e)
+    return None
+
+
+# ------------------------------------------------------------------ nos processos (paralelo.py)
+def _em_processos(distribuidor, path, pasta, total, lidas, inicio, etapas):
+    """A leitura em série de `planejar_pdf`, com as faixas e as páginas nos processos. O pdf_inspector das faixas
+    seguintes roda junto com as páginas desta. O processo principal só junta: as páginas na ordem delas, e a imagem que
+    já saiu numa página anterior vira repetida, como na leitura em série (cada processo só vê a página dele). Se um
+    processo morre no meio (o pool quebra), o documento é lido de novo no pool renovado, uma vez."""
+    for tentativa in (1, 2):
+        try:
+            return _distribuir(distribuidor, path, pasta, total, lidas, inicio, etapas)
+        except BrokenProcessPool:
+            if tentativa == 2:
+                raise RuntimeError("os processos de leitura do PDF caíram duas vezes neste documento") from None
+    raise AssertionError  # inalcançável
+
+
+def _distribuir(distribuidor, path, pasta, total, lidas, inicio, etapas):
+    dono, limite = object(), LIMITE.get()
+    paginas, tarefas, cache, seguranca, pendentes, so_texto, nao_lidas = [], [], {}, [], [], [], []
+    parada, faixas, seguinte = None, deque(), 0
+
+    def adiantar():
+        """O pdf_inspector das próximas faixas, até uma por processo à frente: ele é a parte em série de cada faixa."""
+        nonlocal seguinte
+        while seguinte < lidas and len(faixas) < distribuidor.processos:
+            fim = min(seguinte + FAIXA, lidas)
+            faixas.append((seguinte, distribuidor.submeter(dono, _faixa_no_processo, path, seguinte, fim)))
+            seguinte = fim
+
+    try:
+        adiantar()
+        while faixas:
+            a, inspecao = faixas.popleft()
+            # a primeira faixa sempre entra; as outras, só se o que resta do prazo cobre a montagem, como em série
+            resta = prazo_restante()
+            if a and resta is not None and resta <= RESERVA_MONTAGEM * (time.monotonic() - inicio):
+                _marcar(nao_lidas, a, lidas, "prazo esgotado")
+                break
+            abertas, md_de, ocr, itens_de, gastos = inspecao.result()
+            _somar(etapas, gastos)
+            faixa = range(a, min(a + FAIXA, lidas))
+            if abertas < len(faixa):
+                parada = faixa[abertas]
+            trabalhos = [
+                distribuidor.submeter(
+                    dono, _pagina_no_processo, path, i, md_de.get(i, ""), i in ocr, itens_de.get(i, []), pasta, limite
+                )  # fmt: skip
+                for i in faixa[:abertas]
+            ]
+            if parada is None:
+                adiantar()
+            for trabalho in trabalhos:
+                r = trabalho.result()
+                _somar(etapas, r["etapas"])
+                if r.get("parada"):  # a página não abre: a leitura para nela
+                    parada = r["i"]
+                    break
+                _juntar(r, pasta, paginas, tarefas, cache, seguranca, pendentes, so_texto)
+            if parada is not None:
+                _marcar(nao_lidas, parada, total, f"a página {parada + 1} não abre")
+                break
+        if parada is None:
+            _marcar(nao_lidas, lidas, total, f"teto de {PAGINAS_TEXTO_MAX} páginas de texto")
+    finally:
+        distribuidor.cancelar(dono)
+    return paginas, tarefas, seguranca, pendentes, so_texto, nao_lidas
+
+
+def _juntar(r, pasta, paginas, tarefas, cache, seguranca, pendentes, so_texto):
+    """A página `r` (de `_pagina_no_processo`) no plano. A imagem que já saiu numa página anterior (o mesmo recorte,
+    pelo hash) vira repetida dela, e o arquivo dela sai: na leitura em série, ela nem seria gravada."""
+    i, info = r["i"], r["info"]
+    paginas.append(info)
+    if motivo := r.get("motivo"):
+        _marcar(so_texto, i, i + 1, motivo)
+        return
+    seguranca += r["seguranca"]
+    pendentes += r["pendentes"]
+    trocas = {}
+    for t in r["tarefas"]:
+        chave = r["chaves"].get(t["id"])
+        if chave is not None and chave in cache:
+            trocas[t["id"]] = cache[chave]
+            Path(f"{pasta}/ia/{t['id']}.png").unlink(missing_ok=True)
+            continue
+        if chave is not None:
+            cache[chave] = t["id"]
+        tarefas.append(t)
+    if trocas:
+        info["regioes"] = [
+            {"tarefa": trocas[x["tarefa"]], "depois_de": "", "texto_dentro": "", "repetida": True}
+            if x["tarefa"] in trocas
+            else x
+            for x in info["regioes"]
+        ]
+
+
+def _somar(etapas, gastos):
+    for nome, s in gastos.items():
+        etapas[nome] += s
+
+
+# Documentos abertos em cada processo do pool, os usados por último no fim: as páginas de um documento chegam ao
+# mesmo processo em sequência, e abrir de novo a cada página reconstruiria a tabela de referências danificada.
+_DOCS: OrderedDict = OrderedDict()
+DOCS_ABERTOS = 2
+
+
+def _doc_do_processo(caminho):
+    st = os.stat(caminho)
+    chave = (caminho, st.st_mtime_ns, st.st_size)
+    doc = _DOCS.pop(chave, None)
+    if doc is None:
+        while len(_DOCS) >= DOCS_ABERTOS:
+            _DOCS.popitem(last=False)[1].close()
+        doc = pdfium.PdfDocument(caminho)
+    _DOCS[chave] = doc
+    return doc
+
+
+def _faixa_no_processo(caminho, a, b):
+    """No processo: a cópia das páginas [a, b) e o pdf_inspector sobre ela (`_vez_da_faixa` e `_extrair`). Os itens do
+    pdf_inspector vão como atributos simples: o TextItem dele não passa de um processo para outro."""
+    gastos = {}
+    t = time.monotonic()
+    doc = _doc_do_processo(caminho)
+    gastos["abrir"] = time.monotonic() - t
+    t = time.monotonic()
+    with PDFIUM:
+        dados, abertas = _copia_da_faixa(doc, range(a, b))
+    md_de, ocr, itens_de = _extrair(dados, a)
+    gastos["inspecionar"] = time.monotonic() - t
+    simples = {i: [SimpleNamespace(**_atributos(x)) for x in v] for i, v in itens_de.items()}
+    return abertas, md_de, ocr, simples, gastos
+
+
+def _atributos(x):
+    return {k: getattr(x, k) for k in dir(x) if not k.startswith("_") and not callable(getattr(x, k))}
+
+
+def _pagina_no_processo(caminho, i, md, eh_ocr, itens, pasta, limite):
+    """No processo: a página `i` inteira, como no laço da leitura em série (coleta, análise, renderização e recortes),
+    com o prazo do documento (`limite`). Devolve a página, as tarefas, o texto oculto e as pendências dela, o hash de
+    cada recorte (as repetidas entre páginas saem em `_juntar`) e o tempo de cada etapa."""
+    gastos = defaultdict(float)
+    token = LIMITE.set(limite)
+    try:
+        if motivo := _so_texto(i):
+            return {"i": i, "info": _so_o_texto(i, md), "motivo": motivo, "etapas": gastos}
+        t = time.monotonic()
+        doc = _doc_do_processo(caminho)
+        gastos["abrir"] += time.monotonic() - t
+        t = time.monotonic()
+        with PDFIUM:
+            col = _coleta(doc, i)
+        gastos["coletar"] += time.monotonic() - t
+        if col is None:
+            return {"i": i, "parada": True, "etapas": gastos}
+        if col == PESADA:
+            return {"i": i, "info": _so_o_texto(i, md), "motivo": PESADA, "etapas": gastos}
+        tarefas, cache, seguranca, pendentes = [], {}, [], []
+        t = time.monotonic()
+        info, recorte, motivo = _analisar(doc, i, col, md, eh_ocr, itens, pasta, tarefas, cache, seguranca, pendentes)
+        gastos["regioes"] += time.monotonic() - t
+        if motivo:
+            return {"i": i, "info": info, "motivo": motivo, "etapas": gastos}
+        if recorte:
+            t = time.monotonic()
+            with PDFIUM:
+                img = _renderizar(doc, i, recorte[0])
+            gastos["renderizar"] += time.monotonic() - t
+            t = time.monotonic()
+            motivo = _aplicar_recorte(recorte, img, tarefas, cache, seguranca, pendentes, (0, 0))
+            gastos["recortar"] += time.monotonic() - t
+            if motivo:
+                return {"i": i, "info": _so_o_texto(i, md), "motivo": motivo, "etapas": gastos}
+        chaves = {tid: chave for chave, tid in cache.items()}
+        return {"i": i, "info": info, "tarefas": tarefas, "seguranca": seguranca, "pendentes": pendentes,
+                "chaves": chaves, "etapas": gastos}  # fmt: skip
+    finally:
+        LIMITE.reset(token)
 
 
 def _erro_da_pagina(e):
@@ -262,12 +510,16 @@ def _erro_da_pagina(e):
     return f"erro na página: {type(e).__name__}: {str(e)[:120]}"
 
 
-def _vez_da_faixa(doc, faixa, fim):
+def _vez_da_faixa(doc, faixa, fim, etapas):
     """A cópia da faixa para o pdf_inspector (`_copia_da_faixa`) e, na mesma vez, a coleta das primeiras páginas dela
     (`_coletas`), que não depende do texto dele. Chamar com a trava."""
+    t = time.monotonic()
     copia = _copia_da_faixa(doc, faixa)
+    etapas["inspecionar"] += time.monotonic() - t
     abertas = copia[1]
+    t = time.monotonic()
     coletas = _coletas(doc, faixa[:abertas], fim) if abertas and not _so_texto(faixa[0]) else deque()
+    etapas["coletar"] += time.monotonic() - t
     return copia, coletas
 
 

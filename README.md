@@ -78,6 +78,9 @@ leitor = lince.Leitor(
   enviada). O corte vale também quando o provedor manda a resposta aos poucos ou para no meio dela; só a conexão, o
   envio de uma imagem grande ou um DNS lento podem passar alguns segundos do prazo. Provedor próprio lê o tempo que sobra em `lince.prazo_restante()` e pode levantar `lince.PrazoEsgotado`.
 - 429 e 5xx do provedor são repetidos com espera exponencial e `Retry-After`.
+- PDF em paralelo: `lince.paralelo.ativar()` no início do programa, dentro do `if __name__ == "__main__":`, liga o
+  pool de processos da fase 1 do PDF (um por CPU, até 8), como no servidor. O resultado é o mesmo da leitura em série,
+  que continua sendo o padrão.
 - Falha da IA nunca derruba o documento: a leitura nativa fica e a pendência é registrada.
 - `Uso.custo_usd` traz o custo da chamada quando o provedor informa (`usage.cost`, como no OpenRouter).
 
@@ -167,6 +170,13 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
 - **Fila justa**: os documentos são atendidos em rodízio entre tokens, então quem manda 500 não trava quem
   mandou 1. Até 16 documentos em leitura ao mesmo tempo por instância. As montagens (`POST /v1/montagens`) têm fila
   justa própria, com até 2 ao mesmo tempo: não esperam atrás de leituras presas na IA nem tomam a vaga delas.
+- **PDF em processos**: a fase 1 do PDF (o texto de cada faixa de 50 páginas, a análise, a renderização e os
+  recortes de cada página) roda num pool de processos, um por CPU do contêiner (`os.sched_getaffinity`, até 8,
+  `limites.PROCESSOS_PDF_MAX`). As páginas de um mesmo documento e os documentos diferentes andam em paralelo, com
+  fila justa entre documentos: um PDF de 2.000 páginas não segura os outros. O plano sai igual ao da leitura em série
+  (texto, tarefas e recortes). Se um processo cai, ele é trocado e o documento é lido de novo, uma vez; sem processos,
+  a leitura segue em série. Cada fase 1 deixa uma linha no log com o tempo de cada etapa (abrir, inspecionar,
+  coletar, regiões, renderizar, recortar), a sessão e o documento.
 - **Isolamento**: um token nunca vê sessão nem referência de outro. `LINCE_TOKENS` aceita vários tokens
   separados por vírgula, um por plataforma; cada um pode ter o próprio teto de retenção como `nome:token:teto`
   (`qa:abc123:2G`, `prod:def456:4G`; sem teto, vale o padrão). Para uso local sem token: `lince-servidor --sem-autenticacao`.
@@ -273,7 +283,9 @@ A imagem roda sem root e tem healthcheck em `/saude`. Ela só grava em `/tmp`: o
 resultados esperando entrega (até o teto de cada token). Monte um volume de disco em `/tmp`, e não `tmpfs`: `tmpfs`
 é memória e conta no limite do contêiner. Reserve nele a soma dos tetos dos tokens com folga: o teto é conferido na
 entrada de cada envio, e um documento já aceito guarda o resultado inteiro, então com muitos documentos em leitura
-o uso pode passar do teto por alguns resultados. Tags publicadas:
+o uso pode passar do teto por alguns resultados. A fase 1 do PDF usa um processo por CPU: reserve 4 CPUs para uma
+base de conhecimento que recebe PDFs grandes em lote (na bancada, o relatório pesado de 32 páginas cai para menos de
+um terço do tempo em série com 4) e cerca de 300 MB de memória por CPU, além do que o serviço já usa. Tags publicadas:
 `X.Y.Z` e `X.Y`, para `linux/amd64` e `linux/arm64`, com atestado de procedência do GitHub.
 
 ```yaml
@@ -428,7 +440,8 @@ cada publicação; patch e minor entram sozinhos quando o CI passa.
 ## Estado
 
 Em validação. A bancada `bench/medir.py` gera os próprios documentos (nada de arquivo de terceiro), lê com uma IA
-simulada e confere o que o Lince faz: texto nativo, roteamento, montagem, texto oculto e concorrência. Ela refaz a
+simulada e confere o que o Lince faz: texto nativo, roteamento, montagem, texto oculto, concorrência e a fase 1 do
+PDF em série e em processos (o mesmo plano nos dois, com o tempo de cada um). Ela refaz a
 tabela abaixo em qualquer máquina, e a versão curta roda no CI (`tests/test_bench.py`):
 
 ```bash
@@ -438,13 +451,14 @@ uv run --extra emf python bench/medir.py
 | Conferência | Resultado | |
 | --- | --- | --- |
 | Lote de faturas do mesmo modelo (PDF) | 12/12 faturas no texto, rodapé com a folha nos metadados (0.0 s) | ok |
-| PDF longo | 15000/15000 linhas de 300 páginas (1.6 s) | ok |
-| Currículos com injeção escondida (5 técnicas) | 5/5 removidas, 5/5 com alerta (0.1 s) | ok |
+| PDF longo | 15000/15000 linhas de 300 páginas (1.8 s) | ok |
+| Currículos com injeção escondida (5 técnicas) | 5/5 removidas, 5/5 com alerta (0.2 s) | ok |
 | Apresentação com gráficos e logo repetido | 5/5 slides numerados, 5/5 gráficos no lugar, 6 leituras para 10 imagens (0.1 s) | ok |
-| Leitura em duas fases (IA de quem chama) | 6 tarefas, resultado igual ao da IA do Lince (0.1 s) | ok |
-| Planilha grande | 100000 linhas, perfil data/texto/texto/numero/numero, corte avisado no texto (1.8 s) | ok |
-| Concorrência | 42/42 documentos ao mesmo tempo, 0 erros (1.3 s) | ok |
-| Pico de memória do processo | 245 MB | ok |
+| Leitura em duas fases (IA de quem chama) | 6 tarefas, resultado igual ao da IA do Lince (0.2 s) | ok |
+| Planilha grande | 100000 linhas, perfil data/texto/texto/numero/numero, corte avisado no texto (2.1 s) | ok |
+| Concorrência | 42/42 documentos ao mesmo tempo, 0 erros (1.8 s) | ok |
+| Pico de memória do processo | 286 MB | ok |
+| Fase 1 de PDF pesado, em série e em processos | 32 páginas, 128 tarefas; sozinho 8.8 s em série e 2.7 s em 4 processos; 4 ao mesmo tempo 12.5 s e 9.6 s; plano igual (33.8 s) | ok |
 
 Medido num contêiner de 4 CPUs, Python 3.13; o tempo não inclui gerar os documentos.
 
