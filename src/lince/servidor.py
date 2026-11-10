@@ -39,8 +39,15 @@ from starlette.routing import Route
 from . import antivirus, memoria, paralelo, protecao
 from . import codigo as codigo_doc
 from .cache import CacheComEscopo, CacheRedis
-from .leitor import FORMATOS, VERSAO, Leitor
-from .limites import RETIDOS_POR_TOKEN, DocumentoRecusado
+from .leitor import FORMATOS, VERSAO, Leitor, pendencias_do_teto
+from .limites import (
+    RETIDOS_POR_TOKEN,
+    TAREFAS_EMBUTIDAS_POR_DOCUMENTO,
+    TAREFAS_EMBUTIDAS_POR_SESSAO,
+    TAREFAS_POR_DOCUMENTO,
+    TAREFAS_POR_SESSAO,
+    DocumentoRecusado,
+)
 from .pdf import ROTULO
 from .provedores import OpenAICompativel
 
@@ -63,7 +70,9 @@ ENTREGA_PRAZO = 15 * 60  # resultado não buscado em 15 min depois de concluído
 REENTREGA = 60
 PENDENTES_POR_CLIENTE = 64  # documentos na fila ou lendo por token; acima disso 429
 # Resultado esperando entrega por token (padrão; o porquê em limites.py): acima disso, novos envios recebem 429 até o
-# token buscar o que é dele. Um token não derruba os outros nem enche o disco da instância.
+# token buscar o que é dele. O teto é conferido na entrada de cada envio, e o documento já aceito guarda o resultado
+# inteiro (com as imagens à parte, de um documento grande, até ~2 GB): o uso pode passar dele pelos documentos em
+# leitura, e o volume do disco é dimensionado com essa folga (README, Deploy).
 BYTES_RETIDOS_POR_CLIENTE = RETIDOS_POR_TOKEN
 LIMPEZA_INTERVALO = 60
 CABECALHOS_MAX = {"x-ia-url": 2048, "x-ia-modelo": 200, "x-ia-chave": 4096}
@@ -74,12 +83,11 @@ MODOS = {"leitura", "tarefas"}  # tarefas: o Lince não chama a IA; devolve o qu
 PLANO_VALIDADE = 24 * 3600  # plano devolvido no modo tarefas vale um dia para a montagem
 PLANO_MAX = 64 * 1024 * 1024  # plano descompactado (texto e estado do documento): acima disso é hostil
 PRAZO_MIN, PRAZO_MAX = 1, 3600  # segundos por documento; o chat usa poucos, a base não manda prazo
-# Modo tarefas: cada tarefa leva a imagem em base64 no resultado, que fica guardado até a entrega. Medido: cada metade
-# de uma página escaneada densa sai com 0,6 MB de PNG (texto limpo) a 2 MB (com ruído), e 300 das limpas já somam
-# 230 MB em base64, perto de um quarto dos BYTES_RETIDOS_POR_CLIENTE de um token. O que passa do teto fica nas
-# pendências do preparo, com o motivo; `max_tarefas` só baixa o do documento.
-TAREFAS_POR_DOCUMENTO = 200
-TAREFAS_POR_SESSAO = 300
+# Modo tarefas: os tetos de tarefas por documento e por sessão, com as imagens embutidas e com elas à parte, estão em
+# limites.py, com o porquê. O que passa do teto fica nas pendências do preparo, pelas páginas; `max_tarefas` só baixa
+# o do documento.
+IMAGENS = {"embutidas", "separadas"}
+TAREFA_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # Senha de arquivo protegido: o Office aceita até 255 caracteres e o PDF, 127 bytes; acima de 1024 não é senha.
 SENHA_MAX = 1024
 # Senhas erradas numa janela, para o Lince não servir de quebrador de senha. Por arquivo (o sha256): quem digita erra
@@ -293,11 +301,26 @@ class Servico:
             # a senha
             cache = CacheComEscopo(self.cache, sessao["cliente"]) if self.cache and not doc.get("protegido") else None
             if sessao.get("modo") == "tarefas":
-                teto = min(TAREFAS_POR_DOCUMENTO, sessao.get("max_tarefas") or TAREFAS_POR_DOCUMENTO)
-                plano = Leitor(max_leituras=teto).preparar(doc["arquivo"], prazo=sessao.get("prazo"))
-                reservadas = self._teto_da_sessao(sessao, plano)
+                separadas = sessao.get("imagens") == "separadas"
+                do_modo = TAREFAS_POR_DOCUMENTO if separadas else TAREFAS_EMBUTIDAS_POR_DOCUMENTO
+                teto = min(do_modo, sessao.get("max_tarefas") or do_modo)
+                if separadas:  # cada imagem vai para o disco ao ser preparada, e é buscada sozinha
+                    doc["pasta_imagens"] = os.path.join(self.guardados, f"{doc['id']}-imagens")
+                    os.mkdir(doc["pasta_imagens"])
+                plano = Leitor(max_leituras=teto).preparar(
+                    doc["arquivo"], prazo=sessao.get("prazo"), imagens_em=doc.get("pasta_imagens")
+                )
+                reservadas = self._teto_da_sessao(sessao, plano, doc.get("pasta_imagens"))
+                tarefas = plano.para_json()["tarefas"]  # imagem em base64; à parte, vazia
+                if separadas:
+                    pasta = doc["pasta_imagens"]
+                    doc["imagens"] = {t.id: os.path.getsize(os.path.join(pasta, f"{t.id}.png")) for t in plano.tarefas}
+                    doc["buscadas"] = set()
+                    for t in tarefas:
+                        del t["imagem"]
+                        t["imagem_bytes"] = doc["imagens"][t["id"]]
                 doc["resultado"] = {
-                    "tarefas": plano.para_json()["tarefas"],  # imagem em base64
+                    "tarefas": tarefas,
                     "pendentes": plano.estado.get("pendentes", []) + plano.pendentes,
                     "plano": selar(sessao["segredo"], sessao["cliente"], plano, sessao["kid"]),
                 }
@@ -330,6 +353,8 @@ class Servico:
                     Path(guardado).write_bytes(dados)
                     real = len(dados)
                     del dados
+                    doc["bytes_resultado"] = real  # as imagens à parte contam até cada uma ser buscada
+                    real += sum(doc.get("imagens", {}).values())
                 except Exception as e:  # noqa: BLE001 — disco cheio ou sem memória: o documento falha, nunca fica preso
                     Path(guardado).unlink(missing_ok=True)
                     guardado, estado = None, "falhou"
@@ -337,6 +362,8 @@ class Servico:
                     if reservadas:  # as tarefas não foram entregues: a cota da sessão volta
                         with self.trava:
                             sessao["tarefas"] -= reservadas
+            if guardado is None:  # sem resultado, as imagens dele também não ficam
+                _sem_imagens(doc)
             with self.trava:
                 if sessao["id"] in self.sessoes:
                     # troca a reserva feita na entrada (bytes do arquivo) pelo tamanho real do resultado
@@ -344,18 +371,26 @@ class Servico:
                     doc["bytes_retidos"], doc["guardado"] = real, guardado
                 elif guardado:  # sessão apagada no meio da leitura: o resultado não fica
                     Path(guardado).unlink(missing_ok=True)
+                    _sem_imagens(doc)
                 doc["estado"] = estado  # por último: quem lê "pronto" já encontra resultado e fim
                 self._fechar_se_terminou(sessao)
 
-    def _teto_da_sessao(self, sessao, plano):
-        """Tira do plano as tarefas além do que sobra de TAREFAS_POR_SESSAO, com o motivo nas pendências. Os documentos
-        do lote são preparados em paralelo: a conta da sessão é feita sob a trava. Devolve quantas tarefas reservou,
-        para o documento que falhar depois devolver a cota."""
+    def _teto_da_sessao(self, sessao, plano, pasta_imagens=None):
+        """Tira do plano as tarefas além do que sobra do teto da sessão (limites.py), com o motivo nas pendências, pelas
+        páginas, e as imagens delas da pasta. Os documentos do lote são preparados em paralelo: a conta da sessão é
+        feita sob a trava. Devolve quantas tarefas reservou, para o documento que falhar depois devolver a cota."""
+        teto = TAREFAS_POR_SESSAO if sessao.get("imagens") == "separadas" else TAREFAS_EMBUTIDAS_POR_SESSAO
         with self.trava:
-            cabem = max(0, min(len(plano.tarefas), TAREFAS_POR_SESSAO - sessao.get("tarefas", 0)))
+            cabem = max(0, min(len(plano.tarefas), teto - sessao.get("tarefas", 0)))
             sessao["tarefas"] = sessao.get("tarefas", 0) + cabem
         if cabem < len(plano.tarefas):
-            plano.pendentes += [f"{t.id}: teto de tarefas da sessão" for t in plano.tarefas[cabem:]]
+            cortadas = [{"id": t.id, "modo": t.tipo, "pagina": t.pagina - 1 if t.pagina else None, "itens": t.itens}
+                        for t in plano.tarefas[cabem:]]  # fmt: skip
+            plano.pendentes += pendencias_do_teto(
+                cortadas, plano.estado, f"teto de {teto} tarefa{'' if teto == 1 else 's'} da sessão"
+            )
+            for t in plano.tarefas[cabem:] if pasta_imagens else ():
+                Path(pasta_imagens, f"{t.id}.png").unlink(missing_ok=True)
             plano.tarefas = plano.tarefas[:cabem]
             plano.estado["tarefas"] = plano.estado.get("tarefas", [])[:cabem]
         return cabem
@@ -377,11 +412,30 @@ class Servico:
             corpo = _sessao(sessao)
             if marcar and corpo["estado"] == "concluida" and not sessao.get("entregue_em"):
                 sessao["entregue_em"] = time.time()
-                # entregue: os bytes deixam de contar no teto já; o arquivo fica só os REENTREGA segundos de repetição
+                # entregue: os bytes do resultado deixam de contar no teto já; o arquivo fica só os REENTREGA segundos
+                # de repetição. As imagens à parte contam até cada uma ser buscada (`buscar_imagem`).
                 for d in sessao["itens"]:
-                    self._reter(sessao["cliente"], -d.get("bytes_retidos", 0))
-                    d["bytes_retidos"] = 0
+                    liberados = d.pop("bytes_resultado", d.get("bytes_retidos", 0))
+                    self._reter(sessao["cliente"], -liberados)
+                    d["bytes_retidos"] = d.get("bytes_retidos", 0) - liberados
         return corpo
+
+    def buscar_imagem(self, sessao, item, tid, marcar=True):
+        """O caminho e o tamanho da imagem `tid` do documento `item` da sessão (imagens à parte; o id da tarefa só é
+        único dentro do documento). Buscada, ela deixa de contar no teto do token; o arquivo fica para repetir a busca
+        enquanto a sessão existir. Chamar com a trava."""
+        for d in sessao["itens"]:
+            if d["id"] == item and d["estado"] == "pronto" and tid in d.get("imagens", {}):
+                n = d["imagens"][tid]
+                if marcar and tid not in d["buscadas"]:
+                    d["buscadas"].add(tid)
+                    self._reter(sessao["cliente"], -n)
+                    d["bytes_retidos"] -= n
+                    sessao["ultima_busca"] = time.time()
+                return os.path.join(d["pasta_imagens"], f"{tid}.png"), n
+        raise Problema(
+            404, "imagem-nao-encontrada", "Imagem não encontrada", "A tarefa não existe nesta sessão ou não tem imagem."
+        )
 
     def _reter(self, cliente, delta):
         """Chamar com a trava."""
@@ -402,9 +456,9 @@ class Servico:
         if em_uso + entrada <= teto:
             return None
         vencem = [  # só o que libera bytes ao vencer: a sessão em que tudo falhou não retém nada
-            x["concluida_em"] + ENTREGA_PRAZO - agora
+            _expira(x, x["concluida_em"]) - agora
             for x in [*self.sessoes.values(), *self.edicoes.values()]
-            if x["cliente"] == cliente and x.get("concluida_em") and not x.get("entregue_em") and _retem(x)
+            if x["cliente"] == cliente and x.get("concluida_em") and _retem(x)
         ]
         espera = max(1, math.ceil(min(vencem))) if vencem else 30
         return _limite_retencao(em_uso, teto, min(espera, ENTREGA_PRAZO))
@@ -450,6 +504,7 @@ class Servico:
         for d in x["itens"]:
             if d.get("guardado"):
                 Path(d["guardado"]).unlink(missing_ok=True)
+            _sem_imagens(d)
         if x.get("idempotencia"):
             self.idempotencia.pop((x["cliente"], x["idempotencia"]), None)
 
@@ -625,15 +680,28 @@ def _retem(x) -> bool:
 
 
 def _vencida(x, agora):
-    if x.get("entregue_em"):
-        return agora - x["entregue_em"] > REENTREGA
-    return bool(x["concluida_em"]) and agora - x["concluida_em"] > ENTREGA_PRAZO
+    expira = _expira(x, x["concluida_em"])
+    return expira is not None and agora > expira
 
 
 def _expira(x, concluida):
+    """Entregue, a sessão fica REENTREGA segundos para a repetição, contados da entrega ou da última imagem buscada;
+    com imagens à parte ainda não buscadas, também até ENTREGA_PRAZO depois de concluída, o que vier por último."""
     if x.get("entregue_em"):
-        return x["entregue_em"] + REENTREGA
+        repeticao = max(x["entregue_em"], x.get("ultima_busca", 0)) + REENTREGA
+        return max(repeticao, concluida + ENTREGA_PRAZO) if _imagens_pendentes(x) else repeticao
     return concluida + ENTREGA_PRAZO if concluida else None
+
+
+def _imagens_pendentes(x) -> bool:
+    return any(d.get("imagens", {}).keys() - d.get("buscadas", set()) for d in x.get("itens", ()))
+
+
+def _sem_imagens(doc):
+    """Apaga a pasta das imagens à parte do documento (sessão removida, resultado que não ficou)."""
+    if doc.get("pasta_imagens"):
+        shutil.rmtree(doc["pasta_imagens"], ignore_errors=True)
+    doc["imagens"], doc["buscadas"] = {}, set()
 
 
 def _resumo(x):
@@ -853,9 +921,17 @@ def criar_app(
                     )
                 # qualquer inteiro maior que zero, e o acima do teto vale o teto (contrato); dez algarismos já passam
                 # dele, então o resto nem é convertido (int() de milhares de algarismos é lento ou recusado)
-                max_tarefas = min(TAREFAS_POR_DOCUMENTO, int(digitos[:10]))
+                max_tarefas = int(digitos[:10])
             else:
                 max_tarefas = None
+            imagens = str(form.get("imagens") or "embutidas")
+            if imagens not in IMAGENS or (imagens == "separadas" and modo != "tarefas"):
+                raise Problema(
+                    400, "imagens-invalido", "imagens deve ser 'embutidas' ou 'separadas', esta só no modo tarefas"
+                )
+            if max_tarefas is not None:
+                do_modo = TAREFAS_POR_DOCUMENTO if imagens == "separadas" else TAREFAS_EMBUTIDAS_POR_DOCUMENTO
+                max_tarefas = min(do_modo, max_tarefas)
             pedir_codigo = str(form.get("codigo") or "nao")
             if pedir_codigo not in ("sim", "nao"):
                 raise Problema(400, "codigo-invalido", "codigo deve ser 'sim' ou 'nao'")
@@ -878,6 +954,7 @@ def criar_app(
             sessao = await _receber(
                 s, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=pedir_codigo == "sim", prazo=prazo,
                 modo=modo, segredo=s.segredo(cliente), kid=s.kid(), max_tarefas=max_tarefas, senha=senha,
+                imagens=imagens,
             )  # fmt: skip
             senha = None  # a senha só abriu os arquivos: não fica com o pedido
         finally:
@@ -962,6 +1039,21 @@ def criar_app(
     async def sessao(request: Request):
         # despacho explícito: HEAD (que o Starlette aceita junto com GET) nunca pode cair em apagar
         return await {"GET": obter, "HEAD": obter, "DELETE": apagar}[request.method](request)
+
+    async def tarefa_imagem(request: Request):
+        """A imagem de uma tarefa do modo tarefas com `imagens=separadas`. Buscada (GET), deixa de contar no teto."""
+        cliente = s.cliente(request)
+        tid = request.path_params["tarefa"]
+        if not TAREFA_ID.fullmatch(tid):
+            raise Problema(404, "imagem-nao-encontrada", "Imagem não encontrada", "Id de tarefa inválido.")
+        with s.trava:
+            x = s.da_sessao(cliente, request.path_params["id"])
+            caminho, tamanho = s.buscar_imagem(x, request.path_params["item"], tid, marcar=request.method == "GET")
+        try:
+            dados = await asyncio.to_thread(Path(caminho).read_bytes) if request.method == "GET" else b""
+        except FileNotFoundError:  # a sessão foi apagada (DELETE ou prazo) entre a trava e a leitura
+            raise Problema(404, "imagem-nao-encontrada", "Imagem não encontrada", "A sessão foi apagada.") from None
+        return Response(dados, media_type="image/png", headers={"Content-Length": str(tamanho)})
 
     async def editar(request: Request):
         cliente = s.cliente(request)
@@ -1072,10 +1164,8 @@ def criar_app(
             raise Problema(411, "tamanho-ausente", "Content-Length obrigatório", "Upload chunked não é aceito.")
         if int(tamanho) > TAMANHO_MAX:
             raise Problema(413, "envio-grande", "Envio grande demais", f"Teto de {TAMANHO_MAX // 2**20} MB por envio.")
-        with s.trava:
-            cheio = s.sem_espaco(cliente)
-        if cheio:
-            raise cheio
+        # sem o teto de retenção: a montagem não guarda nada, e um lote com as imagens à parte passa dele enquanto
+        # quem chama monta um documento de cada vez
         if not s.reservar(cliente, 1):  # a vaga antes do corpo: pedidos em paralelo não somam memória sem teto
             raise _limite_pendentes()
         na_fila = False
@@ -1113,6 +1203,7 @@ def criar_app(
             # uma rota por caminho: o 405 informa no Allow todos os métodos aceitos
             Route("/v1/sessoes", sessoes, methods=["GET", "POST"]),
             Route("/v1/sessoes/{id:str}", sessao, methods=["GET", "DELETE"], name="sessao"),
+            Route("/v1/sessoes/{id:str}/itens/{item}/tarefas/{tarefa}/imagem", tarefa_imagem, methods=["GET"]),
             Route("/v1/edicoes", editar, methods=["POST"]),
             Route("/v1/montagens", montar, methods=["POST"]),
             Route("/v1/edicoes/{id:str}/arquivo", edicao, methods=["GET", "DELETE"], name="edicao_arquivo"),
@@ -1234,7 +1325,7 @@ def _protegido(nome, formato, motivo=""):
 
 async def _receber(
     s: Servico, cliente, arquivos, referencia, esforco, ia, chave_idem, codigo=False, prazo=None, modo="leitura",
-    segredo=b"", kid="", max_tarefas=None, senha=None,
+    segredo=b"", kid="", max_tarefas=None, senha=None, imagens="embutidas",
 ):  # fmt: skip
     """Grava o lote, calcula hash e tamanho, aplica a idempotência, abre o que é protegido por senha e põe os documentos
     na fila."""
@@ -1268,6 +1359,8 @@ async def _receber(
         conteudo = [referencia, esforco, provedor, codigo, [(d["nome"], d["sha256"]) for d in itens], prazo, modo]
         if max_tarefas is not None:  # só entra na impressão quando enviado: a de um envio sem ele não muda
             conteudo.append(max_tarefas)
+        if imagens != "embutidas":  # idem
+            conteudo.append(imagens)
         if senha is not None:  # só que veio senha, nunca ela nem um hash dela (a impressão fica com a sessão)
             conteudo.append("com senha")
         impressao = hashlib.sha256(json.dumps(conteudo).encode()).hexdigest()
@@ -1308,6 +1401,7 @@ async def _receber(
                 "segredo": segredo,
                 "kid": kid,
                 "max_tarefas": max_tarefas,
+                "imagens": imagens,
                 "ia": ia,
                 "criada_em": time.time(),
                 "concluida_em": None,

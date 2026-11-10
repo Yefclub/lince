@@ -44,6 +44,8 @@ def conforme(resp, caminho, metodo):
         return resp
     tipo = resp.headers["content-type"].split(";")[0]
     assert tipo in declarada["content"], f"tipo {tipo} fora do contrato"
+    if not tipo.endswith("json"):  # binário (a imagem de uma tarefa): o tipo é o que o contrato confere
+        return resp
     # valida pelo ponteiro dentro do contrato: os $ref internos do esquema resolvem contra o documento inteiro
     partes = [*ponteiro, "content", tipo, "schema"]
     esquema = {"$ref": "urn:contrato#/" + "/".join(x.replace("~", "~0").replace("/", "~1") for x in partes)}
@@ -963,19 +965,24 @@ def test_modo_tarefas_tem_teto_por_documento_e_por_sessao(api, monkeypatch):
 
     assert len(preparo()["tarefas"]) == 2
     um = preparo(max_tarefas="1")  # quem chama pode baixar o teto
-    assert len(um["tarefas"]) == 1 and len([p for p in um["pendentes"] if p.endswith("teto de leituras")]) == 1
+    assert (
+        len(um["tarefas"]) == 1
+        and len([p for p in um["pendentes"] if p.endswith("teto de 1 tarefa por documento")]) == 1
+    )
     r = _montar(api, {"plano": um["plano"], "respostas": {um["tarefas"][0]["id"]: "Figura 1."}}).json()
-    assert any(p.endswith("teto de leituras") for p in r["cobertura"]["pendentes"])  # e a montagem diz o que faltou
-    monkeypatch.setattr(srv, "TAREFAS_POR_DOCUMENTO", 1)
+    assert any(
+        p.endswith("teto de 1 tarefa por documento") for p in r["cobertura"]["pendentes"]
+    )  # e a montagem diz o que faltou
+    monkeypatch.setattr(srv, "TAREFAS_EMBUTIDAS_POR_DOCUMENTO", 1)
     assert len(preparo(max_tarefas="50")["tarefas"]) == 1  # mas não subir
-    monkeypatch.setattr(srv, "TAREFAS_POR_DOCUMENTO", 2)
-    monkeypatch.setattr(srv, "TAREFAS_POR_SESSAO", 3)
+    monkeypatch.setattr(srv, "TAREFAS_EMBUTIDAS_POR_DOCUMENTO", 2)
+    monkeypatch.setattr(srv, "TAREFAS_EMBUTIDAS_POR_SESSAO", 3)
     s = enviar(api, [("r.docx", _docx_com_imagens()), ("s.docx", _docx_com_imagens())], {**A, **ESPERA}, modo="tarefas")
     itens = conforme(s, "/v1/sessoes", "post").json()["itens"]
     assert sum(len(i["resultado"]["tarefas"]) for i in itens) == 3  # o lote inteiro cabe no teto da sessão
-    sobra = [p for i in itens for p in i["resultado"]["pendentes"] if p.endswith("teto de tarefas da sessão")]
+    sobra = [p for i in itens for p in i["resultado"]["pendentes"] if p.endswith("teto de 3 tarefas da sessão")]
     assert len(sobra) == 1
-    monkeypatch.setattr(srv, "TAREFAS_POR_DOCUMENTO", 200)
+    monkeypatch.setattr(srv, "TAREFAS_EMBUTIDAS_POR_DOCUMENTO", 200)
     for grande in ("1" + "0" * 12, "9" * 5000):  # qualquer inteiro maior que zero, como no contrato: vale o teto
         assert len(preparo(max_tarefas=grande)["tarefas"]) == 2
     for campos in ({"max_tarefas": "0"}, {"max_tarefas": "000"}, {"max_tarefas": "dez"}, {"max_tarefas": "-3"}):
@@ -1047,7 +1054,7 @@ def test_documento_que_falha_ao_selar_devolve_as_tarefas_ao_teto_da_sessao(monke
     import lince.servidor as srv
 
     monkeypatch.setattr(srv, "DOCS_SIMULTANEOS", 1)  # um de cada vez, na ordem do envio
-    monkeypatch.setattr(srv, "TAREFAS_POR_SESSAO", 2)  # cada documento tem duas tarefas: só um cabe
+    monkeypatch.setattr(srv, "TAREFAS_EMBUTIDAS_POR_SESSAO", 2)  # cada documento tem duas tarefas: só um cabe
     original, chamadas = srv.selar, []
 
     def falha_na_primeira(*a, **k):
@@ -1063,7 +1070,7 @@ def test_documento_que_falha_ao_selar_devolve_as_tarefas_ao_teto_da_sessao(monke
     assert primeiro["estado"] == "falhou" and "acima do teto" in primeiro["erro"]
     # o que o 1º reservou e não entregou volta à cota da sessão: o 2º recebe as suas duas tarefas
     assert segundo["estado"] == "pronto" and len(segundo["resultado"]["tarefas"]) == 2
-    assert not [p for p in segundo["resultado"]["pendentes"] if p.endswith("teto de tarefas da sessão")]
+    assert not [p for p in segundo["resultado"]["pendentes"] if p.endswith("da sessão")]
 
 
 def test_espera_cancelada_na_fila_nao_roda_o_trabalho_e_devolve_a_vaga():

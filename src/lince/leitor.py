@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import tempfile
 import time
 import zipfile
@@ -187,22 +188,32 @@ class Leitor:
             return _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias=self.ia is not None)
 
     # ------------------------------------------------------------------ em duas fases (a IA é de quem chama)
-    def preparar(self, caminho: str | Path, prazo: float | None = None, senha: str | None = None) -> Plano:
+    def preparar(
+        self,
+        caminho: str | Path,
+        prazo: float | None = None,
+        senha: str | None = None,
+        imagens_em: str | Path | None = None,
+    ) -> Plano:
         """Fase 1: extrai o texto e devolve as leituras que a IA precisa fazer, sem chamar modelo nenhum. Quem chama
         lê cada `TarefaVisual` com o seu modelo (custo, roteamento, cache e cancelamento são dele) e passa as respostas
-        para `concluir`. O teto `max_leituras` vale aqui: o que passar dele fica nas pendências. `prazo` vale para a
-        extração, como em `ler`: no PDF, a página que começa depois dele entra só com o texto, e a faixa que não cabe
-        nele não é lida. `senha` abre o arquivo protegido, como em `ler`; o plano não a guarda, e `concluir` não a
-        pede."""
+        para `concluir`. O teto `max_leituras` vale aqui: o que passar dele fica nas pendências, pelas páginas
+        (`páginas 188–207: teto de 200 tarefas por documento`). `prazo` vale para a extração, como em `ler`: no PDF, a
+        página que começa depois dele entra só com o texto, e a faixa que não cabe nele não é lida. `senha` abre o
+        arquivo protegido, como em `ler`; o plano não a guarda, e `concluir` não a pede.
+
+        `imagens_em`: uma pasta que já existe. A imagem de cada tarefa vai para `{id}.png` nela, em vez de ficar na
+        memória (`TarefaVisual.imagem` sai vazia; a `chave` e os `tokens_estimados` são os mesmos): um documento com
+        centenas de páginas escaneadas não segura todas as imagens de uma vez."""
         if prazo is not None and not (math.isfinite(prazo) and prazo > 0):
             raise ValueError("prazo precisa ser um número de segundos maior que zero")
         token = LIMITE.set(time.monotonic() + prazo if prazo is not None else None)
         try:
-            return self._preparar(caminho, senha)
+            return self._preparar(caminho, senha, imagens_em)
         finally:
             LIMITE.reset(token)
 
-    def _preparar(self, caminho, senha):
+    def _preparar(self, caminho, senha, imagens_em=None):
         from PIL import Image
 
         from .tipos import TarefaVisual
@@ -212,21 +223,25 @@ class Leitor:
             plano = self.planejar(caminho, pasta)
             tarefas, pendentes = plano.get("tarefas", []), []
             if self.max_leituras is not None and len(tarefas) > self.max_leituras:
-                pendentes = [f"{t['id']}: teto de leituras" for t in tarefas[self.max_leituras :]]
+                motivo = f"teto de {_tarefas(self.max_leituras)} por documento"
+                pendentes = pendencias_do_teto(tarefas[self.max_leituras :], plano, motivo)
                 tarefas = plano["tarefas"] = tarefas[: self.max_leituras]
             faixas = len(tarefas) if plano["tipo"] == "imagem" else None
             visuais = []
             for t in tarefas:
-                img = Path(f"{pasta}/ia/{t['id']}.png").read_bytes()
+                arquivo = f"{pasta}/ia/{t['id']}.png"
+                img = Path(arquivo).read_bytes()
                 instr = instrucao(t, self.prompt, faixas)
-                with Image.open(f"{pasta}/ia/{t['id']}.png") as im:
+                with Image.open(arquivo) as im:
                     w, h = im.size
+                if imagens_em is not None:  # uma imagem por vez na memória
+                    shutil.move(arquivo, os.path.join(imagens_em, f"{t['id']}.png"))
                 pagina = t.get("pagina")
                 visuais.append(
                     TarefaVisual(
                         id=t["id"],
                         tipo=t["modo"],
-                        imagem=img,
+                        imagem=img if imagens_em is None else b"",
                         instrucao=instr,
                         chave=chave(img, instr, "", VERSAO_PROMPT),
                         tokens_estimados=round(w * h / 750 + len(instr) / 4),
@@ -576,6 +591,36 @@ def _vencido() -> bool:
 def ler(caminho: str | Path, prazo: float | None = None, senha: str | None = None, **opcoes) -> Resultado:
     """Atalho: `lince.ler("arquivo.pdf", ia=OpenAICompativel(...))`."""
     return Leitor(**opcoes).ler(caminho, prazo=prazo, senha=senha)
+
+
+def _tarefas(n) -> str:
+    return f"{n} tarefa" if n == 1 else f"{n} tarefas"
+
+
+def pendencias_do_teto(cortadas, plano, motivo) -> list[str]:
+    """As pendências das tarefas que passaram de um teto, pelas páginas que elas leriam: `páginas 188–207: {motivo}`
+    (faixas emendadas; o lote, pelas páginas dos recortes dele). A tarefa sem página (Office, HTML, imagem avulsa)
+    fica pelo id. `cortadas`: as tarefas do plano (`id`, `modo`, `pagina` a partir de 0, `itens` com `tarefa`)."""
+    originais = {t["id"]: t for t in plano.get("tarefas_originais", [])}
+    paginas, sem_pagina = set(), []
+    for t in cortadas:
+        if t.get("modo") == "lote":
+            delas = [originais.get(it["tarefa"], {}).get("pagina") for it in t.get("itens", [])]
+        else:
+            delas = [t.get("pagina")]
+        delas = [p for p in delas if isinstance(p, int)]
+        if delas:
+            paginas.update(delas)
+        else:
+            sem_pagina.append(t["id"])
+    faixas, ordem = [], sorted(paginas)
+    for p in ordem:
+        if faixas and faixas[-1][1] == p - 1:
+            faixas[-1][1] = p
+        else:
+            faixas.append([p, p])
+    texto = [f"página {a + 1}" if a == b else f"páginas {a + 1}–{b + 1}" for a, b in faixas]
+    return [f"{f}: {motivo}" for f in texto] + [f"{i}: {motivo}" for i in sem_pagina]
 
 
 def _com_senha(caminho, senha, pasta) -> tuple[str, bool]:

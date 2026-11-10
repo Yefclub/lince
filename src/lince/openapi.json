@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Lince",
-    "version": "1.13.0",
+    "version": "1.14.0",
     "summary": "Leitor único de documentos para bases de conhecimento e IA.",
     "description": "Cada envio (um documento ou um lote) cria uma **sessão**. Quem chama marca a sessão com uma `referencia` própria (o id do usuário ou do processo no sistema de origem) e recupera os resultados pela sessão ou pela referência.\n\nO documento não é guardado: o arquivo é apagado assim que lido. Só se o servidor tiver cache ligado, a transcrição que a IA fez de cada recorte ou página fica no Redis por alguns dias, separada por token, para não ser paga de novo. O resultado fica guardado (em disco, fora da memória do serviço) só até ser **entregue**: a primeira resposta que traz a sessão `concluida` (o `POST` com `Prefer: wait` ou um `GET`) é a entrega. Depois dela, a sessão fica 60 s para o cliente repetir o pedido se a resposta se perdeu, e então some; `DELETE` confirma o recebimento e apaga na hora. Resultado não buscado é descartado 15 min depois de concluída. `expira_em` sempre diz até quando a sessão existe. Cada token pode ter até 1 GiB de resultado esperando entrega (ou o teto que o serviço configurou para ele); o resultado entregue deixa de contar na hora. Acima disso, novos envios recebem 429, com `Retry-After` e o uso no corpo, até o token buscar o que é dele.\n\nO modelo de visão é de quem chama, informado em cada envio (`X-IA-URL`, `X-IA-Modelo`, `X-IA-Chave`); a chave não é guardada nem registrada.\n\nErros seguem a RFC 9457 (`application/problem+json`). Toda resposta traz `X-Request-Id`.\n\n**Documento como código.** Com `codigo=sim`, cada documento de formato editável (PPTX, DOCX, XLSX) traz também `resultado.codigo`: a estrutura do documento com ids estáveis tirados do próprio arquivo (slide, forma, parágrafo, célula, série de gráfico). Com esses ids, `POST /v1/edicoes` aplica operações nomeadas e devolve o arquivo novo, alterando só as partes tocadas; o resto do pacote sai idêntico em bytes.\n\n**Arquivo com senha.** PDF com senha de abertura, Office (OOXML e os binários `.doc`, `.xls`, `.ppt`) e ODF protegidos por senha são reconhecidos antes de qualquer leitura: sem o campo `senha`, o envio é recusado com 422 `arquivo-protegido` (com o `formato` e o `arquivo` no corpo), sem ler nada nem chamar IA. Com `senha`, o arquivo é decifrado numa cópia temporária, só para a leitura, apagada com o documento; a senha errada dá 422 `senha-incorreta`, e senhas erradas demais dão 429 `tentativas-de-senha`. A senha não é guardada nem registrada, e as leituras do documento protegido não entram no cache. O PDF que só tem senha de permissões abre sem ela e é lido como os outros.\n\n**Antivírus.** Se o serviço estiver configurado com ClamAV, todo arquivo é varrido antes de ser lido ou editado: arquivo infectado recusa o envio inteiro ou a edição (422 `arquivo-infectado`) e antivírus fora do ar recusa com 503 `antivirus-indisponivel` (nunca lê sem varrer).",
     "license": {
@@ -132,9 +132,18 @@
                     "default": "leitura"
                   },
                   "max_tarefas": {
-                    "description": "Só no modo `tarefas`: baixa o teto de tarefas de cada documento (200); valor acima dele vale o teto. As que passam ficam em `pendentes` do preparo (`teto de leituras`) e, depois, em `cobertura.pendentes` da montagem. Fora do modo `tarefas`, ou se não for inteiro maior que zero, 400 `max-tarefas-invalido`.",
+                    "description": "Só no modo `tarefas`: baixa o teto de tarefas de cada documento (200 com `imagens=embutidas`, 1.000 com `imagens=separadas`); valor acima dele vale o teto. As que passam ficam em `pendentes` do preparo, pelas páginas (`páginas 188–207: teto de 200 tarefas por documento`), e, depois, em `cobertura.pendentes` da montagem. Fora do modo `tarefas`, ou se não for inteiro maior que zero, 400 `max-tarefas-invalido`.",
                     "type": "integer",
                     "minimum": 1
+                  },
+                  "imagens": {
+                    "description": "Só no modo `tarefas`. `embutidas` (padrão): cada tarefa traz a imagem em base64 no resultado, como sempre, até 200 tarefas por documento e 300 por sessão. `separadas`: as tarefas vêm sem a imagem, com `imagem_bytes`, e cada imagem é buscada em `GET /v1/sessoes/{id}/itens/{item}/tarefas/{tarefa}/imagem`, assim que o documento fica `pronto` (sem esperar os outros do lote); até 1.000 tarefas por documento e 5.000 por sessão. Cada imagem conta no teto de retenção do token até ser buscada, e a sessão fica até 15 min depois de concluída enquanto houver imagem não buscada. Outro valor, ou `separadas` fora do modo `tarefas`: 400 `imagens-invalido`.",
+                    "type": "string",
+                    "enum": [
+                      "embutidas",
+                      "separadas"
+                    ],
+                    "default": "embutidas"
                   },
                   "senha": {
                     "description": "Senha dos arquivos protegidos do envio (PDF com senha de abertura, Office e ODF), válida nos modos `leitura` e `tarefas`. Vale para cada arquivo do envio que pede senha e é ignorada nos outros. Decifra uma cópia temporária só para a leitura; a montagem, a releitura ampliada e `codigo=sim` trabalham sobre ela, sem pedir a senha de novo. Senha errada: 422 `senha-incorreta`. Depois de 5 senhas erradas para o mesmo arquivo (ou 50 no token) em 15 min, as tentativas seguintes recebem 429 `tentativas-de-senha` com `Retry-After`. Cifra que o Lince não decifra: 422 `arquivo-protegido` com o motivo em `detail`; arquivo corrompido com a senha certa: 422 `arquivo-protegido` com o motivo em `detail`, sem contar como senha errada. Pacote decifrado acima dos limites de leitura: 422 `documento-recusado`. Acima de 1024 caracteres: 400 `senha-invalida`. A senha não é guardada, registrada nem devolvida.",
@@ -687,6 +696,75 @@
           },
           "429": {
             "$ref": "#/components/responses/Limite"
+          },
+          "default": {
+            "$ref": "#/components/responses/Problema"
+          }
+        }
+      }
+    },
+    "/v1/sessoes/{id}/itens/{item}/tarefas/{tarefa}/imagem": {
+      "get": {
+        "tags": [
+          "sessoes"
+        ],
+        "operationId": "imagemDaTarefa",
+        "summary": "Imagem de uma tarefa do modo tarefas (imagens=separadas)",
+        "description": "A imagem PNG da tarefa, de um documento `pronto` da sessão (o lote não precisa ter terminado). A primeira busca tira os bytes dela do teto de retenção do token; dá para buscar de novo enquanto a sessão existir. Imagem que não existe, de sessão de outro token, ou de sessão com `imagens=embutidas`: 404 `imagem-nao-encontrada`.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Id"
+            }
+          },
+          {
+            "name": "item",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Id"
+            },
+            "description": "O `id` do documento na sessão (`itens[].id`): o id da tarefa só é único dentro do documento."
+          },
+          {
+            "name": "tarefa",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{1,64}$"
+            },
+            "description": "O `id` da tarefa."
+          },
+          {
+            "$ref": "#/components/parameters/RequestId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A imagem.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            },
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "contentMediaType": "image/png"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/NaoAutorizado"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problema"
           },
           "default": {
             "$ref": "#/components/responses/Problema"
@@ -1343,7 +1421,7 @@
         "properties": {
           "type": {
             "type": "string",
-            "description": "`urn:lince:erro:<codigo>`, estável para tratar no código (ex.: nao-autorizado, limite-pendentes, sessao-nao-encontrada, idempotency-key-reutilizada, plano-invalido, plano-de-outra-chave, limite-retencao, documento-recusado, arquivo-protegido, senha-incorreta, tentativas-de-senha, senha-invalida, rota-inexistente, metodo-nao-permitido, interno)."
+            "description": "`urn:lince:erro:<codigo>`, estável para tratar no código (ex.: nao-autorizado, limite-pendentes, sessao-nao-encontrada, idempotency-key-reutilizada, plano-invalido, plano-de-outra-chave, limite-retencao, documento-recusado, arquivo-protegido, senha-incorreta, tentativas-de-senha, senha-invalida, imagens-invalido, imagem-nao-encontrada, rota-inexistente, metodo-nao-permitido, interno)."
           },
           "title": {
             "type": "string"
@@ -1542,7 +1620,7 @@
       },
       "TarefaVisual": {
         "type": "object",
-        "description": "Uma leitura que a IA precisa fazer.",
+        "description": "Uma leitura que a IA precisa fazer, com a imagem embutida (`imagens=embutidas`, o padrão).",
         "required": [
           "id",
           "tipo",
@@ -1639,6 +1717,110 @@
           }
         }
       },
+      "TarefaVisualSeparada": {
+        "type": "object",
+        "description": "Uma leitura que a IA precisa fazer, com a imagem à parte (`imagens=separadas`): os mesmos campos de `TarefaVisual`, com `imagem_bytes` no lugar de `imagem`.",
+        "required": [
+          "id",
+          "tipo",
+          "imagem_bytes",
+          "instrucao",
+          "chave",
+          "tokens_estimados"
+        ],
+        "not": {
+          "required": [
+            "imagem"
+          ]
+        },
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Chave da resposta em `POST /v1/montagens`."
+          },
+          "tipo": {
+            "type": "string",
+            "enum": [
+              "imagem",
+              "pagina",
+              "desenho",
+              "tabela",
+              "formula",
+              "lote"
+            ],
+            "description": "`imagem` (Office, HTML, imagem inteira do PDF), `pagina` (página escaneada), `desenho` (gráfico ou diagrama vetorial do PDF), `tabela` (tabela duvidosa), `formula` e `lote`: uma folha com recortes pequenos numerados; a resposta esperada é o JSON pedido na instrução, e `itens` diz o que é cada recorte."
+          },
+          "imagem_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Com `imagens=separadas`: o tamanho do PNG em `GET /v1/sessoes/{id}/itens/{item}/tarefas/{tarefa}/imagem`."
+          },
+          "instrucao": {
+            "type": "string",
+            "description": "O prompt para mandar junto com a imagem."
+          },
+          "chave": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Hash da imagem, da instrução e da versão do prompt; junte o seu modelo para usar como chave de cache."
+          },
+          "tokens_estimados": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Conta aproximada: largura × altura da imagem / 750, mais a instrução (caracteres / 4)."
+          },
+          "pagina": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "description": "PDF: a página."
+          },
+          "caixa": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "number"
+            },
+            "minItems": 4,
+            "maxItems": 4,
+            "description": "PDF: x0, y0, x1, y1 em pontos, origem embaixo à esquerda."
+          },
+          "onde": {
+            "type": "string",
+            "description": "Office e HTML: onde a imagem está (`imagem 3`, `aba Vendas, célula B4`)."
+          },
+          "itens": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "n",
+                "tarefa",
+                "tipo",
+                "onde"
+              ],
+              "properties": {
+                "n": {
+                  "type": "integer"
+                },
+                "tarefa": {
+                  "type": "string"
+                },
+                "tipo": {
+                  "type": "string"
+                },
+                "onde": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
       "Preparo": {
         "type": "object",
         "description": "Resultado do modo `tarefas`: a primeira fase da leitura.",
@@ -1651,7 +1833,14 @@
           "tarefas": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/TarefaVisual"
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/TarefaVisual"
+                },
+                {
+                  "$ref": "#/components/schemas/TarefaVisualSeparada"
+                }
+              ]
             }
           },
           "pendentes": {
@@ -1659,7 +1848,7 @@
             "items": {
               "type": "string"
             },
-            "description": "O que já ficou de fora antes da IA (teto de leituras, teto de tarefas da sessão, EMF sem desenhista...). Cada documento tem até 200 tarefas (`teto de leituras` nas pendências, para cada uma que passou) e cada sessão, até 300 somando o lote (`teto de tarefas da sessão`): cada tarefa leva a imagem no resultado, que fica em memória até a entrega."
+            "description": "O que já ficou de fora antes da IA (teto de tarefas do documento ou da sessão, EMF sem desenhista...). O teto vem pelas páginas que as tarefas cortadas leriam (`páginas 188–207: teto de 200 tarefas por documento`, `página 12: teto de 300 tarefas da sessão`); a tarefa sem página (Office, HTML) vem pelo id. Com `imagens=embutidas`, cada documento tem até 200 tarefas e cada sessão, até 300 somando o lote: cada tarefa leva a imagem no resultado. Com `imagens=separadas`, até 1.000 e 5.000."
           },
           "plano": {
             "type": "string",
