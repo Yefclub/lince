@@ -1,8 +1,8 @@
 """Bancada reproduzível do Lince: gera os documentos (nada de arquivo de terceiro), lê com uma IA simulada e
 escreve a tabela do README. Cada linha é uma conferência que passa ou não, com o tempo e a memória medidos.
 
-    uv run --extra emf python bench/medir.py              # tabela completa (a do README)
-    uv run --extra emf python bench/medir.py --rapido     # versão curta, a mesma que roda no CI (tests/test_bench.py)
+    uv run --extra servidor --extra emf python bench/medir.py              # tabela completa (a do README)
+    uv run --extra servidor --extra emf python bench/medir.py --rapido     # curta, a do CI (tests/test_bench.py)
 
 A IA simulada responde, para cada imagem, um texto fixo com o hash dela: o que se mede é o que o Lince faz (texto
 nativo, roteamento, montagem, texto oculto, concorrência), não a qualidade de um modelo."""
@@ -189,6 +189,28 @@ def relatorio_pesado(pasta, paginas):
     return p
 
 
+def escaneado(pasta, paginas):
+    """Laudo escaneado: cada página é uma imagem de texto denso, que vai inteira para a IA (issue #62)."""
+    from PIL import Image, ImageDraw
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+
+    p = pasta / "laudo_escaneado.pdf"
+    c = canvas.Canvas(str(p), pagesize=A4, invariant=1)
+    for k in range(paginas):
+        im = Image.new("L", (1240, 1754), "white")
+        d = ImageDraw.Draw(im)
+        for j in range(60):
+            d.text((80, 60 + 27 * j), f"Laudo {k + 1}, linha {j + 1}: leitura do equipamento {(k * 61 + j) % 997}.")
+        png = io.BytesIO()
+        im.save(png, "PNG")
+        c.drawImage(ImageReader(io.BytesIO(png.getvalue())), 0, 0, *A4)
+        c.showPage()
+    c.save()
+    return p
+
+
 def _rss_mb():
     try:
         import resource
@@ -292,6 +314,53 @@ def medir(rapido=False):
                 igual,
             )
 
+        def tarefas_a_parte():
+            """O laudo escaneado no modo tarefas pela API, com as imagens embutidas na resposta (o modo de sempre) e
+            à parte, buscadas uma a uma: páginas no plano, tamanho da resposta, pico de memória do Python
+            (`tracemalloc`) e disco do resultado. As imagens que os dois modos têm em comum são as mesmas."""
+            import base64
+            import tracemalloc
+
+            from starlette.testclient import TestClient
+
+            import lince.servidor as srv
+
+            cab = {"Authorization": "Bearer bancada", "Prefer": "wait=3600"}
+
+            def modo(**campos):
+                with TestClient(srv.criar_app(["bancada"])) as api:
+                    tracemalloc.start()
+                    r = api.post("/v1/sessoes", files=[("arquivo", ("laudo.pdf", arq_escaneado.read_bytes()))],
+                                 data={"modo": "tarefas", **campos}, headers=cab)  # fmt: skip
+                    s, sessao = api.app.state.servico, r.json()
+                    disco = sum(f.stat().st_size for f in Path(s.guardados).rglob("*") if f.is_file())
+                    resultado = sessao["itens"][0]["resultado"]
+                    imagens = {}
+                    for t in resultado["tarefas"]:
+                        if "imagem" in t:
+                            imagens[t["id"]] = hashlib.sha256(base64.b64decode(t["imagem"])).hexdigest()
+                        else:
+                            img = api.get(f"/v1/sessoes/{sessao['id']}/tarefas/{t['id']}/imagem", headers=cab)
+                            imagens[t["id"]] = hashlib.sha256(img.content).hexdigest()
+                    pico = tracemalloc.get_traced_memory()[1]
+                    tracemalloc.stop()
+                    paginas = {t["pagina"] for t in resultado["tarefas"]}
+                    return imagens, paginas, len(r.content), pico, disco, s.retidos
+
+            emb, pag_emb, resp_emb, pico_emb, disco_emb, _ = modo()
+            sep, pag_sep, resp_sep, pico_sep, disco_sep, retidos = modo(imagens="separadas")
+            mb = 2**20
+            iguais = all(sep[k] == v for k, v in emb.items())
+            ok = len(pag_sep) == paginas_escaneadas and iguais and not retidos
+            return (
+                f"{paginas_escaneadas} páginas; embutidas: {len(pag_emb)} páginas no plano, resposta de "
+                f"{resp_emb / mb:.0f} MB, pico {pico_emb / mb:.0f} MB, disco {disco_emb / mb:.0f} MB; separadas: "
+                f"{len(pag_sep)} páginas, {len(sep)} imagens buscadas à parte, resposta de {resp_sep / mb:.1f} MB, "
+                f"pico {pico_sep / mb:.0f} MB, disco {disco_sep / mb:.0f} MB; imagens em comum "
+                f"{'iguais' if iguais else 'DIFERENTES'}",
+                ok,
+            )
+
         def carga():
             docs = [pasta / "faturas.pdf", pasta / "apresentacao.pptx", *sorted(pasta.glob("cv_*.docx"))] * (
                 2 if rapido else 6
@@ -312,6 +381,7 @@ def medir(rapido=False):
             return f"{len(docs) - len(erros)}/{len(docs)} documentos ao mesmo tempo, {len(erros)} erros", not erros
 
         paginas, n_linhas, paginas_pesado = (30, 20_000, 6) if rapido else (300, 100_000, 32)
+        paginas_escaneadas = 8 if rapido else 260
         arq_faturas, arq_longo, arq_cvs = faturas(pasta), longo(pasta, paginas), curriculos(pasta)
         arq_slides, arq_planilha = apresentacao(pasta), planilha_grande(pasta, n_linhas)  # gerar não entra no tempo
         linha("Lote de faturas do mesmo modelo (PDF)", lote)
@@ -323,10 +393,12 @@ def medir(rapido=False):
         linha("Concorrência", carga)
         # o pico antes da fase 1 pesada: gerar o relatório e ler 4 deles ao mesmo tempo em série, neste processo, o
         # levam a ~1,4 GB
-        pico = _rss_mb()
+        pico, posicao = _rss_mb(), len(linhas)
         arq_pesado = relatorio_pesado(pasta, paginas_pesado)
         linha("Fase 1 de PDF pesado, em série e em processos", fase1)
-    linhas.insert(-1, ("Pico de memória do processo", f"{pico:.0f} MB", True))
+        arq_escaneado = escaneado(pasta, paginas_escaneadas)
+        linha("PDF escaneado no modo tarefas, imagens embutidas e à parte", tarefas_a_parte)
+    linhas.insert(posicao, ("Pico de memória do processo", f"{pico:.0f} MB", True))
     return linhas
 
 
