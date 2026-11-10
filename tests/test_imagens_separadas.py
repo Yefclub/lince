@@ -269,3 +269,16 @@ def test_entregue_perto_do_prazo_ainda_tem_a_janela_de_repeticao(api):
     x["concluida_em"] -= srv.ENTREGA_PRAZO - 5  # entregue a 5 s do prazo, com imagens não buscadas
     x["entregue_em"] = time.time()
     assert srv._expira(x, x["concluida_em"]) >= x["entregue_em"] + srv.REENTREGA
+
+
+def test_montagem_passa_com_o_teto_cheio_de_imagens_ainda_nao_buscadas(api, monkeypatch):
+    """Quem chama monta um documento do lote enquanto as imagens dos outros ainda ocupam o teto: a montagem não guarda
+    nada, e o 429 de retenção fica para os envios novos."""
+    lote = _preparo(api, [("r.docx", _docx_com_imagens()), ("s.docx", _docx_com_imagens())], imagens="separadas")
+    s = api.app.state.servico
+    monkeypatch.setitem(s.tetos, srv._identidade("token-a"), 1)
+    um = lote["itens"][0]["resultado"]
+    respostas = {t["id"]: "Figura." for t in um["tarefas"]}
+    assert _montar(api, {"plano": um["plano"], "respostas": respostas}).status_code == 200
+    novo = conforme(enviar(api, ("r.docx", _docx_com_imagens()), A, modo="tarefas"), SESSOES, "post")
+    assert novo.status_code == 429

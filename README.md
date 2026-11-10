@@ -195,7 +195,8 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   memória livre que o alocador guardou (`malloc_trim`). O processo volta perto do tamanho de repouso depois de uma carga, em vez de
   ficar no teto do contêiner. Em outra libc (Alpine/musl) nada muda.
 - **Limites**: 100 MB por envio (com `Content-Length`), 50 arquivos por sessão, 64 documentos pendentes e 1 GiB
-  de resultado esperando entrega por token (cerca de 6 documentos pesados de uma vez), guardado num diretório
+  de resultado esperando entrega por token (cerca de 6 documentos pesados de uma vez com as imagens embutidas; com
+  `imagens=separadas`, um documento grande sozinho pode passar dele, veja Deploy), guardado num diretório
   temporário em disco, e não na memória do processo (veja Deploy: volume de disco em `/tmp`). O resultado deixa
   de contar no teto assim que é entregue. Acima do teto, `429` com `Retry-After` (quando o próximo resultado não
   buscado vence) e `em_uso_bytes` e `teto_bytes` no corpo. A montagem aceita até 20 mil

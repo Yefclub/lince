@@ -1164,10 +1164,8 @@ def criar_app(
             raise Problema(411, "tamanho-ausente", "Content-Length obrigatório", "Upload chunked não é aceito.")
         if int(tamanho) > TAMANHO_MAX:
             raise Problema(413, "envio-grande", "Envio grande demais", f"Teto de {TAMANHO_MAX // 2**20} MB por envio.")
-        with s.trava:
-            cheio = s.sem_espaco(cliente)
-        if cheio:
-            raise cheio
+        # sem o teto de retenção: a montagem não guarda nada, e um lote com as imagens à parte passa dele enquanto
+        # quem chama monta um documento de cada vez
         if not s.reservar(cliente, 1):  # a vaga antes do corpo: pedidos em paralelo não somam memória sem teto
             raise _limite_pendentes()
         na_fila = False

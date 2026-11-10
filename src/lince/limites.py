@@ -20,9 +20,10 @@ DESCOMPACTADO_MAX = 256 * 1024 * 1024  # 256 MiB somando todas as partes
 PARTE_MAX = 128 * 1024 * 1024  # 128 MiB numa parte só (o mesmo teto do anydoc)
 RAZAO_MAX = 200  # descompactado / compactado, só em parte acima de RAZAO_A_PARTIR
 RAZAO_A_PARTIR = 1024 * 1024  # XML pequeno e repetitivo comprime muito e é legítimo
-# Resultado esperando entrega por token, padrão. Um documento pesado retém de ~70 a ~170 MB (o arquivo enviado, até
-# 100 MB, e depois as imagens do modo tarefas, que o cliente pede até 64 MB): 1 GiB cabe ~6 desses ao mesmo tempo no
-# pior caso, 4x o teto anterior (256 MB), batido com 2. Fica em disco (servidor.py), não na memória do processo; cada
+# Resultado esperando entrega por token, padrão. Com as imagens embutidas, um documento pesado retém de ~70 a ~170 MB
+# (o arquivo enviado, até 100 MB, e depois as imagens do modo tarefas, que o cliente pede até 64 MB): 1 GiB cabe ~6
+# desses ao mesmo tempo no pior caso, 4x o teto anterior (256 MB), batido com 2. Com as imagens à parte, um documento
+# grande sozinho passa dele (veja TAREFAS_POR_DOCUMENTO). Fica em disco (servidor.py), não na memória do processo; cada
 # token pode ter o seu na LINCE_TOKENS (`nome:token:teto`).
 RETIDOS_POR_TOKEN = 1024 * 1024 * 1024
 LADO_MAX_PX = 10_000  # renderização de página de PDF: MediaBox gigante não vira imagem de gigabytes

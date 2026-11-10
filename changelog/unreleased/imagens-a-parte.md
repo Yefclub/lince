@@ -13,7 +13,8 @@ id, a página, a região e o tamanho (`imagem_bytes`), e cada imagem é buscada 
 `GET /v1/sessoes/{id}/itens/{item}/tarefas/{tarefa}/imagem`. A resposta deixa de ter centenas de MB num documento escaneado
 grande, e quem chama já pode começar a IA de um documento assim que ele fica pronto, sem esperar o resto do lote.
 Cada imagem conta no limite de retenção do token só até ser buscada, e a sessão espera, até 15 minutos depois de
-concluída, pelas imagens que ainda não foram buscadas.
+concluída, pelas imagens que ainda não foram buscadas. A montagem (`POST /v1/montagens`) de um documento não espera pelas imagens dos outros: ela não
+guarda nada e não é barrada pelo limite de retenção.
 
 **Pendência que diz o que ficou de fora.** Quando o teto é atingido, a pendência agora diz as páginas, por exemplo
 "páginas 188–207: teto de 200 tarefas por documento", em vez de uma linha por tarefa. Quem chama pode mostrar ao usuário
