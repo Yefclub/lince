@@ -8,21 +8,21 @@ license = "MIT"
 dependencies = [
   "firecrawl-anydoc==0.2.4",   # MIT — Office, ODF, RTF, EPUB, CSV, legados
   "pdf-inspector==1.25.2",     # MIT — texto e tabelas do PDF, posições
-  "pypdfium2>=5.14,<6",        # Apache-2.0/BSD-3 — objetos da página, recorte, renderização
+  "pypdfium2>=5.15.0,<6",        # Apache-2.0/BSD-3 — objetos da página, recorte, renderização
   "openpyxl>=3.1.5,<4",        # MIT — imagens e gráficos de XLSX
   "python-pptx>=1.0.2,<2",     # MIT — setas de fluxograma em PPTX
   "Pillow>=13",                # MIT-CMU — imagem
   "defusedxml>=0.7",           # PSF — o openpyxl só lê XML com proteção se ele estiver instalado
   "lxml>=6.1",                 # BSD-3 — edição cirúrgica de OOXML (documento como código)
   "olefile>=0.47,<1",          # BSD-2 — cabeçalho, rodapé e macro dos binários do Office (DOC, XLS, PPT)
-  "html-to-markdown>=3.20,<4", # MIT — HTML para Markdown (núcleo em Rust, sem dependências)
+  "html-to-markdown>=3.21.1,<4", # MIT — HTML para Markdown (núcleo em Rust, sem dependências)
   "tinycss2>=1.4,<2",          # BSD-3 — style do HTML com a sintaxe e a cascata do CSS
   "resvg-py>=0.5,<0.6",        # MIT (no LICENSE do pacote; o PyPI não traz o campo) — desenha o SVG
   "msoffcrypto-tool>=6.1,<7",  # MIT (cryptography Apache-2.0/BSD-3, olefile BSD-2) — Office com senha
 ]
 
 [project.optional-dependencies]
-servidor = ["starlette>=1.10", "uvicorn>=0.54", "python-multipart>=0.0.32", "redis>=8.1,<9"]  # BSD-3 / BSD-3 / Apache-2.0 / MIT
+servidor = ["starlette>=1.10", "uvicorn>=0.54", "python-multipart>=0.0.33", "redis>=8.1,<9"]  # BSD-3 / BSD-3 / Apache-2.0 / MIT
 redis = ["redis>=8.1,<9"]  # MIT — CacheRedis para quem usa o Lince como lib
 # MIT — desenha EMF e WMF. Opcional: só tem wheel glibc (não instala em Alpine/musl) e ainda não instala no 3.15;
 # sem ele, a imagem EMF/WMF fica marcada no texto e entra em cobertura.pendentes com o motivo
@@ -37,7 +37,7 @@ dev = [
   "httpx2>=2.16",
   "jsonschema>=4.26",
   "openapi-spec-validator>=0.9",
-  "ruff>=0.17",
+  "ruff>=0.17.4",
   "pip-audit>=2.10",
 ]
 
