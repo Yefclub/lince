@@ -20,12 +20,25 @@ DESCOMPACTADO_MAX = 256 * 1024 * 1024  # 256 MiB somando todas as partes
 PARTE_MAX = 128 * 1024 * 1024  # 128 MiB numa parte só (o mesmo teto do anydoc)
 RAZAO_MAX = 200  # descompactado / compactado, só em parte acima de RAZAO_A_PARTIR
 RAZAO_A_PARTIR = 1024 * 1024  # XML pequeno e repetitivo comprime muito e é legítimo
-# Resultado esperando entrega por token, padrão. Um documento pesado retém de ~70 a ~170 MB (o arquivo enviado, até
-# 100 MB, e depois as imagens do modo tarefas, que o cliente pede até 64 MB): 1 GiB cabe ~6 desses ao mesmo tempo no
-# pior caso, 4x o teto anterior (256 MB), batido com 2. Fica em disco (servidor.py), não na memória do processo; cada
+# Resultado esperando entrega por token, padrão. Com as imagens embutidas, um documento pesado retém de ~70 a ~170 MB
+# (o arquivo enviado, até 100 MB, e depois as imagens do modo tarefas, que o cliente pede até 64 MB): 1 GiB cabe ~6
+# desses ao mesmo tempo no pior caso, 4x o teto anterior (256 MB), batido com 2. Com as imagens à parte, um documento
+# grande sozinho passa dele (veja TAREFAS_POR_DOCUMENTO). Fica em disco (servidor.py), não na memória do processo; cada
 # token pode ter o seu na LINCE_TOKENS (`nome:token:teto`).
 RETIDOS_POR_TOKEN = 1024 * 1024 * 1024
 LADO_MAX_PX = 10_000  # renderização de página de PDF: MediaBox gigante não vira imagem de gigabytes
+# Tarefas do modo tarefas, por documento e por sessão. Com as imagens embutidas na resposta (o modo de sempre), 200 e
+# 300: cada metade de uma página escaneada densa sai com 0,6 a 2 MB de PNG, e a resposta inteira, com as imagens em
+# base64 (4/3 do tamanho), é montada na memória do serviço e do cliente: 300 das limpas já somam 230 MB. Com as
+# imagens à parte (`imagens=separadas`), cada uma vai para o disco ao ser preparada e é buscada sozinha: o teto do
+# documento sobe para 1.000 (~500 páginas escaneadas, mais que o dobro do maior PDF real recebido, de 207 páginas) e o
+# da sessão, para 5 documentos desses. A partir daí, quem limita é o teto de bytes por token (RETIDOS_POR_TOKEN), que
+# conta as imagens até cada uma ser buscada: ele é conferido na entrada de cada envio (429), e o documento já aceito
+# guarda todas as imagens dele, de 0,3 a 2 GB num documento de 1.000 tarefas.
+TAREFAS_EMBUTIDAS_POR_DOCUMENTO = 200
+TAREFAS_EMBUTIDAS_POR_SESSAO = 300
+TAREFAS_POR_DOCUMENTO = 1000
+TAREFAS_POR_SESSAO = 5000
 # Processos da fase 1 do PDF (paralelo.py), no máximo: um por CPU disponível até este teto. Cada processo tem o
 # documento aberto e uma página renderizada por vez (~100 a ~300 MB numa página pesada): 8 cabem em ~2,5 GB, e acima
 # disso a fase 1 de um documento passa a esperar mais o pdf_inspector de cada faixa (em série) do que as páginas.

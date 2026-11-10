@@ -128,10 +128,11 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
 
 | Rota | O que faz |
 | --- | --- |
-| `POST /v1/sessoes` | Envia 1 a 50 arquivos (campo `arquivo` repetido), com `referencia`, `esforco` (`padrao` ou `max`), `prazo` (1 a 3600 s por documento), `modo` (`leitura` ou `tarefas`), `max_tarefas` (só no modo `tarefas`) e `senha` (dos arquivos protegidos) opcionais. Responde `201` com a sessão e `Location`. Com `Prefer: wait=N` (até 300 s), espera terminar. |
+| `POST /v1/sessoes` | Envia 1 a 50 arquivos (campo `arquivo` repetido), com `referencia`, `esforco` (`padrao` ou `max`), `prazo` (1 a 3600 s por documento), `modo` (`leitura` ou `tarefas`), `max_tarefas` e `imagens` (`embutidas` ou `separadas`, só no modo `tarefas`) e `senha` (dos arquivos protegidos) opcionais. Responde `201` com a sessão e `Location`. Com `Prefer: wait=N` (até 300 s), espera terminar. |
 | `GET /v1/sessoes/{id}` | Estado da sessão e de cada documento; o que já terminou vem com `markdown`, `metadados`, `cobertura`, `alertas_injecao`, `uso` (tokens por leitura) e `estrutura`. Aceita `Prefer: wait=N`. |
 | `GET /v1/sessoes?referencia=…` | Sessões do token ainda não entregues, da mais nova para a mais antiga (resumo, sem o conteúdo lido). |
 | `DELETE /v1/sessoes/{id}` | Confirma o recebimento (ou cancela o que ainda não foi lido) e apaga a sessão na hora. |
+| `GET /v1/sessoes/{id}/itens/{item}/tarefas/{tarefa}/imagem` | A imagem PNG de uma tarefa do modo `tarefas` com `imagens=separadas`, assim que o documento dela fica `pronto`. |
 | `POST /v1/montagens` | Segunda fase do modo `tarefas`: recebe `{"plano", "respostas": {id: texto}}` e devolve o resultado montado. |
 | `GET /v1/openapi.json`, `GET /saude` | Contrato; serviço no ar, versões e a memória residente do processo (`memoria.rss_bytes`, no Linux). |
 
@@ -160,9 +161,16 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   plano só monta na instância que o entregou. O plano leva o identificador da chave que o selou: depois de um
   reinício sem `LINCE_SEGREDO` (ou numa réplica com outro segredo), a montagem responde `422 plano-de-outra-chave`, e
   a saída é refazer a fase 1; `422 plano-invalido` é só o plano alterado ou de outro token. Cada documento devolve
-  até 200 tarefas e cada sessão, 300 somando o lote (cada tarefa leva a imagem em base64 no resultado, que fica em
-  disco até a entrega); as que passam ficam nas pendências do preparo com o motivo, e `-F max_tarefas=N` baixa o
-  teto do documento (nunca sobe).
+  até 200 tarefas e cada sessão, 300 somando o lote: cada tarefa leva a imagem em base64 no resultado, e a resposta
+  inteira é montada na memória. As que passam ficam nas pendências do preparo, pelas páginas (`páginas 188–207: teto
+  de 200 tarefas por documento`), e `-F max_tarefas=N` baixa o teto do documento (nunca sobe).
+- **Imagens à parte** (`-F imagens=separadas`, no modo `tarefas`): as tarefas vêm sem a imagem, com `imagem_bytes`,
+  e cada imagem é buscada em `GET /v1/sessoes/{id}/itens/{item}/tarefas/{tarefa}/imagem` assim que o documento dela fica `pronto`,
+  sem esperar o resto do lote. A resposta da sessão fica pequena, nenhuma resposta leva centenas de MB, e o teto
+  sobe para 1.000 tarefas por documento e 5.000 por sessão (um PDF de ~500 páginas escaneadas entra inteiro). Cada
+  imagem conta no teto de retenção do token até a primeira busca; dá para buscar de novo enquanto a sessão existir, e
+  ela fica até 15 min depois de concluída enquanto houver imagem não buscada. Na biblioteca, `Leitor.preparar(...,
+  imagens_em=pasta)` grava as imagens em `pasta/{id}.png` em vez de trazê-las na memória.
 - **Prazo**: com `prazo=20`, cada documento tem 20 s a partir do início da leitura dele (a espera na fila não
   conta; a extração nativa conta: no PDF, a faixa de páginas que não começa a tempo não é lida, e a página que começa
   depois do prazo entra só com o texto); o que a IA não leu a tempo aparece em
@@ -187,7 +195,8 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   memória livre que o alocador guardou (`malloc_trim`). O processo volta perto do tamanho de repouso depois de uma carga, em vez de
   ficar no teto do contêiner. Em outra libc (Alpine/musl) nada muda.
 - **Limites**: 100 MB por envio (com `Content-Length`), 50 arquivos por sessão, 64 documentos pendentes e 1 GiB
-  de resultado esperando entrega por token (cerca de 6 documentos pesados de uma vez), guardado num diretório
+  de resultado esperando entrega por token (cerca de 6 documentos pesados de uma vez com as imagens embutidas; com
+  `imagens=separadas`, um documento grande sozinho pode passar dele, veja Deploy), guardado num diretório
   temporário em disco, e não na memória do processo (veja Deploy: volume de disco em `/tmp`). O resultado deixa
   de contar no teto assim que é entregue. Acima do teto, `429` com `Retry-After` (quando o próximo resultado não
   buscado vence) e `em_uso_bytes` e `teto_bytes` no corpo. A montagem aceita até 20 mil
@@ -285,7 +294,8 @@ A imagem roda sem root e tem healthcheck em `/saude`. Ela só grava em `/tmp`: o
 resultados esperando entrega (até o teto de cada token). Monte um volume de disco em `/tmp`, e não `tmpfs`: `tmpfs`
 é memória e conta no limite do contêiner. Reserve nele a soma dos tetos dos tokens com folga: o teto é conferido na
 entrada de cada envio, e um documento já aceito guarda o resultado inteiro, então com muitos documentos em leitura
-o uso pode passar do teto por alguns resultados. A fase 1 do PDF usa um processo por CPU: reserve 4 CPUs para uma
+o uso pode passar do teto por alguns resultados. No modo `tarefas` com `imagens=separadas`, um documento de 1.000
+tarefas guarda de 0,3 a 2 GB de imagens até elas serem buscadas: dimensione o volume com essa folga. A fase 1 do PDF usa um processo por CPU: reserve 4 CPUs para uma
 base de conhecimento que recebe PDFs grandes em lote (na bancada, o relatório pesado de 32 páginas cai para menos de
 um terço do tempo em série com 4) e cerca de 300 MB de memória por CPU, além do que o serviço já usa. Tags publicadas:
 `X.Y.Z` e `X.Y`, para `linux/amd64` e `linux/arm64`, com atestado de procedência do GitHub.
@@ -452,15 +462,16 @@ uv run --extra emf python bench/medir.py
 
 | Conferência | Resultado | |
 | --- | --- | --- |
-| Lote de faturas do mesmo modelo (PDF) | 12/12 faturas no texto, rodapé com a folha nos metadados (0.0 s) | ok |
-| PDF longo | 15000/15000 linhas de 300 páginas (1.8 s) | ok |
+| Lote de faturas do mesmo modelo (PDF) | 12/12 faturas no texto, rodapé com a folha nos metadados (0.1 s) | ok |
+| PDF longo | 15000/15000 linhas de 300 páginas (2.6 s) | ok |
 | Currículos com injeção escondida (5 técnicas) | 5/5 removidas, 5/5 com alerta (0.2 s) | ok |
-| Apresentação com gráficos e logo repetido | 5/5 slides numerados, 5/5 gráficos no lugar, 6 leituras para 10 imagens (0.1 s) | ok |
-| Leitura em duas fases (IA de quem chama) | 6 tarefas, resultado igual ao da IA do Lince (0.2 s) | ok |
-| Planilha grande | 100000 linhas, perfil data/texto/texto/numero/numero, corte avisado no texto (2.1 s) | ok |
-| Concorrência | 42/42 documentos ao mesmo tempo, 0 erros (1.8 s) | ok |
-| Pico de memória do processo | 286 MB | ok |
-| Fase 1 de PDF pesado, em série e em processos | 32 páginas, 128 tarefas; sozinho 8.8 s em série e 2.7 s em 4 processos; 4 ao mesmo tempo 12.5 s e 9.6 s; plano igual (33.8 s) | ok |
+| Apresentação com gráficos e logo repetido | 5/5 slides numerados, 5/5 gráficos no lugar, 6 leituras para 10 imagens (0.2 s) | ok |
+| Leitura em duas fases (IA de quem chama) | 6 tarefas, resultado igual ao da IA do Lince (0.3 s) | ok |
+| Planilha grande | 100000 linhas, perfil data/texto/texto/numero/numero, corte avisado no texto (4.7 s) | ok |
+| Concorrência | 42/42 documentos ao mesmo tempo, 0 erros (3.0 s) | ok |
+| Pico de memória do processo | 288 MB | ok |
+| Fase 1 de PDF pesado, em série e em processos | 32 páginas, 128 tarefas; sozinho 12.5 s em série e 3.9 s em 4 processos; 4 ao mesmo tempo 19.4 s e 14.1 s; plano igual (50.2 s) | ok |
+| PDF escaneado no modo tarefas, imagens embutidas e à parte | 260 páginas; embutidas: 100 páginas no plano, resposta de 83 MB, pico 588 MB, disco 83 MB; separadas: 260 páginas, 520 imagens buscadas à parte, resposta de 1.6 MB, pico 57 MB, disco 164 MB; imagens em comum iguais (290.7 s) | ok |
 
 Medido num contêiner de 4 CPUs, Python 3.13; o tempo não inclui gerar os documentos.
 
