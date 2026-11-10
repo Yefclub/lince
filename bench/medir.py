@@ -340,7 +340,8 @@ def medir(rapido=False):
                         if "imagem" in t:
                             imagens[t["id"]] = hashlib.sha256(base64.b64decode(t["imagem"])).hexdigest()
                         else:
-                            img = api.get(f"/v1/sessoes/{sessao['id']}/tarefas/{t['id']}/imagem", headers=cab)
+                            doc = f"/v1/sessoes/{sessao['id']}/itens/{sessao['itens'][0]['id']}"
+                            img = api.get(f"{doc}/tarefas/{t['id']}/imagem", headers=cab)
                             imagens[t["id"]] = hashlib.sha256(img.content).hexdigest()
                     pico = tracemalloc.get_traced_memory()[1]
                     tracemalloc.stop()

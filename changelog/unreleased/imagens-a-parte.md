@@ -10,7 +10,7 @@ PDF de umas 500 páginas escaneadas entra inteiro no plano.
 
 **Imagens fora da resposta.** Com `imagens=separadas`, a sessão volta com as tarefas sem a imagem embutida, só com o
 id, a página, a região e o tamanho (`imagem_bytes`), e cada imagem é buscada em
-`GET /v1/sessoes/{id}/tarefas/{tarefa}/imagem`. A resposta deixa de ter centenas de MB num documento escaneado
+`GET /v1/sessoes/{id}/itens/{item}/tarefas/{tarefa}/imagem`. A resposta deixa de ter centenas de MB num documento escaneado
 grande, e quem chama já pode começar a IA de um documento assim que ele fica pronto, sem esperar o resto do lote.
 Cada imagem conta no limite de retenção do token só até ser buscada, e a sessão espera, até 15 minutos depois de
 concluída, pelas imagens que ainda não foram buscadas.

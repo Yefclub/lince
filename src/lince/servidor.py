@@ -70,7 +70,9 @@ ENTREGA_PRAZO = 15 * 60  # resultado não buscado em 15 min depois de concluído
 REENTREGA = 60
 PENDENTES_POR_CLIENTE = 64  # documentos na fila ou lendo por token; acima disso 429
 # Resultado esperando entrega por token (padrão; o porquê em limites.py): acima disso, novos envios recebem 429 até o
-# token buscar o que é dele. Um token não derruba os outros nem enche o disco da instância.
+# token buscar o que é dele. O teto é conferido na entrada de cada envio, e o documento já aceito guarda o resultado
+# inteiro (com as imagens à parte, de um documento grande, até ~2 GB): o uso pode passar dele pelos documentos em
+# leitura, e o volume do disco é dimensionado com essa folga (README, Deploy).
 BYTES_RETIDOS_POR_CLIENTE = RETIDOS_POR_TOKEN
 LIMPEZA_INTERVALO = 60
 CABECALHOS_MAX = {"x-ia-url": 2048, "x-ia-modelo": 200, "x-ia-chave": 4096}
@@ -418,11 +420,12 @@ class Servico:
                     d["bytes_retidos"] = d.get("bytes_retidos", 0) - liberados
         return corpo
 
-    def buscar_imagem(self, sessao, tid, marcar=True):
-        """O caminho e o tamanho da imagem `tid` da sessão (imagens à parte). Buscada, ela deixa de contar no teto do
-        token; o arquivo fica para repetir a busca enquanto a sessão existir. Chamar com a trava."""
+    def buscar_imagem(self, sessao, item, tid, marcar=True):
+        """O caminho e o tamanho da imagem `tid` do documento `item` da sessão (imagens à parte; o id da tarefa só é
+        único dentro do documento). Buscada, ela deixa de contar no teto do token; o arquivo fica para repetir a busca
+        enquanto a sessão existir. Chamar com a trava."""
         for d in sessao["itens"]:
-            if d["estado"] == "pronto" and tid in d.get("imagens", {}):
+            if d["id"] == item and d["estado"] == "pronto" and tid in d.get("imagens", {}):
                 n = d["imagens"][tid]
                 if marcar and tid not in d["buscadas"]:
                     d["buscadas"].add(tid)
@@ -683,9 +686,10 @@ def _vencida(x, agora):
 
 def _expira(x, concluida):
     """Entregue, a sessão fica REENTREGA segundos para a repetição, contados da entrega ou da última imagem buscada;
-    com imagens à parte ainda não buscadas, até ENTREGA_PRAZO depois de concluída, como a que não foi entregue."""
-    if x.get("entregue_em") and not _imagens_pendentes(x):
-        return max(x["entregue_em"], x.get("ultima_busca", 0)) + REENTREGA
+    com imagens à parte ainda não buscadas, também até ENTREGA_PRAZO depois de concluída, o que vier por último."""
+    if x.get("entregue_em"):
+        repeticao = max(x["entregue_em"], x.get("ultima_busca", 0)) + REENTREGA
+        return max(repeticao, concluida + ENTREGA_PRAZO) if _imagens_pendentes(x) else repeticao
     return concluida + ENTREGA_PRAZO if concluida else None
 
 
@@ -1044,7 +1048,7 @@ def criar_app(
             raise Problema(404, "imagem-nao-encontrada", "Imagem não encontrada", "Id de tarefa inválido.")
         with s.trava:
             x = s.da_sessao(cliente, request.path_params["id"])
-            caminho, tamanho = s.buscar_imagem(x, tid, marcar=request.method == "GET")
+            caminho, tamanho = s.buscar_imagem(x, request.path_params["item"], tid, marcar=request.method == "GET")
         try:
             dados = await asyncio.to_thread(Path(caminho).read_bytes) if request.method == "GET" else b""
         except FileNotFoundError:  # a sessão foi apagada (DELETE ou prazo) entre a trava e a leitura
@@ -1201,7 +1205,7 @@ def criar_app(
             # uma rota por caminho: o 405 informa no Allow todos os métodos aceitos
             Route("/v1/sessoes", sessoes, methods=["GET", "POST"]),
             Route("/v1/sessoes/{id:str}", sessao, methods=["GET", "DELETE"], name="sessao"),
-            Route("/v1/sessoes/{id:str}/tarefas/{tarefa}/imagem", tarefa_imagem, methods=["GET"]),
+            Route("/v1/sessoes/{id:str}/itens/{item}/tarefas/{tarefa}/imagem", tarefa_imagem, methods=["GET"]),
             Route("/v1/edicoes", editar, methods=["POST"]),
             Route("/v1/montagens", montar, methods=["POST"]),
             Route("/v1/edicoes/{id:str}/arquivo", edicao, methods=["GET", "DELETE"], name="edicao_arquivo"),

@@ -137,7 +137,7 @@
                     "minimum": 1
                   },
                   "imagens": {
-                    "description": "Só no modo `tarefas`. `embutidas` (padrão): cada tarefa traz a imagem em base64 no resultado, como sempre, até 200 tarefas por documento e 300 por sessão. `separadas`: as tarefas vêm sem a imagem, com `imagem_bytes`, e cada imagem é buscada em `GET /v1/sessoes/{id}/tarefas/{tarefa}/imagem`, assim que o documento fica `pronto` (sem esperar os outros do lote); até 1.000 tarefas por documento e 5.000 por sessão. Cada imagem conta no teto de retenção do token até ser buscada, e a sessão fica até 15 min depois de concluída enquanto houver imagem não buscada. Outro valor, ou `separadas` fora do modo `tarefas`: 400 `imagens-invalido`.",
+                    "description": "Só no modo `tarefas`. `embutidas` (padrão): cada tarefa traz a imagem em base64 no resultado, como sempre, até 200 tarefas por documento e 300 por sessão. `separadas`: as tarefas vêm sem a imagem, com `imagem_bytes`, e cada imagem é buscada em `GET /v1/sessoes/{id}/itens/{item}/tarefas/{tarefa}/imagem`, assim que o documento fica `pronto` (sem esperar os outros do lote); até 1.000 tarefas por documento e 5.000 por sessão. Cada imagem conta no teto de retenção do token até ser buscada, e a sessão fica até 15 min depois de concluída enquanto houver imagem não buscada. Outro valor, ou `separadas` fora do modo `tarefas`: 400 `imagens-invalido`.",
                     "type": "string",
                     "enum": [
                       "embutidas",
@@ -703,7 +703,7 @@
         }
       }
     },
-    "/v1/sessoes/{id}/tarefas/{tarefa}/imagem": {
+    "/v1/sessoes/{id}/itens/{item}/tarefas/{tarefa}/imagem": {
       "get": {
         "tags": [
           "sessoes"
@@ -719,6 +719,15 @@
             "schema": {
               "$ref": "#/components/schemas/Id"
             }
+          },
+          {
+            "name": "item",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Id"
+            },
+            "description": "O `id` do documento na sessão (`itens[].id`): o id da tarefa só é único dentro do documento."
           },
           {
             "name": "tarefa",
@@ -1611,10 +1620,11 @@
       },
       "TarefaVisual": {
         "type": "object",
-        "description": "Uma leitura que a IA precisa fazer. Com `imagens=embutidas`, traz `imagem`; com `imagens=separadas`, traz `imagem_bytes`, e a imagem é buscada à parte.",
+        "description": "Uma leitura que a IA precisa fazer, com a imagem embutida (`imagens=embutidas`, o padrão).",
         "required": [
           "id",
           "tipo",
+          "imagem",
           "instrucao",
           "chave",
           "tokens_estimados"
@@ -1639,13 +1649,111 @@
           "imagem": {
             "type": "string",
             "contentEncoding": "base64",
-            "contentMediaType": "image/png",
-            "description": "A imagem em PNG, com `imagens=embutidas`."
+            "contentMediaType": "image/png"
+          },
+          "instrucao": {
+            "type": "string",
+            "description": "O prompt para mandar junto com a imagem."
+          },
+          "chave": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Hash da imagem, da instrução e da versão do prompt; junte o seu modelo para usar como chave de cache."
+          },
+          "tokens_estimados": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Conta aproximada: largura × altura da imagem / 750, mais a instrução (caracteres / 4)."
+          },
+          "pagina": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "description": "PDF: a página."
+          },
+          "caixa": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "number"
+            },
+            "minItems": 4,
+            "maxItems": 4,
+            "description": "PDF: x0, y0, x1, y1 em pontos, origem embaixo à esquerda."
+          },
+          "onde": {
+            "type": "string",
+            "description": "Office e HTML: onde a imagem está (`imagem 3`, `aba Vendas, célula B4`)."
+          },
+          "itens": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "n",
+                "tarefa",
+                "tipo",
+                "onde"
+              ],
+              "properties": {
+                "n": {
+                  "type": "integer"
+                },
+                "tarefa": {
+                  "type": "string"
+                },
+                "tipo": {
+                  "type": "string"
+                },
+                "onde": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "TarefaVisualSeparada": {
+        "type": "object",
+        "description": "Uma leitura que a IA precisa fazer, com a imagem à parte (`imagens=separadas`): os mesmos campos de `TarefaVisual`, com `imagem_bytes` no lugar de `imagem`.",
+        "required": [
+          "id",
+          "tipo",
+          "imagem_bytes",
+          "instrucao",
+          "chave",
+          "tokens_estimados"
+        ],
+        "not": {
+          "required": [
+            "imagem"
+          ]
+        },
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Chave da resposta em `POST /v1/montagens`."
+          },
+          "tipo": {
+            "type": "string",
+            "enum": [
+              "imagem",
+              "pagina",
+              "desenho",
+              "tabela",
+              "formula",
+              "lote"
+            ],
+            "description": "`imagem` (Office, HTML, imagem inteira do PDF), `pagina` (página escaneada), `desenho` (gráfico ou diagrama vetorial do PDF), `tabela` (tabela duvidosa), `formula` e `lote`: uma folha com recortes pequenos numerados; a resposta esperada é o JSON pedido na instrução, e `itens` diz o que é cada recorte."
           },
           "imagem_bytes": {
             "type": "integer",
             "minimum": 0,
-            "description": "Com `imagens=separadas`: o tamanho do PNG em `GET /v1/sessoes/{id}/tarefas/{tarefa}/imagem`."
+            "description": "Com `imagens=separadas`: o tamanho do PNG em `GET /v1/sessoes/{id}/itens/{item}/tarefas/{tarefa}/imagem`."
           },
           "instrucao": {
             "type": "string",
@@ -1725,7 +1833,14 @@
           "tarefas": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/TarefaVisual"
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/TarefaVisual"
+                },
+                {
+                  "$ref": "#/components/schemas/TarefaVisualSeparada"
+                }
+              ]
             }
           },
           "pendentes": {

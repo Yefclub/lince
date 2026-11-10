@@ -31,8 +31,9 @@ LADO_MAX_PX = 10_000  # renderização de página de PDF: MediaBox gigante não 
 # base64 (4/3 do tamanho), é montada na memória do serviço e do cliente: 300 das limpas já somam 230 MB. Com as
 # imagens à parte (`imagens=separadas`), cada uma vai para o disco ao ser preparada e é buscada sozinha: o teto do
 # documento sobe para 1.000 (~500 páginas escaneadas, mais que o dobro do maior PDF real recebido, de 207 páginas) e o
-# da sessão, para 5 documentos desses. A proteção de verdade passa a ser o teto de bytes por token
-# (RETIDOS_POR_TOKEN), que conta as imagens até cada uma ser buscada.
+# da sessão, para 5 documentos desses. A partir daí, quem limita é o teto de bytes por token (RETIDOS_POR_TOKEN), que
+# conta as imagens até cada uma ser buscada: ele é conferido na entrada de cada envio (429), e o documento já aceito
+# guarda todas as imagens dele, de 0,3 a 2 GB num documento de 1.000 tarefas.
 TAREFAS_EMBUTIDAS_POR_DOCUMENTO = 200
 TAREFAS_EMBUTIDAS_POR_SESSAO = 300
 TAREFAS_POR_DOCUMENTO = 1000

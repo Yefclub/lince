@@ -132,7 +132,7 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
 | `GET /v1/sessoes/{id}` | Estado da sessão e de cada documento; o que já terminou vem com `markdown`, `metadados`, `cobertura`, `alertas_injecao`, `uso` (tokens por leitura) e `estrutura`. Aceita `Prefer: wait=N`. |
 | `GET /v1/sessoes?referencia=…` | Sessões do token ainda não entregues, da mais nova para a mais antiga (resumo, sem o conteúdo lido). |
 | `DELETE /v1/sessoes/{id}` | Confirma o recebimento (ou cancela o que ainda não foi lido) e apaga a sessão na hora. |
-| `GET /v1/sessoes/{id}/tarefas/{tarefa}/imagem` | A imagem PNG de uma tarefa do modo `tarefas` com `imagens=separadas`, assim que o documento dela fica `pronto`. |
+| `GET /v1/sessoes/{id}/itens/{item}/tarefas/{tarefa}/imagem` | A imagem PNG de uma tarefa do modo `tarefas` com `imagens=separadas`, assim que o documento dela fica `pronto`. |
 | `POST /v1/montagens` | Segunda fase do modo `tarefas`: recebe `{"plano", "respostas": {id: texto}}` e devolve o resultado montado. |
 | `GET /v1/openapi.json`, `GET /saude` | Contrato; serviço no ar, versões e a memória residente do processo (`memoria.rss_bytes`, no Linux). |
 
@@ -165,7 +165,7 @@ curl -H "Authorization: Bearer $LINCE_TOKEN" \
   inteira é montada na memória. As que passam ficam nas pendências do preparo, pelas páginas (`páginas 188–207: teto
   de 200 tarefas por documento`), e `-F max_tarefas=N` baixa o teto do documento (nunca sobe).
 - **Imagens à parte** (`-F imagens=separadas`, no modo `tarefas`): as tarefas vêm sem a imagem, com `imagem_bytes`,
-  e cada imagem é buscada em `GET /v1/sessoes/{id}/tarefas/{tarefa}/imagem` assim que o documento dela fica `pronto`,
+  e cada imagem é buscada em `GET /v1/sessoes/{id}/itens/{item}/tarefas/{tarefa}/imagem` assim que o documento dela fica `pronto`,
   sem esperar o resto do lote. A resposta da sessão fica pequena, nenhuma resposta leva centenas de MB, e o teto
   sobe para 1.000 tarefas por documento e 5.000 por sessão (um PDF de ~500 páginas escaneadas entra inteiro). Cada
   imagem conta no teto de retenção do token até a primeira busca; dá para buscar de novo enquanto a sessão existir, e
@@ -293,7 +293,8 @@ A imagem roda sem root e tem healthcheck em `/saude`. Ela só grava em `/tmp`: o
 resultados esperando entrega (até o teto de cada token). Monte um volume de disco em `/tmp`, e não `tmpfs`: `tmpfs`
 é memória e conta no limite do contêiner. Reserve nele a soma dos tetos dos tokens com folga: o teto é conferido na
 entrada de cada envio, e um documento já aceito guarda o resultado inteiro, então com muitos documentos em leitura
-o uso pode passar do teto por alguns resultados. A fase 1 do PDF usa um processo por CPU: reserve 4 CPUs para uma
+o uso pode passar do teto por alguns resultados. No modo `tarefas` com `imagens=separadas`, um documento de 1.000
+tarefas guarda de 0,3 a 2 GB de imagens até elas serem buscadas: dimensione o volume com essa folga. A fase 1 do PDF usa um processo por CPU: reserve 4 CPUs para uma
 base de conhecimento que recebe PDFs grandes em lote (na bancada, o relatório pesado de 32 páginas cai para menos de
 um terço do tempo em série com 4) e cerca de 300 MB de memória por CPU, além do que o serviço já usa. Tags publicadas:
 `X.Y.Z` e `X.Y`, para `linux/amd64` e `linux/arm64`, com atestado de procedência do GitHub.
