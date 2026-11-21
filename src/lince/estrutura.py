@@ -181,6 +181,7 @@ _PALAVRAS_TITULO_MAX = 12  # frase em negrito promovida a título tem mais palav
 _NUMERO_FINAL = re.compile(r"\d{1,4}$")  # no máximo 4 caracteres por posição: linear, sem retrocesso
 _SEPARADORES = " \t.·…_-"  # entre o título e o número de página no sumário impresso ("Introdução ....... 3")
 _REFERENCIA = re.compile(r"\[\d{1,4}\]\s")  # "[12] Autor. Título": item da bibliografia, não seção
+_ANCORA_IA = re.compile(r"<!-- lido pela IA: \S+ -->")  # o que a montagem põe antes da leitura de uma página
 _NUMERACAO = re.compile(r"(?:\d{1,3}(?:\.\d{1,3}){0,5}\.?|[ivxlc]{1,6}\.)\s+")  # "1.2 ", "3. ", "iv. "
 
 
@@ -251,9 +252,9 @@ def indice(md: str, estrutura: dict, sumario: list | None = None, sumario_cortad
     corridos = {n for n, ks in primeiras.items() if len(ks) >= 3}
 
     def abertura(k: int) -> int:
-        """Onde começa o conteúdo da página k, depois do cabeçalho corrido."""
+        """Onde começa o conteúdo da página k, depois do cabeçalho corrido e da âncora da leitura pela IA."""
         for pos, linha in linhas_do_comeco(k):
-            if titulo_da_linha(linha) not in corridos:
+            if titulo_da_linha(linha) not in corridos and not _ANCORA_IA.fullmatch(linha.strip()):
                 return pos
         return comecos[k + 1] if k + 1 < len(comecos) else len(md)
 
@@ -267,8 +268,12 @@ def indice(md: str, estrutura: dict, sumario: list | None = None, sumario_cortad
         itens = []
         for nivel, titulo, pagina in sumario[:INDICE_MAX]:
             item = {"titulo": titulo, "nivel": nivel, "pagina": pagina}
-            if (n := _titulo_normal(titulo)) and (pos := na_pagina.get((pagina, n))) is not None:
-                item["inicio"] = pos
+            if n := _titulo_normal(titulo):
+                pos = na_pagina.get((pagina, n))
+                if pos is None:  # o marcador numerado ("1. Introdução") e o título sem a numeração no texto
+                    pos = na_pagina.get((pagina, _sem_numeracao(n)))
+                if pos is not None:
+                    item["inicio"] = pos
             itens.append(item)
         fonte, cortado = "sumario", sumario_cortado or len(sumario) > INDICE_MAX
     else:

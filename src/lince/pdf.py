@@ -642,12 +642,12 @@ def imagens_das_paginas(caminho, paginas, lado=1568) -> dict[int, bytes]:
     PIXELS_IMAGEM_MAX na chamada; e, na vez de cada página, a que não abre ou passa de OBJETOS_MAX objetos (a mesma
     página pesada que a leitura não analisa). O prazo do contexto (`prazo_restante`) é conferido antes de cada página:
     esgotado, levanta PrazoEsgotado. A PDFium fica com a trava só durante a renderização de cada página."""
-    pedidas = list(paginas)
+    pedidas = list(itertools.islice(paginas, PAGINAS_IMAGEM_MAX + 1))  # o iterável enorme para no teto
     if not all(isinstance(n, int) and not isinstance(n, bool) for n in pedidas):
         raise ValueError("as páginas são números inteiros a partir de 1")
-    pedidas = list(dict.fromkeys(pedidas))
     if not pedidas or len(pedidas) > PAGINAS_IMAGEM_MAX:
         raise ValueError(f"peça de 1 a {PAGINAS_IMAGEM_MAX} páginas")
+    pedidas = list(dict.fromkeys(pedidas))
     if not isinstance(lado, int) or not LADO_IMAGEM_MIN <= lado <= LADO_IMAGEM_MAX:
         raise ValueError(f"o lado vai de {LADO_IMAGEM_MIN} a {LADO_IMAGEM_MAX} pixels")
     if len(pedidas) * lado * lado > PIXELS_IMAGEM_MAX:

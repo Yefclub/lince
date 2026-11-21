@@ -223,13 +223,30 @@ def test_titulo_citado_no_texto_da_pagina_nao_encurta_a_secao_anterior():
     assert md[mapa["itens"][1]["inicio"] :].startswith("# Resultados")
 
 
-def test_marcador_acha_o_titulo_sublinhado_ou_numerado_da_pagina():
-    md, estrutura = _md("# 1. Introdução\n\ntexto", "# <u>Resultados</u>\n\ntexto")
+@pytest.mark.parametrize(
+    ("titulos", "marcadores"),
+    [
+        (("# 1. Introdução", "# <u>Resultados</u>"), ("Introdução", "Resultados")),  # numerado ou sublinhado no texto
+        (("# Introdução", "# Resultados"), ("1. Introdução", "2 Resultados")),  # numerado no marcador
+    ],
+)
+def test_marcador_acha_o_titulo_da_pagina_com_ou_sem_numeracao(titulos, marcadores):
+    md, estrutura = _md(*[f"{t}\n\ntexto" for t in titulos])
 
-    mapa = indice(md, estrutura, [[1, "Introdução", 1], [1, "Resultados", 2]])
+    mapa = indice(md, estrutura, [[1, marcadores[0], 1], [1, marcadores[1], 2]])
 
     assert [(x["pagina"], x["pagina_fim"]) for x in mapa["itens"]] == [(1, 1), (2, 2)]
     assert all("inicio" in x for x in mapa["itens"])
+
+
+def test_secao_que_abre_a_pagina_lida_pela_ia_fecha_a_anterior():
+    md, estrutura = _md(
+        "# Métodos\n\ntexto", "<!-- lido pela IA: p002 -->\n# Resultados\n\ntexto lido da página escaneada"
+    )
+
+    mapa = indice(md, estrutura, [[1, "Métodos", 1], [1, "Resultados", 2]])
+
+    assert [(x["titulo"], x["pagina_fim"]) for x in mapa["itens"]] == [("Métodos", 1), ("Resultados", 2)]
 
 
 def test_cabecalho_corrido_nao_prende_a_secao_na_pagina_seguinte_tambem_com_marcadores():
@@ -328,9 +345,26 @@ def test_imagens_das_paginas_recusam_a_pagina_pesada_como_a_leitura(tmp_path, mo
         lince.imagens_das_paginas(p, [1])
 
 
-def test_imagens_das_paginas_respeitam_o_prazo(tmp_path):
+def test_imagens_das_paginas_param_quando_o_prazo_vence_entre_as_paginas(tmp_path, monkeypatch):
+    p = tmp_path / "figuras.pdf"
+    _pdf_com_figuras(p)
+    restante = iter([5.0, 0.0])  # sobra tempo para a primeira página; na segunda, acabou
+    monkeypatch.setattr(lince.pdf, "prazo_restante", lambda: next(restante))
+    renderizadas = []
+    original = lince.pdf.de_pe
+    monkeypatch.setattr(lince.pdf, "de_pe", lambda img, rot: renderizadas.append(1) or original(img, rot))
+
+    with pytest.raises(lince.PrazoEsgotado):
+        lince.imagens_das_paginas(p, [1, 2])
+    assert len(renderizadas) == 1
+
+
+@pytest.mark.parametrize("prazo", [0, -1, float("nan"), float("inf")])
+def test_imagens_das_paginas_recusam_prazo_invalido_como_a_leitura(tmp_path, prazo):
     p = tmp_path / "figuras.pdf"
     _pdf_com_figuras(p)
 
-    with pytest.raises(lince.PrazoEsgotado):
-        lince.imagens_das_paginas(p, [1, 2], prazo=0)
+    with pytest.raises(ValueError, match="prazo"):
+        lince.imagens_das_paginas(p, [1], prazo=prazo)
+    with pytest.raises(ValueError, match="prazo"):
+        lince.ler(p, prazo=prazo)

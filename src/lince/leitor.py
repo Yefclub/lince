@@ -687,6 +687,8 @@ def imagens_das_paginas(
     com `prazo` (segundos), a página que começaria depois dele levanta `PrazoEsgotado`."""
     if _extensao_lida(str(caminho)) != ".pdf":
         raise FormatoNaoSuportado("imagens das páginas só de PDF")
+    if prazo is not None and not (math.isfinite(prazo) and prazo > 0):
+        raise ValueError("prazo precisa ser um número de segundos maior que zero")
     token = LIMITE.set(time.monotonic() + prazo if prazo is not None else None)
     try:
         with tempfile.TemporaryDirectory(prefix="lince-") as pasta:
