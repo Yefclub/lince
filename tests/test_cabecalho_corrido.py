@@ -282,9 +282,9 @@ def test_cabecalho_fixo_que_o_extrator_marcou_como_titulo_vai_para_os_metadados(
         c.setFont("Helvetica", 11)
         for k in range(12):
             c.drawString(60, 740 - k * 18, f"Parágrafo {k + 1} da análise da página {n + 1}, com dados do trimestre.")
-        if n in (3, 6):  # as seções de verdade do documento
+        if n in (1, 3, 6):  # as seções de verdade do documento
             c.setFont("Helvetica-Bold", 16)
-            c.drawString(60, 480, "Inflação" if n == 3 else "Crédito")
+            c.drawString(60, 480, {1: "Atividade", 3: "Inflação", 6: "Crédito"}[n])
         c.showPage()
     c.save()
 
@@ -293,13 +293,13 @@ def test_cabecalho_fixo_que_o_extrator_marcou_como_titulo_vai_para_os_metadados(
     assert "Carta do Trimestre" not in r.markdown
     assert r.metadados["cabeçalho/rodapé"] == ["Carta do Trimestre | 69 | Nota 22"]
     assert r.markdown.count("da análise da página") == 96  # o conteúdo inteiro fica
-    assert [s["titulo"] for s in r.estrutura["secoes"]] == ["Inflação", "Crédito"]  # as seções de verdade ficam
+    assert [s["titulo"] for s in r.estrutura["secoes"]] == ["Atividade", "Inflação", "Crédito"]  # as seções ficam
 
 
 @pytest.mark.parametrize(
     "extra",
-    [None, "observacoes", "itens"],
-    ids=["so-o-titulo", "um-titulo-numa-fatura", "o-mesmo-subtitulo-em-todas"],
+    [None, "observacoes", "observacoes-e-avisos", "itens"],
+    ids=["so-o-titulo", "um-titulo-numa-fatura", "titulos-em-duas-faturas", "o-mesmo-subtitulo-em-todas"],
 )
 def test_lote_com_o_mesmo_titulo_em_cada_documento_mantem_os_titulos(tmp_path, extra):
     p = tmp_path / "faturas.pdf"
@@ -312,9 +312,10 @@ def test_lote_com_o_mesmo_titulo_em_cada_documento_mantem_os_titulos(tmp_path, e
             [f"Fatura nº {1000 + n}", f"Cliente: Transportadora {n + 1} Ltda", f"Valor: R$ {150 + n},00"]
         ):
             c.drawString(60, 760 - k * 18, ln)
-        if (extra == "observacoes" and n == 4) or extra == "itens":
+        proprio = {"observacoes": {4: "Observações"}, "observacoes-e-avisos": {4: "Observações", 9: "Avisos"}}
+        if titulo := "Itens" if extra == "itens" else proprio.get(extra, {}).get(n):
             c.setFont("Helvetica-Bold", 16)
-            c.drawString(60, 680, "Observações" if extra == "observacoes" else "Itens")
+            c.drawString(60, 680, titulo)
         c.showPage()
     c.save()
 

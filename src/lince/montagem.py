@@ -211,7 +211,11 @@ def montar(pasta, respostas):
 
 CABECALHO_MAX = 80  # linha de cabeçalho/rodapé corrido é curta; parágrafo que o leitor juntou numa linha, não
 FRACAO_MAX = 0.25  # se a remoção levaria mais que isso do texto nativo do documento, nada sai
-TITULOS_MIN_FRACAO = 0.1  # títulos distintos por página que dizem que o documento tem seções (o Ipea: 17 em 43)
+# títulos distintos que dizem que o documento tem seções de verdade: TITULOS_MIN_FRACAO das páginas, no mínimo
+# TITULOS_MIN (o Ipea: 17 em 43 páginas). Abaixo disso, dois ou três documentos de um lote com um título próprio não
+# fazem do título comum a todos ("Fatura") um cabeçalho corrido
+TITULOS_MIN_FRACAO = 0.2
+TITULOS_MIN = 3
 FIXA_MIN = 0.8  # linha idêntica na borda de ao menos esta fração das páginas é cabeçalho fixo ("Confidencial")
 
 
@@ -317,7 +321,7 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
     }
     terceira = {0: 2, 1: 2, -1: -3, -2: -3}  # de cada posição da borda, a primeira linha do corpo
     # o título que se repete só sai num documento com seções de verdade: outros títulos, distintos, em número que
-    # acompanha o tamanho do documento (TITULOS_MIN_FRACAO das páginas, no mínimo 2) e que não se repetem eles mesmos
+    # acompanha o tamanho do documento (TITULOS_MIN_FRACAO das páginas, no mínimo TITULOS_MIN) e que não se repetem
     # na maioria das páginas. Num lote de faturas de uma página, "Fatura" no topo de cada uma é o título de cada
     # documento: um "Observações" numa delas ou um "Itens" em todas não fazem dele cabeçalho corrido
     paginas_do_titulo = {}
@@ -327,7 +331,7 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
                 if _TITULO_FIXO.match(ln.lstrip()):
                     paginas_do_titulo.setdefault(ln.strip(), set()).add(i)
     secoes_de_verdade = {t for t, pags in paginas_do_titulo.items() if len(pags) <= n / 2}
-    com_secoes = len(secoes_de_verdade) >= max(2, TITULOS_MIN_FRACAO * n)
+    com_secoes = len(secoes_de_verdade) >= max(TITULOS_MIN, TITULOS_MIN_FRACAO * n)
     fixas = {
         (pos, t)
         for pos, t in repetidas.items()

@@ -111,7 +111,7 @@ def test_no_pdf_a_frase_volta_inteira_sem_o_cabecalho_corrido_e_a_secao_real_fic
             c.setFont("Helvetica", 11)
             c.drawString(200, y - 18, "O PIB cresceu 0,5% no segundo trimestre de 2026.")
             y -= 36
-        y = _secao(c, {2: "Inflação", 3: "Crédito"}.get(n), y)
+        y = _secao(c, {0: "Atividade", 2: "Inflação", 3: "Crédito"}.get(n), y)
         c.setFont("Helvetica", 11)
         for k in range(10):
             c.drawString(60, y - 18 * k, f"Texto corrido {k} da página {n + 1} com a análise do trimestre.")
@@ -126,7 +126,7 @@ def test_no_pdf_a_frase_volta_inteira_sem_o_cabecalho_corrido_e_a_secao_real_fic
     assert f"**{frase}** O PIB cresceu 0,5%" in r.markdown
     assert "Carta do Trimestre" not in r.markdown
     assert r.metadados["cabeçalho/rodapé"] == ["Carta do Trimestre | 69 | Nota 22 | Terceiro trimestre"]
-    assert [s["titulo"] for s in r.estrutura["secoes"]] == ["Inflação", "Crédito"]
+    assert [s["titulo"] for s in r.estrutura["secoes"]] == ["Atividade", "Inflação", "Crédito"]
 
 
 def test_continuacao_com_o_ponto_fora_do_negrito_ou_em_trechos_tambem_junta():
@@ -158,7 +158,7 @@ def test_cabecalho_corrido_no_topo_nao_entra_na_continuacao_da_frase(tmp_path):
             c.setFont("Helvetica", 11)
             c.drawString(200, y, "O PIB cresceu 0,5% no segundo trimestre de 2026.")
             y -= 18
-        y = _secao(c, {1: "Atividade", 3: "Inflação"}.get(n), y)
+        y = _secao(c, {0: "Panorama", 1: "Atividade", 3: "Inflação"}.get(n), y)
         c.setFont("Helvetica", 11)
         for k in range(10):
             c.drawString(60, y - 18 * k, f"Texto corrido {k} da página {n + 1} com a análise do trimestre.")
