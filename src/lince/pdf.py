@@ -5,6 +5,7 @@ import contextvars
 import ctypes
 import hashlib  # noqa: F401
 import io
+import itertools
 import json  # noqa: F401
 import logging
 import math
@@ -28,6 +29,7 @@ from ._trava import PDFIUM
 from .limites import escala
 from .seguranca import NAO_CONFERIDO, texto_oculto_pdf
 from .texto import densidade_matematica, desifenizar, limpar_tabelas, lixo
+from .tipos import PrazoEsgotado
 
 PROMPT_VERSAO = "leitura-ia-v1"
 log = logging.getLogger("lince")
@@ -42,6 +44,20 @@ PAGINAS_ANALISE_MAX = 2000
 # ~2 ms por página de 50 linhas). É o dobro do maior documento real já recebido (2.500 páginas); acima dele, as
 # páginas restantes não são lidas e entram nas pendências, como os outros tetos contra documento hostil de limites.py.
 PAGINAS_TEXTO_MAX = 5000
+# Marcadores lidos do sumário do PDF: livro técnico grande tem algumas centenas; o resto de um arquivo hostil não entra
+# (e o índice sai com `cortado`). O título do marcador vai até TITULO_MAX caracteres: título de seção cabe numa linha,
+# e o marcador hostil de megabytes não passa para o resultado.
+SUMARIO_MAX = 2000
+TITULO_MAX = 200
+# Páginas como imagem por chamada (`imagens_das_paginas`): a resposta a uma pergunta usa poucas páginas. O lado vai de
+# LADO_IMAGEM_MIN, abaixo do qual o texto da página deixa de ser legível, a LADO_IMAGEM_MAX, o dobro do que o
+# provedor de visão aceita sem reduzir (~1568 px); a chamada inteira não passa de PIXELS_IMAGEM_MAX, 50 páginas de
+# 1568 px de lado (~123 Mpx: dezenas de MB em PNG, umas centenas na renderização), para nenhum pedido segurar a
+# memória do serviço.
+PAGINAS_IMAGEM_MAX = 50
+LADO_IMAGEM_MIN = 256
+LADO_IMAGEM_MAX = 4096
+PIXELS_IMAGEM_MAX = PAGINAS_IMAGEM_MAX * 1568 * 1568
 # Páginas por chamada do pdf_inspector. Ele não usa a PDFium, mas segura a GIL e, chamado com o arquivo, analisa o
 # documento inteiro a cada vez, mesmo pedindo uma página (medido: 4 s por chamada num PDF de 2.500 páginas). Ele só lê
 # cópias de FAIXA páginas feitas pela PDFium (~0,05 s cada), nunca o arquivo, e roda fora da trava: o prazo é
@@ -177,6 +193,7 @@ def planejar_pdf(path, pasta):
             # percorrê-la é o que o pdf_inspector faz com o arquivo, sem teto nem prazo.
             total = len(doc)
             propriedades = _propriedades(doc)
+            sumario, sumario_cortado = _sumario(doc, total)
             lidas = min(total, PAGINAS_TEXTO_MAX)
             etapas["abrir"] += time.monotonic() - inicio
             if distribuidor is not None:  # cada processo abre o dele
@@ -276,6 +293,10 @@ def planejar_pdf(path, pasta):
              "pendentes": pendentes}  # fmt: skip
     if propriedades:
         plano["propriedades"] = propriedades
+    if sumario:
+        plano["sumario"] = sumario
+    if sumario_cortado:
+        plano["sumario_cortado"] = True
     _registrar(etapas, total, len(tarefas), time.monotonic() - inicio, distribuidor)
     return plano
 
@@ -613,12 +634,85 @@ def _renderizar(doc, i, fator):
         page.close()
 
 
+def imagens_das_paginas(caminho, paginas, lado=1568) -> dict[int, bytes]:
+    """As páginas pedidas (lista de números a partir de 1) em PNG, como são exibidas (de pé), com o maior lado em
+    `lado` pixels: a evidência original para quem lê na hora da pergunta as páginas que o Markdown só descreve
+    (`paginas_visuais`). Recusa com ValueError, antes de renderizar: pedido vazio ou acima de PAGINAS_IMAGEM_MAX
+    páginas, número que não é inteiro ou fora do documento, `lado` fora de LADO_IMAGEM_MIN a LADO_IMAGEM_MAX ou acima de
+    PIXELS_IMAGEM_MAX na chamada; e, na vez de cada página, a que não abre ou passa de OBJETOS_MAX objetos (a mesma
+    página pesada que a leitura não analisa). O prazo do contexto (`prazo_restante`) é conferido antes de cada página:
+    esgotado, levanta PrazoEsgotado. A PDFium fica com a trava só durante a renderização de cada página."""
+    pedidas = list(itertools.islice(paginas, PAGINAS_IMAGEM_MAX + 1))  # o iterável enorme para no teto
+    if not all(isinstance(n, int) and not isinstance(n, bool) for n in pedidas):
+        raise ValueError("as páginas são números inteiros a partir de 1")
+    if not pedidas or len(pedidas) > PAGINAS_IMAGEM_MAX:
+        raise ValueError(f"peça de 1 a {PAGINAS_IMAGEM_MAX} páginas")
+    pedidas = list(dict.fromkeys(pedidas))
+    if not isinstance(lado, int) or not LADO_IMAGEM_MIN <= lado <= LADO_IMAGEM_MAX:
+        raise ValueError(f"o lado vai de {LADO_IMAGEM_MIN} a {LADO_IMAGEM_MAX} pixels")
+    if len(pedidas) * lado * lado > PIXELS_IMAGEM_MAX:
+        raise ValueError(
+            f"imagens demais para uma chamada: até {PIXELS_IMAGEM_MAX // (lado * lado)} páginas com {lado} px"
+        )
+    imagens, doc = {}, None
+    try:
+        with PDFIUM:
+            doc = pdfium.PdfDocument(str(caminho))
+            total = len(doc)
+        if fora := [n for n in pedidas if not 1 <= n <= total]:
+            raise ValueError(f"o documento tem {total} páginas; fora dele: {fora}")
+        for n in pedidas:
+            if (resta := prazo_restante()) is not None and resta <= 0:
+                raise PrazoEsgotado(f"prazo esgotado antes da página {n}")
+            with PDFIUM:
+                try:
+                    page = pagina_visivel(doc, n - 1)
+                except pdfium.PdfiumError as e:
+                    raise ValueError(f"a página {n} não abre") from e
+                try:
+                    if any(k >= OBJETOS_MAX for k, _ in enumerate(objetos(page))):
+                        raise ValueError(f"a página {n} tem conteúdo demais para virar imagem")
+                    W, H = page.get_size()
+                    img = page.render(scale=escala(W, H, lado / max(W, H, 1))).to_pil().convert("RGB")
+                    rotacao = page.rotacao_exibida
+                finally:
+                    page.close()
+            saida = io.BytesIO()
+            de_pe(img, rotacao).save(saida, "PNG")
+            imagens[n] = saida.getvalue()
+    finally:
+        if doc is not None:
+            with PDFIUM:
+                doc.close()
+    return imagens
+
+
 def _propriedades(doc):
     """Propriedades do PDF (título, autor, produtor), sem as vazias. Chamar com a trava."""
     try:
         return {k: v for k, v in doc.get_metadata_dict().items() if v}
     except Exception:  # noqa: BLE001 — PDF sem propriedades legíveis: segue sem elas
         return {}
+
+
+def _sumario(doc, total):
+    """Os marcadores do PDF (o sumário que o visualizador mostra ao lado) como [nível, título, página a partir de 1],
+    na ordem do arquivo, e se a lista foi cortada. Marcador sem destino nesta cópia (ação externa, página fora do
+    /Count) fica de fora. Até SUMARIO_MAX itens: arquivo hostil pode ter milhões. Chamar com a trava."""
+    try:
+        itens, vistos = [], 0
+        for b in itertools.islice(doc.get_toc(), SUMARIO_MAX + 1):
+            vistos += 1
+            if vistos > SUMARIO_MAX:
+                return itens, True
+            destino = b.get_dest()
+            pagina = destino.get_index() if destino is not None else None
+            titulo = re.sub(r"\s+", " ", (b.get_title() or "")[: 4 * TITULO_MAX]).strip()[:TITULO_MAX]
+            if titulo and isinstance(pagina, int) and 0 <= pagina < total:
+                itens.append([b.level + 1, titulo, pagina + 1])
+        return itens, False
+    except Exception:  # noqa: BLE001 — sumário ilegível: a estrutura sai dos títulos do texto
+        return [], False
 
 
 def _marcar(intervalos, a, b, motivo):

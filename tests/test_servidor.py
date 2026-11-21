@@ -1138,3 +1138,31 @@ def test_espera_cancelada_com_o_trabalho_em_curso_deixa_ele_terminar_e_devolve_a
 
     asyncio.run(principal())
     assert s.vagas == {} and rodou == ["terminou"]
+
+
+def test_estrutura_do_pdf_traz_o_indice_e_as_paginas_visuais_no_contrato(tmp_path):
+    from PIL import Image
+
+    Image.new("RGB", (900, 500), "navy").save(tmp_path / "g.png")
+    p = tmp_path / "relatorio.pdf"
+    c = canvas.Canvas(str(p), pagesize=A4)
+    for n, titulo in enumerate(("Introdução", "Resultados"), 1):
+        c.bookmarkPage(f"s{n}")
+        c.addOutlineEntry(titulo, f"s{n}")
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(60, 780, titulo)
+        if n == 2:
+            c.drawImage(str(tmp_path / "g.png"), 60, 400, width=450, height=250)
+        c.showPage()
+    c.save()
+    api = TestClient(criar_app(["token-a"]))
+
+    r = enviar(api, ("relatorio.pdf", p.read_bytes()), {**A, **ESPERA})
+
+    estrutura = conforme(r, "/v1/sessoes", "post").json()["itens"][0]["resultado"]["estrutura"]
+    assert estrutura["indice"]["fonte"] == "sumario"
+    assert [(x["titulo"], x["pagina"], x["pagina_fim"]) for x in estrutura["indice"]["itens"]] == [
+        ("Introdução", 1, 1),
+        ("Resultados", 2, 2),
+    ]
+    assert estrutura["paginas_visuais"] == [{"pagina": 2, "conteudo": ["imagem"], "alertas": ["nao_lida"]}]

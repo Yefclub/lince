@@ -271,3 +271,73 @@ def test_numero_com_parentese_so_de_um_lado_e_item_de_lista_e_fica(forma):
     nativas = _paginas(*([corpo, forma.format(n + 1)] for n in range(4)))  # "1)", "2)"...: bate com a página, mas não é
     assert _sem_cabecalho_corrido(nativas) == set()
     assert [b[1] for _, b in nativas] == [forma.format(n + 1) for n in range(4)]
+
+
+def test_cabecalho_fixo_que_o_extrator_marcou_como_titulo_vai_para_os_metadados(tmp_path):
+    p = tmp_path / "carta.pdf"
+    c = canvas.Canvas(str(p), pagesize=A4)
+    for n in range(8):
+        c.setFont("Helvetica-Bold", 16)  # a fonte grande faz o leitor marcar a linha como título
+        c.drawString(60, 800, "Carta do Trimestre | 69 | Nota 22")
+        c.setFont("Helvetica", 11)
+        for k in range(12):
+            c.drawString(60, 740 - k * 18, f"Parágrafo {k + 1} da análise da página {n + 1}, com dados do trimestre.")
+        if n in (1, 3, 6):  # as seções de verdade do documento
+            c.setFont("Helvetica-Bold", 16)
+            c.drawString(60, 480, {1: "Atividade", 3: "Inflação", 6: "Crédito"}[n])
+        c.showPage()
+    c.save()
+
+    r = lince.ler(p)
+
+    assert "Carta do Trimestre" not in r.markdown
+    assert r.metadados["cabeçalho/rodapé"] == ["Carta do Trimestre | 69 | Nota 22"]
+    assert r.markdown.count("da análise da página") == 96  # o conteúdo inteiro fica
+    assert [s["titulo"] for s in r.estrutura["secoes"]] == ["Atividade", "Inflação", "Crédito"]  # as seções ficam
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [None, "observacoes", "observacoes-e-avisos", "itens"],
+    ids=["so-o-titulo", "um-titulo-numa-fatura", "titulos-em-duas-faturas", "o-mesmo-subtitulo-em-todas"],
+)
+def test_lote_com_o_mesmo_titulo_em_cada_documento_mantem_os_titulos(tmp_path, extra):
+    p = tmp_path / "faturas.pdf"
+    c = canvas.Canvas(str(p), pagesize=A4)
+    for n in range(12):
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(60, 800, "Fatura")  # o título de cada fatura, não cabeçalho corrido
+        c.setFont("Helvetica", 11)
+        for k, ln in enumerate(
+            [f"Fatura nº {1000 + n}", f"Cliente: Transportadora {n + 1} Ltda", f"Valor: R$ {150 + n},00"]
+        ):
+            c.drawString(60, 760 - k * 18, ln)
+        proprio = {"observacoes": {4: "Observações"}, "observacoes-e-avisos": {4: "Observações", 9: "Avisos"}}
+        if titulo := "Itens" if extra == "itens" else proprio.get(extra, {}).get(n):
+            c.setFont("Helvetica-Bold", 16)
+            c.drawString(60, 680, titulo)
+        c.showPage()
+    c.save()
+
+    r = lince.ler(p)
+
+    titulos = [s["titulo"] for s in r.estrutura["secoes"]]
+    assert titulos.count("Fatura") == 12 and "cabeçalho/rodapé" not in r.metadados  # onde cada fatura começa
+
+
+def test_linha_que_comeca_com_cerquilha_sem_ser_titulo_nao_conta_como_secao():
+    paginas = [
+        (
+            i,
+            [
+                "# Fatura",
+                f"Fatura nº {1000 + i}\nValor: R$ {150 + i},00",
+                f"#{i + 1} em vendas do mês",
+                "#define LIMITE 3",
+            ],
+        )
+        for i in range(12)
+    ]
+
+    assert _sem_cabecalho_corrido(paginas) == set()
+    assert all(blocos[0] == "# Fatura" for _, blocos in paginas)

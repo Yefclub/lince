@@ -10,7 +10,7 @@ from xml.etree import ElementTree as ET  # noqa: F401
 
 from .agrupamento import por_tarefa
 from .seguranca import alertas_injecao
-from .texto import NUM_PAGINA, sem_repeticao
+from .texto import NUM_PAGINA, grupos_de_frases, sem_repeticao
 
 # Caracteres que a montagem escreve, o texto nativo junto. A leitura de uma imagem repetida entra uma vez, e as outras
 # posições levam só a referência: em 16 Mi cabem as 2.000 páginas que o PDF analisa (PAGINAS_ANALISE_MAX) com 8 mil
@@ -198,21 +198,30 @@ def montar(pasta, respostas):
             continue
         cab, limpos, inserir = pg
         saida = [cab] + inserir.get(-1, [])
-        for k, b in enumerate(limpos):
-            if b.strip():
-                saida.append(b)
-            saida.extend(inserir.get(k, []))
+        # a frase partida é juntada depois de sair o cabeçalho corrido (senão ele entraria na frase); a figura de um
+        # bloco juntado entra depois do grupo
+        for a, b, texto in grupos_de_frases(limpos):
+            if texto.strip():
+                saida.append(texto)
+            for k in range(a, b):
+                saida.extend(inserir.get(k, []))
         partes.append("\n\n".join(saida))
     return _metadados(pasta, plano, acabamento(leituras("\n\n".join(partes))), moveis)
 
 
 CABECALHO_MAX = 80  # linha de cabeçalho/rodapé corrido é curta; parágrafo que o leitor juntou numa linha, não
 FRACAO_MAX = 0.25  # se a remoção levaria mais que isso do texto nativo do documento, nada sai
+# títulos distintos que dizem que o documento tem seções de verdade: TITULOS_MIN_FRACAO das páginas, no mínimo
+# TITULOS_MIN (o Ipea: 17 em 43 páginas). Abaixo disso, dois ou três documentos de um lote com um título próprio não
+# fazem do título comum a todos ("Fatura") um cabeçalho corrido
+TITULOS_MIN_FRACAO = 0.2
+TITULOS_MIN = 3
 FIXA_MIN = 0.8  # linha idêntica na borda de ao menos esta fração das páginas é cabeçalho fixo ("Confidencial")
 
 
 DESLOCAMENTO_MAX = 50  # número impresso = índice da página + d (capa e páginas iniciais sem número): |d| até isto
 # o rótulo logo antes do número que diz que ele é o da página, e a linha que é só o número ("3 de 12", "3/12")
+_TITULO_FIXO = re.compile(r"#{1,6}[ \t]+")  # a marca de título que o extrator pôs no cabeçalho corrido
 _ROTULO_PAGINA = re.compile(r"(?<![^\W\d_])(p[aá]gina|p[aá]g|page|pg|p|folha|fls|fl)\.?:?\s*$", flags=re.I)
 _SO_O_NUMERO = re.compile(r"\W*#(\s*(de|of|/)\s*\d{1,4})?\W*", flags=re.I)
 _ROMANOS = [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
@@ -240,7 +249,8 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
     metadados como a linha com o número trocado por #. A linha curta idêntica na borda de FIXA_MIN das páginas, sem
     número de página, é cabeçalho fixo e sai também, se couber em FRACAO_MAX junto com o resto (senão só ela fica).
     Valor, data e número de documento que mudam entre páginas não casam, a página escaneada e o texto lido pela IA não
-    passam por aqui, título (linha com #) nunca sai e, se o que sairia passa de FRACAO_MAX do texto nativo do
+    passam por aqui, título (linha com #) só sai como cabeçalho fixo (idêntico na borda de FIXA_MIN das páginas, num
+    documento com seções de verdade: veja `com_secoes`) e, se o que sairia passa de FRACAO_MAX do texto nativo do
     documento, nada sai."""
     from collections import Counter
 
@@ -282,8 +292,10 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
         return v - pagina, t[: m.start(g)] + "#" + t[m.end(g) :]
 
     def fixa(ln):
-        """A linha, se ela pode ser cabeçalho fixo: curta, com letra, fora de título, tabela e marca do Lince."""
-        t = ln.strip()
+        """A linha, sem a marca de título, se ela pode ser cabeçalho fixo: curta, com letra, fora de tabela e marca do
+        Lince. O título entra aqui (e só aqui): a linha idêntica na borda de quase toda página é o cabeçalho corrido que
+        o extrator promoveu a título pela fonte grande ("# Carta de Conjuntura | 69 | Nota 22"), não uma seção."""
+        t = _TITULO_FIXO.sub("", ln.strip(), count=1)
         if len(t) > CABECALHO_MAX or t.startswith(("#", "|", "<!--", "> [")) or not re.search(r"[^\W\d]", t):
             return None
         return t
@@ -308,7 +320,23 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
         pos: t for pos, c in por_posicao.items() for t, v in c.most_common(1) if n >= 3 and v >= max(3, FIXA_MIN * n)
     }
     terceira = {0: 2, 1: 2, -1: -3, -2: -3}  # de cada posição da borda, a primeira linha do corpo
-    fixas = {(pos, t) for pos, t in repetidas.items() if pos in terceira and terceira[pos] not in repetidas and fixa(t)}
+    # o título que se repete só sai num documento com seções de verdade: outros títulos, distintos, em número que
+    # acompanha o tamanho do documento (TITULOS_MIN_FRACAO das páginas, no mínimo TITULOS_MIN) e que não se repetem
+    # na maioria das páginas. Num lote de faturas de uma página, "Fatura" no topo de cada uma é o título de cada
+    # documento: um "Observações" numa delas ou um "Itens" em todas não fazem dele cabeçalho corrido
+    paginas_do_titulo = {}
+    for i, blocos in nativas:
+        for b in blocos:
+            for ln in b.split("\n"):
+                if _TITULO_FIXO.match(ln.lstrip()):
+                    paginas_do_titulo.setdefault(ln.strip(), set()).add(i)
+    secoes_de_verdade = {t for t, pags in paginas_do_titulo.items() if len(pags) <= n / 2}
+    com_secoes = len(secoes_de_verdade) >= max(TITULOS_MIN, TITULOS_MIN_FRACAO * n)
+    fixas = {
+        (pos, t)
+        for pos, t in repetidas.items()
+        if pos in terceira and terceira[pos] not in repetidas and fixa(t) and (com_secoes or not _TITULO_FIXO.match(t))
+    }
     extremos = {}
     for i, blocos in nativas:
         cheias = linhas(blocos)
@@ -326,7 +354,7 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
                 tirar[(i, k, j)] = (ln, achadas[0][0])
         for pos, t in fixas:
             if -len(cheias) <= pos < len(cheias) and cheias[pos][2].strip() == t:
-                tirar_fixas[(i, *cheias[pos][:2])] = (cheias[pos][2], t)
+                tirar_fixas[(i, *cheias[pos][:2])] = (cheias[pos][2], fixa(t))
         for k, j, ln, d, forma in extremos[i]:
             if d in numeros:
                 tirar.setdefault((i, k, j), (ln, forma))

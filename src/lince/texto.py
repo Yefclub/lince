@@ -137,3 +137,81 @@ def sem_repeticao(txt, limite=10):
             out += linhas[k : j + 1]
         k = j + 1
     return "\n".join(out)
+
+
+_TITULO_DO_BLOCO = re.compile(r"(#{1,6})[ \t]+(\S.*)")
+# "i. ", "2) ", "a. ": item de lista novo, não continuação da frase
+_ITEM_DE_LISTA = re.compile(r"(?:[ivxlc]{1,6}|\d{1,3}|[a-z])[.)][ \t]")
+_CERCA = re.compile(r" {0,3}(?:`{3,}|~{3,})")  # linha que abre ou fecha bloco de código
+_FIM_DE_FRASE = re.compile(r"[.!?…][\d⁰¹²³⁴⁵⁶⁷⁸⁹)\]”\"']*")  # "aquecido.", "crescendo.⁵", "(nota 3)."
+PALAVRAS_FRASE_MIN = 6  # título curto ("Atividade econômica") nunca é tratado como frase partida
+
+
+def _continua(t: str) -> bool:
+    """O texto continua uma frase: começa em letra minúscula e não é um item de lista novo."""
+    t = t.lstrip()
+    return bool(t) and t[0].isalpha() and t[0].islower() and not _ITEM_DE_LISTA.match(t)
+
+
+def _fecha_a_frase(negrito: str) -> bool:
+    """O negrito do começo do bloco continua a frase e a termina: com a pontuação final dentro ("**seguiu aquecido.**
+    O PIB…") ou logo depois dele ("**… de 2026**. Logo…"). Trechos em negrito colados ("**… e** **perspectivas da
+    economia.**") contam como um só. Negrito sem pontuação ("**em milhões de reais**") pode ser legenda: não junta."""
+    texto = negrito.replace("** **", " ")
+    fim = texto.find("**", 2)
+    if fim < 0 or not _continua(texto[2:fim]):
+        return False
+    trecho, depois = texto[2:fim].rstrip(), texto[fim + 2 :]
+    pontuado = any(_FIM_DE_FRASE.fullmatch(trecho[k:]) for k in range(max(0, len(trecho) - 8), len(trecho)))
+    return pontuado or depois[:1] in (".", "!", "?", "…")
+
+
+def grupos_de_frases(blocos: list[str]) -> list[tuple[int, int, str]]:
+    """Os blocos da página em grupos (início, fim, texto): a frase de abertura em negrito que o extrator do PDF parte em
+    título e continuação ("## A atividade econômica expandiu-se em ritmo mais moderado, mas o mercado de trabalho" +
+    "**seguiu aquecido.** O PIB…") volta a ser um parágrafo só, com a frase em negrito ("**A atividade… trabalho
+    seguiu aquecido.** O PIB…"), e o título partido em vários títulos seguidos do mesmo nível, cada um continuando o
+    anterior em minúscula, vira uma frase em negrito. Os outros blocos são grupos de um bloco, com o texto como está.
+
+    Só junta com a prova da quebra: título de PALAVRAS_FRASE_MIN palavras ou mais, que não termina em pontuação,
+    seguido de título do mesmo nível que continua a frase ou de negrito que continua e termina a frase (com pontuação
+    final). Fica como está:
+    título seguido de frase nova, de subtítulo (nível mais fundo), de item de lista, de nota ("**nota:** …") ou de
+    rótulo ("Riscos para a inflação:"), e tudo dentro de bloco de código. Nenhuma palavra sai do texto, e cada bloco é
+    visto no máximo duas vezes."""
+    grupos, k, codigo = [], 0, False
+    while k < len(blocos):
+        bloco = blocos[k].strip()
+        cercas = sum(1 for ln in bloco.split("\n") if _CERCA.match(ln))
+        m = _TITULO_DO_BLOCO.fullmatch(bloco) if not codigo and not cercas and "\n" not in bloco else None
+        codigo ^= cercas % 2 == 1
+        if not m or len(m.group(2).split()) < PALAVRAS_FRASE_MIN or m.group(2).rstrip()[-1] in ".:;!?":
+            grupos.append((k, k + 1, blocos[k]))
+            k += 1
+            continue
+        nivel, partes, j = m.group(1), [m.group(2).strip()], k + 1
+        while (
+            j < len(blocos)
+            and (n := _TITULO_DO_BLOCO.fullmatch(blocos[j].strip()))
+            and n.group(1) == nivel
+            and _continua(n.group(2))
+        ):
+            partes.append(n.group(2).strip())
+            j += 1
+        seguinte = blocos[j].lstrip() if j < len(blocos) else ""
+        sem_codigo = not any(_CERCA.match(ln) for ln in seguinte.split("\n"))  # a paridade das cercas fica certa
+        if seguinte.startswith("**") and sem_codigo and _fecha_a_frase(seguinte):
+            grupos.append((k, j + 1, "**" + " ".join(partes) + " " + seguinte[2:]))
+            k = j + 1
+        elif len(partes) > 1:
+            grupos.append((k, j, "**" + " ".join(partes) + "**"))
+            k = j
+        else:
+            grupos.append((k, k + 1, blocos[k]))
+            k += 1
+    return grupos
+
+
+def juntar_frases_partidas(blocos: list[str]) -> list[str]:
+    """Os blocos com as frases partidas juntadas (`grupos_de_frases`)."""
+    return [texto for _, _, texto in grupos_de_frases(blocos)]
