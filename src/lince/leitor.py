@@ -522,23 +522,26 @@ def _paginas_visuais(plano, lidos) -> list[dict]:
     """As páginas do PDF em que o Markdown traz uma transcrição feita pela IA no lugar do que se vê, para quem
     responde decidir quando mandar a imagem da página ao modelo: o que havia nela (`conteudo`: imagem, desenho,
     tabela, fórmula, ou a página inteira escaneada, de texto corrompido ou de matemática densa) e o que a leitura
-    deixou de garantir (`alertas`: valor estimado com ≈, trecho ilegível, leitura que não veio). Página nativa sem
-    figura fica de fora: o texto dela é o do arquivo."""
+    deixou de garantir (`alertas`: valor estimado com ≈ fora de fórmula, trecho ilegível, leitura que não veio). Toda
+    posição conta, inclusive a da imagem repetida, com a leitura de quem a leu. Página nativa sem figura fica de fora:
+    o texto dela é o do arquivo."""
     iguais = plano.get("iguais", {})
+    originais = {t["id"]: t for t in plano.get("tarefas_originais", [])}
     por_pagina = {}
-    for t in plano.get("tarefas_originais", []):
-        if not isinstance(t.get("pagina"), int):
+    for posicao in plano.get("posicoes", []):
+        if not isinstance(posicao.get("pagina"), int):
             continue
-        conteudo, alertas = por_pagina.setdefault(t["pagina"] + 1, (set(), set()))
-        if t["modo"] == "pagina":
-            conteudo.add(_MOTIVO_PAGINA.get(t.get("motivo", ""), "matematica"))
+        leitor = iguais.get(posicao["id"], posicao["id"])
+        conteudo, alertas = por_pagina.setdefault(posicao["pagina"] + 1, (set(), set()))
+        if posicao["modo"] == "pagina":
+            conteudo.add(_MOTIVO_PAGINA.get(originais.get(leitor, {}).get("motivo", ""), "matematica"))
         else:
-            conteudo.add(t["modo"])
-        texto = str(lidos.get(iguais.get(t["id"], t["id"]), ""))
+            conteudo.add(posicao["modo"])
+        texto = str(lidos.get(leitor, ""))
         if not texto.strip():
             alertas.add("nao_lida")
         else:
-            if "≈" in texto:
+            if "≈" in texto and posicao["modo"] != "formula":  # na fórmula, ≈ é o símbolo, não estimativa
                 alertas.add("estimado")
             if "[ilegível]" in texto or "[illegible]" in texto:
                 alertas.add("ilegivel")
@@ -612,7 +615,9 @@ def _com_estrutura(r: Resultado, plano) -> Resultado:
     if plano["tipo"] == "pdf":
         r.estrutura["paginas"] = r.cobertura.paginas
     r.estrutura.update(secoes(r.markdown, pdf=plano["tipo"] == "pdf", apresentacao=bool(plano.get("slides"))))
-    if plano["tipo"] == "pdf" and (mapa := indice(r.markdown, r.estrutura, plano.get("sumario"))):
+    if plano["tipo"] == "pdf" and (
+        mapa := indice(r.markdown, r.estrutura, plano.get("sumario"), bool(plano.get("sumario_cortado")))
+    ):
         r.estrutura["indice"] = mapa
     return r
 
@@ -671,18 +676,26 @@ def _com_senha(caminho, senha, pasta) -> tuple[str, bool]:
     return lido, lido != str(caminho)
 
 
-def imagens_das_paginas(caminho: str | Path, paginas, lado: int = 1568, senha: str | None = None) -> dict[int, bytes]:
-    """As páginas pedidas do PDF (a partir de 1) em PNG, de pé, com o maior lado em `lado` pixels, para quem responde
-    ler a página original na hora da pergunta (as de `estrutura.paginas_visuais`, onde o Markdown traz a transcrição
-    de um gráfico, de uma figura ou de um scan). O arquivo não é guardado. Com senha, ele é decifrado numa pasta
-    temporária, apagada no fim; protegido sem senha levanta `DocumentoProtegido`, como na leitura."""
+def imagens_das_paginas(
+    caminho: str | Path, paginas, lado: int = 1568, senha: str | None = None, prazo: float | None = None
+) -> dict[int, bytes]:
+    """As páginas pedidas do PDF (lista de números a partir de 1) em PNG, de pé, com o maior lado em `lado` pixels,
+    para quem responde ler a página original na hora da pergunta (as de `estrutura.paginas_visuais`, onde o Markdown
+    traz a transcrição de um gráfico, de uma figura ou de um scan). O arquivo não é guardado. Com senha, ele é
+    decifrado numa pasta temporária, apagada no fim; protegido sem senha levanta `DocumentoProtegido`, como na leitura.
+    Pedido fora dos tetos (páginas, lado, pixels da chamada, página pesada demais ou que não abre) levanta ValueError;
+    com `prazo` (segundos), a página que começaria depois dele levanta `PrazoEsgotado`."""
     if _extensao_lida(str(caminho)) != ".pdf":
         raise FormatoNaoSuportado("imagens das páginas só de PDF")
-    with tempfile.TemporaryDirectory(prefix="lince-") as pasta:
-        lido, _ = _com_senha(caminho, senha, pasta)
-        if senha is None and (formato := formato_protegido(lido)):
-            raise DocumentoProtegido(formato)
-        return paginas_em_png(lido, paginas, lado)
+    token = LIMITE.set(time.monotonic() + prazo if prazo is not None else None)
+    try:
+        with tempfile.TemporaryDirectory(prefix="lince-") as pasta:
+            lido, _ = _com_senha(caminho, senha, pasta)
+            if senha is None and (formato := formato_protegido(lido)):
+                raise DocumentoProtegido(formato)
+            return paginas_em_png(lido, paginas, lado)
+    finally:
+        LIMITE.reset(token)
 
 
 def _texto(caminho):

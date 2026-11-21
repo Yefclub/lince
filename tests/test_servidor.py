@@ -1149,6 +1149,7 @@ def test_estrutura_do_pdf_traz_o_indice_e_as_paginas_visuais_no_contrato(tmp_pat
     for n, titulo in enumerate(("Introdução", "Resultados"), 1):
         c.bookmarkPage(f"s{n}")
         c.addOutlineEntry(titulo, f"s{n}")
+        c.setFont("Helvetica-Bold", 18)
         c.drawString(60, 780, titulo)
         if n == 2:
             c.drawImage(str(tmp_path / "g.png"), 60, 400, width=450, height=250)

@@ -174,88 +174,131 @@ def _odf(arquivo, ext) -> dict:
 
 
 INDICE_MAX = SECOES_MAX
-_PALAVRAS_TITULO_MAX = 12  # título de seção é curto; frase em negrito que o extrator promoveu a título, não
-_ENTRADA_DE_SUMARIO = re.compile(r"(.+?)[\s.·…_-]+(\d{1,4})")  # "Conjuntura econômica 8", "Introdução ....... 3"
+# título de seção cabe numa linha: acima disto é parágrafo que o extrator promoveu a título, e nenhuma conta do índice
+# (normalização, busca do número de página no fim) passa dele, para o custo ficar linear em qualquer arquivo
+TITULO_INDICE_MAX = 200
+_PALAVRAS_TITULO_MAX = 12  # frase em negrito promovida a título tem mais palavras que isso; título de seção, não
+_NUMERO_FINAL = re.compile(r"\d{1,4}$")  # no máximo 4 caracteres por posição: linear, sem retrocesso
+_SEPARADORES = " \t.·…_-"  # entre o título e o número de página no sumário impresso ("Introdução ....... 3")
 _REFERENCIA = re.compile(r"\[\d{1,4}\]\s")  # "[12] Autor. Título": item da bibliografia, não seção
+_NUMERACAO = re.compile(r"(?:\d{1,3}(?:\.\d{1,3}){0,5}\.?|[ivxlc]{1,6}\.)\s+")  # "1.2 ", "3. ", "iv. "
 
 
 def _normal(t: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[*_`<>]|</?u>", "", t)).strip().casefold()
+    return re.sub(r"\s+", " ", re.sub(r"</?u>|[*_`<>]", "", t)).strip().casefold()
 
 
-def indice(md: str, estrutura: dict, sumario: list | None = None) -> dict:
+def _titulo_normal(t: str) -> str | None:
+    """O título normalizado, ou None quando ele é longo demais para ser título de seção."""
+    return _normal(t) if len(t) <= TITULO_INDICE_MAX else None
+
+
+def _sem_numeracao(n: str) -> str:
+    return n[m.end() :] if (m := _NUMERACAO.match(n)) else n
+
+
+def _entrada_de_sumario(t: str) -> str | None:
+    """O título sem o número de página do fim, quando a linha é uma entrada do sumário impresso ("Conjuntura
+    econômica 8" → "conjuntura econômica"); senão None. Chamar só com título curto."""
+    if not (m := _NUMERO_FINAL.search(t)) or not (antes := t[: m.start()]) or antes[-1] not in _SEPARADORES:
+        return None
+    return _normal(antes.rstrip(_SEPARADORES)) or None
+
+
+def indice(md: str, estrutura: dict, sumario: list | None = None, sumario_cortado: bool = False) -> dict:
     """O mapa do PDF para quem navega antes de ler: cada seção com a página onde começa e a última página que ela pode
     ocupar (`pagina_fim`, que inclui a página partilhada com a seção seguinte quando ela começa no meio da página).
 
     A fonte é o sumário do próprio PDF quando ele tem marcadores (`fonte: "sumario"`); senão, os títulos do Markdown
-    (`fonte: "titulos"`), sem o que o extrator promove a título e não é seção: linha que se repete em 3 páginas ou
-    mais (cabeçalho corrido), frase longa ou terminada em pontuação, item de bibliografia e a entrada do sumário
-    impresso ("Conjuntura econômica 8"), quando o mesmo título aparece em outro lugar. O Markdown não muda: o índice é
-    só um mapa sobre ele, e `inicio` (quando o título foi achado no texto) é a posição dele, como em `secoes`."""
+    (`fonte: "titulos"`), sem o que o extrator promove a título e não é seção: o cabeçalho corrido (o título que abre
+    3 páginas ou mais), frase longa ou terminada em pontuação, item de bibliografia e a entrada do sumário impresso
+    ("Conjuntura econômica 8") de um título que aparece no documento. O Markdown não muda: o índice é só um mapa sobre
+    ele, e `inicio` é a posição, como em `secoes`, do título da página que tem o mesmo texto (com ou sem a numeração
+    "1.2"); sem ele, a seção não encurta a anterior. Lista cortada (acima de SUMARIO_MAX marcadores ou de SECOES_MAX
+    títulos) sai com `cortado: true`. Cada página e cada título passam uma vez: o custo é linear no Markdown."""
     paginas = estrutura.get("inicio_das_paginas") or []
     total = estrutura.get("paginas") or (paginas[-1]["pagina"] if paginas else 0)
     if not paginas or not total:
         return {}
     comecos = [p["inicio"] for p in paginas]
     numeros = [p["pagina"] for p in paginas]
+    posicao_da_pagina = {n: k for k, n in enumerate(numeros)}
 
     def pagina_de(pos: int) -> int:
-        k = bisect.bisect_right(comecos, pos) - 1
-        return numeros[max(k, 0)]
+        return numeros[max(bisect.bisect_right(comecos, pos) - 1, 0)]
 
-    def trecho(pagina: int) -> tuple[int, int]:
-        k = bisect.bisect_left(numeros, pagina)
-        if k >= len(numeros) or numeros[k] != pagina:
-            return 0, 0
-        return comecos[k], comecos[k + 1] if k + 1 < len(comecos) else len(md)
+    def linhas_do_comeco(k: int):
+        """(posição, linha) das linhas com texto da página k, da primeira em diante, sem o marcador do Lince."""
+        fim_pagina = comecos[k + 1] if k + 1 < len(comecos) else len(md)
+        pos = md.find("\n", comecos[k], fim_pagina)
+        pos = fim_pagina if pos < 0 else pos + 1
+        while pos < fim_pagina:
+            fim = md.find("\n", pos, fim_pagina)
+            fim = fim_pagina if fim < 0 else fim
+            if md[pos:fim].strip():
+                yield pos, md[pos:fim]
+            pos = fim + 1
 
-    corridos = set()  # cabeçalho corrido que o extrator promoveu a título: não conta como texto da página
+    def titulo_da_linha(linha: str) -> str | None:
+        t = linha.strip()
+        return _titulo_normal(t.lstrip("#").strip()) if t.startswith("#") else None
+
+    # cabeçalho corrido promovido a título: o mesmo título como primeira linha de 3 páginas ou mais
+    primeiras = {}
+    for k in range(len(comecos)):
+        if (primeira := next(linhas_do_comeco(k), None)) and (n := titulo_da_linha(primeira[1])):
+            primeiras.setdefault(n, set()).add(k)
+    corridos = {n for n, ks in primeiras.items() if len(ks) >= 3}
+
+    def abertura(k: int) -> int:
+        """Onde começa o conteúdo da página k, depois do cabeçalho corrido."""
+        for pos, linha in linhas_do_comeco(k):
+            if titulo_da_linha(linha) not in corridos:
+                return pos
+        return comecos[k + 1] if k + 1 < len(comecos) else len(md)
+
+    secoes_md = [(s, _titulo_normal(s["titulo"].strip())) for s in estrutura.get("secoes") or []]
     if sumario:
+        na_pagina = {}  # (página, título normalizado, com e sem a numeração) → posição do primeiro título igual
+        for s, n in secoes_md:
+            if n:
+                for forma in (n, _sem_numeracao(n)):
+                    na_pagina.setdefault((pagina_de(s["inicio"]), forma), s["inicio"])
         itens = []
         for nivel, titulo, pagina in sumario[:INDICE_MAX]:
             item = {"titulo": titulo, "nivel": nivel, "pagina": pagina}
-            a, b = trecho(pagina)
-            alvo = _normal(titulo)
-            if alvo and b > a:
-                pos = a
-                for linha in md[a:b].split("\n"):  # a primeira linha da página que traz o título
-                    if alvo in _normal(linha):
-                        item["inicio"] = pos
-                        break
-                    pos += len(linha) + 1
+            if (n := _titulo_normal(titulo)) and (pos := na_pagina.get((pagina, n))) is not None:
+                item["inicio"] = pos
             itens.append(item)
-        fonte = "sumario"
+        fonte, cortado = "sumario", sumario_cortado or len(sumario) > INDICE_MAX
     else:
-        secoes_md = estrutura.get("secoes") or []
-        contagem = {}
-        for s in secoes_md:
-            contagem.setdefault(_normal(s["titulo"]), set()).add(pagina_de(s["inicio"]))
-        corridos = {n for n, pags in contagem.items() if len(pags) >= 3}
-        todos = [_normal(s["titulo"]) for s in secoes_md]
+        presentes = {n for _, n in secoes_md if n}
         itens = []
-        for k, s in enumerate(secoes_md):
+        for s, n in secoes_md:
             t = s["titulo"].strip()
-            n = _normal(t)
             if not n or n in corridos or len(t.split()) > _PALAVRAS_TITULO_MAX or t[-1] in ".,;:":
                 continue
-            if _REFERENCIA.match(t):
-                continue
-            if (m := _ENTRADA_DE_SUMARIO.fullmatch(t)) and _normal(m.group(1)) in todos[:k] + todos[k + 1 :]:
+            if _REFERENCIA.match(t) or ((base := _entrada_de_sumario(t)) and base in presentes):
                 continue
             itens.append({"titulo": t, "nivel": s["nivel"], "pagina": pagina_de(s["inicio"]), "inicio": s["inicio"]})
-        fonte = "titulos"
+        fonte, cortado = "titulos", bool(estrutura.get("secoes_cortadas"))
     if not itens:
         return {}
-    for k, item in enumerate(itens):
-        seguinte = next((x for x in itens[k + 1 :] if x["nivel"] <= item["nivel"]), None)
-        if seguinte is None:
-            fim = total
-        else:
-            fim = seguinte["pagina"]
-            a, _ = trecho(fim)
-            antes = md[a : seguinte["inicio"]].split("\n")[1:] if "inicio" in seguinte else ["?"]
-            # a seção seguinte abre a página dela (só o cabeçalho corrido antes): esta termina na anterior
-            if not [ln for ln in antes if ln.strip() and _normal(ln.lstrip("# ")) not in corridos]:
+    # a seção seguinte de nível igual ou acima de cada item, da direita para a esquerda, numa passada só
+    seguintes, pilha = [None] * len(itens), []
+    for k in range(len(itens) - 1, -1, -1):
+        while pilha and itens[pilha[-1]]["nivel"] > itens[k]["nivel"]:
+            pilha.pop()
+        seguintes[k] = itens[pilha[-1]] if pilha else None
+        pilha.append(k)
+    aberturas = {}
+    for item, seguinte in zip(itens, seguintes, strict=True):
+        fim = total if seguinte is None else seguinte["pagina"]
+        k = posicao_da_pagina.get(fim)
+        if seguinte is not None and "inicio" in seguinte and k is not None:
+            if k not in aberturas:
+                aberturas[k] = abertura(k)
+            if seguinte["inicio"] <= aberturas[k]:  # a seção seguinte abre a página dela: esta termina na anterior
                 fim -= 1
         item["pagina_fim"] = max(item["pagina"], fim)
-    return {"fonte": fonte, "itens": itens}
+    return {"fonte": fonte, "itens": itens} | ({"cortado": True} if cortado else {})
