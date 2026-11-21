@@ -271,3 +271,26 @@ def test_numero_com_parentese_so_de_um_lado_e_item_de_lista_e_fica(forma):
     nativas = _paginas(*([corpo, forma.format(n + 1)] for n in range(4)))  # "1)", "2)"...: bate com a página, mas não é
     assert _sem_cabecalho_corrido(nativas) == set()
     assert [b[1] for _, b in nativas] == [forma.format(n + 1) for n in range(4)]
+
+
+def test_cabecalho_fixo_que_o_extrator_marcou_como_titulo_vai_para_os_metadados(tmp_path):
+    p = tmp_path / "carta.pdf"
+    c = canvas.Canvas(str(p), pagesize=A4)
+    for n in range(8):
+        c.setFont("Helvetica-Bold", 16)  # a fonte grande faz o leitor marcar a linha como título
+        c.drawString(60, 800, "Carta do Trimestre | 69 | Nota 22")
+        c.setFont("Helvetica", 11)
+        for k in range(12):
+            c.drawString(60, 740 - k * 18, f"Parágrafo {k + 1} da análise da página {n + 1}, com dados do trimestre.")
+        if n == 3:
+            c.setFont("Helvetica-Bold", 16)
+            c.drawString(60, 480, "Inflação")
+        c.showPage()
+    c.save()
+
+    r = lince.ler(p)
+
+    assert "Carta do Trimestre" not in r.markdown
+    assert r.metadados["cabeçalho/rodapé"] == ["Carta do Trimestre | 69 | Nota 22"]
+    assert r.markdown.count("da análise da página") == 96  # o conteúdo inteiro fica
+    assert [s["titulo"] for s in r.estrutura["secoes"]] == ["Inflação"]  # o título de seção de verdade também

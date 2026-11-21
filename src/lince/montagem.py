@@ -10,7 +10,7 @@ from xml.etree import ElementTree as ET  # noqa: F401
 
 from .agrupamento import por_tarefa
 from .seguranca import alertas_injecao
-from .texto import NUM_PAGINA, sem_repeticao
+from .texto import NUM_PAGINA, juntar_frases_partidas, sem_repeticao
 
 # Caracteres que a montagem escreve, o texto nativo junto. A leitura de uma imagem repetida entra uma vez, e as outras
 # posições levam só a referência: em 16 Mi cabem as 2.000 páginas que o PDF analisa (PAGINAS_ANALISE_MAX) com 8 mil
@@ -180,6 +180,7 @@ def montar(pasta, respostas):
             ):
                 continue
             limpos.append(b)
+        limpos = juntar_frases_partidas(limpos)  # antes de achar onde entram as figuras: o texto delas não muda
         inserir = {}
         for r in p["regioes"]:
             if r.get("repetida") or "substitui_tabela" in r or "substitui_formula" in r:
@@ -213,6 +214,7 @@ FIXA_MIN = 0.8  # linha idêntica na borda de ao menos esta fração das página
 
 DESLOCAMENTO_MAX = 50  # número impresso = índice da página + d (capa e páginas iniciais sem número): |d| até isto
 # o rótulo logo antes do número que diz que ele é o da página, e a linha que é só o número ("3 de 12", "3/12")
+_TITULO_FIXO = re.compile(r"#{1,6}[ \t]+")  # a marca de título que o extrator pôs no cabeçalho corrido
 _ROTULO_PAGINA = re.compile(r"(?<![^\W\d_])(p[aá]gina|p[aá]g|page|pg|p|folha|fls|fl)\.?:?\s*$", flags=re.I)
 _SO_O_NUMERO = re.compile(r"\W*#(\s*(de|of|/)\s*\d{1,4})?\W*", flags=re.I)
 _ROMANOS = [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
@@ -240,8 +242,8 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
     metadados como a linha com o número trocado por #. A linha curta idêntica na borda de FIXA_MIN das páginas, sem
     número de página, é cabeçalho fixo e sai também, se couber em FRACAO_MAX junto com o resto (senão só ela fica).
     Valor, data e número de documento que mudam entre páginas não casam, a página escaneada e o texto lido pela IA não
-    passam por aqui, título (linha com #) nunca sai e, se o que sairia passa de FRACAO_MAX do texto nativo do
-    documento, nada sai."""
+    passam por aqui, título (linha com #) só sai como cabeçalho fixo (idêntico na borda de FIXA_MIN das páginas) e,
+    se o que sairia passa de FRACAO_MAX do texto nativo do documento, nada sai."""
     from collections import Counter
 
     def linhas(blocos):
@@ -282,8 +284,10 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
         return v - pagina, t[: m.start(g)] + "#" + t[m.end(g) :]
 
     def fixa(ln):
-        """A linha, se ela pode ser cabeçalho fixo: curta, com letra, fora de título, tabela e marca do Lince."""
-        t = ln.strip()
+        """A linha, sem a marca de título, se ela pode ser cabeçalho fixo: curta, com letra, fora de tabela e marca do
+        Lince. O título entra aqui (e só aqui): a linha idêntica na borda de quase toda página é o cabeçalho corrido que
+        o extrator promoveu a título pela fonte grande ("# Carta de Conjuntura | 69 | Nota 22"), não uma seção."""
+        t = _TITULO_FIXO.sub("", ln.strip(), count=1)
         if len(t) > CABECALHO_MAX or t.startswith(("#", "|", "<!--", "> [")) or not re.search(r"[^\W\d]", t):
             return None
         return t
@@ -326,7 +330,7 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
                 tirar[(i, k, j)] = (ln, achadas[0][0])
         for pos, t in fixas:
             if -len(cheias) <= pos < len(cheias) and cheias[pos][2].strip() == t:
-                tirar_fixas[(i, *cheias[pos][:2])] = (cheias[pos][2], t)
+                tirar_fixas[(i, *cheias[pos][:2])] = (cheias[pos][2], fixa(t))
         for k, j, ln, d, forma in extremos[i]:
             if d in numeros:
                 tirar.setdefault((i, k, j), (ln, forma))

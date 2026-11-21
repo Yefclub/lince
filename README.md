@@ -41,7 +41,7 @@ renderizado de novo em 2–3x a resolução e relido com a primeira leitura como
 revisão, código, classificação). No PDF, sai a linha curta da borda da página em que só o número da página muda,
 rotulado como página ("Página 3 de 12", "fls. 3"), a linha que é só o número ("3", "3 de 12", "- 3 -", "(3)",
 registrada com o número trocado por `#`) e a linha idêntica na borda de ao menos 80% das páginas ("Contrato
-123/2026 - Confidencial"). O número sem rótulo no meio de outras palavras fica no texto: no carnê com uma parcela por
+123/2026 - Confidencial"), mesmo quando o extrator a marca como título pela fonte grande. O número sem rótulo no meio de outras palavras fica no texto: no carnê com uma parcela por
 página, "Parcela 3 de 12" é conteúdo. Também vão para os metadados a marca d'água, as propriedades do arquivo, os
 comentários e as alterações rastreadas do Word e as abas ocultas do Excel.
 

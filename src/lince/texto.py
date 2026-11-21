@@ -137,3 +137,49 @@ def sem_repeticao(txt, limite=10):
             out += linhas[k : j + 1]
         k = j + 1
     return "\n".join(out)
+
+
+_TITULO_DO_BLOCO = re.compile(r"#{1,6}[ \t]+(\S.*)")
+_ITEM_DE_LISTA = re.compile(
+    r"(?:[ivxlc]{1,6}|\d{1,3}|[a-z])[.)][ \t]"
+)  # "i. ", "2) ", "a. ": item novo, não continuação
+PALAVRAS_FRASE_MIN = 6  # título curto ("Atividade econômica") nunca é tratado como frase partida
+
+
+def _continua(t: str) -> bool:
+    """O texto continua uma frase: começa em letra minúscula e não é um item de lista novo."""
+    t = t.lstrip()
+    return bool(t) and t[0].isalpha() and t[0].islower() and not _ITEM_DE_LISTA.match(t)
+
+
+def juntar_frases_partidas(blocos: list[str]) -> list[str]:
+    """A frase de abertura em negrito que o extrator do PDF parte em título e continuação ("## A atividade econômica
+    expandiu-se em ritmo mais moderado, mas o mercado de trabalho" + "**seguiu aquecido.** O PIB…") volta a ser um
+    parágrafo só, com a frase em negrito ("**A atividade… trabalho seguiu aquecido.** O PIB…"); o título partido em
+    vários títulos seguidos, cada um continuando o anterior, vira uma frase em negrito. Só junta com a prova da quebra:
+    título de PALAVRAS_FRASE_MIN palavras ou mais, que não termina em pontuação, seguido de bloco que continua a frase
+    (começa em minúscula, em negrito ou como outro título). Título seguido de frase nova, de item de lista ou de
+    rótulo ("Riscos para a inflação:") fica como está. Nenhuma palavra sai do texto."""
+    saida, k = [], 0
+    while k < len(blocos):
+        bloco = blocos[k].strip()
+        m = _TITULO_DO_BLOCO.fullmatch(bloco) if "\n" not in bloco else None
+        if not m or len(m.group(1).split()) < PALAVRAS_FRASE_MIN or m.group(1).rstrip()[-1] in ".:;!?":
+            saida.append(blocos[k])
+            k += 1
+            continue
+        partes, j = [m.group(1).strip()], k + 1
+        while j < len(blocos) and (n := _TITULO_DO_BLOCO.fullmatch(blocos[j].strip())) and _continua(n.group(1)):
+            partes.append(n.group(1).strip())
+            j += 1
+        seguinte = blocos[j].lstrip() if j < len(blocos) else ""
+        if seguinte.startswith("**") and _continua(seguinte[2:]):
+            saida.append("**" + " ".join(partes) + " " + seguinte[2:])
+            k = j + 1
+        elif len(partes) > 1:
+            saida.append("**" + " ".join(partes) + "**")
+            k = j
+        else:
+            saida.append(blocos[k])
+            k += 1
+    return saida
