@@ -21,7 +21,7 @@ from ._prazo import LIMITE, prazo_restante
 from ._trava import PDFIUM
 from .agrupamento import agrupar, distribuir_lotes, resposta_aproveitavel
 from .cache import Cache, chave
-from .estrutura import secoes
+from .estrutura import indice, secoes
 from .instrucoes import PROMPT_PADRAO, VERSAO_PROMPT, instrucao
 from .limites import LADO_MAX_PX, com_barras_normais, conferir_zip
 from .metadados import metadados_arquivo
@@ -29,6 +29,7 @@ from .montagem import SAIDA_MAX, montar, tamanho_da_saida
 from .office import planejar_office
 from .pagina_html import planejar_html, planejar_svg
 from .pdf import de_pe, pagina_visivel, planejar_pdf
+from .pdf import imagens_das_paginas as paginas_em_png
 from .protecao import DocumentoProtegido, aberto, formato_protegido
 from .provedores import LeitorVisual
 from .tipos import Cobertura, Plano, PrazoEsgotado, Resultado, Uso
@@ -506,9 +507,45 @@ def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
             if t["id"] not in ja and not str(lidos.get(t["id"], "")).strip()
         ]
     r = _com_estrutura(Resultado(md, meta, cobertura, usos), plano)
-    if imagens := _imagens(plano, distribuir_lotes(plano, respostas)):
+    lidos = distribuir_lotes(plano, respostas)
+    if imagens := _imagens(plano, lidos):
         r.estrutura["imagens"] = imagens
+    if plano["tipo"] == "pdf" and (visuais := _paginas_visuais(plano, lidos)):
+        r.estrutura["paginas_visuais"] = visuais
     return r
+
+
+_MOTIVO_PAGINA = {"escaneada": "escaneada", "texto nativo corrompido": "texto_corrompido"}  # o resto é matemática
+
+
+def _paginas_visuais(plano, lidos) -> list[dict]:
+    """As páginas do PDF em que o Markdown traz uma transcrição feita pela IA no lugar do que se vê, para quem
+    responde decidir quando mandar a imagem da página ao modelo: o que havia nela (`conteudo`: imagem, desenho,
+    tabela, fórmula, ou a página inteira escaneada, de texto corrompido ou de matemática densa) e o que a leitura
+    deixou de garantir (`alertas`: valor estimado com ≈, trecho ilegível, leitura que não veio). Página nativa sem
+    figura fica de fora: o texto dela é o do arquivo."""
+    iguais = plano.get("iguais", {})
+    por_pagina = {}
+    for t in plano.get("tarefas_originais", []):
+        if not isinstance(t.get("pagina"), int):
+            continue
+        conteudo, alertas = por_pagina.setdefault(t["pagina"] + 1, (set(), set()))
+        if t["modo"] == "pagina":
+            conteudo.add(_MOTIVO_PAGINA.get(t.get("motivo", ""), "matematica"))
+        else:
+            conteudo.add(t["modo"])
+        texto = str(lidos.get(iguais.get(t["id"], t["id"]), ""))
+        if not texto.strip():
+            alertas.add("nao_lida")
+        else:
+            if "≈" in texto:
+                alertas.add("estimado")
+            if "[ilegível]" in texto or "[illegible]" in texto:
+                alertas.add("ilegivel")
+    return [
+        {"pagina": n, "conteudo": sorted(c)} | ({"alertas": sorted(a)} if a else {})
+        for n, (c, a) in sorted(por_pagina.items())
+    ]
 
 
 def _deduplicar(plano, pasta) -> dict[str, str]:
@@ -575,6 +612,8 @@ def _com_estrutura(r: Resultado, plano) -> Resultado:
     if plano["tipo"] == "pdf":
         r.estrutura["paginas"] = r.cobertura.paginas
     r.estrutura.update(secoes(r.markdown, pdf=plano["tipo"] == "pdf", apresentacao=bool(plano.get("slides"))))
+    if plano["tipo"] == "pdf" and (mapa := indice(r.markdown, r.estrutura, plano.get("sumario"))):
+        r.estrutura["indice"] = mapa
     return r
 
 
@@ -630,6 +669,20 @@ def _com_senha(caminho, senha, pasta) -> tuple[str, bool]:
         return str(caminho), False
     lido = aberto(caminho, senha, os.path.join(pasta, "aberto"))
     return lido, lido != str(caminho)
+
+
+def imagens_das_paginas(caminho: str | Path, paginas, lado: int = 1568, senha: str | None = None) -> dict[int, bytes]:
+    """As páginas pedidas do PDF (a partir de 1) em PNG, de pé, com o maior lado em `lado` pixels, para quem responde
+    ler a página original na hora da pergunta (as de `estrutura.paginas_visuais`, onde o Markdown traz a transcrição
+    de um gráfico, de uma figura ou de um scan). O arquivo não é guardado. Com senha, ele é decifrado numa pasta
+    temporária, apagada no fim; protegido sem senha levanta `DocumentoProtegido`, como na leitura."""
+    if _extensao_lida(str(caminho)) != ".pdf":
+        raise FormatoNaoSuportado("imagens das páginas só de PDF")
+    with tempfile.TemporaryDirectory(prefix="lince-") as pasta:
+        lido, _ = _com_senha(caminho, senha, pasta)
+        if senha is None and (formato := formato_protegido(lido)):
+            raise DocumentoProtegido(formato)
+        return paginas_em_png(lido, paginas, lado)
 
 
 def _texto(caminho):

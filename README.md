@@ -15,7 +15,8 @@ r.metadados         # versão, rodapé, marca d'água, propriedades, comentário
 r.cobertura         # rotas por página, leituras pela IA, leituras do cache, pendências
 r.uso               # custo de cada leitura (para o seu ledger)
 r.estrutura         # páginas, slides, abas (e quais são ocultas), seções com a posição no Markdown (pontos de código)
-                    # e, nas planilhas e no CSV, o perfil de cada tabela: colunas com o tipo, amostra e linhas no texto
+                    # e, nas planilhas e no CSV, o perfil de cada tabela: colunas com o tipo, amostra e linhas no texto;
+                    # no PDF, o índice com as páginas de cada seção e as páginas em que vale ler a imagem original
 ```
 
 ## O que ele faz
@@ -83,6 +84,21 @@ leitor = lince.Leitor(
   que continua sendo o padrão.
 - Falha da IA nunca derruba o documento: a leitura nativa fica e a pendência é registrada.
 - `Uso.custo_usd` traz o custo da chamada quando o provedor informa (`usage.cost`, como no OpenRouter).
+
+### Mapa de evidência do PDF
+
+A transcrição é decidida antes da pergunta, e um gráfico lido com `≈` não volta a ser o gráfico. Para quem responde
+olhar o original só onde precisa, a estrutura do PDF traz:
+
+- `estrutura.indice`: cada seção com a página onde começa e a última que ela pode ocupar (`pagina_fim`), dos
+  marcadores do PDF ou, sem eles, dos títulos do texto (sem cabeçalho corrido, frase em negrito promovida a título,
+  bibliografia e entrada do sumário impresso). Quem busca navega pelo índice antes de ler, como num sumário.
+- `estrutura.paginas_visuais`: as páginas em que o Markdown traz a transcrição de algo que se vê (imagem, desenho,
+  tabela, fórmula, página escaneada) e o que a leitura não garante (`estimado`, `ilegivel`, `nao_lida`).
+- `lince.imagens_das_paginas(arquivo, [12, 13], lado=1568, senha=None)`: as páginas pedidas em PNG, como são exibidas,
+  para mandar ao modelo junto com o Markdown na hora da pergunta. O arquivo não é guardado.
+
+O Markdown não muda: o mapa é só um guia sobre ele.
 
 ### Em duas fases: a IA é de quem chama
 
