@@ -10,7 +10,7 @@ from xml.etree import ElementTree as ET  # noqa: F401
 
 from .agrupamento import por_tarefa
 from .seguranca import alertas_injecao
-from .texto import NUM_PAGINA, juntar_frases_partidas, sem_repeticao
+from .texto import NUM_PAGINA, grupos_de_frases, sem_repeticao
 
 # Caracteres que a montagem escreve, o texto nativo junto. A leitura de uma imagem repetida entra uma vez, e as outras
 # posições levam só a referência: em 16 Mi cabem as 2.000 páginas que o PDF analisa (PAGINAS_ANALISE_MAX) com 8 mil
@@ -180,7 +180,6 @@ def montar(pasta, respostas):
             ):
                 continue
             limpos.append(b)
-        limpos = juntar_frases_partidas(limpos)  # antes de achar onde entram as figuras: o texto delas não muda
         inserir = {}
         for r in p["regioes"]:
             if r.get("repetida") or "substitui_tabela" in r or "substitui_formula" in r:
@@ -199,10 +198,13 @@ def montar(pasta, respostas):
             continue
         cab, limpos, inserir = pg
         saida = [cab] + inserir.get(-1, [])
-        for k, b in enumerate(limpos):
-            if b.strip():
-                saida.append(b)
-            saida.extend(inserir.get(k, []))
+        # a frase partida é juntada depois de sair o cabeçalho corrido (senão ele entraria na frase); a figura de um
+        # bloco juntado entra depois do grupo
+        for a, b, texto in grupos_de_frases(limpos):
+            if texto.strip():
+                saida.append(texto)
+            for k in range(a, b):
+                saida.extend(inserir.get(k, []))
         partes.append("\n\n".join(saida))
     return _metadados(pasta, plano, acabamento(leituras("\n\n".join(partes))), moveis)
 
@@ -242,8 +244,8 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
     metadados como a linha com o número trocado por #. A linha curta idêntica na borda de FIXA_MIN das páginas, sem
     número de página, é cabeçalho fixo e sai também, se couber em FRACAO_MAX junto com o resto (senão só ela fica).
     Valor, data e número de documento que mudam entre páginas não casam, a página escaneada e o texto lido pela IA não
-    passam por aqui, título (linha com #) só sai como cabeçalho fixo (idêntico na borda de FIXA_MIN das páginas) e,
-    se o que sairia passa de FRACAO_MAX do texto nativo do documento, nada sai."""
+    passam por aqui, título (linha com #) só sai como cabeçalho fixo (idêntico na borda de FIXA_MIN das páginas, num
+    documento que tem outros títulos) e, se o que sairia passa de FRACAO_MAX do texto nativo do documento, nada sai."""
     from collections import Counter
 
     def linhas(blocos):
@@ -312,7 +314,19 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
         pos: t for pos, c in por_posicao.items() for t, v in c.most_common(1) if n >= 3 and v >= max(3, FIXA_MIN * n)
     }
     terceira = {0: 2, 1: 2, -1: -3, -2: -3}  # de cada posição da borda, a primeira linha do corpo
-    fixas = {(pos, t) for pos, t in repetidas.items() if pos in terceira and terceira[pos] not in repetidas and fixa(t)}
+    # o título que se repete só sai se o documento tem outros títulos: num lote de faturas de uma página, "Fatura" no
+    # topo de cada uma é o título de cada documento, e tirá-lo deixaria o lote sem onde cada uma começa
+    outros_titulos = {
+        ln.strip() for _, blocos in nativas for b in blocos for ln in b.split("\n") if ln.lstrip().startswith("#")
+    }
+    fixas = {
+        (pos, t)
+        for pos, t in repetidas.items()
+        if pos in terceira
+        and terceira[pos] not in repetidas
+        and fixa(t)
+        and (not t.startswith("#") or outros_titulos - {t})
+    }
     extremos = {}
     for i, blocos in nativas:
         cheias = linhas(blocos)

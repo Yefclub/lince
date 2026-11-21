@@ -294,3 +294,23 @@ def test_cabecalho_fixo_que_o_extrator_marcou_como_titulo_vai_para_os_metadados(
     assert r.metadados["cabeçalho/rodapé"] == ["Carta do Trimestre | 69 | Nota 22"]
     assert r.markdown.count("da análise da página") == 96  # o conteúdo inteiro fica
     assert [s["titulo"] for s in r.estrutura["secoes"]] == ["Inflação"]  # o título de seção de verdade também
+
+
+def test_lote_com_o_mesmo_titulo_em_cada_documento_mantem_os_titulos(tmp_path):
+    p = tmp_path / "faturas.pdf"
+    c = canvas.Canvas(str(p), pagesize=A4)
+    for n in range(12):
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(60, 800, "Fatura")  # o título de cada fatura, não cabeçalho corrido
+        c.setFont("Helvetica", 11)
+        for k, ln in enumerate(
+            [f"Fatura nº {1000 + n}", f"Cliente: Transportadora {n + 1} Ltda", f"Valor: R$ {150 + n},00"]
+        ):
+            c.drawString(60, 760 - k * 18, ln)
+        c.showPage()
+    c.save()
+
+    r = lince.ler(p)
+
+    assert [s["titulo"] for s in r.estrutura["secoes"]] == ["Fatura"] * 12  # onde cada fatura começa
+    assert "cabeçalho/rodapé" not in r.metadados
