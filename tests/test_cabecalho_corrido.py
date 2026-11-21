@@ -282,9 +282,9 @@ def test_cabecalho_fixo_que_o_extrator_marcou_como_titulo_vai_para_os_metadados(
         c.setFont("Helvetica", 11)
         for k in range(12):
             c.drawString(60, 740 - k * 18, f"Parágrafo {k + 1} da análise da página {n + 1}, com dados do trimestre.")
-        if n == 3:
+        if n in (3, 6):  # as seções de verdade do documento
             c.setFont("Helvetica-Bold", 16)
-            c.drawString(60, 480, "Inflação")
+            c.drawString(60, 480, "Inflação" if n == 3 else "Crédito")
         c.showPage()
     c.save()
 
@@ -293,10 +293,15 @@ def test_cabecalho_fixo_que_o_extrator_marcou_como_titulo_vai_para_os_metadados(
     assert "Carta do Trimestre" not in r.markdown
     assert r.metadados["cabeçalho/rodapé"] == ["Carta do Trimestre | 69 | Nota 22"]
     assert r.markdown.count("da análise da página") == 96  # o conteúdo inteiro fica
-    assert [s["titulo"] for s in r.estrutura["secoes"]] == ["Inflação"]  # o título de seção de verdade também
+    assert [s["titulo"] for s in r.estrutura["secoes"]] == ["Inflação", "Crédito"]  # as seções de verdade ficam
 
 
-def test_lote_com_o_mesmo_titulo_em_cada_documento_mantem_os_titulos(tmp_path):
+@pytest.mark.parametrize(
+    "extra",
+    [None, "observacoes", "itens"],
+    ids=["so-o-titulo", "um-titulo-numa-fatura", "o-mesmo-subtitulo-em-todas"],
+)
+def test_lote_com_o_mesmo_titulo_em_cada_documento_mantem_os_titulos(tmp_path, extra):
     p = tmp_path / "faturas.pdf"
     c = canvas.Canvas(str(p), pagesize=A4)
     for n in range(12):
@@ -307,10 +312,31 @@ def test_lote_com_o_mesmo_titulo_em_cada_documento_mantem_os_titulos(tmp_path):
             [f"Fatura nº {1000 + n}", f"Cliente: Transportadora {n + 1} Ltda", f"Valor: R$ {150 + n},00"]
         ):
             c.drawString(60, 760 - k * 18, ln)
+        if (extra == "observacoes" and n == 4) or extra == "itens":
+            c.setFont("Helvetica-Bold", 16)
+            c.drawString(60, 680, "Observações" if extra == "observacoes" else "Itens")
         c.showPage()
     c.save()
 
     r = lince.ler(p)
 
-    assert [s["titulo"] for s in r.estrutura["secoes"]] == ["Fatura"] * 12  # onde cada fatura começa
-    assert "cabeçalho/rodapé" not in r.metadados
+    titulos = [s["titulo"] for s in r.estrutura["secoes"]]
+    assert titulos.count("Fatura") == 12 and "cabeçalho/rodapé" not in r.metadados  # onde cada fatura começa
+
+
+def test_linha_que_comeca_com_cerquilha_sem_ser_titulo_nao_conta_como_secao():
+    paginas = [
+        (
+            i,
+            [
+                "# Fatura",
+                f"Fatura nº {1000 + i}\nValor: R$ {150 + i},00",
+                f"#{i + 1} em vendas do mês",
+                "#define LIMITE 3",
+            ],
+        )
+        for i in range(12)
+    ]
+
+    assert _sem_cabecalho_corrido(paginas) == set()
+    assert all(blocos[0] == "# Fatura" for _, blocos in paginas)

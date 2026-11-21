@@ -77,6 +77,9 @@ def test_sem_marcadores_o_indice_vem_dos_titulos_sem_o_que_nao_e_secao():
     ]
 
 
+_CORES = {2: (200, 30, 30), 3: (30, 30, 200)}  # uma cor por página: a IA simulada responde pela imagem
+
+
 def _figura(cor):
     im = Image.new("RGB", (400, 300), "white")
     im.paste(cor, (40, 40, 360, 260))
@@ -93,7 +96,7 @@ def _pdf_com_figuras(caminho):
         c.setFont("Helvetica", 11)
         c.drawString(72, 780, f"Texto da página {n}.")
         if n > 1:
-            c.drawImage(_figura((30, 90 * n, 200)), 72, 400, width=300, height=225)
+            c.drawImage(_figura(_CORES[n]), 72, 400, width=300, height=225)
         c.showPage()
     c.save()
 
@@ -101,8 +104,12 @@ def _pdf_com_figuras(caminho):
 def test_paginas_visuais_dizem_o_que_a_ia_transcreveu_e_o_que_a_leitura_nao_garante(tmp_path):
     p = tmp_path / "figuras.pdf"
     _pdf_com_figuras(p)
-    leituras = iter(["Gráfico (barras): vendas\n\n| mês | valor |\n| --- | --- |\n| jan | ≈3 |", "[ilegível]"])
-    ia = lince.FuncaoLeitor(lambda imagem, instrucao: next(leituras), "simulado")
+
+    def ler(imagem, instrucao):  # pela cor da figura, não pela ordem das chamadas (as leituras rodam em paralelo)
+        r, _, b = Image.open(io.BytesIO(imagem)).convert("RGB").resize((1, 1)).getpixel((0, 0))
+        return "Gráfico (barras): vendas\n\n| mês | valor |\n| --- | --- |\n| jan | ≈3 |" if r > b else "[ilegível]"
+
+    ia = lince.FuncaoLeitor(ler, "simulado")
 
     r = lince.Leitor(ia=ia, agrupar=False).ler(p)
 

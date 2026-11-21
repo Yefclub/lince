@@ -155,15 +155,15 @@ def _continua(t: str) -> bool:
 
 def _fecha_a_frase(negrito: str) -> bool:
     """O negrito do começo do bloco continua a frase e a termina: com a pontuação final dentro ("**seguiu aquecido.**
-    O PIB…") ou logo depois dele ("**… de 2026**. Logo…"), ou ocupando o bloco inteiro. Trechos em negrito colados
-    ("**… e** **perspectivas da economia.**") contam como um só."""
+    O PIB…") ou logo depois dele ("**… de 2026**. Logo…"). Trechos em negrito colados ("**… e** **perspectivas da
+    economia.**") contam como um só. Negrito sem pontuação ("**em milhões de reais**") pode ser legenda: não junta."""
     texto = negrito.replace("** **", " ")
     fim = texto.find("**", 2)
     if fim < 0 or not _continua(texto[2:fim]):
         return False
     trecho, depois = texto[2:fim].rstrip(), texto[fim + 2 :]
     pontuado = any(_FIM_DE_FRASE.fullmatch(trecho[k:]) for k in range(max(0, len(trecho) - 8), len(trecho)))
-    return pontuado or depois[:1] in (".", "!", "?", "…") or not depois.strip()
+    return pontuado or depois[:1] in (".", "!", "?", "…")
 
 
 def grupos_de_frases(blocos: list[str]) -> list[tuple[int, int, str]]:
@@ -174,7 +174,8 @@ def grupos_de_frases(blocos: list[str]) -> list[tuple[int, int, str]]:
     anterior em minúscula, vira uma frase em negrito. Os outros blocos são grupos de um bloco, com o texto como está.
 
     Só junta com a prova da quebra: título de PALAVRAS_FRASE_MIN palavras ou mais, que não termina em pontuação,
-    seguido de título do mesmo nível que continua a frase ou de negrito que continua e termina a frase. Fica como está:
+    seguido de título do mesmo nível que continua a frase ou de negrito que continua e termina a frase (com pontuação
+    final). Fica como está:
     título seguido de frase nova, de subtítulo (nível mais fundo), de item de lista, de nota ("**nota:** …") ou de
     rótulo ("Riscos para a inflação:"), e tudo dentro de bloco de código. Nenhuma palavra sai do texto, e cada bloco é
     visto no máximo duas vezes."""
@@ -198,7 +199,8 @@ def grupos_de_frases(blocos: list[str]) -> list[tuple[int, int, str]]:
             partes.append(n.group(2).strip())
             j += 1
         seguinte = blocos[j].lstrip() if j < len(blocos) else ""
-        if seguinte.startswith("**") and _fecha_a_frase(seguinte):
+        sem_codigo = not any(_CERCA.match(ln) for ln in seguinte.split("\n"))  # a paridade das cercas fica certa
+        if seguinte.startswith("**") and sem_codigo and _fecha_a_frase(seguinte):
             grupos.append((k, j + 1, "**" + " ".join(partes) + " " + seguinte[2:]))
             k = j + 1
         elif len(partes) > 1:

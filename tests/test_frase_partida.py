@@ -7,6 +7,15 @@ import lince
 from lince.texto import juntar_frases_partidas
 
 
+def _secao(c, titulo, y):
+    """Um título de seção de verdade na página (o documento com seções é o que tem cabeçalho corrido a tirar)."""
+    if titulo:
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(60, y, titulo)
+        y -= 24
+    return y
+
+
 def test_titulo_seguido_da_continuacao_em_negrito_volta_a_ser_a_frase():
     blocos = [
         "## A atividade econômica doméstica expandiu-se em ritmo moderado, mas o mercado de trabalho",
@@ -67,6 +76,10 @@ def test_titulo_seguido_de_subtitulo_nota_ou_negrito_sem_fim_de_frase_fica_como_
         "**nota:** dados do censo.",  # nota, não continuação
         "## Os principais indicadores de condições financeiras mantiveram",
         "**comportamentos variados** em relação ao trimestre anterior.",  # o negrito não termina a frase
+        "## Panorama da evolução fiscal brasileira nos últimos anos",
+        "**em milhões de reais**",  # legenda: negrito sem pontuação
+        "## Exemplo de configuração do serviço de leitura em lote",
+        "**veja o arquivo de exemplo.**\n```yaml\nservico: lince\n```",  # código na continuação
     ]
 
     assert juntar_frases_partidas(blocos) == blocos
@@ -98,10 +111,7 @@ def test_no_pdf_a_frase_volta_inteira_sem_o_cabecalho_corrido_e_a_secao_real_fic
             c.setFont("Helvetica", 11)
             c.drawString(200, y - 18, "O PIB cresceu 0,5% no segundo trimestre de 2026.")
             y -= 36
-        if n == 2:
-            c.setFont("Helvetica-Bold", 14)
-            c.drawString(60, y, "Inflação")
-            y -= 24
+        y = _secao(c, {2: "Inflação", 3: "Crédito"}.get(n), y)
         c.setFont("Helvetica", 11)
         for k in range(10):
             c.drawString(60, y - 18 * k, f"Texto corrido {k} da página {n + 1} com a análise do trimestre.")
@@ -116,10 +126,10 @@ def test_no_pdf_a_frase_volta_inteira_sem_o_cabecalho_corrido_e_a_secao_real_fic
     assert f"**{frase}** O PIB cresceu 0,5%" in r.markdown
     assert "Carta do Trimestre" not in r.markdown
     assert r.metadados["cabeçalho/rodapé"] == ["Carta do Trimestre | 69 | Nota 22 | Terceiro trimestre"]
-    assert [s["titulo"] for s in r.estrutura["secoes"]] == ["Inflação"]
+    assert [s["titulo"] for s in r.estrutura["secoes"]] == ["Inflação", "Crédito"]
 
 
-def test_continuacao_com_o_ponto_fora_do_negrito_em_trechos_ou_sem_ponto_tambem_junta():
+def test_continuacao_com_o_ponto_fora_do_negrito_ou_em_trechos_tambem_junta():
     titulo = "## O preço do petróleo oscilou ao longo do trimestre, assim como sua trajetória"
     for continuacao, fim in [
         (
@@ -129,10 +139,6 @@ def test_continuacao_com_o_ponto_fora_do_negrito_em_trechos_ou_sem_ponto_tambem_
         (
             "**prospectiva e** **perspectivas da economia.** Mais adiante.",
             "trajetória prospectiva e** **perspectivas da",
-        ),
-        (
-            "**prospectiva, que considera queda mais acentuada**",
-            "trajetória prospectiva, que considera queda mais acentuada**",
         ),
     ]:
         (juntado,) = juntar_frases_partidas([titulo, continuacao])
@@ -152,10 +158,7 @@ def test_cabecalho_corrido_no_topo_nao_entra_na_continuacao_da_frase(tmp_path):
             c.setFont("Helvetica", 11)
             c.drawString(200, y, "O PIB cresceu 0,5% no segundo trimestre de 2026.")
             y -= 18
-        if n == 3:
-            c.setFont("Helvetica-Bold", 14)
-            c.drawString(60, y, "Inflação")
-            y -= 24
+        y = _secao(c, {1: "Atividade", 3: "Inflação"}.get(n), y)
         c.setFont("Helvetica", 11)
         for k in range(10):
             c.drawString(60, y - 18 * k, f"Texto corrido {k} da página {n + 1} com a análise do trimestre.")
@@ -166,3 +169,27 @@ def test_cabecalho_corrido_no_topo_nao_entra_na_continuacao_da_frase(tmp_path):
 
     assert "Carta do Trimestre" not in r.markdown
     assert "**trabalho seguiu aquecido.** O PIB cresceu" in r.markdown
+
+
+def test_figura_logo_abaixo_da_frase_juntada_entra_depois_do_paragrafo(tmp_path):
+    from PIL import Image
+
+    Image.new("RGB", (600, 300), "navy").save(tmp_path / "g.png")
+    p = tmp_path / "carta.pdf"
+    c = canvas.Canvas(str(p), pagesize=A4)
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(60, 760, "A atividade econômica doméstica expandiu-se em ritmo mais moderado, mas o mercado de")
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(60, 742, "trabalho seguiu aquecido.")
+    c.setFont("Helvetica", 11)
+    c.drawString(200, 742, "O PIB cresceu 0,5% no segundo trimestre de 2026.")
+    c.drawImage(str(tmp_path / "g.png"), 60, 480, width=400, height=200)  # logo abaixo da continuação
+    for k in range(6):
+        c.drawString(60, 440 - 18 * k, f"Texto corrido {k} depois da figura.")
+    c.showPage()
+    c.save()
+
+    md = lince.ler(p).markdown
+
+    assert "**A atividade econômica" in md
+    assert md.index("**A atividade econômica") < md.index("> [figura: pendente]") < md.index("Texto corrido 0")

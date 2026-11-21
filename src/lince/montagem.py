@@ -211,6 +211,7 @@ def montar(pasta, respostas):
 
 CABECALHO_MAX = 80  # linha de cabeçalho/rodapé corrido é curta; parágrafo que o leitor juntou numa linha, não
 FRACAO_MAX = 0.25  # se a remoção levaria mais que isso do texto nativo do documento, nada sai
+TITULOS_MIN_FRACAO = 0.1  # títulos distintos por página que dizem que o documento tem seções (o Ipea: 17 em 43)
 FIXA_MIN = 0.8  # linha idêntica na borda de ao menos esta fração das páginas é cabeçalho fixo ("Confidencial")
 
 
@@ -245,7 +246,8 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
     número de página, é cabeçalho fixo e sai também, se couber em FRACAO_MAX junto com o resto (senão só ela fica).
     Valor, data e número de documento que mudam entre páginas não casam, a página escaneada e o texto lido pela IA não
     passam por aqui, título (linha com #) só sai como cabeçalho fixo (idêntico na borda de FIXA_MIN das páginas, num
-    documento que tem outros títulos) e, se o que sairia passa de FRACAO_MAX do texto nativo do documento, nada sai."""
+    documento com seções de verdade: veja `com_secoes`) e, se o que sairia passa de FRACAO_MAX do texto nativo do
+    documento, nada sai."""
     from collections import Counter
 
     def linhas(blocos):
@@ -314,18 +316,22 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
         pos: t for pos, c in por_posicao.items() for t, v in c.most_common(1) if n >= 3 and v >= max(3, FIXA_MIN * n)
     }
     terceira = {0: 2, 1: 2, -1: -3, -2: -3}  # de cada posição da borda, a primeira linha do corpo
-    # o título que se repete só sai se o documento tem outros títulos: num lote de faturas de uma página, "Fatura" no
-    # topo de cada uma é o título de cada documento, e tirá-lo deixaria o lote sem onde cada uma começa
-    outros_titulos = {
-        ln.strip() for _, blocos in nativas for b in blocos for ln in b.split("\n") if ln.lstrip().startswith("#")
-    }
+    # o título que se repete só sai num documento com seções de verdade: outros títulos, distintos, em número que
+    # acompanha o tamanho do documento (TITULOS_MIN_FRACAO das páginas, no mínimo 2) e que não se repetem eles mesmos
+    # na maioria das páginas. Num lote de faturas de uma página, "Fatura" no topo de cada uma é o título de cada
+    # documento: um "Observações" numa delas ou um "Itens" em todas não fazem dele cabeçalho corrido
+    paginas_do_titulo = {}
+    for i, blocos in nativas:
+        for b in blocos:
+            for ln in b.split("\n"):
+                if _TITULO_FIXO.match(ln.lstrip()):
+                    paginas_do_titulo.setdefault(ln.strip(), set()).add(i)
+    secoes_de_verdade = {t for t, pags in paginas_do_titulo.items() if len(pags) <= n / 2}
+    com_secoes = len(secoes_de_verdade) >= max(2, TITULOS_MIN_FRACAO * n)
     fixas = {
         (pos, t)
         for pos, t in repetidas.items()
-        if pos in terceira
-        and terceira[pos] not in repetidas
-        and fixa(t)
-        and (not t.startswith("#") or outros_titulos - {t})
+        if pos in terceira and terceira[pos] not in repetidas and fixa(t) and (com_secoes or not _TITULO_FIXO.match(t))
     }
     extremos = {}
     for i, blocos in nativas:
