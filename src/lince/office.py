@@ -1,5 +1,6 @@
 """Office (DOCX, PPTX, XLSX, ODF, RTF, EPUB, legados): anydoc + gráficos nativos, setas de fluxograma e imagens."""
 
+import copy
 import hashlib
 import html
 import io  # noqa: F401
@@ -18,6 +19,7 @@ from . import legados, perfil_tabular
 from .limites import DocumentoRecusado, xml_ou_nada
 from .metadados import BINARIOS_OLE, ERROS_DE_PARTE, ODF
 from .seguranca import NAO_CONFERIDO, XMLIlegivel, _xml, fora_da_conferencia, limpar_docx, limpar_pptx
+from .texto import romano
 
 NS = {
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
@@ -552,7 +554,7 @@ def planejar_office(path, pasta, ext=None):
     elif doc is None:
         (md, perfis), ilegiveis[:0] = md_xlsb, ilegiveis_xlsb
     else:
-        md = serializar(doc, ler_imagem, links=formato in ("docx", "rtf"))[0]
+        md = serializar(doc, ler_imagem, formato=formato, marca_slide=marca if ext in PPTX else None)[0]
         perfis = _perfis(doc) if ext in PLANILHAS else []
         if limpeza is not None:  # a rede de segurança: o que o anydoc leu e a conferência não viu é falha
             lido = re.sub(rf"{marca}G?\d+X", " ", texto_lido(doc))
@@ -583,7 +585,7 @@ def planejar_office(path, pasta, ext=None):
 
             md = re.sub(rf"(?m)^{marca}G(\d+)X$", substituir_grafico, md)
             md = re.sub(r"(?m)^(<!-- slide \d+ -->)$", r"\\\1", md)
-            md = re.sub(rf"(?m)^{marca}(\d+)X$", r"<!-- slide \1 -->", md)
+            md = re.sub(rf"(?m)^{marca}(\d+)X$", r'<!-- slide \1 -->\n\n<a id="slide-\1"></a>', md)
     if ext in BINARIOS_OLE:  # o leitor do corpo quase não entrega as imagens do .doc, .xls e .ppt: o armazém, sim
 
         def imagens_legado():
@@ -1290,16 +1292,25 @@ def _marcar(dados, marca, graficos):
     with zipfile.ZipFile(io.BytesIO(dados)) as zi:
         nomes = set(zi.namelist())
         ordem = {parte: n for n, parte in enumerate(_slides_pptx(zi, nomes), 1)}
+        notas = {nota for slide in ordem for nota in _alvos(zi, slide, nomes, "notesSlide").values()}
         saida = io.BytesIO()
         with zipfile.ZipFile(saida, "w", zipfile.ZIP_DEFLATED) as zo:
             for info in zi.infolist():
                 conteudo = zi.read(info)
-                if info.filename in ordem:
+                if info.filename in ordem or info.filename in notas:
                     try:
                         raiz = _xml(conteudo)
+                        # O anydoc representa tanto um vínculo externo relativo quanto uma parte interna órfã como
+                        # "relative". Na cópia de leitura, retire só os vínculos internos sem slide de destino.
+                        rels = _alvos(zi, info.filename, nomes)
+                        mudou = False
+                        for link in raiz.iter(f"{{{NS['a']}}}hlinkClick"):
+                            rid = link.get(f"{_REL}id")
+                            if rid in rels and rels[rid] not in ordem:
+                                link.attrib.pop(f"{_REL}id")
+                                mudou = True
                         arvore = raiz.find(f"{_P}cSld/{_P}spTree")
-                        if arvore is not None:
-                            rels = _alvos(zi, info.filename, nomes) if graficos else {}
+                        if info.filename in ordem and arvore is not None:
                             for forma in arvore.iter(f"{_P}graphicFrame"):
                                 ch = forma.find("a:graphic/a:graphicData/c:chart", NS)
                                 if ch is not None and (parte := rels.get(ch.get(f"{_REL}id"))) in graficos:
@@ -1309,10 +1320,13 @@ def _marcar(dados, marca, graficos):
                                     else:  # tipo não interpretado: manter também a tabela do anydoc
                                         forma.addnext(_caixa_marca(marcador))
                             arvore.insert(min(2, len(arvore)), _caixa_marca(f"{marca}{ordem[info.filename]}X"))
+                            mudou = True
+                        if mudou:
                             conteudo = etree.tostring(raiz, xml_declaration=True, encoding="UTF-8", standalone=True)
                     except XMLIlegivel:
                         pass
-                zo.writestr(info, conteudo)
+                # writestr altera header_offset. As relações podem preceder o slide e ainda serão lidas em zi.
+                zo.writestr(copy.copy(info), conteudo)
     return saida.getvalue()
 
 
@@ -1431,6 +1445,8 @@ def texto_lido(doc) -> str:
                 inl(b.content)
             elif b.kind == "list":
                 for it in b.list.items:
+                    if it.marker_label:
+                        out.append(f" {it.marker_label} ")
                     blocos(it.blocks)
             elif b.kind == "table":
                 for linha in b.table.grid:
@@ -1469,10 +1485,36 @@ def _link_markdown(rotulo, alvo):
     return f"[{texto}]({destino})"
 
 
-def serializar(doc, ler_imagem, *, links=False):
+def _rotulo_word(lista, item, numero):
+    """O anydoc já resolveu a máscara multinível e os reinícios. Marcadores simples trazem apenas a família."""
+    if item.marker_label is not None:
+        rotulo = " ".join(item.marker_label.split())
+        # A máscara pode conter texto arbitrário. O rótulo publicado é literal, inclusive dentro de tabelas.
+        return re.sub(r"([\\\[\]*_\x60#!~])", r"\\\1", html.escape(rotulo, quote=False))
+    if lista.marker.endswith("_roman"):
+        valor = romano(numero)
+    elif lista.marker.endswith("_alpha"):
+        valor = "" if numero else "0"
+        while numero:
+            numero, letra = divmod(numero - 1, 26)
+            valor = chr(ord("a") + letra) + valor
+    else:
+        return "-" if lista.marker == "bullet" else f"{numero}."
+    return (valor.upper() if lista.marker.startswith("upper") else valor) + "."
+
+
+def serializar(doc, ler_imagem, *, links=False, formato=None, marca_slide=None):
     cobertura = {"pendente": []}
     assets = {a.id: a for a in doc.assets}
     n_img = {"n": 0}
+    links = links or formato in ("docx", "rtf", "pptx")
+    # Só uma marca inserida pelo Lince comprova que a parte de destino foi lida. A numeração segue a apresentação.
+    slides = set()
+    if marca_slide:
+        for b in doc.blocks:
+            if b.kind == "paragraph" and len(b.content) == 1 and b.content[0].kind == "text":
+                if m := re.fullmatch(rf"{marca_slide}(\d+)X", b.content[0].text or ""):
+                    slides.add(f"slide-{m[1]}")
 
     def inl(xs):
         out = []
@@ -1482,9 +1524,13 @@ def serializar(doc, ler_imagem, *, links=False):
                 out.append(x.text or "")
             elif k == "link":
                 rotulo = inl(x.content)
-                out.append(_link_markdown(rotulo, x.target) if links else rotulo)
+                alvo = x.target
+                if marca_slide and alvo and alvo.kind == "anchor" and alvo.value not in slides:
+                    alvo = None
+                out.append(_link_markdown(rotulo, alvo) if links else rotulo)
             elif k == "anchor" and links and x.anchor:
-                out.append(f'<a id="{html.escape(x.anchor, quote=True)}"></a>')
+                if not marca_slide:  # a âncora dos slides entra dentro do próprio slide, junto da marca de posição
+                    out.append(f'<a id="{html.escape(x.anchor, quote=True)}"></a>')
             elif k == "image":
                 n_img["n"] += 1
                 src = x.source
@@ -1523,6 +1569,10 @@ def serializar(doc, ler_imagem, *, links=False):
                 for i, it in enumerate(b.list.items):
                     corpo = blocos(it.blocks, prof + 1).strip().replace("\n", "\n  ")
                     marca = "-" if b.list.marker == "bullet" else f"{b.list.start + i}."
+                    if formato == "docx":
+                        marca = _rotulo_word(b.list, it, b.list.start + i)
+                        if b.list.marker != "bullet" and marca and corpo.startswith(marca + " "):
+                            corpo = corpo[len(marca) + 1 :]
                     out.append("  " * prof + f"{marca} {corpo}")
             elif k == "table":
                 linhas = []

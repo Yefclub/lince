@@ -12,6 +12,7 @@ from typing import NamedTuple
 from xml.etree import ElementTree as ET  # noqa: F401
 
 from .limites import escala
+from .texto import romano
 
 PADROES_INJECAO = [
     # "ignore todas as instruções anteriores", "ignore all the previous rules", "ignore as orientações acima"
@@ -263,13 +264,33 @@ _MATEMATICA = (f"{_M}oMathPara", f"{_M}oMath")
 _RECUSAS_DE_NOTA = ("separator", "continuationSeparator", "continuationNotice")
 
 
-def _emitido_word(raiz, papel) -> _Emitido:
+class _CampoDeCaixa(NamedTuple):
+    inicio: object
+    caixa: object
+    instrucao: list
+
+    def projetar(self):
+        codigo = "".join(self.instrucao).split(maxsplit=1)
+        if not codigo or codigo[0].upper() != "FORMCHECKBOX":
+            return None
+        estado = self.caixa.find(f"{_W}checked")
+        if estado is None:
+            estado = self.caixa.find(f"{_W}default")
+        # No próprio run, para a conferência aplicar também o estilo da caixa.
+        t = self.inicio.makeelement(f"{_W}t")
+        t.text = "[x]" if _ligado(estado) else "[ ]"
+        self.inicio.addprevious(t)
+        return t
+
+
+def _emitido_word(raiz, papel, formatar_caixas=False) -> tuple[_Emitido, bool]:
     """O percurso do anydoc numa parte do Word (formats/docx/content.rs), para a rede comparar só o que ele de fato
     escreve: o corpo (w:body) ou cada nota que não é separador; nos blocos, parágrafo, tabela (sem a célula coberta
     pela mesclagem vertical), sdt e customXml; no parágrafo, o run, o hiperlink, o campo simples e os embrulhos que
     ele percorre (w:del e w:moveFrom, não); no run, o w:t filho, fora da instrução de um campo (entre o begin e o
     separate); no desenho, as caixas de texto e, sem elas, o gráfico ou o SmartArt."""
     out = _Emitido(set(), [], [])
+    mudou = False
 
     def blocos(el):
         for f in el:
@@ -290,7 +311,7 @@ def _emitido_word(raiz, papel) -> _Emitido:
                 blocos(f)
 
     def inline(el, campos, mostra):
-        """`campos`: em cada campo aberto, se já passou do separate; o texto só sai com todos no resultado."""
+        """O texto só sai quando todos os campos abertos já passaram do separate (estado True)."""
         for f in el:
             if f.tag == f"{_MC}AlternateContent":
                 if (ramo := _ramo_lido(f, _LIDOS_WORD)) is not None:
@@ -298,12 +319,12 @@ def _emitido_word(raiz, papel) -> _Emitido:
             elif f.tag == f"{_M}oMathPara":
                 out.textos.update(f.iter(f"{_M}t"))
             elif f.tag == f"{_M}oMath":
-                if mostra and all(campos):
+                if mostra and all(c is True for c in campos):
                     out.textos.update(f.iter(f"{_M}t"))
             elif f.tag == f"{_W}r":
                 run(f, campos, mostra)
             elif f.tag in (f"{_W}hyperlink", f"{_W}fldSimple"):  # leitura própria, que sai inteira no lugar
-                inline(f, [], mostra and all(campos))
+                inline(f, [], mostra and all(c is True for c in campos))
             elif f.tag == f"{_W}sdt":
                 if (conteudo := f.find(f"{_W}sdtContent")) is not None:
                     inline(conteudo, campos, mostra)
@@ -311,23 +332,34 @@ def _emitido_word(raiz, papel) -> _Emitido:
                 inline(f, campos, mostra)
 
     def run(r, campos, mostra):
+        nonlocal mudou
         for f in r:
             if f.tag == f"{_MC}AlternateContent":
                 if (ramo := _ramo_lido(f, _LIDOS_WORD)) is not None:
                     run(ramo, campos, mostra)
             elif f.tag == f"{_W}t":
-                if mostra and all(campos):
+                if mostra and all(c is True for c in campos):
                     out.textos.add(f)
             elif f.tag in (f"{_W}drawing", f"{_W}pict", f"{_W}object"):
                 desenho(f)
+            elif f.tag == f"{_W}instrText" and campos and isinstance(campos[-1], _CampoDeCaixa):
+                campos[-1].instrucao.append(f.text or "")
             elif f.tag == f"{_W}fldChar":
                 tipo = _attr(f, _W[1:-1], "fldCharType")
                 if tipo == "begin":
-                    campos.append(False)
-                elif tipo == "separate" and campos:
-                    campos[-1] = True
-                elif tipo == "end" and campos:
-                    campos.pop()
+                    caixa = f.find(f"{_W}ffData/{_W}checkBox") if formatar_caixas else None
+                    campos.append(_CampoDeCaixa(f, caixa, []) if caixa is not None else False)
+                elif campos and tipo in ("separate", "end"):
+                    campo = campos.pop()
+                    marcador = campo.projetar() if isinstance(campo, _CampoDeCaixa) else None
+                    if marcador is not None:
+                        if mostra and all(c is True for c in campos):
+                            out.textos.add(marcador)
+                        mudou = True
+                    if tipo == "separate":
+                        if marcador is not None:
+                            f.getparent().remove(f)  # o estado da caixa substitui o resultado em cache
+                        campos.append(marcador is None)
 
     def desenho(el):
         caixas = []
@@ -371,7 +403,7 @@ def _emitido_word(raiz, papel) -> _Emitido:
         for nota in raiz.iterfind(f"{_W}{_local(raiz)[:-1]}"):
             if _attr(nota, _W[1:-1], "type") not in _RECUSAS_DE_NOTA and _attr(nota, _W[1:-1], "id") is not None:
                 blocos(nota)
-    return out
+    return out, mudou
 
 
 def _qualificado(el, local):
@@ -1582,7 +1614,7 @@ def _conferir_word(z, so_metadados=False, formatar_texto=False) -> tuple:
         atras = (255, 255, 255) if papel == "comentario" else pagina  # o comentário fica no balão, fora da página
         cobre = faixas if papel == "corpo" else [(-1, 1 << 62)] if faixas and papel == "nota" else ()
         # o anydoc lê o corpo e as notas; o resto, só os metadados
-        emitido = _emitido_word(raiz, papel) if papel in ("corpo", "nota") else None
+        emitido, caixas = _emitido_word(raiz, papel, formatar_texto) if papel in ("corpo", "nota") else (None, False)
         try:
             achados, mudou = _conferir_parte(
                 raiz,
@@ -1602,7 +1634,7 @@ def _conferir_word(z, so_metadados=False, formatar_texto=False) -> tuple:
             pac.falhou(nome, e)
             continue
         ocultos += achados
-        if mudou:
+        if mudou or caixas:
             limpas[nome] = _serializar(raiz, z.read(nome))
         if emitido is not None:
             pprs += emitido.pprs
@@ -1615,16 +1647,7 @@ def _conferir_word(z, so_metadados=False, formatar_texto=False) -> tuple:
 @functools.cache
 def _romanos() -> frozenset:
     """Os números romanos de 1 a 3999 (o anydoc escreve os maiores em algarismos), em minúsculas."""
-    valores = ((1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
-               (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"))  # fmt: skip
-    out = set()
-    for n in range(1, 4000):
-        romano = ""
-        for valor, letras in valores:
-            while n >= valor:
-                romano, n = romano + letras, n - valor
-        out.add(romano)
-    return frozenset(out)
+    return frozenset(romano(n) for n in range(1, 4000))
 
 
 class _Paragrafo(NamedTuple):

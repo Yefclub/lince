@@ -4,14 +4,62 @@ leu, e a mesma imagem lida uma vez só (issue #33, itens 6 e 9)."""
 import hashlib
 import io
 import re
+from zipfile import ZipFile
 
 from PIL import Image, ImageDraw
 from pptx import Presentation
 from pptx.chart.data import CategoryChartData
 from pptx.enum.chart import XL_CHART_TYPE
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.util import Inches
 
 import lince
+
+
+def test_links_em_slides_e_notas_seguem_a_ordem_da_apresentacao(tmp_path):
+    prs = Presentation()
+    destino, indice = [prs.slides.add_slide(prs.slide_layouts[6]) for _ in range(2)]
+    # O arquivo slide1.xml agora ocupa a segunda posição e só é alvo de um link das notas.
+    ordem = prs.slides._sldIdLst
+    ordem.insert(0, ordem[-1])
+    destino.shapes.add_textbox(Inches(1), Inches(1), Inches(6), Inches(1)).text = "Dados do contrato"
+    p = indice.shapes.add_textbox(Inches(1), Inches(1), Inches(6), Inches(1)).text_frame.paragraphs[0]
+    externo = p.add_run()
+    externo.text = "Fonte [oficial]"
+    externo.hyperlink.address = "https://example.org/guia(2)"
+    notas = indice.notes_slide
+    p = notas.notes_text_frame.paragraphs[0]
+    for texto, alvo in (
+        ("Consultar dados", notas.part.relate_to(destino.part, RT.SLIDE)),
+        (" Sem destino", "rIdAusente"),
+    ):
+        run = p.add_run()
+        run.text = texto
+        run._r.get_or_add_rPr().add_hlinkClick(alvo).set("action", "ppaction://hlinksldjump")
+    run = p.add_run()
+    run.text = " Manual"
+    run.hyperlink.address = "https://example.org/notas"
+    run = p.add_run()
+    run.text = "Anexo relativo"
+    run.hyperlink.address = "anexos/manual.pdf"
+    run = p.add_run()
+    run.text = " Referência órfã"
+    run._r.get_or_add_rPr().add_hlinkClick(notas.part.relate_to(prs.slide_master.part, RT.HYPERLINK))
+    path = tmp_path / "navegacao.pptx"
+    prs.save(path)
+    # OPC não impõe ordem às entradas do ZIP. O vínculo já copiado ainda precisa ser consultado no original.
+    with ZipFile(io.BytesIO(path.read_bytes())) as origem, ZipFile(path, "w") as saida:
+        for nome in sorted(origem.namelist(), key=lambda n: not n.endswith(".rels")):
+            saida.writestr(nome, origem.read(nome))
+    r = lince.ler(path)
+    inicio, destino = [s["inicio"] for s in r.estrutura["inicio_dos_slides"]]
+    primeiro, segundo = r.markdown[inicio:destino], r.markdown[destino:]
+    assert r"[Fonte \[oficial\]](https://example.org/guia%282%29)" in primeiro
+    assert "> [Consultar dados](#slide-2) Sem destino[ Manual](https://example.org/notas)" in primeiro
+    assert "[Anexo relativo](anexos/manual.pdf)" in primeiro
+    assert " Referência órfã" in primeiro and "slideMasters/" not in primeiro
+    assert '<a id="slide-2"></a>' in segundo and "Dados do contrato" in segundo
+    assert "rIdAusente" not in r.markdown and not r.cobertura.pendentes
 
 
 def _png(cor, tamanho=(600, 300)):
