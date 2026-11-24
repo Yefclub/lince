@@ -374,6 +374,17 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
     return {c for _, c in tirar.values()}
 
 
+def partes_da_imagem(plano, respostas):
+    """As mesmas partes na montagem e na medida, inclusive a origem de cada página TIFF."""
+    anterior = None
+    for tarefa in plano["tarefas"]:
+        pagina = tarefa.get("pagina")
+        if pagina != anterior:
+            yield f"<!-- página {pagina + 1} · TIFF -->"
+            anterior = pagina
+        yield respostas.get(tarefa["id"], "")
+
+
 def tamanho_da_saida(e, respostas, medidas=None) -> int:
     """Quanto texto a montagem vai escrever, no máximo: cada marca vira a leitura (a da mesma imagem repetida entra uma
     vez, e as outras posições, a referência) ou a tabela e a fórmula nativas, e cada página leva o comentário e as
@@ -381,7 +392,7 @@ def tamanho_da_saida(e, respostas, medidas=None) -> int:
     montagem o escreve (_textos). `medidas` guarda esse tamanho por chave de resposta entre chamadas com as mesmas
     respostas (a busca do que cabe), para cada uma ser lida uma vez só."""
     if e.get("tipo") == "imagem":  # a imagem solta sai como as leituras das faixas, uma depois da outra
-        return sum(len(respostas.get(t["id"], "")) + 2 for t in e.get("tarefas", []))
+        return max(0, sum(len(t) + 2 for t in partes_da_imagem(e, respostas)) - 2)
     from collections import Counter
 
     medidas = {} if medidas is None else medidas

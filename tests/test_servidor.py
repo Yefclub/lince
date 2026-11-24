@@ -1166,3 +1166,23 @@ def test_estrutura_do_pdf_traz_o_indice_e_as_paginas_visuais_no_contrato(tmp_pat
         ("Resultados", 2, 2),
     ]
     assert estrutura["paginas_visuais"] == [{"pagina": 2, "conteudo": ["imagem"], "alertas": ["nao_lida"]}]
+
+
+def test_tiff_multipagina_preparo_e_montagem_http(api):
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (500, 180), "red").save(
+        buf, "TIFF", save_all=True, append_images=[Image.new("RGB", (500, 180), "blue")]
+    )
+    s = conforme(
+        enviar(api, ("cores.tiff", buf.getvalue()), {**A, **ESPERA}, modo="tarefas"), "/v1/sessoes", "post"
+    ).json()
+    preparo = s["itens"][0]["resultado"]
+    assert [t["pagina"] for t in preparo["tarefas"]] == [1, 2]
+    respostas = {t["id"]: f"Página de cor {t['pagina']}." for t in preparo["tarefas"]}
+    r = _montar(api, {"plano": preparo["plano"], "respostas": respostas}).json()
+    assert r["cobertura"]["paginas"] == 2 and not r["cobertura"]["pendentes"]
+    assert r["markdown"].index("cor 1") < r["markdown"].index("cor 2")

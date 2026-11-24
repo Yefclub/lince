@@ -23,12 +23,12 @@ from .agrupamento import LADO, agrupar, distribuir_lotes, resposta_aproveitavel
 from .cache import Cache, chave
 from .estrutura import indice, secoes
 from .instrucoes import PROMPT_PADRAO, VERSAO_PROMPT, instrucao
-from .limites import LADO_MAX_PX, com_barras_normais, conferir_zip
+from .limites import LADO_MAX_PX, TAREFAS_POR_DOCUMENTO, com_barras_normais, conferir_zip
 from .metadados import metadados_arquivo
-from .montagem import SAIDA_MAX, montar, tamanho_da_saida
+from .montagem import SAIDA_MAX, montar, partes_da_imagem, tamanho_da_saida
 from .office import planejar_office
 from .pagina_html import planejar_html, planejar_svg
-from .pdf import de_pe, pagina_visivel, planejar_pdf
+from .pdf import PIXELS_IMAGEM_MAX, de_pe, pagina_visivel, planejar_pdf
 from .pdf import imagens_das_paginas as paginas_em_png
 from .protecao import DocumentoProtegido, aberto, formato_protegido
 from .provedores import LeitorVisual
@@ -481,7 +481,7 @@ def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
 
     def montado(respostas):  # o texto e os metadados com estas respostas
         if plano["tipo"] == "imagem":
-            md = "\n\n".join(respostas.get(t["id"], "") for t in plano["tarefas"])
+            md = "\n\n".join(partes_da_imagem(plano, respostas))
             return md, dict(plano.get("meta_arquivo") or {})
         md = montar(pasta, respostas)
         return md, json.loads(Path(f"{pasta}/metadados.json").read_text(encoding="utf-8"))
@@ -515,9 +515,15 @@ def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
         ja |= {tid for lid, itens in (plano.get("lotes") or {}).items() if lid in ja for _, tid in itens}
         cobertura.pendentes += [
             f"{t['id']}: resposta vazia da IA"
-            for t in plano.get("tarefas_originais", [])
+            for t in (plano["tarefas"] if plano["tipo"] == "imagem" else plano.get("tarefas_originais", []))
             if t["id"] not in ja and not str(lidos.get(t["id"], "")).strip()
         ]
+    if plano["tipo"] == "imagem" and plano.get("paginas_total", 1) > 1:
+        paginas = {t["id"]: t["pagina"] + 1 for t in plano["tarefas"] if "pagina" in t}
+        for i, p in enumerate(cobertura.pendentes):
+            tid, _, motivo = p.partition(": ")
+            if tid in paginas:
+                cobertura.pendentes[i] = f"{tid}: página {paginas[tid]}: {motivo}"
     r = _com_estrutura(Resultado(md, meta, cobertura, usos), plano)
     lidos = distribuir_lotes(plano, respostas)
     if imagens := _imagens(plano, lidos):
@@ -726,12 +732,58 @@ def _plano_imagem(caminho, pasta):
     """Imagem avulsa: faixas que cabem no limite do provedor (imagem alta não é reduzida até ficar ilegível)."""
     from PIL import Image
 
-    im = Image.open(caminho).convert("RGB")
-    alt = im.height if max(im.size) <= LADO else min(im.height, int(im.width * 0.75)) or im.height
-    tarefas, y, k = [], 0, 1
-    while y < im.height:
-        tid = f"faixa{k}"
-        im.crop((0, max(0, y - 40), im.width, min(im.height, y + alt))).save(f"{pasta}/ia/{tid}.png")
-        tarefas.append({"id": tid, "modo": "pagina", "ancora": ""})
-        y, k = y + alt, k + 1
-    return {"tipo": "imagem", "tarefas": tarefas}
+    tarefas, pendentes = [], []
+    pixels = pagina = 0
+    with Image.open(caminho) as origem:
+        multipagina = origem.format == "TIFF" and origem.is_animated
+        while True:
+            if multipagina and (_vencido() or pagina >= TAREFAS_POR_DOCUMENTO):
+                motivo = "prazo esgotado" if _vencido() else "teto de páginas TIFF"
+                pagina += 1
+                pendentes.append(f"a partir da página {pagina}: {motivo} (contagem do TIFF interrompida)")
+                break
+            try:
+                origem.seek(pagina)
+            except (OSError, EOFError, SyntaxError, ValueError, Image.DecompressionBombError) as erro:
+                if not multipagina:
+                    raise
+                pagina += 1
+                pendentes.append(f"a partir da página {pagina}: diretório TIFF ilegível ({type(erro).__name__})")
+                break
+            pagina += 1
+            ultima = not multipagina or not origem.tag_v2.next
+            w, h = origem.size
+            alt = h if max(w, h) <= LADO else min(h, int(w * 0.75)) or h
+            numero = (h + alt - 1) // alt
+            pixels += w * h
+            if multipagina and (pixels > PIXELS_IMAGEM_MAX or len(tarefas) + numero > TAREFAS_POR_DOCUMENTO):
+                pendentes.append(
+                    f"a partir da página {pagina}: teto de extração de imagens TIFF (contagem interrompida)"
+                )
+                break
+            try:
+                quadro = origem.convert("RGB")
+            except (OSError, EOFError, SyntaxError, ValueError, Image.DecompressionBombError) as erro:
+                if not multipagina:
+                    raise
+                pendentes.append(f"página {pagina}: quadro TIFF ilegível ({type(erro).__name__})")
+            else:
+                with quadro as im:
+                    for n, y in enumerate(range(0, h, alt), 1):
+                        if multipagina and _vencido():
+                            pendentes.append(f"a partir da página {pagina}: prazo esgotado (contagem interrompida)")
+                            return {
+                                "tipo": "imagem",
+                                "tarefas": tarefas,
+                                "paginas_total": pagina,
+                                "pendentes": pendentes,
+                            }
+                        tid = f"faixa{len(tarefas) + 1}"
+                        im.crop((0, max(0, y - 40), w, min(h, y + alt))).save(f"{pasta}/ia/{tid}.png")
+                        tarefa = {"id": tid, "modo": "pagina", "ancora": ""}
+                        if multipagina:
+                            tarefa.update(pagina=pagina - 1, faixa=n, faixas_na_pagina=numero)
+                        tarefas.append(tarefa)
+            if ultima:
+                break
+    return {"tipo": "imagem", "tarefas": tarefas, "paginas_total": pagina, "pendentes": pendentes}

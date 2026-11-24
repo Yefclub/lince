@@ -66,7 +66,7 @@ class TarefaVisual:
     instrucao: str
     chave: str
     tokens_estimados: int
-    pagina: int | None = None  # PDF, a partir de 1
+    pagina: int | None = None  # PDF ou TIFF multipágina, a partir de 1
     caixa: list[float] | None = None  # PDF: x0, y0, x1, y1 em pontos, origem embaixo à esquerda
     onde: str = ""  # Office e HTML: "imagem 3", "aba Vendas, célula B4"...
     itens: list[dict] = field(default_factory=list)  # lote: {"n", "tarefa", "tipo", "onde"} de cada recorte
