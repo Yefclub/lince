@@ -17,7 +17,7 @@ _MANTISSA = re.compile(
 _UNIDADE = re.compile(r"(?:[\s$|~]|\\[,;:! ])*(?:\\(?:mathrm|text|unit)\s*\{\s*)?([a-zA-ZµμΩΩ]+)\b")
 # Uma unidade composta só seria comparável se todos os fatores e potências coincidissem.
 _CONTINUACAO_UNIDADE = re.compile(
-    r"(?:[}\t $~]|\\[,;:! ])*(?:[/·⋅*/^]|\\(?:cdot|times|per)\b|(?:\\mathrm\{)?(?:kg|mol|[msAK]|Hz|Pa|J|W|N|V|C)\b)"
+    r"(?:[}\t $~]|\\[,;:! ])*(?:[/·⋅*^]|\\(?:cdot|times|per)\b|(?:\\(?:mathrm|text|unit)\{)?[^\W\d_])"
 )
 _HACHURA = re.compile(r"hachur|shad(?:ed|ing)|hatch|fundo\s+(?:branco|cinza)|background\s+colou?r", re.I)
 _EFETIVO = re.compile(r"\b(?:(?:efetiv|realizad|observad|hist[óo]ric)[oa]s?|actuals?|observed|historical)\b", re.I)

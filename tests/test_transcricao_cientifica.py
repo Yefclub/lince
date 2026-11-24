@@ -116,6 +116,7 @@ def test_comparacao_nao_confunde_unidades_compostas_com_prefixo_igual():
 
     for fonte, descricao in (
         ("2.345678 × 10⁶ mol/m³", "2.345678 × 10⁰ mol/cm³"),
+        ("2.345678 × 10³ mol cm⁻³", "2.345678 × 10⁰ mol mm⁻³"),
         ("2.345678 × 10⁶ mol m⁻³", r"$2.345678 \times 10^{0}\,\mathrm{mol}\,\mathrm{cm}^{-3}$"),
     ):
         ref = potencias(fonte, camada_pdf=True)
