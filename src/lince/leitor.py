@@ -301,7 +301,7 @@ class Leitor:
             # a chave é o que muda a resposta: imagem, instrução, modelo e versão do prompt (não a versão do pacote,
             # senão cada release leria e pagaria tudo de novo)
             k = chave(img, instr, getattr(self.ia, "identidade", self.ia.modelo), VERSAO_PROMPT)
-            if com_cache and (txt := self._cache_obter(k)) is not None:
+            if com_cache and (txt := self._cache_obter(k)) is not None and resposta_aproveitavel(plano, t["id"], txt):
                 return t["id"], txt, Uso(self.ia.modelo, cache=True, tarefa=t["id"]), True
             r = self.ia.ler(img, instr)
             if com_cache and resposta_aproveitavel(plano, t["id"], r.texto):
