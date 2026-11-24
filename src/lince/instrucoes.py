@@ -3,7 +3,7 @@
 from importlib.resources import files
 
 PROMPT_PADRAO = files("lince").joinpath("prompts/leitura.md").read_text(encoding="utf-8")
-VERSAO_PROMPT = "leitura-v5"
+VERSAO_PROMPT = "leitura-v6"
 
 MODOS = {
     "pagina": "Página inteira de documento: transcreva tudo, na ordem de leitura.",

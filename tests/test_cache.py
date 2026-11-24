@@ -134,7 +134,8 @@ def test_lote_quebrado_nao_vai_para_o_cache():
     assert not resposta_aproveitavel(plano, "lote1", "Desculpe, não consegui.")
     assert not resposta_aproveitavel(plano, "lote1", '{"1": "", "2": ""}')
     assert not resposta_aproveitavel(plano, "lote1", '{"1": null, "2": false}')  # modo JSON dizendo "nada"
-    assert resposta_aproveitavel(plano, "lote1", 'Aqui: {"1": "Receita", "2": ""}')
+    assert not resposta_aproveitavel(plano, "lote1", 'Aqui: {"1": "Receita", "2": ""}')
+    assert resposta_aproveitavel(plano, "lote1", '{"1":"Receita","2":"Despesa"}')
     assert not resposta_aproveitavel(plano, "t1", "  ") and resposta_aproveitavel(plano, "t1", "texto")
 
 
