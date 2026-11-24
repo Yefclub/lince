@@ -558,7 +558,7 @@ def _paginas_visuais(plano, lidos, pendentes=None) -> list[dict]:
             continue
         leitor = iguais.get(posicao["id"], posicao["id"])
         numero = posicao["pagina"] + 1
-        conteudo, alertas = por_pagina.setdefault(numero, (set(), set()))
+        conteudo, alertas, conferencias = por_pagina.setdefault(numero, (set(), set(), set()))
         if posicao["modo"] == "pagina":
             conteudo.add(_MOTIVO_PAGINA.get(originais.get(leitor, {}).get("motivo", ""), "matematica"))
         else:
@@ -572,14 +572,16 @@ def _paginas_visuais(plano, lidos, pendentes=None) -> list[dict]:
             for alerta, motivo in avisos_transcricao(texto, ancora, ref).items():
                 if pendentes is not None:
                     pendentes.append(f"página {numero}, {leitor}: {motivo}")
-                alertas.add(alerta)
+                conferencias.add(alerta)
             if "≈" in texto and posicao["modo"] != "formula":  # na fórmula, ≈ é o símbolo, não estimativa
                 alertas.add("estimado")
             if "[ilegível]" in texto or "[illegible]" in texto:
                 alertas.add("ilegivel")
     return [
-        {"pagina": n, "conteudo": sorted(c)} | ({"alertas": sorted(a)} if a else {})
-        for n, (c, a) in sorted(por_pagina.items())
+        {"pagina": n, "conteudo": sorted(c)}
+        | ({"alertas": sorted(a)} if a else {})
+        | ({"conferencias": sorted(v)} if v else {})
+        for n, (c, a, v) in sorted(por_pagina.items())
     ]
 
 

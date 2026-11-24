@@ -22,7 +22,7 @@ def test_divergencia_de_expoente_registra_evidencia(tmp_path):
     (t,) = plano.tarefas
     erro = "| Conversão | Valor |\n|---|---|\n| Kelvin–hertz | 2.083 661 912 × 10⁻⁴ Hz |"
     r = lince.Leitor().concluir(plano, {t.id: erro})
-    assert "expoente_divergente" in r.estrutura["paginas_visuais"][0]["alertas"]
+    assert "expoente_divergente" in r.estrutura["paginas_visuais"][0]["conferencias"]
     assert any("10^-4" in p and "10^10" in p and t.id in p for p in r.cobertura.pendentes)
     assert erro in r.markdown
 
@@ -41,7 +41,7 @@ def test_legenda_hachurada_sem_correspondencia_na_tabela(tmp_path):
     legenda = "Valores em fundo branco são efetivos e os em fundo hachurado são projeções."
     sem = "| Período | IPCA |\n|---|---|\n| III | 4,4 |\n| IV | 4,9 |\n\n" + legenda
     r = lince.Leitor().concluir(plano, {t.id: sem})
-    assert "condicao_visual" in r.estrutura["paginas_visuais"][0]["alertas"]
+    assert "condicao_visual" in r.estrutura["paginas_visuais"][0]["conferencias"]
     assert any(t.id in p and "condição visual" in p for p in r.cobertura.pendentes)
     com = sem.replace("| III |", "| III (efetivo) |").replace("| IV |", "| IV (projeção) |")
     assert not lince.Leitor().concluir(plano, {t.id: com}).cobertura.pendentes
@@ -71,7 +71,9 @@ def test_api_devolve_alertas_de_transcricao_conformes(tmp_path):
         resposta = "2.083661912 × 10⁻⁴ Hz. Fundo branco = efetivo e fundo hachurado = projeção"
         montado = api.post("/v1/montagens", headers=A, json={"plano": prep["plano"], "respostas": {tarefa: resposta}})
         item = conforme(montado, "/v1/montagens", "post").json()
-        assert {"expoente_divergente", "condicao_visual"} <= set(item["estrutura"]["paginas_visuais"][0]["alertas"])
+        assert {"expoente_divergente", "condicao_visual"} <= set(
+            item["estrutura"]["paginas_visuais"][0]["conferencias"]
+        )
 
 
 def test_potencia_em_latex_e_condicao_so_no_rodape():
