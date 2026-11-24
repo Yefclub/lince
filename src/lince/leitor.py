@@ -182,10 +182,12 @@ class Leitor:
             if self.max_leituras is not None and len(tarefas) > self.max_leituras:
                 cobertura.pendentes += [f"{t['id']}: teto de leituras" for t in tarefas[self.max_leituras :]]
                 tarefas = tarefas[: self.max_leituras]
-            respostas, usos = self._ler_tarefas(plano, tarefas, pasta, cobertura, com_cache=not protegido)
+            respostas, usos, acertos_cache = self._ler_tarefas(
+                plano, tarefas, pasta, cobertura, com_cache=not protegido
+            )
             if self.esforco == "max" and self.ia is not None and plano["tipo"] == "pdf" and not _vencido():
                 respostas = distribuir_lotes(plano, respostas)
-                usos += self._segunda_passada(str(caminho), plano, respostas, cobertura)
+                usos += self._segunda_passada(str(caminho), plano, respostas, cobertura, tarefas, acertos_cache)
             return _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias=self.ia is not None)
 
     # ------------------------------------------------------------------ em duas fases (a IA é de quem chama)
@@ -283,11 +285,12 @@ class Leitor:
 
     def _ler_tarefas(self, plano, tarefas, pasta, cobertura, com_cache=True):
         respostas, usos = {}, []
+        acertos_cache = 0
         if not tarefas:
-            return respostas, usos
+            return respostas, usos, acertos_cache
         if self.ia is None:
             cobertura.pendentes += [f"{t['id']}: sem modelo de visão configurado" for t in tarefas]
-            return respostas, usos
+            return respostas, usos, acertos_cache
         faixas = len(plano["tarefas"]) if plano["tipo"] == "imagem" else None
 
         def um(t):
@@ -299,24 +302,25 @@ class Leitor:
             # senão cada release leria e pagaria tudo de novo)
             k = chave(img, instr, getattr(self.ia, "identidade", self.ia.modelo), VERSAO_PROMPT)
             if com_cache and (txt := self._cache_obter(k)) is not None and resposta_aproveitavel(plano, t["id"], txt):
-                return t["id"], txt, Uso(self.ia.modelo, cache=True, tarefa=t["id"])
+                return t["id"], txt, Uso(self.ia.modelo, cache=True, tarefa=t["id"]), True
             r = self.ia.ler(img, instr)
             if com_cache and resposta_aproveitavel(plano, t["id"], r.texto):
                 self._cache_guardar(k, r.texto)
             r.uso.tarefa = t["id"]
-            return t["id"], r.texto, r.uso
+            return t["id"], r.texto, r.uso, False
 
         with ThreadPoolExecutor(self.concorrencia) as ex:
             futuros = {ex.submit(contextvars.copy_context().run, um, t): t for t in tarefas}  # o prazo vai junto
             for f, t in futuros.items():
                 try:
-                    tid, txt, uso = f.result()
+                    tid, txt, uso, veio_do_cache = f.result()
                 except PrazoEsgotado:
                     cobertura.pendentes.append(f"{t['id']}: prazo esgotado")
                     continue
                 except Exception as e:  # noqa: BLE001 — leitura falhou: o nativo segue, a pendência fica registrada
                     cobertura.pendentes.append(f"{t['id']}: {type(e).__name__}: {str(e)[:120]}")
                     continue
+                acertos_cache += veio_do_cache
                 respostas[tid] = txt
                 usos.append(uso)
                 if uso.cache:
@@ -325,7 +329,7 @@ class Leitor:
                     cobertura.leituras_ia += 1
                 if self.ao_usar:
                     self.ao_usar(uso)
-        return respostas, usos
+        return respostas, usos, acertos_cache
 
     def _cache_obter(self, k):
         """Cache fora do ar (Redis caído, rede) não derruba a leitura: segue lendo pela IA, como sem cache."""
@@ -346,13 +350,21 @@ class Leitor:
             _avisar_cache(e)
 
     # ------------------------------------------------------------------ esforço máximo
-    def _segunda_passada(self, caminho, plano, R, cobertura):
+    def _segunda_passada(self, caminho, plano, R, cobertura, tarefas, acertos_cache):
         """Releitura ampliada (2–3x) do que saiu ilegível, estimado ou vazio, com a 1ª leitura como contexto."""
         import io
 
         import pypdfium2 as pdfium
 
         alvos = [t for t in plano.get("tarefas_originais", []) if "caixa" in t and _precisa_rever(R.get(t["id"], ""))]
+        if self.max_leituras is not None:
+            # Uma tentativa que falhou também pode ser cobrada. Só o cache devolve saldo.
+            admitidos = {t["id"] for t in tarefas}
+            admitidos.update(it["tarefa"] for t in tarefas for it in t.get("itens", []))
+            saldo = max(0, self.max_leituras - len(tarefas) + acertos_cache)
+            candidatos = [t for t in alvos if t["id"] in admitidos]
+            cobertura.pendentes.extend(f"{t['id']}: teto de releituras ampliadas" for t in candidatos[saldo:])
+            alvos = candidatos[:saldo]
         if not alvos:
             return []
         usos, preparados = [], []
