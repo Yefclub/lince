@@ -1186,3 +1186,23 @@ def test_tiff_multipagina_preparo_e_montagem_http(api):
     r = _montar(api, {"plano": preparo["plano"], "respostas": respostas}).json()
     assert r["cobertura"]["paginas"] == 2 and not r["cobertura"]["pendentes"]
     assert r["markdown"].index("cor 1") < r["markdown"].index("cor 2")
+
+
+@pytest.mark.parametrize("ext", ["gif", "webp"])
+def test_quadros_animados_na_sessao_de_tarefas(api, ext):
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (200, 90), "red").save(
+        buf, format=ext, save_all=True, append_images=[Image.new("RGB", (200, 90), "blue")], duration=90
+    )
+    s = conforme(
+        enviar(api, ("estado." + ext, buf.getvalue()), {**A, **ESPERA}, modo="tarefas"), "/v1/sessoes", "post"
+    ).json()
+    p = s["itens"][0]["resultado"]
+    assert [t["pagina"] for t in p["tarefas"]] == [1, 2]
+    r = _montar(api, {"plano": p["plano"], "respostas": {t["id"]: str(i) for i, t in enumerate(p["tarefas"])}}).json()
+    assert r["cobertura"]["paginas"] == 2 and not r["cobertura"]["pendentes"]
+    assert f"quadro 2 · {ext.upper()}" in r["markdown"]

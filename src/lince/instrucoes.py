@@ -3,7 +3,7 @@
 from importlib.resources import files
 
 PROMPT_PADRAO = files("lince").joinpath("prompts/leitura.md").read_text(encoding="utf-8")
-VERSAO_PROMPT = "leitura-v8"
+VERSAO_PROMPT = "leitura-v9"
 
 MODOS = {
     "pagina": "Página inteira de documento: transcreva tudo, na ordem de leitura.",
@@ -46,7 +46,9 @@ def instrucao(t: dict, prompt: str = PROMPT_PADRAO, total_faixas: int | None = N
             " fica para a próxima parte, linha cortada na borda de cima já saiu na parte anterior."
         )
     if "faixas_na_pagina" in t:
-        out += f"\n\nPágina {t['pagina'] + 1} do TIFF, faixa {t['faixa']} de {t['faixas_na_pagina']}."
+        formato = t.get("formato_quadro", "TIFF")
+        unidade = "Página" if formato == "TIFF" else "Quadro"
+        out += f"\n\n{unidade} {t['pagina'] + 1} do {formato}, faixa {t['faixa']} de {t['faixas_na_pagina']}."
     elif total_faixas and total_faixas > 1:
         out += f"\n\nEsta é a faixa {t['id'][5:]} de {total_faixas} de uma imagem alta; transcreva só o que está nela."
     return out
