@@ -147,13 +147,15 @@ def test_paragrafo_do_boxe_completo_e_parcial(tmp_path):
 
 def test_paragrafo_curto_do_boxe_precisa_de_transcricao_completa(tmp_path):
     texto = "O relatório da equipe confirma a inclusão das despesas previstas para o ano fiscal."
+    titulo = "Despesas do período"
     assert len(texto) == 83
     pagina = {
         "i": 0,
         "rota": "regioes",
-        "md": texto,
-        "regioes": [{"tarefa": "r1", "depois_de": "", "desenho": True, "texto_dentro": texto}],
+        "md": "# " + titulo + "\n\n" + texto,
+        "regioes": [{"tarefa": "r1", "depois_de": "", "desenho": True, "texto_dentro": titulo + " " + texto}],
     }
     (tmp_path / "plano.json").write_text(json.dumps({"tipo": "pdf", "paginas": [pagina]}), encoding="utf8")
-    for respostas in ({}, {"r1": "O relatório da equipe"}, {"r1": texto}):
-        assert montar(tmp_path, respostas).count(texto) == 1
+    for respostas in ({}, {"r1": "O relatório da equipe"}, {"r1": "## " + titulo + "\n\n" + texto}):
+        md = montar(tmp_path, respostas)
+        assert md.count(texto) == 1 and md.count(titulo) == 1

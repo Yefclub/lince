@@ -131,6 +131,15 @@ def _cobre_ocr(nativo, visual):
     return True
 
 
+def _texto_do_bloco(bloco):
+    # A geometria dá o título sem o prefixo Markdown. Dois leitores podem atribuir
+    # níveis diferentes ao mesmo título. O conteúdo e a pontuação precisam coincidir.
+    bloco = bloco.strip()
+    if "\n" not in bloco:
+        bloco = re.sub(r"^#{1,6}[ \t]+", "", bloco)
+    return " ".join(bloco.split())
+
+
 def _paragrafos_do_desenho(regioes, blocos, lido):
     """Um boxe vetorial pode conter parágrafos inteiros. A transcrição deve trazer o
     mesmo parágrafo com a mesma pontuação, e o recorte deve conter todas as linhas."""
@@ -138,7 +147,7 @@ def _paragrafos_do_desenho(regioes, blocos, lido):
     # Conferência opcional: limita buscas de trecho em páginas e respostas muito grandes.
     if not desenhos or len(desenhos) > 16 or sum(map(len, blocos)) > 128_000:
         return set()
-    unicos = Counter(" ".join(b.split()) for b in blocos)
+    unicos = Counter(_texto_do_bloco(b) for b in blocos)
     copiados = set()
     buscas = 0
     for r in desenhos:
@@ -147,7 +156,7 @@ def _paragrafos_do_desenho(regioes, blocos, lido):
             continue
         dentro = " " + " ".join(ancora.split()) + " "
         for b in visual.split("\n\n"):
-            texto = " ".join(b.split())
+            texto = _texto_do_bloco(b)
             if not texto or unicos[texto] != 1:
                 continue
             buscas += 1
@@ -255,7 +264,7 @@ def montar(pasta, respostas, pendentes=None):
         copiados = _paragrafos_do_desenho(p["regioes"], blocos, lido)
         limpos = []
         for b in blocos:
-            if copiados and " ".join(b.split()) in copiados:
+            if copiados and _texto_do_bloco(b) in copiados:
                 continue
             pal = re.findall(r"\w+", b.lower())
             if (
