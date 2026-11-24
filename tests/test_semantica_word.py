@@ -169,3 +169,31 @@ def test_caixas_legadas_preservam_estado_no_lugar_do_campo(tmp_path):
     assert "[ ] opção A [x] opção B [x] opção C [ ] opção D ☐ literal" in r.markdown
     assert r.markdown.count("[x]") == 2 and r.markdown.count("☐") == 1
     assert "Resultado textual" in r.markdown
+
+
+def test_letras_do_word_repetem_em_ciclos_de_26_inclusive_no_nivel_pai(tmp_path):
+    doc = Document()
+    num = doc.part.numbering_part.element
+    for nid, formato, mascara in [(90, "upperLetter", "%1."), (91, "lowerLetter", "%1)"), (92, "upperLetter", "%1")]:
+        num.insert(
+            0,
+            parse_xml(
+                f'<w:abstractNum {nsdecls("w")} w:abstractNumId="{nid}">'
+                f'<w:lvl w:ilvl="0"><w:start w:val="26"/><w:numFmt w:val="{formato}"/>'
+                f'<w:lvlText w:val="{mascara}"/></w:lvl>'
+                '<w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/>'
+                '<w:lvlText w:val="AB: %1.%2"/></w:lvl></w:abstractNum>'
+            ),
+        )
+        num.append(parse_xml(f'<w:num {nsdecls("w")} w:numId="{nid}"><w:abstractNumId w:val="{nid}"/></w:num>'))
+        for nivel, texto in [(0, "fim"), (0, "primeira"), (0, "segunda"), (1, "filha")]:
+            p = doc.add_paragraph(texto)
+            p._p.get_or_add_pPr().append(
+                parse_xml(f'<w:numPr {nsdecls("w")}><w:ilvl w:val="{nivel}"/><w:numId w:val="{nid}"/></w:numPr>')
+            )
+    path = tmp_path / "letras.docx"
+    doc.save(path)
+    r = lince.ler(path)
+    assert all(s in r.markdown for s in ("Z. fim", "AA. primeira", "BB. segunda", "bb) segunda", "BB segunda"))
+    assert "AB: BB.1 filha" in r.markdown and "AB: bb.1 filha" in r.markdown
+    assert not r.cobertura.pendentes

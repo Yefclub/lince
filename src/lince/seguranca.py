@@ -454,7 +454,7 @@ def _celulas(pai, linha):
             _celulas(f, linha)
 
 
-def _rotulos(numeracao, estilos, pprs) -> set:
+def _rotulos(numeracao, estilos, pprs, marca_letra=None) -> tuple[set, bool]:
     """As palavras do rótulo de numeração dos parágrafos que o anydoc emite (resolve_numbering e numbering.rs): o
     lvlText do nível de cada parágrafo numerado, pela instância (w:num, com lvlOverride e numStyleLink), e os romanos
     quando um nível citado no rótulo (%1, %2...) é romano. O nível que nenhum parágrafo usa não conta."""
@@ -507,6 +507,7 @@ def _rotulos(numeracao, estilos, pprs) -> set:
         achado = el.find(caminho) if el is not None else None
         return _attr(achado, _W[1:-1], "val") if achado is not None else None
 
+    projecoes = {}
     for ppr in pprs:
         nid, ilvl = _inteiro(valor(ppr, f"{_W}numPr/{_W}numId")), _inteiro(valor(ppr, f"{_W}numPr/{_W}ilvl"))
         estilo = valor(ppr, f"{_W}pStyle")
@@ -518,14 +519,51 @@ def _rotulos(numeracao, estilos, pprs) -> set:
             ligados = {valor(lvl, f"{_W}pStyle"): k for k, lvl in sorted(niveis.items(), reverse=True) if k < 9}
             cadeia = (st.get(f"{_W}styleId") for st in estilos._cadeia(estilo))
             ilvl = next((ligados[sid] for sid in cadeia if sid in ligados), 0)
-        lvl = niveis.get(min(ilvl or 0, 8))
+        ilvl = min(ilvl or 0, 8)
+        lvl = niveis.get(ilvl)
         if lvl is None or (valor(lvl, f"{_W}numFmt") or "bullet") in ("bullet", "none"):
             continue  # o marcador do tópico não é rótulo; o nível sem numeração não escreve nada
         texto = valor(lvl, f"{_W}lvlText") or ""
         out.append(texto)
         citados = (niveis.get(int(k) - 1) for k in re.findall(r"%([1-9])", texto))
         romano |= any(valor(c, f"{_W}numFmt") in ("lowerRoman", "upperRoman") for c in citados if c is not None)
-    return palavras(" ".join(out)) | (_romanos() if romano else set())
+        chave = nid, ilvl
+        if marca_letra and chave not in projecoes and not _ligado(lvl.find(f"{_W}isLgl")):
+            # Delimita só o contador alfabético, inclusive quando ele pertence ao nível pai. Os literais da
+            # máscara e os números romanos podem conter as mesmas letras e têm de ficar intactos.
+            def marcar(m):
+                origem = niveis.get(int(m[1]) - 1)
+                if valor(origem, f"{_W}numFmt") in ("lowerLetter", "upperLetter"):
+                    return marca_letra + m[0] + ":"
+                return m[0]
+
+            padrao = texto or f"%{ilvl + 1}."
+            projecoes[chave] = (lvl, re.sub(r"%([1-9])", marcar, padrao), padrao)
+    mudou = False
+    for (nid, ilvl), (lvl, marcado, original) in projecoes.items():
+        if marcado == original:
+            continue
+        num = diretos[nid][1]
+        sobre = next((s for s in reversed(num.findall(f"{_W}lvlOverride")) if s.get(f"{_W}ilvl") == str(ilvl)), None)
+        if sobre is None:
+            sobre = num.makeelement(f"{_W}lvlOverride", {f"{_W}ilvl": str(ilvl)})
+            num.append(sobre)
+        copia = sobre.find(f"{_W}lvl")
+        if copia is None:
+            # Uma instância pode sobrescrever o formato de um nível citado por outra. A máscara é portanto
+            # própria da instância. Bastam as propriedades escalares que o conversor lê no nível.
+            copia = lvl.makeelement(f"{_W}lvl", {f"{_W}ilvl": str(ilvl)})
+            for nome in ("start", "numFmt", "lvlRestart", "pStyle"):
+                if (v := valor(lvl, f"{_W}{nome}")) is not None:
+                    copia.append(lvl.makeelement(f"{_W}{nome}", {f"{_W}val": v}))
+            sobre.append(copia)
+        texto_nivel = copia.find(f"{_W}lvlText")
+        if texto_nivel is None:
+            texto_nivel = copia.makeelement(f"{_W}lvlText")
+            copia.append(texto_nivel)
+        texto_nivel.set(f"{_W}val", marcado)
+        mudou = True
+    return palavras(" ".join(out)) | (_romanos() if romano else set()), mudou
 
 
 def _xml(dados):
@@ -1536,14 +1574,14 @@ def _deslocamento(pos, margem):
 _BORDA = re.compile(r"word/(header|footer)\d*\.xml")
 
 
-def limpar_docx(dados: bytes, *, formatar_texto=False) -> Limpeza:
+def limpar_docx(dados: bytes, *, formatar_texto=False, marca_letra=None) -> Limpeza:
     """Texto do Word que a IA leria e o humano não vê, esvaziado no próprio XML antes da conversão: corpo, caixas de
     texto, notas de rodapé e de fim, comentários, cabeçalho e rodapé, achados pelas relações do pacote, como o anydoc
     acha. Só as partes alteradas são regravadas; texto visível igual a um oculto fica onde está. A parte que não pode
     ser lida vai para `falhas` e fica como estava."""
     try:
         with zipfile.ZipFile(io.BytesIO(dados)) as z:
-            ocultos, limpas, falhas, vistas = _conferir_word(z, formatar_texto=formatar_texto)
+            ocultos, limpas, falhas, vistas = _conferir_word(z, formatar_texto=formatar_texto, marca_letra=marca_letra)
             return Limpeza(ocultos, _regravar(z, limpas) if limpas else dados, falhas, frozenset(vistas))
     except MemoryError:
         raise
@@ -1562,7 +1600,7 @@ def bordas_sem_oculto(z) -> dict:
         return {}
 
 
-def _conferir_word(z, so_metadados=False, formatar_texto=False) -> tuple:
+def _conferir_word(z, so_metadados=False, formatar_texto=False, marca_letra=None) -> tuple:
     """As partes que o anydoc lê (a principal pelo officeDocument; estilos e notas pelas relações dela) e as que os
     metadados leem (cabeçalho, rodapé e comentários, pelas relações e pelo nome)."""
     pac = _Pacote(z)
@@ -1639,8 +1677,12 @@ def _conferir_word(z, so_metadados=False, formatar_texto=False) -> tuple:
         if emitido is not None:
             pprs += emitido.pprs
             _fontes_sem_estilo(pac, nome, emitido.fontes, vistas)
-    if not so_metadados and (numeracao := pac.arvore(tipo("numbering", "numbering.xml"))) is not None:
-        vistas |= _rotulos(numeracao, estilos, pprs)  # o rótulo do título numerado ("Cláusula 1.", "IV.")
+    nome_num = tipo("numbering", "numbering.xml")
+    if not so_metadados and (numeracao := pac.arvore(nome_num)) is not None:
+        palavras_rotulo, mudou = _rotulos(numeracao, estilos, pprs, marca_letra)
+        vistas |= palavras_rotulo
+        if mudou:
+            limpas[nome_num] = _serializar(numeracao, z.read(nome_num))
     return ocultos, limpas, pac.falhas, vistas
 
 

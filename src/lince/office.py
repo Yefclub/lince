@@ -497,8 +497,11 @@ def planejar_office(path, pasta, ext=None):
         # a limpeza segue o formato que o anydoc vai ler, pelo conteúdo (um Word gravado como .doc, ou uma apresentação
         # como .docx, é conferido), e o anydoc recebe esse formato explícito
         formato = "csv" if ext in (".csv", ".tsv") else anydoc.format_from_bytes(dados)
+        letras = None
         if formato == "docx":
-            dados = (limpeza := limpar_docx(dados, formatar_texto=True)).dados
+            marca_letra = marca + "A"
+            dados = (limpeza := limpar_docx(dados, formatar_texto=True, marca_letra=marca_letra)).dados
+            letras = re.compile(rf"{marca_letra}([a-zA-Z]+|0):")
         elif formato == "pptx":
             dados = (limpeza := limpar_pptx(dados)).dados
         if ext in PPTX:
@@ -554,10 +557,12 @@ def planejar_office(path, pasta, ext=None):
     elif doc is None:
         (md, perfis), ilegiveis[:0] = md_xlsb, ilegiveis_xlsb
     else:
-        md = serializar(doc, ler_imagem, formato=formato, marca_slide=marca if ext in PPTX else None)[0]
+        md = serializar(doc, ler_imagem, formato=formato, marca_slide=marca if ext in PPTX else None, letras=letras)[0]
         perfis = _perfis(doc) if ext in PLANILHAS else []
         if limpeza is not None:  # a rede de segurança: o que o anydoc leu e a conferência não viu é falha
             lido = re.sub(rf"{marca}G?\d+X", " ", texto_lido(doc))
+            if letras is not None:
+                lido = letras.sub(" ", lido)  # a marca aleatória e o contador vêm da máscara, fora do corpo
             if falha := fora_da_conferencia(limpeza.vistas, lido):
                 limpeza.falhas.append(falha)
         if ext in PPTX:  # o texto do slide que imita a marca não vira marca: só a do Lince numera os slides
@@ -1485,25 +1490,44 @@ def _link_markdown(rotulo, alvo):
     return f"[{texto}]({destino})"
 
 
-def _rotulo_word(lista, item, numero):
+def _letra_word(numero):
+    if numero == 0:
+        return "0"
+    ciclos, indice = divmod(numero - 1, 26)
+    letra = chr(ord("a") + indice)
+    # Um start pode ser qualquer inteiro de 32 bits. A forma compacta mantém a contagem sem expandir milhões de letras.
+    return letra * (ciclos + 1) if ciclos < 256 else f"{letra}×{ciclos + 1}"
+
+
+def _do_contador_alfabetico(m):
+    original = m[1]
+    if original == "0":
+        return original
+    numero = 0
+    for letra in original.lower():
+        numero = 26 * numero + ord(letra) - ord("a") + 1
+    texto = _letra_word(numero)
+    return texto.upper() if original.isupper() else texto
+
+
+def _rotulo_word(lista, item, numero, letras):
     """O anydoc já resolveu a máscara multinível e os reinícios. Marcadores simples trazem apenas a família."""
     if item.marker_label is not None:
         rotulo = " ".join(item.marker_label.split())
+        if letras is not None:
+            rotulo = letras.sub(_do_contador_alfabetico, rotulo)
         # A máscara pode conter texto arbitrário. O rótulo publicado é literal, inclusive dentro de tabelas.
         return re.sub(r"([\\\[\]*_\x60#!~])", r"\\\1", html.escape(rotulo, quote=False))
     if lista.marker.endswith("_roman"):
         valor = romano(numero)
     elif lista.marker.endswith("_alpha"):
-        valor = "" if numero else "0"
-        while numero:
-            numero, letra = divmod(numero - 1, 26)
-            valor = chr(ord("a") + letra) + valor
+        valor = _letra_word(numero)
     else:
         return "-" if lista.marker == "bullet" else f"{numero}."
     return (valor.upper() if lista.marker.startswith("upper") else valor) + "."
 
 
-def serializar(doc, ler_imagem, *, links=False, formato=None, marca_slide=None):
+def serializar(doc, ler_imagem, *, links=False, formato=None, marca_slide=None, letras=None):
     cobertura = {"pendente": []}
     assets = {a.id: a for a in doc.assets}
     n_img = {"n": 0}
@@ -1521,7 +1545,8 @@ def serializar(doc, ler_imagem, *, links=False, formato=None, marca_slide=None):
         for x in xs or []:
             k = x.kind
             if k == "text":
-                out.append(x.text or "")
+                texto = x.text or ""
+                out.append(letras.sub(_do_contador_alfabetico, texto) if letras is not None else texto)
             elif k == "link":
                 rotulo = inl(x.content)
                 alvo = x.target
@@ -1570,7 +1595,7 @@ def serializar(doc, ler_imagem, *, links=False, formato=None, marca_slide=None):
                     corpo = blocos(it.blocks, prof + 1).strip().replace("\n", "\n  ")
                     marca = "-" if b.list.marker == "bullet" else f"{b.list.start + i}."
                     if formato == "docx":
-                        marca = _rotulo_word(b.list, it, b.list.start + i)
+                        marca = _rotulo_word(b.list, it, b.list.start + i, letras)
                         if b.list.marker != "bullet" and marca and corpo.startswith(marca + " "):
                             corpo = corpo[len(marca) + 1 :]
                     out.append("  " * prof + f"{marca} {corpo}")
