@@ -49,18 +49,27 @@ class _Pontos(NamedTuple):
     quantidade: int
 
 
+def _indice(el, atributo):
+    try:
+        n = int(el.get(atributo, ""))
+        if 0 <= n <= 4_294_967_295:  # unsignedInt no OOXML
+            return n
+    except ValueError:
+        pass
+    raise ValueError(f"{el.tag.rsplit('}', 1)[-1]} com {atributo} ausente ou inválido")
+
+
 def _pontos(campo):
     if campo is None:
         return _Pontos({}, 0)
     qtd = campo.find(".//c:ptCount", NS)
-    tamanho = int(qtd.get("val", "0")) if qtd is not None else 0
+    tamanho = _indice(qtd, "val") if qtd is not None else 0
     pontos = {}
     # Nas categorias hierárquicas, cada nível pode ter um rótulo no mesmo índice.
     for pt in campo.iterfind(".//c:pt", NS):
-        idx = int(pt.get("idx"))
-        if idx >= 0:
-            pontos.setdefault(idx, []).append(pt.findtext("c:v", default="", namespaces=NS) or "")
-            tamanho = max(tamanho, idx + 1)
+        idx = _indice(pt, "idx")
+        pontos.setdefault(idx, []).append(pt.findtext("c:v", default="", namespaces=NS) or "")
+        tamanho = max(tamanho, idx + 1)
     return _Pontos({idx: " / ".join(reversed(rotulos)) for idx, rotulos in pontos.items()}, tamanho)
 
 
@@ -96,7 +105,7 @@ def _valores_sem_cache(path, refs) -> dict:
         for aba, rs in por_aba.items():
             c1, l1 = min(r[1] for r in rs), min(r[2] for r in rs)
             c2, l2 = max(r[3] for r in rs), max(r[4] for r in rs)
-            if (c2 - c1 + 1) * (l2 - l1 + 1) <= _UNIAO_SEM_CACHE_MAX:
+            if (c2 - c1 + 1) * (l2 - l1 + 1) <= min(_UNIAO_SEM_CACHE_MAX, _CELULAS_GRAFICOS_MAX):
                 grade = list(wb[aba].iter_rows(min_row=l1, max_row=l2, min_col=c1, max_col=c2, values_only=True))
                 for r in rs:
                     out[r] = [v for linha in grade[r[2] - l1 : r[4] - l1 + 1] for v in linha[r[1] - c1 : r[3] - c1 + 1]]
@@ -115,9 +124,35 @@ def _titulo_grafico(el):
     return " ".join(t.text or "" for t in el.findall(".//a:t", NS)).strip() or el.findtext(".//c:v", "", NS)
 
 
+def _area_intervalo(r):
+    return (r[3] - r[1] + 1) * (r[4] - r[2] + 1)
+
+
+def _series_ooxml(tipo_el, xy, abas, pendentes):
+    series = []
+    for ser in tipo_el.findall("c:ser", NS):
+        cat = ser.find("c:xVal" if xy else "c:cat", NS)
+        val = ser.find("c:yVal" if xy else "c:val", NS)
+        ref = val.findtext(".//c:f", namespaces=NS) if val is not None else None
+        s = {"nome": ser.findtext("c:tx//c:v", default="", namespaces=NS), "ref": ref}
+        for campo, el in [("cats", cat), ("vals", val)]:
+            s[campo] = _pontos(el)
+            if abas and not s[campo].quantidade and el is not None:
+                for fonte in el:
+                    if r := _intervalo(fonte, abas):
+                        s[campo] = _Pontos({}, _area_intervalo(r))
+                        pendentes.append((s, campo, r))
+                        break
+        if abas and not s["nome"] and (r := _intervalo(ser.find("c:tx/c:strRef", NS), abas)):
+            pendentes.append((s, "nome", r))
+        series.append(s)
+    return series
+
+
 def graficos_ooxml(path):
     """Gráfico nativo do Office: tipo, título, séries e valores do cache — dado exato. Sem cache (gráfico gravado
     por biblioteca), os valores vêm do intervalo na planilha, lidos depois de todos os gráficos, uma vez por aba."""
+    saldo_intervalos = saldo_tabelas = _CELULAS_GRAFICOS_MAX
     out, pendentes = [], []  # (série, campo, intervalo) a completar com os valores da planilha
     planilha = path.lower().endswith((".xlsx", ".xlsm"))
     with zipfile.ZipFile(path) as z:
@@ -135,7 +170,11 @@ def graficos_ooxml(path):
                 continue  # gráfico malformado ou hostil: a leitura segue sem ele
             titulo = _titulo_grafico(root.find(".//c:chart/c:title", NS))
             plot = root.find(".//c:plotArea", NS)
-            eixo = _titulo_grafico(plot.find("c:catAx/c:title", NS))
+            eixos = {
+                eixo.find("c:axId", NS).get("val"): _titulo_grafico(eixo.find("c:title", NS))
+                for eixo in plot
+                if eixo.find("c:axPos", NS) is not None and eixo.find("c:axId", NS) is not None
+            }
             tipos = [e.tag.rsplit("}", 1)[-1] for e in plot if e.tag.endswith("Chart")]
             completo = all(t in TIPOS_GRAFICO and t != "bubbleChart" for t in tipos)
             for tipo_el in plot:
@@ -143,33 +182,34 @@ def graficos_ooxml(path):
                 if tag not in TIPOS_GRAFICO:
                     continue
                 xy = tag == "scatterChart"
-                series = []
-                for ser in tipo_el.findall("c:ser", NS):
-                    cat = ser.find("c:xVal" if xy else "c:cat", NS)
-                    val = ser.find("c:yVal" if xy else "c:val", NS)
-                    ref = val.findtext(".//c:f", namespaces=NS) if val is not None else None
-                    s = {"nome": ser.findtext("c:tx//c:v", default="", namespaces=NS), "ref": ref}
-                    for campo, el in [("cats", cat), ("vals", val)]:
-                        s[campo] = _pontos(el)
-                        if planilha and not s[campo].quantidade and el is not None:
-                            for fonte in el:
-                                if r := _intervalo(fonte, abas):
-                                    pendentes.append((s, campo, r))
-                                    break
-                    if planilha and not s["nome"] and (r := _intervalo(ser.find("c:tx/c:strRef", NS), abas)):
-                        pendentes.append((s, "nome", r))
-                    series.append(s)
-                out.append(
-                    {
-                        "parte": nome,
-                        "tipo": TIPOS_GRAFICO[tag],
-                        "titulo": titulo,
-                        "eixo": eixo,
-                        "xy": xy,
-                        "series": series,
-                        "completo": completo,
-                    }
-                )
+                ids = [e.get("val") for e in tipo_el.findall("c:axId", NS)]
+                g = {
+                    "parte": nome,
+                    "tipo": TIPOS_GRAFICO[tag],
+                    "titulo": titulo,
+                    "xy": xy,
+                    "series": [],
+                    "completo": completo,
+                    "eixo": eixos.get(ids[0], "") if ids else "",
+                    "eixo_y": eixos.get(ids[1], "") if len(ids) > 1 else "",
+                }
+                out.append(g)
+                faltantes = []
+                try:
+                    g["series"] = _series_ooxml(tipo_el, xy, abas, faltantes)
+                except ValueError as erro:
+                    g["falha"] = str(erro)
+                    continue
+                if planilha:
+                    # Cobrar cada cópia do intervalo e todas as tabelas anteriores, mesmo as que tinham cache.
+                    custo_intervalos = sum(_area_intervalo(r) for _, _, r in faltantes)
+                    custo_tabela = _dimensoes_grafico(g)[-1]
+                    if custo_intervalos > saldo_intervalos or custo_tabela > saldo_tabelas:
+                        g["falha"] = "teto de células dos gráficos OOXML"
+                        continue
+                    saldo_intervalos -= custo_intervalos
+                    saldo_tabelas -= custo_tabela
+                    pendentes.extend(faltantes)
     if pendentes:
         valores = _valores_sem_cache(path, {r for _, _, r in pendentes})
         for s, campo, r in pendentes:
@@ -177,7 +217,7 @@ def graficos_ooxml(path):
             if campo == "nome":
                 s[campo] = " ".join(str(v) for v in lidos if v is not None)
             else:
-                tamanho = (r[3] - r[1] + 1) * (r[4] - r[2] + 1)
+                tamanho = _area_intervalo(r)
                 s[campo] = _Pontos({i: str(v) for i, v in enumerate(lidos) if v is not None}, tamanho)
     for g in out:
         for s in g["series"]:
@@ -284,17 +324,26 @@ def _grafico_odf(z, nome, ilegiveis, saldo) -> dict | None:
     }
 
 
+def _dimensoes_grafico(g):
+    series = g["series"]
+    eixos = [s["cats"] for s in series if s["cats"].quantidade]
+    alturas = [max(s["cats"].quantidade, s["vals"].quantidade) for s in series]
+    linhas = max(alturas, default=0)
+    separar = g["xy"] or any(e != eixos[0] for e in eixos[1:])  # os eixos X podem ser independentes
+    custo = 2 * sum(alturas) if separar else linhas * (len(series) + 1)
+    return eixos, linhas, separar, custo
+
+
 def _tabela_ooxml(g, saldo, ilegiveis):
     """Renderiza cada coordenada pelo índice no arquivo. Um ptCount alto não aloca uma lista de vazios."""
+    if "falha" in g:
+        ilegiveis.append(f"gráfico {g['parte']}: {g['falha']}")
+        return "[tabela do gráfico não lida]"
     ss = g["series"]
-    eixos = [s["cats"] for s in ss if s["cats"].quantidade]
-    linhas = max((max(s["cats"].quantidade, s["vals"].quantidade) for s in ss), default=0)
+    eixos, linhas, separar, custo = _dimensoes_grafico(g)
     if not linhas:
         refs = ", ".join(s["nome"] + (f" ({s['ref']})" if s["ref"] else "") for s in ss)
         return f"Séries: {refs} — sem valores em cache; dados na planilha."
-    # Séries de dispersão têm eixos X independentes. Também separam-se séries categóricas com eixos distintos.
-    separar = g["xy"] or any(e != eixos[0] for e in eixos[1:])
-    custo = sum(max(s["cats"].quantidade, s["vals"].quantidade) * 2 for s in ss) if separar else linhas * (len(ss) + 1)
     if custo > saldo[0]:
         ilegiveis.append(f"gráfico {g['parte']}: teto de células dos gráficos OOXML")
         return "[tabela do gráfico não lida]"
@@ -303,7 +352,9 @@ def _tabela_ooxml(g, saldo, ilegiveis):
         partes = []
         for s in ss:
             cats, vals = s["cats"], s["vals"]
-            cabecalho = "| X | Y |" if g["xy"] else f"| {_celula(g['eixo'] or 'Categoria')} | Valor |"
+            x = _celula(g["eixo"] or ("X" if g["xy"] else "Categoria"))
+            y = _celula(g["eixo_y"] or ("Y" if g["xy"] else "Valor"))
+            cabecalho = f"| {x} | {y} |"
             tabela = [f"**{_celula(s['nome'])}**", "", cabecalho, "| --- | --- |"]
             for k in range(max(cats.quantidade, vals.quantidade)):
                 tabela.append(f"| {_celula(cats.valores.get(k))} | {_celula(vals.valores.get(k))} |")
@@ -313,6 +364,8 @@ def _tabela_ooxml(g, saldo, ilegiveis):
         "| " + " | ".join([_celula(g["eixo"] or "Categoria"), *(_celula(s["nome"]) for s in ss)]) + " |",
         "|" + " --- |" * (len(ss) + 1),
     ]
+    if g["eixo_y"]:
+        tabela[:0] = [f"Eixo de valores: {_celula(g['eixo_y'])}", ""]
     for k in range(linhas):
         cat = _celula(eixos[0].valores.get(k)) if eixos else str(k + 1)
         tabela.append("| " + " | ".join([cat, *(_celula(s["vals"].valores.get(k)) for s in ss)]) + " |")

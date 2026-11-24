@@ -164,3 +164,81 @@ def test_teto_de_pontos_preserva_o_slide_e_indica_o_grafico(tmp_path, monkeypatc
     assert "Fim do relatório" in r.markdown and "[tabela do gráfico não lida]" in r.markdown
     # Um complemento nativo ilegível deixa a parte e o motivo nos metadados.
     assert any("chart1.xml" in aviso and "teto" in aviso for aviso in r.metadados["partes_ilegiveis"])
+
+
+def test_dispersao_preserva_os_titulos_dos_eixos_do_grupo(tmp_path):
+    prs, slide = _slide()
+    dados = XyChartData()
+    dados.add_series("Medição").add_data_point(2, 8)
+    slide.shapes.add_chart(XL_CHART_TYPE.XY_SCATTER, Inches(0), Inches(1), Inches(3), Inches(2), dados)
+    p = tmp_path / "origem.pptx"
+    prs.save(p)
+
+    def titular(raiz):
+        ids = [e.get("val") for e in raiz.findall(f".//{_C}scatterChart/{_C}axId")]
+        for eixo in raiz.findall(f".//{_C}valAx"):
+            i = ids.index(eixo.find(_C + "axId").get("val"))
+            tx = etree.SubElement(etree.SubElement(eixo, _C + "title"), _C + "tx")
+            rich = etree.SubElement(tx, _C + "rich")
+            a = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+            par = etree.SubElement(rich, a + "p")
+            etree.SubElement(etree.SubElement(par, a + "r"), a + "t").text = ["Horas (h)", "Energia (kWh)"][i]
+        # A ordem física dos eixos não determina a coordenada.
+        primeiro = raiz.find(f".//{_C}valAx")
+        primeiro.getparent().append(primeiro)
+
+    md = lince.ler(_pacote(p, tmp_path / "eixos.pptx", titular)).markdown
+    assert "| Horas (h) | Energia (kWh) |" in md and "| 2 | 8 |" in md
+
+
+@pytest.mark.parametrize("atributo", ["idx", "val"])
+def test_cache_invalido_fica_isolado_no_proprio_grafico(tmp_path, atributo):
+    prs, slide = _slide()
+    for nome in ("Primeira", "Segunda"):
+        dados = CategoryChartData()
+        dados.categories = ["Jan", "Fev"]
+        dados.add_series(nome, (2, 8))
+        slide.shapes.add_chart(XL_CHART_TYPE.LINE, Inches(0), Inches(1), Inches(3), Inches(2), dados)
+    p = tmp_path / "origem.pptx"
+    prs.save(p)
+
+    def sem_indice(raiz):
+        tag = "pt" if atributo == "idx" else "ptCount"
+        del raiz.find(f".//{_C}val//{_C}{tag}").attrib[atributo]
+
+    r = lince.ler(_pacote(p, tmp_path / "campo.pptx", sem_indice))
+    assert any("chart1.xml" in aviso and atributo in aviso for aviso in r.metadados["partes_ilegiveis"])
+    assert "[tabela do gráfico não lida]" in r.markdown and "| Categoria | Segunda |" in r.markdown
+    assert r.markdown.count("| Fev | 8 |") == 1
+
+
+def test_orcamento_antecede_a_leitura_dos_intervalos_sem_cache(tmp_path, monkeypatch):
+    from lince import office
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    for linha in [("Mês", "Primeira", "Segunda"), ("Jan", 2, 11), ("Fev", 8, 22)]:
+        ws.append(linha)
+    for col in [2, 3]:
+        g = BarChart()
+        g.add_data(Reference(ws, min_col=col, min_row=1, max_row=3), titles_from_data=True)
+        g.set_categories(Reference(ws, min_col=1, min_row=2, max_row=3))
+        ws.add_chart(g, "D1")
+    p = tmp_path / "orcamento.xlsx"
+    wb.save(p)
+    intervalos = []
+    original = office._valores_sem_cache
+
+    def vigiar(path, refs):
+        intervalos.extend(refs)
+        return original(path, refs)
+
+    monkeypatch.setattr(office, "_valores_sem_cache", vigiar)
+    monkeypatch.setattr(office, "_CELULAS_GRAFICOS_MAX", 5)
+    r = lince.ler(p)
+    assert "| Fev | 8 |" in r.markdown.split("**Gráfico")[1]
+    assert "[tabela do gráfico não lida]" in r.markdown.split("**Gráfico")[2]
+    assert intervalos and all(r[1] <= 2 for r in intervalos)
+    intervalos.clear()
+    monkeypatch.setattr(office, "_CELULAS_GRAFICOS_MAX", 1)
+    assert lince.ler(p).markdown.count("[tabela do gráfico não lida]") == 2 and not intervalos
