@@ -15,6 +15,10 @@ _MANTISSA = re.compile(
     r"(?<![\d.,])([+\-]?\d{1,6}[.,]\d+(?:[ \t]\d{1,4}){0,8})(?:\(\d{1,6}\))?(?:\s*(?:…|\.\s*\.\s*\.))?\s*$"
 )
 _UNIDADE = re.compile(r"(?:[\s$|~]|\\[,;:! ])*(?:\\(?:mathrm|text|unit)\s*\{\s*)?([a-zA-ZµμΩΩ]+)\b")
+# Uma unidade composta só seria comparável se todos os fatores e potências coincidissem.
+_CONTINUACAO_UNIDADE = re.compile(
+    r"(?:[}\t $~]|\\[,;:! ])*(?:[/·⋅*/^]|\\(?:cdot|times|per)\b|(?:\\mathrm\{)?(?:kg|mol|[msAK]|Hz|Pa|J|W|N|V|C)\b)"
+)
 _HACHURA = re.compile(r"hachur|shad(?:ed|ing)|hatch|fundo\s+(?:branco|cinza)|background\s+colou?r", re.I)
 _EFETIVO = re.compile(r"\b(?:(?:efetiv|realizad|observad|hist[óo]ric)[oa]s?|actuals?|observed|historical)\b", re.I)
 _PROJECAO = re.compile(
@@ -35,7 +39,7 @@ def potencias(texto, *, camada_pdf=False):
             continue
         m = _MANTISSA.search(texto[max(0, ponto.start() - 100) : ponto.start()])
         u = _UNIDADE.match(texto, ponto.end())
-        if not m or not u:
+        if not m or not u or _CONTINUACAO_UNIDADE.match(texto, u.end()):
             continue
         v = Decimal(m[1].replace(" ", "").replace("\t", "").replace(",", ".")).normalize()
         if len(v.as_tuple().digits) < 6:

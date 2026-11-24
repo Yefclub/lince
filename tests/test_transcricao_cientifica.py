@@ -109,3 +109,15 @@ def test_condicoes_indicadas_por_cabecalhos_coloridos():
         "<tbody><tr><td>4,4</td><td>4,9</td></tr></tbody></table>",
     ):
         assert not avisos_transcricao(tabela, "", {})
+
+
+def test_comparacao_nao_confunde_unidades_compostas_com_prefixo_igual():
+    from lince.conferencia_visual import avisos_transcricao, potencias
+
+    for fonte, descricao in (
+        ("2.345678 × 10⁶ mol/m³", "2.345678 × 10⁰ mol/cm³"),
+        ("2.345678 × 10⁶ mol m⁻³", r"$2.345678 \times 10^{0}\,\mathrm{mol}\,\mathrm{cm}^{-3}$"),
+    ):
+        ref = potencias(fonte, camada_pdf=True)
+        assert not ref
+        assert not avisos_transcricao(descricao, "", ref)
