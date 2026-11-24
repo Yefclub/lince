@@ -659,7 +659,7 @@ wheels = [
 
 [[package]]
 name = "lince"
-version = "0.7.1.dev20261124225101"
+version = "0.7.1.dev20261124232711"
 source = { editable = "." }
 dependencies = [
     { name = "defusedxml" },
