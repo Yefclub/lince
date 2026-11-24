@@ -148,7 +148,7 @@ def _paragrafos_do_desenho(regioes, blocos, lido):
         dentro = " " + " ".join(ancora.split()) + " "
         for b in visual.split("\n\n"):
             texto = " ".join(b.split())
-            if len(texto) < 100 or unicos[texto] != 1:
+            if not texto or unicos[texto] != 1:
                 continue
             buscas += 1
             if buscas > 128:
@@ -241,30 +241,27 @@ def montar(pasta, respostas, pendentes=None):
         md = re.sub(r"\{\{(TABELA|FORMULA):(\d+)\}\}", troca, p["md"])
         blocos = [b for b in md.split("\n\n") if b.strip()]
         # tira do nativo o texto que pertence à figura (rótulos de eixo etc.)
+        # Em um boxe vetorial os próprios parágrafos aparecem na âncora. Só a
+        # correspondência literal na transcrição confirma que já estão na saída.
         figuras = [
             r
             for r in p["regioes"]
-            if not r.get("preserva_texto") and "substitui_tabela" not in r and "substitui_formula" not in r
+            if not r.get("desenho")
+            and not r.get("preserva_texto")
+            and "substitui_tabela" not in r
+            and "substitui_formula" not in r
         ]
         palavras_dentro = set(re.findall(r"\w+", " ".join(r["texto_dentro"] for r in figuras).lower()))
-        palavras_fotos = (
-            set(re.findall(r"\w+", " ".join(r["texto_dentro"] for r in figuras if not r.get("desenho")).lower()))
-            if any(r.get("desenho") for r in figuras)
-            else palavras_dentro
-        )
         copiados = _paragrafos_do_desenho(p["regioes"], blocos, lido)
         limpos = []
         for b in blocos:
             if copiados and " ".join(b.split()) in copiados:
                 continue
             pal = re.findall(r"\w+", b.lower())
-            # Para o parágrafo de um desenho vale a correspondência literal acima. A mera
-            # presença das palavras no boxe também ocorreria se a transcrição estivesse incompleta.
-            rotulos = palavras_fotos if len(b) >= 100 else palavras_dentro
             if (
                 pal
-                and rotulos
-                and sum(w in rotulos for w in pal) / len(pal) > 0.8
+                and palavras_dentro
+                and sum(w in palavras_dentro for w in pal) / len(pal) > 0.8
                 and len(pal) < 60
                 and "lido pela IA" not in b
                 and not b.lstrip().startswith("|")
