@@ -1,5 +1,6 @@
 """Orquestrador: arquivo → extração nativa e roteamento → leituras pela IA (com cache) → markdown + metadados."""
 
+import codecs
 import contextvars
 import json
 import logging
@@ -720,6 +721,10 @@ def imagens_das_paginas(
 
 def _texto(caminho):
     raw = Path(caminho).read_bytes()
+    if raw.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        return raw.decode("utf-32", errors="replace")
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return raw.decode("utf-16", errors="replace")
     for cod in ("utf-8-sig", "cp1252", "latin-1"):
         try:
             return raw.decode(cod)
@@ -730,35 +735,48 @@ def _texto(caminho):
 
 def _plano_imagem(caminho, pasta):
     """Imagem avulsa: faixas que cabem no limite do provedor (imagem alta não é reduzida até ficar ilegível)."""
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     tarefas, pendentes = [], []
     pixels = pagina = 0
     with Image.open(caminho) as origem:
-        multipagina = origem.format == "TIFF" and origem.is_animated
+        formato = origem.format
+        animacao = formato in ("GIF", "WEBP") and origem.is_animated
+        multipagina = animacao or (formato == "TIFF" and origem.is_animated)
+        if formato == "JPEG":
+            ImageOps.exif_transpose(origem, in_place=True)
         while True:
-            if multipagina and (_vencido() or pagina >= TAREFAS_POR_DOCUMENTO):
-                motivo = "prazo esgotado" if _vencido() else "teto de páginas TIFF"
+            if animacao and _vencido():
+                pendentes.append(f"contagem de {formato} interrompida após {pagina} quadros: prazo esgotado")
+                break
+            if multipagina and not animacao and (_vencido() or pagina >= TAREFAS_POR_DOCUMENTO):
+                motivo = "prazo esgotado" if _vencido() else f"teto de páginas {formato}"
                 pagina += 1
-                pendentes.append(f"a partir da página {pagina}: {motivo} (contagem do TIFF interrompida)")
+                pendentes.append(f"a partir da página {pagina}: {motivo} (contagem do {formato} interrompida)")
                 break
             try:
                 origem.seek(pagina)
             except (OSError, EOFError, SyntaxError, ValueError, Image.DecompressionBombError) as erro:
+                if animacao and isinstance(erro, EOFError):
+                    break
                 if not multipagina:
                     raise
                 pagina += 1
-                pendentes.append(f"a partir da página {pagina}: diretório TIFF ilegível ({type(erro).__name__})")
+                pendentes.append(f"a partir da página {pagina}: diretório {formato} ilegível ({type(erro).__name__})")
                 break
             pagina += 1
-            ultima = not multipagina or not origem.tag_v2.next
+            ultima = not multipagina or (formato == "TIFF" and not origem.tag_v2.next)
             w, h = origem.size
             alt = h if max(w, h) <= LADO else min(h, int(w * 0.75)) or h
             numero = (h + alt - 1) // alt
             pixels += w * h
-            if multipagina and (pixels > PIXELS_IMAGEM_MAX or len(tarefas) + numero > TAREFAS_POR_DOCUMENTO):
+            if multipagina and (
+                pagina > TAREFAS_POR_DOCUMENTO
+                or pixels > PIXELS_IMAGEM_MAX
+                or len(tarefas) + numero > TAREFAS_POR_DOCUMENTO
+            ):
                 pendentes.append(
-                    f"a partir da página {pagina}: teto de extração de imagens TIFF (contagem interrompida)"
+                    f"a partir da página {pagina}: teto de extração de imagens {formato} (contagem interrompida)"
                 )
                 break
             try:
@@ -766,7 +784,7 @@ def _plano_imagem(caminho, pasta):
             except (OSError, EOFError, SyntaxError, ValueError, Image.DecompressionBombError) as erro:
                 if not multipagina:
                     raise
-                pendentes.append(f"página {pagina}: quadro TIFF ilegível ({type(erro).__name__})")
+                pendentes.append(f"página {pagina}: quadro {formato} ilegível ({type(erro).__name__})")
             else:
                 with quadro as im:
                     for n, y in enumerate(range(0, h, alt), 1):
@@ -782,7 +800,7 @@ def _plano_imagem(caminho, pasta):
                         im.crop((0, max(0, y - 40), w, min(h, y + alt))).save(f"{pasta}/ia/{tid}.png")
                         tarefa = {"id": tid, "modo": "pagina", "ancora": ""}
                         if multipagina:
-                            tarefa.update(pagina=pagina - 1, faixa=n, faixas_na_pagina=numero)
+                            tarefa.update(pagina=pagina - 1, faixa=n, faixas_na_pagina=numero, formato_quadro=formato)
                         tarefas.append(tarefa)
             if ultima:
                 break

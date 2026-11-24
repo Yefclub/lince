@@ -32,6 +32,7 @@ r.estrutura         # páginas, slides, abas (e quais são ocultas), seções co
 | Tabela nativa com estrutura duvidosa | Recorte da tabela lido pela IA, com os valores nativos como âncora |
 | Fórmula escrita como texto no PDF | Recorte do bloco de fórmulas → LaTeX |
 | Página escaneada ou com texto corrompido | Página lida pela IA (dividida em duas quando densa) |
+| GIF e WebP animados | Quadros em ordem, com origem nas tarefas e limites de extração. JPEG respeita a orientação EXIF antes dos recortes. |
 | TIFF multipágina | Cada página segue em ordem, com origem nos recortes. Se a contagem for interrompida por prazo, teto ou diretório ilegível, a cobertura informa até onde o leitor chegou e registra a pendência |
 | Imagem avulsa alta | Fatiada para não ser reduzida até ficar ilegível |
 

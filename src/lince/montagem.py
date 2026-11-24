@@ -386,7 +386,9 @@ def partes_da_imagem(plano, respostas):
     for tarefa in plano["tarefas"]:
         pagina = tarefa.get("pagina")
         if pagina != anterior:
-            yield f"<!-- página {pagina + 1} · TIFF -->"
+            formato = tarefa.get("formato_quadro", "TIFF")
+            unidade = "página" if formato == "TIFF" else "quadro"
+            yield f"<!-- {unidade} {pagina + 1} · {formato} -->"
             anterior = pagina
         yield respostas.get(tarefa["id"], "")
 
