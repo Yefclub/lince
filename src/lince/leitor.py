@@ -19,7 +19,7 @@ import anydoc
 
 from ._prazo import LIMITE, prazo_restante
 from ._trava import PDFIUM
-from .agrupamento import agrupar, distribuir_lotes, resposta_aproveitavel
+from .agrupamento import LADO, agrupar, distribuir_lotes, resposta_aproveitavel
 from .cache import Cache, chave
 from .estrutura import indice, secoes
 from .instrucoes import PROMPT_PADRAO, VERSAO_PROMPT, instrucao
@@ -223,11 +223,11 @@ class Leitor:
             caminho, _ = _com_senha(caminho, senha, pasta)
             plano = self.planejar(caminho, pasta)
             tarefas, pendentes = plano.get("tarefas", []), []
+            faixas = len(tarefas) if plano["tipo"] == "imagem" else None
             if self.max_leituras is not None and len(tarefas) > self.max_leituras:
                 motivo = f"teto de {_tarefas(self.max_leituras)} por documento"
                 pendentes = pendencias_do_teto(tarefas[self.max_leituras :], plano, motivo)
                 tarefas = plano["tarefas"] = tarefas[: self.max_leituras]
-            faixas = len(tarefas) if plano["tipo"] == "imagem" else None
             visuais = []
             for t in tarefas:
                 arquivo = f"{pasta}/ia/{t['id']}.png"
@@ -715,7 +715,7 @@ def _plano_imagem(caminho, pasta):
     from PIL import Image
 
     im = Image.open(caminho).convert("RGB")
-    alt = min(im.height, int(im.width * 0.75)) or im.height
+    alt = im.height if max(im.size) <= LADO else min(im.height, int(im.width * 0.75)) or im.height
     tarefas, y, k = [], 0, 1
     while y < im.height:
         tid = f"faixa{k}"
