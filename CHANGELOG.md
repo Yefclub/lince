@@ -1,5 +1,140 @@
 # Changelog
 
+## 0.8.0 — 2026-11-24
+
+### Novidades
+
+**Mapa de evidência do PDF: índice com as páginas, páginas visuais e a imagem da página original**
+
+**Índice com as páginas de cada seção.** O resultado de um PDF traz `estrutura.indice`: cada seção com a página onde
+começa e a última que ela pode ocupar (`pagina_fim`). A fonte são os marcadores do próprio PDF (`fonte: sumario`) ou,
+sem eles, os títulos do texto (`fonte: titulos`), sem o que o extrator promove a título e não é seção: o cabeçalho
+corrido que se repete em toda página, a frase em negrito, o item da bibliografia e a entrada do sumário impresso. Quem
+busca pode navegar pelo índice antes de ler, como num sumário, ou pôr o caminho da seção em cada trecho que indexa.
+
+**Onde vale olhar o original.** `estrutura.paginas_visuais` lista as páginas em que o Markdown traz a transcrição de
+algo que se vê (imagem, desenho, tabela, fórmula, página escaneada) e o que a leitura não garante: valor estimado
+(`≈`), trecho ilegível ou leitura que não veio. Com `lince.imagens_das_paginas(arquivo, [12, 13])`, quem responde
+pega essas páginas em PNG, como são exibidas, e manda ao modelo junto com o Markdown na hora da pergunta.
+
+**Nada muda para quem já usa.** O Markdown, os metadados e o resto da estrutura saem idênticos (conferido byte a
+byte). Contrato da API 1.15.0: `indice` e `paginas_visuais` são campos novos e opcionais da estrutura.
+
+### Correções
+
+**Cabeçalho corrido em fonte grande sai do corpo do PDF, e a frase em negrito partida volta inteira**
+
+**Cabeçalho que parecia título.** O cabeçalho corrido escrito em fonte grande ("Carta de Conjuntura | 69 | Nota 22",
+na Carta de Conjuntura do Ipea) chegava à montagem marcado como título e ficava no corpo, uma vez por página (40 vezes
+num documento de 43 páginas). Agora a linha idêntica na borda de ao menos 80% das páginas sai do corpo e vai para os
+metadados (`cabeçalho/rodapé`) também quando está marcada como título. Título de seção que não se repete na borda fica.
+
+**Frase em negrito partida.** Relatórios que abrem o parágrafo com uma frase em negrito (o Relatório de Política
+Monetária do Banco Central, por exemplo) chegavam com o começo da frase como título e o resto no parágrafo:
+`## A atividade econômica… mas o mercado de trabalho` seguido de `**seguiu aquecido.** O PIB…`. A frase volta a ser
+uma só, em negrito, no começo do parágrafo, e deixa de aparecer como seção em `estrutura.secoes`. Só junta quando o
+bloco seguinte continua a frase; título de verdade, rótulo terminado em dois-pontos e item de lista ficam como estão.
+Nenhuma palavra sai do texto (conferido no relatório de 90 páginas: as mesmas 38.186 palavras, 30 falsos títulos a
+menos).
+
+**Word conserva a numeração das cláusulas e as caixas de formulário, e PowerPoint preserva os links**
+
+As listas do DOCX mantêm os identificadores multinível, alfabéticos e romanos calculados a partir dos estilos e da
+numeração do arquivo. Uma caixa de formulário legada aparece junto da opção como `[x]` ou `[ ]`, com prioridade
+para o valor atual e, na ausência dele, para o padrão salvo.
+
+No PowerPoint, o Markdown preserva os rótulos e os destinos dos links nos slides e nas notas do apresentador.
+Os links internos apontam para âncoras na ordem da apresentação. Um vínculo sem slide de destino conserva o rótulo.
+
+**Mapa visual alerta sobre expoentes divergentes e condições sem identificação na tabela**
+
+Quando a referência numérica comparável diverge da transcrição, a cobertura informa a página e os expoentes. A leitura de tabela preserva em texto a distinção indicada por hachura entre valores efetivos e projeções.
+
+**EPUB preserva versos, continuação de notas e alternativas de imagem e HTML conserva alvos de navegação**
+
+O texto alternativo do autor fica disponível quando falta a leitura visual. A leitura mantém as quebras de verso e o recuo de parágrafos do item numerado. Links locais no HTML ganham alvos explícitos no Markdown.
+
+**Leitura de campos preenchíveis, ordem de colunas e camada OCR em PDF**
+
+O leitor distingue valores, escolhas e caixas marcadas nos formulários AcroForm. Duas colunas
+simples com títulos próprios seguem a ordem de leitura. Em uma folha escaneada, a transcrição
+visual que cobre o OCR substitui a camada duplicada. A camada nativa fica disponível quando a
+leitura visual falta ou é curta.
+
+**Planilhas preservam máscaras numéricas, identificam o cache das fórmulas e recuperam desenhos do XLSB**
+
+No XLSX e XLSM, a leitura em fluxo aplica o formato numérico às células, incluindo identificadores com zeros à
+esquerda, percentuais e moeda. As datas continuam em ISO. As fórmulas têm um aviso por aba com a quantidade e até
+32 endereços de cada grupo. A expressão aparece quando consta da célula e a leitura confirma que a aba está
+desprotegida. Os valores vêm do último resultado salvo no arquivo. As fórmulas sem resultado salvo entram nas
+pendências.
+
+O XLSB passa a trazer o texto das formas DrawingML e os gráficos vinculados às abas visíveis, com os dados em
+cache. Formas e grupos ocultos ficam fora dessa leitura. Nos CSV e TSV, um campo vazio permanece vazio no Markdown.
+O perfil tabular reconhece um cabeçalho com
+rótulos distintos à direita de um título isolado por uma linha vazia. Título e notas na margem ficam no texto e
+as contagens e amostras passam a considerar as linhas da tabela.
+
+**Cabeçalhos, expoentes e símbolos em tabelas PDF e parágrafos em boxe vetorial**
+
+O leitor associa cabeçalhos de grupo às colunas delimitadas pelos filetes da tabela e recupera
+expoentes deslocados quando as posições confirmam a base. Caracteres ASCII de fontes simbólicas
+ambíguas na coluna de símbolos recebem indicação de conferência. Parágrafos confirmados tanto no
+boxe vetorial quanto na transcrição visual entram uma vez no documento.
+
+**Gráficos do Office preservam lacunas e pares X/Y, e diagramas respeitam a direção das setas**
+
+Na leitura de gráficos nativos, cada categoria mantém o valor do seu índice e células vazias da planilha ficam em branco. A dispersão mostra os pares X/Y de cada série. O PPTX apresenta a tabela na posição do gráfico e distingue setas no início, no fim ou nas duas pontas de linhas sem direção.
+
+**Leitura de texto Unicode, orientação de fotos e quadros animados**
+
+Assinaturas UTF-16 e UTF-32 identificam a codificação de texto. O provedor recebe fotos JPEG orientadas e os quadros de GIF e WebP na ordem do arquivo.
+
+**Imagens HTML preservam o alfa e o significado dos ícones**
+
+O recorte leva o fundo inline recuperável ou preserva a transparência. O texto alternativo informativo de ícones pequenos fica no documento.
+
+**O esforço máximo respeita o teto de chamadas também nas releituras ampliadas**
+
+O esforço máximo respeita o teto de chamadas também nas releituras ampliadas.
+
+**O cache só reutiliza lotes com leitura para todos os itens**
+
+O cache só reutiliza lotes com leitura para todos os itens.
+
+**Imagens avulsas de até 1568 pixels no maior lado seguem inteiras para o provedor**
+
+Imagens avulsas de até 1568 pixels no maior lado seguem inteiras para o provedor.
+
+**PDF preserva o texto nativo utilizável na faixa sem leitura visual**
+
+Uma página encaminhada à visão conserva o trecho digital disponível quando a resposta falta. A pendência continua visível.
+
+**Planilhas Excel preservam links, notas, validações, recuos e regras de negrito**
+
+O XLSX e o XLSM incluem as anotações com a aba e o endereço de origem no Markdown. A leitura registra o
+intervalo e a condição original do negrito. Para razões e razões logarítmicas entre células da mesma linha,
+identifica as células que satisfazem a regra pelos valores numéricos salvos, inclusive antes do arredondamento
+da exibição. Outras expressões de negrito ficam identificadas como não avaliadas.
+
+O perfil tabular mantém o tipo numérico quando a máscara exibe um montante com espaços, moeda ou um traço.
+Blocos lado a lado com títulos próprios e sequências de cabeçalhos iguais recebem perfis separados, com título,
+coluna de origem e os rótulos distribuídos por várias linhas.
+
+**O Word preserva expoentes, índices e prazos riscados e os links de DOCX e RTF conservam o destino**
+
+A leitura mantém a distinção do texto riscado e dos runs elevados ou rebaixados. O rótulo de um link acompanha seu destino.
+
+**TIFF multipágina preserva as páginas e informa a cobertura**
+
+O leitor percorre as páginas do TIFF em ordem e registra nas pendências o que ficou além do teto ou do prazo.
+
+### Documentação
+
+**Identidade visual do Lince**
+
+O README apresenta a logo oficial do Lince. O símbolo está disponível em PNG com fundo transparente em `docs/midia/lince.png`.
+
 ## 0.7.0 — 2026-11-10
 
 ### Novidades
