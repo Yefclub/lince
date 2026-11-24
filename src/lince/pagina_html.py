@@ -428,6 +428,73 @@ def _esvaziar(el):
     el.tag = "span"
 
 
+def _png_do_html(im, el):
+    """Compõe apenas fundos inline conhecidos; conserva o alfa se o contexto não for recuperável."""
+    from itertools import chain
+
+    from PIL import Image
+    from tinycss2.color4 import parse_color
+
+    if "A" not in im.getbands() and "transparency" not in im.info:
+        return im.convert("RGB")
+    imagem = im.convert("RGBA")
+    fundo = Image.new("RGBA", (1, 1))
+    for no in chain((el,), el.iterancestors()):
+        cores = {"background-color": no.get("bgcolor")}
+        importantes = set()
+        for d in tinycss2.parse_blocks_contents(no.get("style") or "", skip_comments=True, skip_whitespace=True):
+            if d.type != "declaration":
+                continue
+            nome = d.lower_name
+            valor = tinycss2.serialize(d.value).strip()
+            if nome == "background":
+                # O atalho redefine as duas propriedades. Fundos complexos requerem o alfa original.
+                simples = parse_color(valor) is not None or valor.lower() == "none"
+                valores = {
+                    "background-color": valor if valor.lower() != "none" else None,
+                    "background-image": "none" if simples else valor,
+                }
+            elif nome in ("background-color", "background-image"):
+                if nome == "background-color" and parse_color(valor) is None:
+                    if valor.lower() in ("initial", "unset"):
+                        valor = "transparent"
+                    elif valor.lower() in ("inherit", "revert", "revert-layer") or any(
+                        token.type == "function" for token in d.value
+                    ):
+                        # O navegador pode resolver esse valor. Conservar alfa se não o conhecemos.
+                        valor = "currentcolor"
+                    else:
+                        continue
+                valores = {nome: valor}
+            else:
+                continue
+            for prop, v in valores.items():
+                if d.important or prop not in importantes:
+                    cores[prop] = v
+                    if d.important:
+                        importantes.add(prop)
+        if cores.get("background-image", "none").lower() != "none":
+            return imagem
+        cor = cores["background-color"]
+        if not cor:
+            continue
+        rgba = parse_color(cor)
+        if rgba is None or isinstance(rgba, str) or rgba.space not in ("srgb", "hsl", "hwb"):
+            return imagem
+        srgb = rgba.to("srgb")
+        if None in srgb.coordinates or srgb.alpha is None:
+            return imagem
+        canais = (*srgb.coordinates, srgb.alpha)
+        camada = Image.new("RGBA", (1, 1), tuple(round(max(0, min(1, c)) * 255) for c in canais))
+        fundo = Image.alpha_composite(camada, fundo)
+        if fundo.getpixel((0, 0))[3] == 255:
+            break
+    tinta = fundo.getpixel((0, 0))
+    if tinta[3] == 0:
+        return imagem
+    return Image.alpha_composite(Image.new("RGBA", imagem.size, tinta), imagem)
+
+
 def _imagens(raiz, pasta, tarefas, prefixo) -> dict:
     """Imagem data: vira tarefa da IA (marca sentinela no lugar, trocada depois da conversão); decorativa sai;
     externa e ilegível ficam marcadas com o alt."""
@@ -443,11 +510,11 @@ def _imagens(raiz, pasta, tarefas, prefixo) -> dict:
                 if len(carga) * 3 // 4 > IMAGEM_MAX:  # estimado antes de decodificar: nem aloca o que não lerá
                     raise ValueError("imagem embutida grande demais")
                 im = Image.open(io.BytesIO(base64.b64decode(carga, validate=False)))
-                if min(im.size) < 48:  # ícone ou separador: decorativo, como no Office
-                    substituto = ""
+                if min(im.size) < 48:
+                    substituto = alt
                 else:
                     tid = f"img{len(tarefas) + 1:02d}"
-                    im.convert("RGB").save(f"{pasta}/ia/{tid}.png")
+                    _png_do_html(im, el).save(f"{pasta}/ia/{tid}.png")
                     tarefas.append({"id": tid, "modo": "imagem", "ancora": alt or f"imagem {len(tarefas) + 1}"})
                     substituto = f"{{{{IA:{tid}}}}}"
             except (binascii.Error, ValueError, OSError, Image.DecompressionBombError):

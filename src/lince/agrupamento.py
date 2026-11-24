@@ -27,8 +27,12 @@ def agrupar(tarefas, pasta, max_itens=12):
         if t["modo"] in ("pagina", "tabela"):
             resto.append(t)
             continue
-        w, h = Image.open(f"{pasta}/ia/{t['id']}.png").size
-        (pequenas if w <= 900 and h <= 260 else resto).append(t)
+        with Image.open(f"{pasta}/ia/{t['id']}.png") as imagem:
+            w, h = imagem.size
+            pequena = w <= 900 and h <= 260
+            if pequena and "A" in imagem.getbands():
+                pequena = imagem.getchannel("A").getextrema()[0] == 255
+        (pequenas if pequena else resto).append(t)
     if len(pequenas) < 3:
         return tarefas, {}
     lotes, folha, itens, x, y, alt_linha = {}, [], [], 0, 0, 0
