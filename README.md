@@ -8,10 +8,6 @@ O Lince usa o texto nativo do arquivo sempre que ele é bom e chama o modelo de 
 **só onde precisa**: imagem, gráfico, diagrama, tabela duvidosa, fórmula e página escaneada. A saída é um
 Markdown pronto para busca e para LLM, mais metadados e um relatório do que foi lido de onde.
 
-[![Assistir a O rastro de um número, demonstração do Lince](docs/midia/capa-demonstracao.jpg)](docs/midia/como-o-lince-le.mp4)
-
-[O rastro de um número · 1 min 25 s · MP4 com narração e legendas em português](docs/midia/como-o-lince-le.mp4). Siga a projeção de 3,5% no [relatório do Banco Central de dezembro de 2024](https://www.bcb.gov.br/content/ri/relatorioinflacao/202412/ri202412b1p.pdf). O filme mostra o texto extraído do PDF, os pixels e o texto de referência da tarefa visual, a resposta gravada da página 2 e as duas regiões que continuam pendentes no resultado. [Fontes e créditos](docs/midia/README.md)
-
 ```python
 import lince
 
