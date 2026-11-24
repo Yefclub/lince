@@ -23,6 +23,9 @@ Por tipo de conteúdo:
 - Tabela simples: tabela Markdown. Tabela com célula mesclada ou cabeçalho em
   várias linhas: HTML (<table>, <th>, rowspan/colspan) com cada valor na sua
   célula; linha de subgrupo/subtotal recuada leva data-level="1" no <td>.
+  Se cor ou hachura distinguir condições, escreva a condição em cada grupo de
+  colunas, linha ou célula correspondente (por exemplo, efetivo e projeção).
+  Conserve também a legenda. Marque [ilegível] onde não puder associá-la.
 - Equação: LaTeX. Em bloco com $$ … $$, no meio do texto com $ … $.
 - Algoritmo/pseudocódigo: bloco de código com a numeração e o recuo originais.
 - Gráfico: "Gráfico (<tipo>): <título>"; eixos com unidade e escala (linear/log);

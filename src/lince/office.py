@@ -1,6 +1,8 @@
 """Office (DOCX, PPTX, XLSX, ODF, RTF, EPUB, legados): anydoc + gráficos nativos, setas de fluxograma e imagens."""
 
+import copy
 import hashlib
+import html
 import io  # noqa: F401
 import json  # noqa: F401
 import os  # noqa: F401
@@ -8,14 +10,16 @@ import posixpath
 import re
 import secrets
 import zipfile
+from typing import NamedTuple
 from xml.etree import ElementTree as ET  # noqa: F401
 
 from lxml import etree
 
-from . import legados, perfil_tabular
+from . import legados, perfil_tabular, xlsx_anotacoes
 from .limites import DocumentoRecusado, xml_ou_nada
 from .metadados import BINARIOS_OLE, ERROS_DE_PARTE, ODF
 from .seguranca import NAO_CONFERIDO, XMLIlegivel, _xml, fora_da_conferencia, limpar_docx, limpar_pptx
+from .texto import romano
 
 NS = {
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
@@ -39,12 +43,37 @@ TIPOS_GRAFICO = {
 
 _CELULAS_SEM_CACHE_MAX = 100_000  # intervalo de série sem cache lido da planilha; um gráfico real tem centenas
 _UNIAO_SEM_CACHE_MAX = 1_000_000  # retângulo que cobre os intervalos de uma aba, lido de uma vez
-# onde cada campo da série aponta para a planilha quando o gráfico não guarda os valores
-_CAMPOS_SEM_CACHE = (
-    ("nome", ("c:tx/c:strRef",)),
-    ("cats", ("c:cat/c:strRef", "c:cat/c:numRef")),
-    ("vals", ("c:val/c:numRef",)),
-)
+# Total de células das tabelas dos gráficos OOXML. idx e ptCount vêm do arquivo e podem declarar bilhões de lacunas.
+_CELULAS_GRAFICOS_MAX = 1_000_000
+
+
+class _Pontos(NamedTuple):
+    valores: dict[int, str]
+    quantidade: int
+
+
+def _indice(el, atributo):
+    try:
+        n = int(el.get(atributo, ""))
+        if 0 <= n <= 4_294_967_295:  # unsignedInt no OOXML
+            return n
+    except ValueError:
+        pass
+    raise ValueError(f"{el.tag.rsplit('}', 1)[-1]} com {atributo} ausente ou inválido")
+
+
+def _pontos(campo):
+    if campo is None:
+        return _Pontos({}, 0)
+    qtd = campo.find(".//c:ptCount", NS)
+    tamanho = _indice(qtd, "val") if qtd is not None else 0
+    pontos = {}
+    # Nas categorias hierárquicas, cada nível pode ter um rótulo no mesmo índice.
+    for pt in campo.iterfind(".//c:pt", NS):
+        idx = _indice(pt, "idx")
+        pontos.setdefault(idx, []).append(pt.findtext("c:v", default="", namespaces=NS) or "")
+        tamanho = max(tamanho, idx + 1)
+    return _Pontos({idx: " / ".join(reversed(rotulos)) for idx, rotulos in pontos.items()}, tamanho)
 
 
 def _intervalo(el, nomes_das_abas):
@@ -54,15 +83,15 @@ def _intervalo(el, nomes_das_abas):
 
     f = el.find("c:f", NS) if el is not None else None
     m = re.match(r"^'?(.+?)'?!(.+)$", (f.text or "") if f is not None else "")
-    if not m or m.group(1) not in nomes_das_abas:
+    if not m or (aba := m.group(1).replace("''", "'")) not in nomes_das_abas:
         return None
     try:
         c1, l1, c2, l2 = range_boundaries(m.group(2).replace("$", ""))
     except ValueError:
         return None
-    if None in (c1, l1, c2, l2) or (c2 - c1 + 1) * (l2 - l1 + 1) > _CELULAS_SEM_CACHE_MAX:
+    if None in (c1, l1, c2, l2) or c2 < c1 or l2 < l1 or (c2 - c1 + 1) * (l2 - l1 + 1) > _CELULAS_SEM_CACHE_MAX:
         return None
-    return m.group(1), c1, l1, c2, l2
+    return aba, c1, l1, c2, l2
 
 
 def _valores_sem_cache(path, refs) -> dict:
@@ -79,7 +108,7 @@ def _valores_sem_cache(path, refs) -> dict:
         for aba, rs in por_aba.items():
             c1, l1 = min(r[1] for r in rs), min(r[2] for r in rs)
             c2, l2 = max(r[3] for r in rs), max(r[4] for r in rs)
-            if (c2 - c1 + 1) * (l2 - l1 + 1) <= _UNIAO_SEM_CACHE_MAX:
+            if (c2 - c1 + 1) * (l2 - l1 + 1) <= min(_UNIAO_SEM_CACHE_MAX, _CELULAS_GRAFICOS_MAX):
                 grade = list(wb[aba].iter_rows(min_row=l1, max_row=l2, min_col=c1, max_col=c2, values_only=True))
                 for r in rs:
                     out[r] = [v for linha in grade[r[2] - l1 : r[4] - l1 + 1] for v in linha[r[1] - c1 : r[3] - c1 + 1]]
@@ -92,9 +121,41 @@ def _valores_sem_cache(path, refs) -> dict:
     return out
 
 
-def graficos_ooxml(path):
+def _titulo_grafico(el):
+    if el is None:
+        return ""
+    return " ".join(t.text or "" for t in el.findall(".//a:t", NS)).strip() or el.findtext(".//c:v", "", NS)
+
+
+def _area_intervalo(r):
+    return (r[3] - r[1] + 1) * (r[4] - r[2] + 1)
+
+
+def _series_ooxml(tipo_el, xy, abas, pendentes):
+    series = []
+    for ser in tipo_el.findall("c:ser", NS):
+        cat = ser.find("c:xVal" if xy else "c:cat", NS)
+        val = ser.find("c:yVal" if xy else "c:val", NS)
+        ref = val.findtext(".//c:f", namespaces=NS) if val is not None else None
+        s = {"nome": ser.findtext("c:tx//c:v", default="", namespaces=NS), "ref": ref}
+        for campo, el in [("cats", cat), ("vals", val)]:
+            s[campo] = _pontos(el)
+            if abas and not s[campo].quantidade and el is not None:
+                for fonte in el:
+                    if r := _intervalo(fonte, abas):
+                        s[campo] = _Pontos({}, _area_intervalo(r))
+                        pendentes.append((s, campo, r))
+                        break
+        if abas and not s["nome"] and (r := _intervalo(ser.find("c:tx/c:strRef", NS), abas)):
+            pendentes.append((s, "nome", r))
+        series.append(s)
+    return series
+
+
+def graficos_ooxml(path, partes=None):
     """Gráfico nativo do Office: tipo, título, séries e valores do cache — dado exato. Sem cache (gráfico gravado
     por biblioteca), os valores vêm do intervalo na planilha, lidos depois de todos os gráficos, uma vez por aba."""
+    saldo_intervalos = saldo_tabelas = _CELULAS_GRAFICOS_MAX
     out, pendentes = [], []  # (série, campo, intervalo) a completar com os valores da planilha
     planilha = path.lower().endswith((".xlsx", ".xlsm"))
     with zipfile.ZipFile(path) as z:
@@ -106,38 +167,63 @@ def graficos_ooxml(path):
                 if livro is not None
                 else set()
             )
-        for nome in sorted(n for n in z.namelist() if re.search(r"/charts/chart\d+\.xml$", n)):
+        if partes is None:
+            partes = sorted(n for n in z.namelist() if re.search(r"/charts/chart\d+\.xml$", n))
+        for nome in partes:
             root = xml_ou_nada(z.read(nome))
             if root is None or root.find(".//c:plotArea", NS) is None:
                 continue  # gráfico malformado ou hostil: a leitura segue sem ele
-            titulo = " ".join(t.text or "" for t in root.findall(".//c:title//a:t", NS)).strip()
+            titulo = _titulo_grafico(root.find(".//c:chart/c:title", NS))
             plot = root.find(".//c:plotArea", NS)
-            for tipo_el in list(plot):
-                tag = tipo_el.tag.split("}")[1]
+            eixos = {
+                eixo.find("c:axId", NS).get("val"): _titulo_grafico(eixo.find("c:title", NS))
+                for eixo in plot
+                if eixo.find("c:axPos", NS) is not None and eixo.find("c:axId", NS) is not None
+            }
+            tipos = [e.tag.rsplit("}", 1)[-1] for e in plot if e.tag.endswith("Chart")]
+            completo = all(t in TIPOS_GRAFICO and t != "bubbleChart" for t in tipos)
+            for tipo_el in plot:
+                tag = tipo_el.tag.rsplit("}", 1)[-1]
                 if tag not in TIPOS_GRAFICO:
                     continue
-                series = []
-                for ser in tipo_el.findall("c:ser", NS):
-                    ref = ser.find("c:val//c:f", NS)
-                    s = {
-                        "nome": " ".join(v.text or "" for v in ser.findall("c:tx//c:v", NS)),
-                        "cats": [v.text for v in ser.findall("c:cat//c:pt/c:v", NS)],
-                        "vals": [v.text for v in ser.findall("c:val//c:pt/c:v", NS)],
-                        "ref": ref.text if ref is not None else None,
-                    }
-                    for campo, caminhos in _CAMPOS_SEM_CACHE:
-                        if not s[campo] and planilha:
-                            for caminho in caminhos:
-                                if r := _intervalo(ser.find(caminho, NS), abas):
-                                    pendentes.append((s, campo, r))
-                                    break
-                    series.append(s)
-                out.append({"parte": nome, "tipo": TIPOS_GRAFICO[tag], "titulo": titulo, "series": series})
+                xy = tag == "scatterChart"
+                ids = [e.get("val") for e in tipo_el.findall("c:axId", NS)]
+                g = {
+                    "parte": nome,
+                    "tipo": TIPOS_GRAFICO[tag],
+                    "titulo": titulo,
+                    "xy": xy,
+                    "series": [],
+                    "completo": completo,
+                    "eixo": eixos.get(ids[0], "") if ids else "",
+                    "eixo_y": eixos.get(ids[1], "") if len(ids) > 1 else "",
+                }
+                out.append(g)
+                faltantes = []
+                try:
+                    g["series"] = _series_ooxml(tipo_el, xy, abas, faltantes)
+                except ValueError as erro:
+                    g["falha"] = str(erro)
+                    continue
+                if planilha:
+                    # Cobrar cada cópia do intervalo e todas as tabelas anteriores, mesmo as que tinham cache.
+                    custo_intervalos = sum(_area_intervalo(r) for _, _, r in faltantes)
+                    custo_tabela = _dimensoes_grafico(g)[-1]
+                    if custo_intervalos > saldo_intervalos or custo_tabela > saldo_tabelas:
+                        g["falha"] = "teto de células dos gráficos OOXML"
+                        continue
+                    saldo_intervalos -= custo_intervalos
+                    saldo_tabelas -= custo_tabela
+                    pendentes.extend(faltantes)
     if pendentes:
         valores = _valores_sem_cache(path, {r for _, _, r in pendentes})
         for s, campo, r in pendentes:
-            lidos = [str(v) for v in valores.get(r, [])]
-            s[campo] = " ".join(lidos) if campo == "nome" else lidos
+            lidos = valores.get(r, [])
+            if campo == "nome":
+                s[campo] = " ".join(str(v) for v in lidos if v is not None)
+            else:
+                tamanho = _area_intervalo(r)
+                s[campo] = _Pontos({i: str(v) for i, v in enumerate(lidos) if v is not None}, tamanho)
     for g in out:
         for s in g["series"]:
             s["nome"] = s["nome"] or "série"
@@ -243,8 +329,64 @@ def _grafico_odf(z, nome, ilegiveis, saldo) -> dict | None:
     }
 
 
-def grafico_md(g):
+def _dimensoes_grafico(g):
+    series = g["series"]
+    eixos = [s["cats"] for s in series if s["cats"].quantidade]
+    alturas = [max(s["cats"].quantidade, s["vals"].quantidade) for s in series]
+    linhas = max(alturas, default=0)
+    separar = g["xy"] or any(e != eixos[0] for e in eixos[1:])  # os eixos X podem ser independentes
+    custo = 2 * sum(alturas) if separar else linhas * (len(series) + 1)
+    return eixos, linhas, separar, custo
+
+
+def _tabela_ooxml(g, saldo, ilegiveis):
+    """Renderiza cada coordenada pelo índice no arquivo. Um ptCount alto não aloca uma lista de vazios."""
+    if "falha" in g:
+        ilegiveis.append(f"gráfico {g['parte']}: {g['falha']}")
+        return "[tabela do gráfico não lida]"
+    ss = g["series"]
+    eixos, linhas, separar, custo = _dimensoes_grafico(g)
+    if not linhas:
+        refs = ", ".join(s["nome"] + (f" ({s['ref']})" if s["ref"] else "") for s in ss)
+        return f"Séries: {refs} — sem valores em cache; dados na planilha."
+    if custo > saldo[0]:
+        ilegiveis.append(f"gráfico {g['parte']}: teto de células dos gráficos OOXML")
+        return "[tabela do gráfico não lida]"
+    saldo[0] -= custo
+    if separar:
+        partes = []
+        for s in ss:
+            cats, vals = s["cats"], s["vals"]
+            x = _celula(g["eixo"] or ("X" if g["xy"] else "Categoria"))
+            y = _celula(g["eixo_y"] or ("Y" if g["xy"] else "Valor"))
+            cabecalho = f"| {x} | {y} |"
+            tabela = [f"**{_celula(s['nome'])}**", "", cabecalho, "| --- | --- |"]
+            for k in range(max(cats.quantidade, vals.quantidade)):
+                tabela.append(f"| {_celula(cats.valores.get(k))} | {_celula(vals.valores.get(k))} |")
+            partes.append("\n".join(tabela))
+        return "\n\n".join(partes)
+    tabela = [
+        "| " + " | ".join([_celula(g["eixo"] or "Categoria"), *(_celula(s["nome"]) for s in ss)]) + " |",
+        "|" + " --- |" * (len(ss) + 1),
+    ]
+    if g["eixo_y"]:
+        tabela[:0] = [f"Eixo de valores: {_celula(g['eixo_y'])}", ""]
+    for k in range(linhas):
+        cat = _celula(eixos[0].valores.get(k)) if eixos else str(k + 1)
+        tabela.append("| " + " | ".join([cat, *(_celula(s["vals"].valores.get(k)) for s in ss)]) + " |")
+    return "\n".join(tabela)
+
+
+def grafico_md(g, saldo=None, ilegiveis=None):
     linhas = [f"**Gráfico ({g['tipo']}): {g['titulo'] or 'sem título'}**"]
+    if "xy" in g:
+        return (
+            linhas[0]
+            + "\n"
+            + _tabela_ooxml(
+                g, saldo if saldo is not None else [_CELULAS_GRAFICOS_MAX], ilegiveis if ilegiveis is not None else []
+            )
+        )
     ss = g["series"]
     if ss and ss[0]["vals"]:
         cats = ss[0]["cats"] or [str(k + 1) for k in range(len(ss[0]["vals"]))]
@@ -303,14 +445,22 @@ def fluxos_pptx(path):
         arestas = []
         for c, a_, b_ in conectores:
             rot = de_rotulo.get(id(c))
-            arestas.append(f"{nomes.get(a_, a_)} → {nomes.get(b_, b_)}" + (f" ({rot})" if rot else ""))
+            pontas = []
+            for tag in ("headEnd", "tailEnd"):
+                el = c._element.find(f"p:spPr/a:ln/a:{tag}", NS)
+                pontas.append(el is not None and el.get("type") in {"arrow", "stealth", "triangle"})
+            inicio, fim = pontas
+            if inicio and not fim:
+                a_, b_ = b_, a_
+            seta = "↔" if inicio and fim else "→" if inicio or fim else "—"
+            arestas.append((nomes.get(a_, a_), seta, nomes.get(b_, b_), rot))
         if arestas:
             out[n] = arestas
     return out
 
 
 def mermaid_do_fluxo(arestas):
-    """Arestas "A → B" em flowchart Mermaid (rótulos das caixas preservados)."""
+    """Diagrama Mermaid com a direção e o rótulo de cada ligação."""
     ids, linhas = {}, ["```mermaid", "flowchart LR"]
 
     def no(nome):
@@ -320,15 +470,11 @@ def mermaid_do_fluxo(arestas):
             linhas.append(f'    {ids[nome]}["{rot}"]')
         return ids[nome]
 
-    pares = []
-    for ar in arestas:
-        a, b = ar.split(" → ", 1)
-        m = re.match(r"^(.*) \(([^()]{1,15})\)$", b)
-        b, rot = (m.group(1), m.group(2)) if m else (b, None)
-        pares.append((a, b, rot))
-    for a, b, _ in pares:
+    operadores = {"→": "-->", "↔": "<-->", "—": "---"}
+    for a, _, b, _ in arestas:
         no(a), no(b)
-    linhas += [f"    {ids[a]} -->{'|' + rot + '|' if rot else ''} {ids[b]}" for a, b, rot in pares]
+    for a, seta, b, rot in arestas:
+        linhas.append(f"    {ids[a]} {operadores[seta]}{'|' + rot + '|' if rot else ''} {ids[b]}")
     return "\n".join(linhas + ["```"])
 
 
@@ -341,6 +487,8 @@ def planejar_office(path, pasta, ext=None):
     grande = ext in (".xlsx", ".xlsm") and _celulas_declaradas(path) > _CELULAS_ANYDOC_MAX
     # planilha grande não passa pelo anydoc, que monta o documento inteiro na memória (1,2 GB para 100 mil linhas)
     marca = f"LINCE{secrets.token_hex(8)}D"  # início de cada slide, trocado por <!-- slide N --> depois da leitura
+    ilegiveis, graficos_pptx = [], {}
+    saldo_graficos = [_CELULAS_GRAFICOS_MAX]
     limpeza = None  # o texto oculto sai do próprio XML, antes da conversão: nunca por busca no Markdown montado
     if grande:
         doc = None
@@ -349,12 +497,25 @@ def planejar_office(path, pasta, ext=None):
         # a limpeza segue o formato que o anydoc vai ler, pelo conteúdo (um Word gravado como .doc, ou uma apresentação
         # como .docx, é conferido), e o anydoc recebe esse formato explícito
         formato = "csv" if ext in (".csv", ".tsv") else anydoc.format_from_bytes(dados)
+        letras = None
         if formato == "docx":
-            dados = (limpeza := limpar_docx(dados)).dados
+            marca_letra = marca + "A"
+            dados = (limpeza := limpar_docx(dados, formatar_texto=True, marca_letra=marca_letra)).dados
+            letras = re.compile(rf"{marca_letra}([a-zA-Z]+|0):")
         elif formato == "pptx":
             dados = (limpeza := limpar_pptx(dados)).dados
         if ext in PPTX:
-            dados = _com_marcas_de_slide(dados, marca)
+
+            def tabelas_pptx():
+                for g in graficos_ooxml(path):
+                    graficos_pptx.setdefault(g["parte"], []).append(g)
+
+            _complemento(tabelas_pptx, "gráficos", ilegiveis)
+            marcas_graficos = {
+                parte: (f"{marca}G{i}X", grupos[0]["completo"])
+                for i, (parte, grupos) in enumerate(graficos_pptx.items())
+            }
+            dados = _com_marcas_de_slide(dados, marca, marcas_graficos)
         try:
             doc = anydoc.to_document(dados, format=formato if formato in ("csv", "docx", "pptx") else None)
         except anydoc.ConvertError as recusa:
@@ -367,15 +528,19 @@ def planejar_office(path, pasta, ext=None):
                 raise
             except Exception:  # noqa: BLE001 — o leitor tolerante também não abre: vale o erro do leitor do corpo
                 raise recusa from None
-    tarefas, ilegiveis, pendentes = [], [], []  # pendentes: o que entra em cobertura.pendentes, com o motivo
+    tarefas, pendentes = [], []  # pendentes: o que entra em cobertura.pendentes, com o motivo
     svgs, sentinela = [], f"LINCE{secrets.token_hex(8)}S"  # desenhos vetoriais, juntos no fim, num lote só
     vistas = set()  # imagens já lidas (sha256): o armazém dos binários não as repete
 
-    def ler_imagem(data, mime, onde):
+    alternativas = {}
+
+    def ler_imagem(data, mime, onde, alt=""):
         """A imagem vira tarefa da IA; a que não abre (formato quebrado) fica marcada no lugar e registrada, nunca
         derruba o documento. SVG, EMF e WMF ficam com uma marca provisória e são desenhados no fim, num lote só."""
         from PIL import Image
 
+        if alt:
+            alternativas[onde] = alt
         vistas.add(hashlib.sha256(data).digest())
         tid = f"img{len(tarefas) + 1:02d}"
         try:
@@ -386,24 +551,50 @@ def planejar_office(path, pasta, ext=None):
             if "svg" in (mime or "").lower() or _metafile(data, mime):
                 svgs.append((data, mime, onde))
                 return f"{sentinela}{len(svgs) - 1}X"
-            return _nao_lida(onde, mime, ilegiveis)
+            return _nao_lida(onde, mime, ilegiveis) + (f" [texto alternativo: {alt}]" if alt else "")
         tarefas.append({"id": tid, "modo": "imagem", "ancora": onde})
         return f"{{{{IA:{tid}}}}}"
 
+    limites_formulas = {} if grande else None
     if grande:
-        md, perfis = _xlsx_em_fluxo(path, ilegiveis)
+        md, perfis = _xlsx_em_fluxo(path, ilegiveis, limites_formulas)
     elif doc is None:
         (md, perfis), ilegiveis[:0] = md_xlsb, ilegiveis_xlsb
     else:
-        md = serializar(doc, ler_imagem)[0]
-        perfis = _perfis(doc) if ext in PLANILHAS else []
+        md = serializar(doc, ler_imagem, formato=formato, marca_slide=marca if ext in PPTX else None, letras=letras)[0]
+        perfis = _perfis(doc) if ext in PLANILHAS - {".xlsx", ".xlsm"} else []
         if limpeza is not None:  # a rede de segurança: o que o anydoc leu e a conferência não viu é falha
-            lido = re.sub(rf"{marca}\d+X", " ", texto_lido(doc))
+            lido = re.sub(rf"{marca}G?\d+X", " ", texto_lido(doc))
+            if letras is not None:
+                lido = letras.sub(" ", lido)  # a marca aleatória e o contador vêm da máscara, fora do corpo
             if falha := fora_da_conferencia(limpeza.vistas, lido):
                 limpeza.falhas.append(falha)
         if ext in PPTX:  # o texto do slide que imita a marca não vira marca: só a do Lince numera os slides
+            # Só a ocorrência da forma cobra o orçamento; slides distintos podem apontar para a mesma parte.
+            graficos = list(graficos_pptx.values())
+            caracteres = _CARACTERES_GRAFICOS_MAX
+
+            def substituir_grafico(m):
+                nonlocal caracteres
+                textos = []
+                for g in graficos[int(m[1])]:
+                    titulo = g["titulo"]
+                    nota = f"_(gráfico de {g['tipo']} acima: {titulo or 'sem título'})_"
+                    texto = nota
+                    if g["completo"] and caracteres:
+                        tabela = _tabela_ooxml(g, saldo_graficos, ilegiveis)
+                        texto = "\n\n".join(filter(None, (titulo, tabela, nota)))
+                    if len(texto) > caracteres:
+                        caracteres = 0
+                        ilegiveis.append(f"gráfico {g['parte']}: teto de caracteres dos gráficos")
+                        return "[gráfico não lido]"
+                    caracteres -= len(texto)
+                    textos.append(texto)
+                return "\n\n".join(textos)
+
+            md = re.sub(rf"(?m)^{marca}G(\d+)X$", substituir_grafico, md)
             md = re.sub(r"(?m)^(<!-- slide \d+ -->)$", r"\\\1", md)
-            md = re.sub(rf"(?m)^{marca}(\d+)X$", r"<!-- slide \1 -->", md)
+            md = re.sub(rf"(?m)^{marca}(\d+)X$", r'<!-- slide \1 -->\n\n<a id="slide-\1"></a>', md)
     if ext in BINARIOS_OLE:  # o leitor do corpo quase não entrega as imagens do .doc, .xls e .ppt: o armazém, sim
 
         def imagens_legado():
@@ -447,8 +638,22 @@ def planejar_office(path, pasta, ext=None):
             seguranca.append(
                 {"tecnicas": sorted({m for m, _ in ocultos}), "texto": " ".join(t for _, t in ocultos)[:500]}
             )
-    extras = []
+    extras, anotacoes = [], []
     if ext in (".xlsx", ".xlsm"):  # o anydoc não extrai imagem de planilha: as partes de desenho, com aba e célula
+
+        def anotacoes_planilha():
+            nonlocal perfis
+            cortadas = {p["aba"] for p in perfis if p.get("extracao_cortada")}
+            grades = xlsx_anotacoes.extrair(path, limites_formulas, cortadas, anotacoes, pendentes)
+            if doc is not None:
+                perfis = _perfis(doc, grades)
+
+        _complemento(anotacoes_planilha, "anotações da planilha", pendentes)
+        if doc is not None and not perfis:
+            perfis = _perfis(doc)
+        _complemento(
+            lambda: _formulas_xlsx(path, limites_formulas, extras, pendentes), "fórmulas da planilha", ilegiveis
+        )
 
         def imagens_planilha():
             nonlocal md
@@ -468,7 +673,20 @@ def planejar_office(path, pasta, ext=None):
 
         _complemento(imagens_ods, "imagens da planilha", ilegiveis)
     if ext in (".xlsx", ".xlsm", ".docx"):
-        _complemento(lambda: extras.extend(grafico_md(g) for g in graficos_ooxml(path)), "gráficos", ilegiveis)
+        _complemento(
+            lambda: extras.extend(grafico_md(g, saldo_graficos, ilegiveis) for g in graficos_ooxml(path)),
+            "gráficos",
+            ilegiveis,
+        )
+    if ext == ".xlsb":
+        falhas_desenhos = []
+        _complemento(
+            lambda: _desenhos_xlsb(path, extras, falhas_desenhos, saldo_graficos),
+            "desenhos da planilha",
+            falhas_desenhos,
+        )
+        ilegiveis.extend(falhas_desenhos)
+        pendentes.extend(falhas_desenhos)
     if ext == ".xls":  # o gráfico do Excel 97-2003: tipo, título e séries; os valores já estão nas células
 
         def graficos_xls():
@@ -491,44 +709,42 @@ def planejar_office(path, pasta, ext=None):
     if ext in ODF:  # o leitor do corpo não entrega o gráfico do LibreOffice: tipo, título e os dados que ele desenha
         _complemento(lambda: extras.extend(grafico_md(g) for g in graficos_odf(path, ilegiveis)), "gráficos", ilegiveis)
     if ext in PPTX:
-        por_slide = {}  # n -> o que entra no fim do slide (ou logo depois da tabela do gráfico)
 
         def diagramas():
-            for n, arestas in fluxos_pptx(io.BytesIO(limpeza.dados)).items():  # o rótulo oculto não vira aresta
-                por_slide.setdefault(n, []).append(
-                    (
-                        None,
-                        f"**Diagrama do slide {n}:**\n\n"
-                        + mermaid_do_fluxo(arestas)
-                        + "\n\n"
-                        + "\n".join(f"- {a}" for a in arestas),
-                    )
+            nonlocal md
+            partes = re.split(r"(?m)^(<!-- slide \d+ -->)$", md)
+            inicio = {int(re.search(r"\d+", partes[k]).group()): k + 1 for k in range(1, len(partes), 2)}
+            for n, arestas in fluxos_pptx(io.BytesIO(limpeza.dados)).items():
+                texto = (
+                    f"**Diagrama do slide {n}:**\n\n"
+                    + mermaid_do_fluxo(arestas)
+                    + "\n\n"
+                    + "\n".join(f"- {a} {seta} {b}" + (f" ({rot})" if rot else "") for a, seta, b, rot in arestas)
                 )
+                if n in inicio:
+                    k = inicio[n]
+                    partes[k] = partes[k].rstrip("\n") + "\n\n" + texto + "\n\n"
+                else:
+                    extras.append(texto)
+            md = "".join(partes)
 
         _complemento(diagramas, "diagramas de formas", ilegiveis)
-
-        def graficos():  # o leitor do corpo já entrega os dados; o tipo e o título entram logo depois da tabela
-            slide_do_grafico = _slides_dos_graficos(path)
-            for g in graficos_ooxml(path):
-                nota = f"_(gráfico de {g['tipo']} acima: {g['titulo'] or 'sem título'})_"
-                n = slide_do_grafico.get(g["parte"])
-                if n is None:
-                    extras.append(nota)
-                else:
-                    por_slide.setdefault(n, []).append(([se["nome"] for se in g["series"]], nota))
-
-        _complemento(graficos, "gráficos", ilegiveis)
-        md = _nos_slides(md, por_slide, extras)
     if svgs:
-        md = re.sub(rf"{sentinela}(\d+)X", _desenhar_svgs(svgs, pasta, tarefas, ilegiveis, pendentes), md)
+        md = re.sub(rf"{sentinela}(\d+)X", _desenhar_svgs(svgs, pasta, tarefas, ilegiveis, pendentes, alternativas), md)
     return {
         "tipo": "office",
         "md": md,
         "extras": extras,
+        "anotacoes_planilha": "\n".join(anotacoes),
         "tarefas": tarefas,
         "texto_oculto": seguranca,
         "ilegiveis": ilegiveis,
         "perfil_tabular": perfis,
+        **(
+            {"alt_das_tarefas": {t["id"]: alternativas[t["ancora"]] for t in tarefas if t["ancora"] in alternativas}}
+            if alternativas
+            else {}
+        ),
         "pendentes": pendentes,
         "slides": ext in PPTX,  # só a apresentação tem <!-- slide N --> com a posição na estrutura
     }
@@ -628,7 +844,94 @@ _PKG = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 _A_BLIP = "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
 
 
-def _alvos(z, parte, nomes) -> dict:
+def _formulas_xlsx(path, limites, extras, pendentes):
+    """Localiza as células de fórmula e distingue <v> salvo de cache ausente. Na rota grande, até a última linha
+    lida de cada aba. Os endereços são amostras limitadas por aba, mesmo se todas as células forem fórmulas."""
+    from openpyxl.utils import column_index_from_string, get_column_letter
+
+    with zipfile.ZipFile(path) as z:
+        nomes = set(z.namelist())
+        parte_livro = next(iter(_alvos(z, "", nomes, "officeDocument").values()), "xl/workbook.xml")
+        if parte_livro not in nomes:
+            return
+        livro = xml_ou_nada(z.read(parte_livro))
+        alvos = _alvos(z, parte_livro, nomes)
+        for aba in livro.findall(".//{*}sheets/{*}sheet") if livro is not None else ():
+            rid = aba.get(f"{_REL}id") or aba.get("{http://purl.oclc.org/ooxml/officeDocument/relationships}id")
+            nome, parte = aba.get("name"), alvos.get(rid)
+            if (
+                aba.get("state", "visible") != "visible"
+                or parte not in nomes
+                or (limites is not None and nome not in limites)
+            ):
+                continue
+            totais, enderecos = [0, 0], [[], []]
+            linha = 0
+            mostrar_expressao, depois_da_grade = True, False
+            with z.open(parte) as arquivo:
+                for _, el in etree.iterparse(
+                    arquivo,
+                    resolve_entities=False,
+                    load_dtd=False,
+                    no_network=True,
+                ):
+                    if el.tag.endswith("}sheetProtection") and el.get("sheet") in ("1", "true"):
+                        mostrar_expressao = False
+                        break
+                    if el.tag.endswith("}sheetData"):
+                        depois_da_grade = True
+                    if not el.tag.endswith("}row"):
+                        if depois_da_grade:
+                            el.clear()
+                            while el.getprevious() is not None:
+                                del el.getparent()[0]
+                        continue
+                    linha = int(el.get("r", linha + 1))
+                    if limites is not None and linha > limites[nome]:
+                        # A proteção fica depois da grade. Preserva os endereços sem percorrer a aba cortada até o fim.
+                        mostrar_expressao = False
+                        break
+                    ultima_ref, sem_ref = "", 0
+                    for c in el.iterfind("{*}c"):
+                        if endereco := c.get("r"):
+                            ultima_ref, sem_ref = endereco, 0
+                        else:
+                            sem_ref += 1
+                        formula = c.find("{*}f")
+                        if formula is not None:
+                            v = c.find("{*}v")
+                            salvo = v is not None and (v.text is not None or c.get("t") == "str")
+                            totais[salvo] += 1
+                            if len(enderecos[salvo]) < 32:
+                                if not endereco:
+                                    coluna = (
+                                        column_index_from_string(ultima_ref.rstrip("0123456789")) if ultima_ref else 0
+                                    )
+                                    endereco = f"{get_column_letter(coluna + sem_ref)}{linha}"
+                                expressao_md = ""
+                                if formula.text:
+                                    expressao = " ".join(formula.text.splitlines())
+                                    if len(expressao) > CARACTERES_POR_CELULA_MAX:
+                                        expressao = expressao[:CARACTERES_POR_CELULA_MAX] + "…"
+                                    crases = max((len(m) for m in re.findall(r"`+", expressao)), default=0) + 1
+                                    marca = "`" * crases
+                                    expressao_md = f" {marca} ={expressao} {marca}"
+                                enderecos[salvo].append((endereco, expressao_md))
+                    el.clear()
+                    while el.getprevious() is not None:
+                        del el.getparent()[0]
+            for salvo, quantidade in enumerate(totais):
+                if quantidade:
+                    estado = "com resultado salvo no arquivo (sem recálculo)" if salvo else "sem resultado salvo"
+                    itens = [e + f if mostrar_expressao else e for e, f in enderecos[salvo]]
+                    amostra = ", ".join(itens) + (", …" if quantidade > len(itens) else "")
+                    aviso = f"Aba {nome} — células de fórmula {estado} ({quantidade}): {amostra}."
+                    extras.append(aviso)
+                    if not salvo:
+                        pendentes.append(aviso)
+
+
+def _alvos(z, parte, nomes, *tipos, externos=False) -> dict:
     """Id -> parte do zip das relações de `parte` (alvo relativo à pasta dela, ou absoluto a partir da raiz)."""
     pasta, arquivo = posixpath.split(parte)
     rels = posixpath.join(pasta, "_rels", arquivo + ".rels")
@@ -636,11 +939,97 @@ def _alvos(z, parte, nomes) -> dict:
     out = {}
     for r in raiz.iter(f"{_PKG}Relationship") if raiz is not None else ():
         alvo = r.get("Target") or ""
-        if r.get("TargetMode") != "External":
+        if (r.get("TargetMode") == "External") == externos and (
+            not tipos or r.get("Type", "").rsplit("/", 1)[-1] in tipos
+        ):
             out[r.get("Id")] = (
-                alvo.lstrip("/") if alvo.startswith("/") else posixpath.normpath(posixpath.join(pasta, alvo))
+                alvo
+                if externos
+                else (alvo.lstrip("/") if alvo.startswith("/") else posixpath.normpath(posixpath.join(pasta, alvo)))
             )
     return out
+
+
+def _objetos_visiveis_xlsb(raiz):
+    """Formas e quadros gráficos na ordem do desenho. Um grupo oculto esconde também todo o seu conteúdo."""
+    fila = [raiz]
+    while fila:
+        el = fila.pop()
+        if el.tag in (f"{_XDR}grpSp", f"{_XDR}sp", f"{_XDR}graphicFrame"):
+            prop = el.find(f"*/{_XDR}cNvPr")
+            if prop is not None and prop.get("hidden") in ("1", "true"):
+                continue
+            if el.tag != f"{_XDR}grpSp":
+                yield el
+                continue
+        fila.extend(reversed(el))
+
+
+def _desenhos_xlsb(path, extras, ilegiveis, saldo):
+    graficos, vistos = {}, set()
+    with zipfile.ZipFile(path) as z:
+        nomes = set(z.namelist())
+        livro = "xl/workbook.bin"
+        if livro not in nomes:
+            return
+        abas = legados.abas_visiveis_xlsb(z.read(livro), _alvos(z, livro, nomes))
+        for nome, parte in abas:
+            desenhos = _alvos(z, parte, nomes, "drawing", "vmlDrawing")
+            if not desenhos or parte not in nomes:
+                continue
+            for rid in legados.desenhos_da_aba_xlsb(z.read(parte)):
+                desenho = desenhos.get(rid)
+                if desenho in vistos:
+                    continue
+                vistos.add(desenho)
+                raiz = xml_ou_nada(z.read(desenho)) if desenho in nomes else None
+                if raiz is None:
+                    ilegiveis.append(f"aba {nome}: desenho {rid} ilegível")
+                    continue
+                if raiz.tag != f"{_XDR}wsDr":
+                    if desenho.lower().endswith(".vml"):
+                        # Notas de célula também têm uma v:textbox: não são caixas de texto do desenho.
+                        if not any(
+                            forma.find("{*}ClientData[@ObjectType='Note']") is None
+                            and (forma.find("{*}textbox") is not None or forma.find("{*}textpath") is not None)
+                            for forma in raiz.iter()
+                        ):
+                            continue
+                    ilegiveis.append(f"aba {nome}: desenho {desenho} em formato sem suporte")
+                    continue
+                rels = _alvos(z, desenho, nomes, "chart")
+                for forma in _objetos_visiveis_xlsb(raiz):
+                    if forma.tag == f"{_XDR}graphicFrame":
+                        for grafico in forma.iter(f"{{{NS['c']}}}chart"):
+                            alvo = rels.get(grafico.get(f"{_REL}id"))
+                            if alvo in nomes:
+                                graficos[alvo] = nome
+                            else:
+                                ilegiveis.append(f"aba {nome}: gráfico sem parte interna legível")
+                        continue
+                    paragrafos = []
+                    for p in forma.findall(f"{_XDR}txBody/a:p", NS):
+                        trechos = []
+                        for t in p.iter():
+                            if t.tag == f"{{{NS['a']}}}t":
+                                trechos.append(t.text or "")
+                            elif t.tag == f"{{{NS['a']}}}br":
+                                trechos.append("\n")
+                        paragrafos.append("".join(trechos))
+                    texto = "\n".join(paragrafos).strip()
+                    if texto:
+                        extras.append(f"**Texto de forma (aba {nome}):**\n\n{texto}")
+                    elif forma.get("textlink"):
+                        ilegiveis.append(f"aba {nome}: forma com texto vinculado sem cópia salva em {desenho}")
+    lidos = set()
+    for g in graficos_ooxml(path, graficos) if graficos else ():
+        parte = g["parte"]
+        lidos.add(parte)
+        extras.append(f"Aba {graficos[parte]}\n\n" + grafico_md(g, saldo, ilegiveis))
+        if any(not s["vals"].quantidade for s in g["series"]):
+            ilegiveis.append(f"aba {graficos[parte]}: gráfico {parte} com série sem valores em cache")
+    for parte in graficos.keys() - lidos:
+        ilegiveis.append(f"aba {graficos[parte]}: gráfico {parte} ilegível ou com tipo sem suporte")
 
 
 def _imagens_xlsx(path, ilegiveis) -> list[tuple[str, str, bytes]]:
@@ -736,7 +1125,24 @@ def _celula(v) -> str:
     return texto.replace("|", "\\|")
 
 
-def _xlsx_em_fluxo(path, ilegiveis) -> tuple[str, list[dict]]:
+def _numero_formatado(celula, formatos_invalidos):
+    from xlformat import format_value
+
+    valor = celula.value
+    if type(valor) not in (int, float) or not (mascara := celula.number_format) or mascara == "General":
+        return _celula(valor)
+    # O Excel admite até 255 caracteres no formato numérico. Uma máscara inválida preserva o valor original.
+    if len(mascara) <= 255:
+        try:
+            return _celula(format_value(valor, mascara))
+        except (ValueError, ArithmeticError):
+            pass
+    if not formatos_invalidos:
+        formatos_invalidos.append(celula.coordinate)
+    return _celula(valor)
+
+
+def _xlsx_em_fluxo(path, ilegiveis, limites_formulas=None) -> tuple[str, list[dict]]:
     """Corpo da planilha grande, aba por aba (as ocultas e as vazias ficam de fora, como no leitor do corpo), em
     tabela Markdown, lida em fluxo. Acima dos tetos, o resto da aba (ou as abas seguintes) não entra, e o aviso fica
     no próprio texto e em `ilegiveis`: quem lê nunca toma o recorte pelo todo. Os tetos contam as células que saem
@@ -758,13 +1164,17 @@ def _xlsx_em_fluxo(path, ilegiveis) -> tuple[str, list[dict]]:
                 continue
             ws.reset_dimensions()  # lê as linhas que existem, não as que a <dimension> declara
             linhas, largura, cortada, vazias, inicio = [], 0, False, 0, None
-            for valores in ws.iter_rows(values_only=True):
-                varridas += len(valores) + 1
+            formatos_invalidos, numeros = [], {}
+            for n_linha, celulas in enumerate(ws.iter_rows(), 1):
+                varridas += len(celulas) + 1
                 if varridas > _VARREDURA_MAX:
                     cortada, esgotado = True, f"teto de {_VARREDURA_MAX} células varridas do documento"
                     break
-                cheias = [i for i, v in enumerate(valores) if _celula(v)]
+                valores = [_numero_formatado(c, formatos_invalidos) for c in celulas]
+                cheias = [i for i, v in enumerate(valores) if v]
                 if not cheias:
+                    if limites_formulas is not None:
+                        limites_formulas[ws.title] = n_linha
                     vazias += bool(linhas)  # linha vazia entre linhas com dados entra na tabela, como no corpo
                     continue
                 nova, n = max(largura, cheias[-1] + 1), len(linhas) + vazias + 1
@@ -774,10 +1184,17 @@ def _xlsx_em_fluxo(path, ilegiveis) -> tuple[str, list[dict]]:
                 if n > LINHAS_POR_ABA_MAX + 1 or nova * n > CELULAS_POR_ABA_MAX:
                     cortada = True
                     break
-                linhas += [[]] * vazias + [[_celula(v) for v in valores[: cheias[-1] + 1]]]
+                if limites_formulas is not None:
+                    limites_formulas[ws.title] = n_linha
+                linhas += [[]] * vazias + [valores[: cheias[-1] + 1]]
+                numeros[len(linhas) - 1] = [i for i, c in enumerate(celulas) if type(c.value) in (int, float)]
                 largura, vazias = nova, 0
                 inicio = cheias[0] if inicio is None else min(inicio, cheias[0])
             total += largura * len(linhas)
+            if formatos_invalidos:
+                ilegiveis.append(
+                    f"aba {ws.title}: formato numérico ilegível a partir de {formatos_invalidos[0]}; valor bruto"
+                )
             if not linhas:
                 if cortada:  # o teto chegou antes da primeira linha: a aba não some sem aviso
                     aviso = f"aba {ws.title}: {esgotado} atingido antes dela"
@@ -790,13 +1207,15 @@ def _xlsx_em_fluxo(path, ilegiveis) -> tuple[str, list[dict]]:
             ]  # colunas à esquerda vazias saem
             tabela = ["| " + " | ".join(corpo[0]) + " |", "|" + " --- |" * (largura - inicio)]
             tabela += ["| " + " | ".join(linha) + " |" for linha in corpo[1:]]
-            aba = perfil_tabular.Aba(ws.title)
-            for linha in corpo:
-                aba.linha([c.replace("\\|", "|") for c in linha])
-            perfis.append(aba.montar(cortada))
+            linhas_perfil = (
+                ([c.replace("\\|", "|") for c in linha], {i - inicio for i in numeros.get(n, ()) if i >= inicio})
+                for n, linha in enumerate(corpo)
+            )
+            perfis_aba = perfil_tabular.perfis_xlsx(ws.title, linhas_perfil, range(inicio + 1, largura + 1), cortada)
+            perfis.extend(perfis_aba)
             texto = titulo + "\n".join(tabela)
             if cortada:
-                com_dado = sum(1 for linha in linhas[1:] if any(linha))  # o mesmo número do perfil
+                com_dado = max(p["linhas_extraidas"] for p in perfis_aba)
                 aviso = f"aba {ws.title} entregue com {com_dado} linhas de dados por limite de extração"
                 texto += (
                     f"\n\n[TRUNCADO: {aviso}. O restante NÃO está nesta leitura; não afirme nada sobre ele. Para a"
@@ -856,7 +1275,7 @@ def _texto_simples(blocos) -> str:
     return "\n\n".join(t for t in (inl(b.content) for b in blocos or []) if t.strip()).replace("\n", " ").strip()
 
 
-def _perfis(doc) -> list[dict]:
+def _perfis(doc, grades=None) -> list[dict]:
     """Perfil de cada tabela da planilha lida pelo anydoc, com o nome da aba pelo título que a precede (planilha de
     aba única e CSV vêm sem título: o nome fica None)."""
     perfis, nome = [], None
@@ -864,10 +1283,21 @@ def _perfis(doc) -> list[dict]:
         if b.kind == "heading":  # o título da aba traz o nome exato, espaços inclusive
             nome = "".join(x.text or "" for x in b.content or [] if x.kind == "text")
         elif b.kind == "table":
-            aba = perfil_tabular.Aba(nome)
-            for linha in b.table.grid:
-                aba.linha([_texto_simples(s.cell.blocks) if s.kind == "origin" and s.cell else "" for s in linha])
-            perfis.append(aba.montar())
+            linhas = (
+                [_texto_simples(s.cell.blocks) if s.kind == "origin" and s.cell else "" for s in linha]
+                for linha in b.table.grid
+            )
+            grade = grades.get(nome) if grades else None
+            if nome is None and grades and len(grades) == 1:
+                grade = next(iter(grades.values()))
+            if grade:
+                tipadas, colunas = grade.projetar(linhas)
+                perfis.extend(perfil_tabular.perfis_xlsx(nome, tipadas, colunas))
+            else:
+                aba = perfil_tabular.Aba(nome)
+                for linha in linhas:
+                    aba.linha(linha)
+                perfis.append(aba.montar())
             nome = None
     return perfis
 
@@ -888,37 +1318,59 @@ def _slides_pptx(z, nomes) -> list[str]:
     return [rels[s.get(f"{_REL}id")] for s in ids if s.get(f"{_REL}id") in rels]
 
 
-def _com_marcas_de_slide(dados: bytes, marca: str) -> bytes:
+def _com_marcas_de_slide(dados: bytes, marca: str, graficos) -> bytes:
     """Cópia do pacote com uma caixa de texto invisível ("<marca>N X", tamanho 1, no canto) no começo de cada slide:
     o leitor do corpo a escreve antes do resto do slide, e ela vira <!-- slide N -->. Slide que não abre fica sem
-    marca (o texto dele segue com o slide anterior); pacote que não abre segue sem marca nenhuma."""
+    marca (o texto dele segue com o slide anterior); pacote que não abre segue sem marca nenhuma. O gráfico tem
+    sua própria marca na posição da forma para a tabela entrar só nele, mesmo que repita o cabeçalho de outro."""
     try:
-        return _marcar(dados, marca)
+        return _marcar(dados, marca, graficos)
     except MemoryError:
         raise
     except Exception:  # noqa: BLE001 — pacote que não dá para copiar (CRC, parte cifrada): segue sem marca
         return dados
 
 
-def _marcar(dados, marca):
+def _marcar(dados, marca, graficos):
 
     with zipfile.ZipFile(io.BytesIO(dados)) as zi:
         nomes = set(zi.namelist())
         ordem = {parte: n for n, parte in enumerate(_slides_pptx(zi, nomes), 1)}
+        notas = {nota for slide in ordem for nota in _alvos(zi, slide, nomes, "notesSlide").values()}
         saida = io.BytesIO()
         with zipfile.ZipFile(saida, "w", zipfile.ZIP_DEFLATED) as zo:
             for info in zi.infolist():
                 conteudo = zi.read(info)
-                if info.filename in ordem:
+                if info.filename in ordem or info.filename in notas:
                     try:
                         raiz = _xml(conteudo)
+                        # O anydoc representa tanto um vínculo externo relativo quanto uma parte interna órfã como
+                        # "relative". Na cópia de leitura, retire só os vínculos internos sem slide de destino.
+                        rels = _alvos(zi, info.filename, nomes)
+                        mudou = False
+                        for link in raiz.iter(f"{{{NS['a']}}}hlinkClick"):
+                            rid = link.get(f"{_REL}id")
+                            if rid in rels and rels[rid] not in ordem:
+                                link.attrib.pop(f"{_REL}id")
+                                mudou = True
                         arvore = raiz.find(f"{_P}cSld/{_P}spTree")
-                        if arvore is not None:
+                        if info.filename in ordem and arvore is not None:
+                            for forma in arvore.iter(f"{_P}graphicFrame"):
+                                ch = forma.find("a:graphic/a:graphicData/c:chart", NS)
+                                if ch is not None and (parte := rels.get(ch.get(f"{_REL}id"))) in graficos:
+                                    marcador, completo = graficos[parte]
+                                    if completo:
+                                        forma.getparent().replace(forma, _caixa_marca(marcador))
+                                    else:  # tipo não interpretado: manter também a tabela do anydoc
+                                        forma.addnext(_caixa_marca(marcador))
                             arvore.insert(min(2, len(arvore)), _caixa_marca(f"{marca}{ordem[info.filename]}X"))
+                            mudou = True
+                        if mudou:
                             conteudo = etree.tostring(raiz, xml_declaration=True, encoding="UTF-8", standalone=True)
                     except XMLIlegivel:
                         pass
-                zo.writestr(info, conteudo)
+                # writestr altera header_offset. As relações podem preceder o slide e ainda serão lidas em zi.
+                zo.writestr(copy.copy(info), conteudo)
     return saida.getvalue()
 
 
@@ -929,40 +1381,6 @@ def _caixa_marca(texto):
         f'txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1" cy="1"/></a:xfrm>'
         f"</p:spPr><p:txBody><a:bodyPr/><a:p><a:r><a:t>{texto}</a:t></a:r></a:p></p:txBody></p:sp>"
     )
-
-
-def _slides_dos_graficos(path) -> dict[str, int]:
-    """Parte do gráfico -> número do slide em que ele está."""
-    with zipfile.ZipFile(path) as z:
-        nomes = set(z.namelist())
-        return {
-            alvo: n
-            for n, parte in enumerate(_slides_pptx(z, nomes), 1)
-            for alvo in _alvos(z, parte, nomes).values()
-            if "/charts/" in alvo
-        }
-
-
-def _nos_slides(md, por_slide, extras) -> str:
-    """Põe cada item no slide dele: o que tem séries logo depois da primeira tabela do slide com essas séries no
-    cabeçalho (a tabela do gráfico), o resto no fim do slide. Sem a marca do slide, vai para o fim do documento."""
-    partes = re.split(r"(?m)^(<!-- slide \d+ -->)$", md)
-    inicio = {int(re.search(r"\d+", partes[k]).group()): k + 1 for k in range(1, len(partes), 2)}
-    for n, itens in por_slide.items():
-        if n not in inicio:
-            extras.extend(texto for _, texto in itens)
-            continue
-        k = inicio[n]
-        for series, texto in itens:
-            tabelas = list(re.finditer(r"(?m)^\|(.*)\|\n\|(?: --- \|)+\n(?:\|.*\|\n?)*", partes[k]))
-            alvo = next(
-                (t for t in tabelas if series and all(f" {nome} " in f" {t.group(1)} " for nome in series)), None
-            )
-            if alvo is None:
-                partes[k] = partes[k].rstrip("\n") + "\n\n" + texto.replace(" acima:", " neste slide:") + "\n\n"
-            else:
-                partes[k] = partes[k][: alvo.end()].rstrip("\n") + "\n\n" + texto + "\n\n" + partes[k][alvo.end() :]
-    return "".join(partes)
 
 
 def _nao_lida(onde, mime, ilegiveis) -> str:
@@ -985,7 +1403,7 @@ def _metafile(data, mime) -> str | None:
     return (mime or "").lower() if (mime or "").lower() in _METAFILES else None
 
 
-def _desenhar_svgs(svgs, pasta, tarefas, ilegiveis, pendentes):
+def _desenhar_svgs(svgs, pasta, tarefas, ilegiveis, pendentes, alternativas):
     """Desenha os SVG, EMF e WMF do documento num lote só (o teto de tempo é do documento) e até DESENHOS_MAX;
     devolve a troca de cada marca provisória pela tarefa da IA ou pela marca de imagem não lida."""
     from lxml import etree
@@ -1019,7 +1437,16 @@ def _desenhar_svgs(svgs, pasta, tarefas, ilegiveis, pendentes):
             if feito.startswith("sem "):  # falta o desenhista: dá para resolver instalando, fica pendente
                 extra = ' (instale "lince[emf]")' if feito == "sem metafile-render" else ""
                 pendentes.append(f"{onde}: {_FORMATOS.get(mime, mime)} não desenhado, {feito}{extra}")
-    return lambda m: trocas[int(m.group(1))]
+
+    def substituir(m):
+        k = int(m.group(1))
+        marca = trocas[k]
+        alt = alternativas.get(svgs[k][2])
+        if alt and not marca.startswith("{{IA:"):
+            return f"{marca} [texto alternativo: {alt}]"
+        return marca
+
+    return substituir
 
 
 def _complemento(funcao, nome, ilegiveis):
@@ -1071,6 +1498,8 @@ def texto_lido(doc) -> str:
                 inl(b.content)
             elif b.kind == "list":
                 for it in b.list.items:
+                    if it.marker_label:
+                        out.append(f" {it.marker_label} ")
                     blocos(it.blocks)
             elif b.kind == "table":
                 for linha in b.table.grid:
@@ -1090,19 +1519,96 @@ def texto_lido(doc) -> str:
     return "".join(out)
 
 
-def serializar(doc, ler_imagem):
+def _link_markdown(rotulo, alvo):
+    """Conserva o destino como dado, sem buscar o recurso."""
+    if alvo is None or not alvo.value:
+        return rotulo
+    destino = alvo.value.strip()
+    if alvo.kind == "anchor":
+        destino = "#" + destino.lstrip("#")
+    return _destino_markdown(rotulo, destino) or rotulo
+
+
+def _destino_markdown(rotulo, destino):
+    from urllib.parse import quote
+
+    esquema = re.match(r"^([a-z][a-z0-9+.-]*):", destino, flags=re.I)
+    if esquema and esquema[1].lower() not in ("http", "https", "mailto", "ftp", "tel"):
+        return ""
+    if not destino or any(ord(c) < 32 for c in destino):
+        return ""
+    destino = quote(destino, safe="/:?#@!$&'*+,;=%~")
+    texto = (rotulo or destino).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+    return f"[{texto}]({destino})"
+
+
+def _letra_word(numero):
+    if numero == 0:
+        return "0"
+    ciclos, indice = divmod(numero - 1, 26)
+    letra = chr(ord("a") + indice)
+    # Um start pode ser qualquer inteiro de 32 bits. A forma compacta mantém a contagem sem expandir milhões de letras.
+    return letra * (ciclos + 1) if ciclos < 256 else f"{letra}×{ciclos + 1}"
+
+
+def _do_contador_alfabetico(m):
+    original = m[1]
+    if original == "0":
+        return original
+    numero = 0
+    for letra in original.lower():
+        numero = 26 * numero + ord(letra) - ord("a") + 1
+    texto = _letra_word(numero)
+    return texto.upper() if original.isupper() else texto
+
+
+def _rotulo_word(lista, item, numero, letras):
+    """O anydoc já resolveu a máscara multinível e os reinícios. Marcadores simples trazem apenas a família."""
+    if item.marker_label is not None:
+        rotulo = " ".join(item.marker_label.split())
+        if letras is not None:
+            rotulo = letras.sub(_do_contador_alfabetico, rotulo)
+        # A máscara pode conter texto arbitrário. O rótulo publicado é literal, inclusive dentro de tabelas.
+        return re.sub(r"([\\\[\]*_\x60#!~])", r"\\\1", html.escape(rotulo, quote=False))
+    if lista.marker.endswith("_roman"):
+        valor = romano(numero)
+    elif lista.marker.endswith("_alpha"):
+        valor = _letra_word(numero)
+    else:
+        return "-" if lista.marker == "bullet" else f"{numero}."
+    return (valor.upper() if lista.marker.startswith("upper") else valor) + "."
+
+
+def serializar(doc, ler_imagem, *, links=False, formato=None, marca_slide=None, letras=None):
+    epub = formato == "epub"
     cobertura = {"pendente": []}
     assets = {a.id: a for a in doc.assets}
     n_img = {"n": 0}
+    links = links or formato in ("docx", "rtf", "pptx")
+    # Só uma marca inserida pelo Lince comprova que a parte de destino foi lida. A numeração segue a apresentação.
+    slides = set()
+    if marca_slide:
+        for b in doc.blocks:
+            if b.kind == "paragraph" and len(b.content) == 1 and b.content[0].kind == "text":
+                if m := re.fullmatch(rf"{marca_slide}(\d+)X", b.content[0].text or ""):
+                    slides.add(f"slide-{m[1]}")
 
     def inl(xs):
         out = []
         for x in xs or []:
             k = x.kind
             if k == "text":
-                out.append(x.text or "")
+                texto = x.text or ""
+                out.append(letras.sub(_do_contador_alfabetico, texto) if letras is not None else texto)
             elif k == "link":
-                out.append(inl(x.content))
+                rotulo = inl(x.content)
+                alvo = x.target
+                if marca_slide and alvo and alvo.kind == "anchor" and alvo.value not in slides:
+                    alvo = None
+                out.append(_link_markdown(rotulo, alvo) if links else rotulo)
+            elif k == "anchor" and links and x.anchor:
+                if not marca_slide:  # a âncora dos slides entra dentro do próprio slide, junto da marca de posição
+                    out.append(f'<a id="{html.escape(x.anchor, quote=True)}"></a>')
             elif k == "image":
                 n_img["n"] += 1
                 src = x.source
@@ -1112,14 +1618,22 @@ def serializar(doc, ler_imagem):
                     if not a.media_type.startswith("image/"):
                         cobertura["pendente"].append(f"{onde}: {a.media_type}")
                         out.append(f"[{onde}: objeto {a.media_type}]")
-                    elif min(_tam(a.data)) < 48:
+                    elif min(_tam(a.data)) < 48 and not (epub and x.alt):
                         cobertura["pendente"].append(f"{onde}: decorativa")
                     else:
-                        out.append(ler_imagem(a.data, a.media_type, onde))
+                        if epub and x.alt:
+                            alt = (
+                                html.escape(" ".join(x.alt.split()), quote=False)
+                                .replace("{", "&#123;")
+                                .replace("}", "&#125;")
+                            )
+                            out.append(ler_imagem(a.data, a.media_type, onde, alt))
+                        else:
+                            out.append(ler_imagem(a.data, a.media_type, onde))
                 else:
                     out.append(f"[{onde}: {x.alt or 'sem fonte'}]")
             elif k == "line_break":
-                out.append(" ")
+                out.append("  \n" if epub else " ")
             elif k == "math":
                 out.append(f"${x.text}$")
             elif k == "note_ref":
@@ -1136,12 +1650,22 @@ def serializar(doc, ler_imagem):
                 out.append("#" * (b.level or 1) + " " + inl(b.content))
             elif k == "paragraph":
                 txt = inl(b.content)
-                out.append("\\" + txt if txt[:1] in ">#-+|" else txt)
+                out.append("\\" + txt if txt and txt[0] in ">#-+|" else txt)
             elif k == "list":
                 for i, it in enumerate(b.list.items):
-                    corpo = blocos(it.blocks, prof + 1).strip().replace("\n", "\n  ")
+                    corpo = blocos(it.blocks, prof + 1).strip()
+                    if not epub:
+                        corpo = corpo.replace("\n", "\n  ")
                     marca = "-" if b.list.marker == "bullet" else f"{b.list.start + i}."
-                    out.append("  " * prof + f"{marca} {corpo}")
+                    if formato == "docx":
+                        marca = _rotulo_word(b.list, it, b.list.start + i, letras)
+                        if b.list.marker != "bullet" and marca and corpo.startswith(marca + " "):
+                            corpo = corpo[len(marca) + 1 :]
+                    if epub:
+                        recuo = " " * (len(marca) + 1)
+                        out.append(f"{marca} " + corpo.replace("\n", "\n" + recuo))
+                    else:
+                        out.append("  " * prof + f"{marca} {corpo}")
             elif k == "table":
                 linhas = []
                 for row in b.table.grid:

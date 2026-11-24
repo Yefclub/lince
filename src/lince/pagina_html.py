@@ -121,6 +121,71 @@ def decodificar(dados: bytes) -> str:
         return dados.decode("cp1252", "replace")
 
 
+def _ancoras_do_documento(raiz, prefixo):
+    """Conserva a posição dos destinos de links locais que o conversor não leva ao Markdown."""
+    from html import escape
+    from urllib.parse import unquote
+
+    fragmentos = {href[1:] for el in raiz.iter("a") if (href := el.get("href", "")).startswith("#") and len(href) > 1}
+    marcas = {}
+    if not fragmentos:
+        return marcas
+    candidatos = fragmentos | {unquote(f) for f in fragmentos}
+    ids = {el.get("id") for el in raiz.iter() if el.get("id") in candidatos}
+    destinos_existentes = ids | {el.get("name") for el in raiz.iter("a") if el.get("name") in candidatos}
+    alvos = {f if f in destinos_existentes else unquote(f) for f in fragmentos} & destinos_existentes
+    for el in list(raiz.iter()):
+        ident, nome = el.get("id"), el.get("name") if el.tag == "a" else None
+        # Na navegação HTML um id existente tem prioridade sobre o name de qualquer âncora.
+        destinos = [v for v in (ident, nome if nome not in ids else None) if v in alvos]
+        if not destinos:
+            continue
+        alvos.difference_update(destinos)
+        marca = f"{prefixo}A{len(marcas)}X"
+        marcas[marca] = "".join(f'<a id="{escape(v, quote=True)}"></a>' for v in destinos)
+        pre = next(el.iterancestors("pre", "code"), None)
+        if pre is not None:
+            pre = next(pre.iterancestors("pre"), pre)
+            pos = etree.Element("p" if pre.tag == "pre" else "span")
+            pos.text = marca
+            pre.addprevious(pos)
+        elif el.tag in ("td", "th", "li", "body"):
+            el.text = marca + (el.text or "")
+        elif el.tag in ("tr", "tbody", "thead", "tfoot", "col", "colgroup"):
+            # Não inserir um pseudo-elemento entre linhas ou células da grade.
+            celula = next(el.iter("td", "th"), None)
+            if celula is not None:
+                celula.text = marca + (celula.text or "")
+            elif (tabela := next(el.iterancestors("table"), None)) is not None:
+                pos = etree.Element("p")
+                pos.text = marca
+                tabela.addprevious(pos)
+        elif el.getparent() is not None:
+            bloco = el.tag in (
+                "section",
+                "article",
+                "nav",
+                "div",
+                "table",
+                "pre",
+                "p",
+                "h1",
+                "h2",
+                "h3",
+                "h4",
+                "h5",
+                "h6",
+            )
+            pos = etree.Element("p" if bloco else "span")
+            pos.text = marca
+            el.addprevious(pos)
+        else:
+            corpo = raiz.find("body")
+            if corpo is not None:
+                corpo.text = marca + (corpo.text or "")
+    return marcas
+
+
 def planejar_html(path, pasta) -> dict:
     """Plano no formato do Office: Markdown com marcas {{IA:id}} onde vai a leitura de cada imagem embutida, e as
     propriedades do <head> (lidas no mesmo parse)."""
@@ -139,6 +204,7 @@ def planejar_html(path, pasta) -> dict:
     herdado = {}
     ocultos = _tirar_oculto(raiz, herdado)
     prefixo = _prefixo_livre(texto)
+    ancoras = _ancoras_do_documento(raiz, prefixo)
     # o desenho sai da árvore já limpa: só mostra texto que ficou no corpo; SVG que herda o invisível não é desenhado
     externos = [s for s in raiz.iter("svg") if next(s.iterancestors("svg"), None) is None]  # só o mais externo
     copias = {svg: de_html(svg) if herdado.get(svg) is False else None for svg in externos}
@@ -169,7 +235,7 @@ def planejar_html(path, pasta) -> dict:
             desenhos[marca := f"{prefixo}S{k}X"] = f"{{{{IA:{tid}}}}}"
             troca.text = marca + troca.text
         svg.getparent().replace(svg, troca)
-    marcas = _imagens(raiz, pasta, plano["tarefas"], prefixo) | desenhos
+    marcas = _imagens(raiz, pasta, plano["tarefas"], prefixo) | desenhos | ancoras
     for a in raiz.iter("a"):  # link para data: carregaria o arquivo inteiro em base64 para o texto
         if (a.get("href") or "").strip().lower().startswith("data:"):
             del a.attrib["href"]
@@ -183,7 +249,7 @@ def planejar_html(path, pasta) -> dict:
     r = html_to_markdown.convert(lxml_html.tostring(raiz, encoding="unicode"), opcoes)
     md = (r.content or "").strip()
     if marcas:  # uma passada só: um replace por marca seria quadrático com milhares de imagens
-        md = re.sub(prefixo + r"S?\d+X", lambda m: marcas.get(m.group(0), m.group(0)), md)
+        md = re.sub(prefixo + r"[AS]?\d+X", lambda m: marcas.get(m.group(0), m.group(0)), md)
     plano["md"] = md
     if r.warnings:
         plano["ilegiveis"] += sorted({f"html: {w.message}"[:200] for w in r.warnings})
@@ -428,6 +494,73 @@ def _esvaziar(el):
     el.tag = "span"
 
 
+def _png_do_html(im, el):
+    """Compõe apenas fundos inline conhecidos; conserva o alfa se o contexto não for recuperável."""
+    from itertools import chain
+
+    from PIL import Image
+    from tinycss2.color4 import parse_color
+
+    if "A" not in im.getbands() and "transparency" not in im.info:
+        return im.convert("RGB")
+    imagem = im.convert("RGBA")
+    fundo = Image.new("RGBA", (1, 1))
+    for no in chain((el,), el.iterancestors()):
+        cores = {"background-color": no.get("bgcolor")}
+        importantes = set()
+        for d in tinycss2.parse_blocks_contents(no.get("style") or "", skip_comments=True, skip_whitespace=True):
+            if d.type != "declaration":
+                continue
+            nome = d.lower_name
+            valor = tinycss2.serialize(d.value).strip()
+            if nome == "background":
+                # O atalho redefine as duas propriedades. Fundos complexos requerem o alfa original.
+                simples = parse_color(valor) is not None or valor.lower() == "none"
+                valores = {
+                    "background-color": valor if valor.lower() != "none" else None,
+                    "background-image": "none" if simples else valor,
+                }
+            elif nome in ("background-color", "background-image"):
+                if nome == "background-color" and parse_color(valor) is None:
+                    if valor.lower() in ("initial", "unset"):
+                        valor = "transparent"
+                    elif valor.lower() in ("inherit", "revert", "revert-layer") or any(
+                        token.type == "function" for token in d.value
+                    ):
+                        # O navegador pode resolver esse valor. Conservar alfa se não o conhecemos.
+                        valor = "currentcolor"
+                    else:
+                        continue
+                valores = {nome: valor}
+            else:
+                continue
+            for prop, v in valores.items():
+                if d.important or prop not in importantes:
+                    cores[prop] = v
+                    if d.important:
+                        importantes.add(prop)
+        if cores.get("background-image", "none").lower() != "none":
+            return imagem
+        cor = cores["background-color"]
+        if not cor:
+            continue
+        rgba = parse_color(cor)
+        if rgba is None or isinstance(rgba, str) or rgba.space not in ("srgb", "hsl", "hwb"):
+            return imagem
+        srgb = rgba.to("srgb")
+        if None in srgb.coordinates or srgb.alpha is None:
+            return imagem
+        canais = (*srgb.coordinates, srgb.alpha)
+        camada = Image.new("RGBA", (1, 1), tuple(round(max(0, min(1, c)) * 255) for c in canais))
+        fundo = Image.alpha_composite(camada, fundo)
+        if fundo.getpixel((0, 0))[3] == 255:
+            break
+    tinta = fundo.getpixel((0, 0))
+    if tinta[3] == 0:
+        return imagem
+    return Image.alpha_composite(Image.new("RGBA", imagem.size, tinta), imagem)
+
+
 def _imagens(raiz, pasta, tarefas, prefixo) -> dict:
     """Imagem data: vira tarefa da IA (marca sentinela no lugar, trocada depois da conversão); decorativa sai;
     externa e ilegível ficam marcadas com o alt."""
@@ -443,11 +576,11 @@ def _imagens(raiz, pasta, tarefas, prefixo) -> dict:
                 if len(carga) * 3 // 4 > IMAGEM_MAX:  # estimado antes de decodificar: nem aloca o que não lerá
                     raise ValueError("imagem embutida grande demais")
                 im = Image.open(io.BytesIO(base64.b64decode(carga, validate=False)))
-                if min(im.size) < 48:  # ícone ou separador: decorativo, como no Office
-                    substituto = ""
+                if min(im.size) < 48:
+                    substituto = alt
                 else:
                     tid = f"img{len(tarefas) + 1:02d}"
-                    im.convert("RGB").save(f"{pasta}/ia/{tid}.png")
+                    _png_do_html(im, el).save(f"{pasta}/ia/{tid}.png")
                     tarefas.append({"id": tid, "modo": "imagem", "ancora": alt or f"imagem {len(tarefas) + 1}"})
                     substituto = f"{{{{IA:{tid}}}}}"
             except (binascii.Error, ValueError, OSError, Image.DecompressionBombError):

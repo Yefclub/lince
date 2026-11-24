@@ -6,11 +6,12 @@ import json  # noqa: F401
 import os  # noqa: F401
 import re  # noqa: F401
 import zipfile  # noqa: F401
+from collections import Counter
 from xml.etree import ElementTree as ET  # noqa: F401
 
 from .agrupamento import por_tarefa
 from .seguranca import alertas_injecao
-from .texto import NUM_PAGINA, sem_repeticao
+from .texto import NUM_PAGINA, grupos_de_frases, sem_repeticao
 
 # Caracteres que a montagem escreve, o texto nativo junto. A leitura de uma imagem repetida entra uma vez, e as outras
 # posições levam só a referência: em 16 Mi cabem as 2.000 páginas que o PDF analisa (PAGINAS_ANALISE_MAX) com 8 mil
@@ -35,6 +36,9 @@ def _metadados(pasta, plano, corpo, moveis):
         meta[k] = sorted(set(meta.get(k, [])) | v)
     if plano.get("texto_oculto"):
         meta["texto_oculto_removido"] = plano["texto_oculto"]
+    if anotacoes := plano.get("anotacoes_planilha"):
+        # Endereços, URLs e textos de nota são literais. Não sofrem tipografia nem viram marcas da IA.
+        corpo = corpo.rstrip() + "\n\n" + anotacoes
     alertas = alertas_injecao(corpo) + [a for o in plano.get("texto_oculto", []) for a in alertas_injecao(o["texto"])]
     alertas += [o["alerta"] for o in plano.get("texto_oculto", []) if o.get("alerta")]
     if alertas:
@@ -73,8 +77,39 @@ def acabamento(txt: str) -> str:
     return "".join(saida)
 
 
+_HIFENS = re.compile(r"(?<=\w)--(?=\w)")
+_ANCORA_OU_HIFENS = re.compile(r'<a id="[^"\n]*"></a>|\]\(#|(?<=\w)--(?=\w)')
+_DELIMITADOR_DESTINO = re.compile(r"\\[^\n]|[()\s]")
+
+
+def _travessoes(t):
+    if "--" not in t:
+        return t
+    if "](#" not in t and '<a id="' not in t:
+        return _HIFENS.sub("—", t)
+    partes, inicio, protegido = [], 0, 0
+    for m in _ANCORA_OU_HIFENS.finditer(t):
+        if m.start() < protegido:
+            continue
+        if m[0] == "](#":
+            # O conversor conserva parênteses internos balanceados e escapa espaços no fragmento.
+            nivel, protegido = 1, len(t)
+            for d in _DELIMITADOR_DESTINO.finditer(t, m.end()):
+                if d[0].isspace():
+                    protegido = d.start()
+                    break
+                nivel += (d[0] == "(") - (d[0] == ")")
+                if not nivel:
+                    protegido = d.end()
+                    break
+        elif m[0] == "--":
+            partes.extend([t[inicio : m.start()], "—"])
+            inicio = m.end()
+    return "".join([*partes, t[inicio:]])
+
+
 def _limpar(t: str) -> str:
-    t = re.sub(r"(?<=\w)--(?=\w)", "—", t)  # travessão datilografado
+    t = _travessoes(t)
     t = re.sub(r"(?m)^[ \t]*\\[ \t]*$", "", t)  # parágrafo vazio vira "\" no Markdown: some
     return re.sub(r"\n{3,}", "\n\n", t)
 
@@ -95,7 +130,87 @@ def _textos(plano, chave, resposta) -> dict[str, str]:
     return {tid: sem_repeticao(t).strip() for tid, t in por_tarefa(plano, chave, resposta).items()}
 
 
-def montar(pasta, respostas):
+def _pendente(rotulo, alt):
+    marca = f"> [{rotulo}: pendente]"
+    return f"{marca} [texto alternativo: {alt}]" if alt else marca
+
+
+def _ancora_leitura(tid):
+    return f"<!-- lido pela IA: {tid} -->\n"
+
+
+def _cobre_ocr(nativo, visual):
+    # A mesma tabela pode trocar a ordem das células. Conta ocorrências, sem exigir a mesma
+    # ordem nem grafia perfeita do OCR. Uma legenda ou resposta curta conserva a reserva.
+    # A comparação é de uma única folha, com teto para as listas e os contadores de palavras.
+    if max(len(nativo), len(visual)) > 128_000:
+        return False
+
+    def palavras(texto):
+        return re.findall(r"\w+", re.sub(r"<[^<>]{1,256}>", " ", texto).casefold())
+
+    original, lida = palavras(nativo), Counter(palavras(visual))
+    frequencias = Counter(original)
+    if lida < frequencias:  # transcreveu só um subconjunto literal, mesmo reordenado
+        return False
+    if not original or (frequencias & lida).total() < 0.8 * len(original):
+        return False
+
+    # Numa lista de registros reconhecidos literalmente, basta faltar uma linha para perder
+    # uma medição. Também vale se a visão acrescentou um título ou mudou a ordem dos registros.
+    def registros(texto):
+        return Counter(tuple(ws) for ln in texto.splitlines() if len(ws := palavras(ln)) >= 3)
+
+    nativas = registros(nativo)
+    iguais = (nativas & registros(visual)).total()
+    if 2 <= iguais < nativas.total() and iguais >= nativas.total() / 2:
+        return False
+    # A maioria global também ocorreria se a transcrição acabasse antes de um parágrafo inteiro.
+    # Cada trecho precisa ter correspondência local, mesmo quando a tabela muda a ordem das linhas.
+    for i in range(0, len(original), 40):
+        trecho = original[i : i + 40]
+        if (Counter(trecho) & lida).total() < 0.7 * len(trecho):
+            return False
+    return True
+
+
+def _texto_do_bloco(bloco):
+    # A geometria dá o título sem o prefixo Markdown. Dois leitores podem atribuir
+    # níveis diferentes ao mesmo título. O conteúdo e a pontuação precisam coincidir.
+    bloco = bloco.strip()
+    if "\n" not in bloco:
+        bloco = re.sub(r"^#{1,6}[ \t]+", "", bloco)
+    return " ".join(bloco.split())
+
+
+def _paragrafos_do_desenho(regioes, blocos, lido):
+    """Um boxe vetorial pode conter parágrafos inteiros. A transcrição deve trazer o
+    mesmo parágrafo com a mesma pontuação, e o recorte deve conter todas as linhas."""
+    desenhos = [r for r in regioes if r.get("desenho") and lido(r["tarefa"])]
+    # Conferência opcional: limita buscas de trecho em páginas e respostas muito grandes.
+    if not desenhos or len(desenhos) > 16 or sum(map(len, blocos)) > 128_000:
+        return set()
+    unicos = Counter(_texto_do_bloco(b) for b in blocos)
+    copiados = set()
+    buscas = 0
+    for r in desenhos:
+        visual, ancora = lido(r["tarefa"]), r["texto_dentro"]
+        if max(len(visual), len(ancora)) > 128_000:
+            continue
+        dentro = " " + " ".join(ancora.split()) + " "
+        for b in visual.split("\n\n"):
+            texto = _texto_do_bloco(b)
+            if not texto or unicos[texto] != 1:
+                continue
+            buscas += 1
+            if buscas > 128:
+                return copiados
+            if f" {texto} " in dentro:
+                copiados.add(texto)
+    return copiados
+
+
+def montar(pasta, respostas, pendentes=None):
     plano = json.load(open(f"{pasta}/plano.json", encoding="utf-8"))
     R = _lidas(plano, respostas, lambda chave: _textos(plano, chave, respostas[chave]))
     iguais = plano.get("iguais", {})  # a mesma imagem em outro lugar: a mesma leitura
@@ -108,7 +223,9 @@ def montar(pasta, respostas):
     def bloco_ia(tid, rotulo):
         # provisório até o corpo estar pronto: na ordem do texto, a primeira posição recebe a leitura e as outras a
         # referência; o texto da IA também não passa pelo corte de cabeçalho nem pelo filtro de rótulos da figura
-        return f"<!-- lido pela IA: {tid} {marca} -->" if lido(tid) else f"> [{rotulo}: pendente]"
+        if lido(tid):
+            return f"<!-- lido pela IA: {tid} {marca} -->"
+        return _pendente(rotulo, plano.get("alt_das_tarefas", {}).get(tid))
 
     def leituras(corpo):
         primeira = {}
@@ -117,9 +234,9 @@ def montar(pasta, respostas):
             tid = m.group(1)
             leitora = iguais.get(tid, tid)
             if leitora in primeira:
-                return f"<!-- lido pela IA: {tid} -->\n" + REPETIDA.format(primeira[leitora])
+                return _ancora_leitura(tid) + REPETIDA.format(primeira[leitora])
             primeira[leitora] = tid
-            return f"<!-- lido pela IA: {tid} -->\n{lido(tid)}"
+            return _ancora_leitura(tid) + lido(tid)
 
         return re.sub(rf"<!-- lido pela IA: (\S+) {marca} -->", troca, corpo)  # numa passada: a leitura não é varrida
 
@@ -141,9 +258,24 @@ def montar(pasta, respostas):
     paginas = []  # por página: o texto já pronto (escaneada) ou (cabeçalho, blocos nativos, inserções da IA)
     for p in plano["paginas"]:
         cab = f"<!-- página {p['i'] + 1} · {p['rota']} -->"
+        if tid := p.get("ocr_da_imagem"):
+            visual = lido(tid)
+            partes_ocr = [cab, bloco_ia(tid, "figura")]
+            if not visual or not _cobre_ocr(p["md"], visual):
+                partes_ocr.append(p["md"])
+                if visual and pendentes is not None:
+                    pendentes.append(f"página {p['i'] + 1}: transcrição visual parcial, mantida a camada de OCR")
+            paginas.append("\n\n".join(partes_ocr))
+            continue
         if p["rota"] == "pagina":
             ids = p.get("tarefas") or [p["tarefa"]]
-            paginas.append(cab + "\n" + "\n\n".join(bloco_ia(t, "página") for t in ids))
+            partes_pagina = []
+            for tid in ids:
+                bloco = bloco_ia(tid, "página")
+                if not lido(tid) and (nativo := p.get("nativo_pendente", {}).get(tid)):
+                    bloco = nativo + "\n\n" + bloco
+                partes_pagina.append(bloco)
+            paginas.append(cab + "\n" + "\n\n".join(partes_pagina))
             continue
         tabelas = p.get("tabelas", [])
         trocadas = {
@@ -163,12 +295,22 @@ def montar(pasta, respostas):
         md = re.sub(r"\{\{(TABELA|FORMULA):(\d+)\}\}", troca, p["md"])
         blocos = [b for b in md.split("\n\n") if b.strip()]
         # tira do nativo o texto que pertence à figura (rótulos de eixo etc.)
-        dentro = " ".join(
-            r["texto_dentro"] for r in p["regioes"] if "substitui_tabela" not in r and "substitui_formula" not in r
-        )
-        palavras_dentro = set(re.findall(r"\w+", dentro.lower()))
+        # Em um boxe vetorial os próprios parágrafos aparecem na âncora. Só a
+        # correspondência literal na transcrição confirma que já estão na saída.
+        figuras = [
+            r
+            for r in p["regioes"]
+            if not r.get("desenho")
+            and not r.get("preserva_texto")
+            and "substitui_tabela" not in r
+            and "substitui_formula" not in r
+        ]
+        palavras_dentro = set(re.findall(r"\w+", " ".join(r["texto_dentro"] for r in figuras).lower()))
+        copiados = _paragrafos_do_desenho(p["regioes"], blocos, lido)
         limpos = []
         for b in blocos:
+            if copiados and _texto_do_bloco(b) in copiados:
+                continue
             pal = re.findall(r"\w+", b.lower())
             if (
                 pal
@@ -192,27 +334,40 @@ def montar(pasta, respostas):
         paginas.append((cab, limpos, inserir))
     moveis = _sem_cabecalho_corrido([(k, pg[1]) for k, pg in enumerate(paginas) if not isinstance(pg, str)])
     partes = []
-    for pg in paginas:
+    for pg, pagina in zip(paginas, plano["paginas"], strict=True):
         if isinstance(pg, str):
             partes.append(pg)
+            if campos := pagina.get("campos"):
+                partes.append(campos)
             continue
         cab, limpos, inserir = pg
         saida = [cab] + inserir.get(-1, [])
-        for k, b in enumerate(limpos):
-            if b.strip():
-                saida.append(b)
-            saida.extend(inserir.get(k, []))
+        # a frase partida é juntada depois de sair o cabeçalho corrido (senão ele entraria na frase); a figura de um
+        # bloco juntado entra depois do grupo
+        for a, b, texto in grupos_de_frases(limpos):
+            if texto.strip():
+                saida.append(texto)
+            for k in range(a, b):
+                saida.extend(inserir.get(k, []))
+        if campos := pagina.get("campos"):
+            saida.append(campos)
         partes.append("\n\n".join(saida))
     return _metadados(pasta, plano, acabamento(leituras("\n\n".join(partes))), moveis)
 
 
 CABECALHO_MAX = 80  # linha de cabeçalho/rodapé corrido é curta; parágrafo que o leitor juntou numa linha, não
 FRACAO_MAX = 0.25  # se a remoção levaria mais que isso do texto nativo do documento, nada sai
+# títulos distintos que dizem que o documento tem seções de verdade: TITULOS_MIN_FRACAO das páginas, no mínimo
+# TITULOS_MIN (o Ipea: 17 em 43 páginas). Abaixo disso, dois ou três documentos de um lote com um título próprio não
+# fazem do título comum a todos ("Fatura") um cabeçalho corrido
+TITULOS_MIN_FRACAO = 0.2
+TITULOS_MIN = 3
 FIXA_MIN = 0.8  # linha idêntica na borda de ao menos esta fração das páginas é cabeçalho fixo ("Confidencial")
 
 
 DESLOCAMENTO_MAX = 50  # número impresso = índice da página + d (capa e páginas iniciais sem número): |d| até isto
 # o rótulo logo antes do número que diz que ele é o da página, e a linha que é só o número ("3 de 12", "3/12")
+_TITULO_FIXO = re.compile(r"#{1,6}[ \t]+")  # a marca de título que o extrator pôs no cabeçalho corrido
 _ROTULO_PAGINA = re.compile(r"(?<![^\W\d_])(p[aá]gina|p[aá]g|page|pg|p|folha|fls|fl)\.?:?\s*$", flags=re.I)
 _SO_O_NUMERO = re.compile(r"\W*#(\s*(de|of|/)\s*\d{1,4})?\W*", flags=re.I)
 _ROMANOS = [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
@@ -240,9 +395,9 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
     metadados como a linha com o número trocado por #. A linha curta idêntica na borda de FIXA_MIN das páginas, sem
     número de página, é cabeçalho fixo e sai também, se couber em FRACAO_MAX junto com o resto (senão só ela fica).
     Valor, data e número de documento que mudam entre páginas não casam, a página escaneada e o texto lido pela IA não
-    passam por aqui, título (linha com #) nunca sai e, se o que sairia passa de FRACAO_MAX do texto nativo do
+    passam por aqui, título (linha com #) só sai como cabeçalho fixo (idêntico na borda de FIXA_MIN das páginas, num
+    documento com seções de verdade: veja `com_secoes`) e, se o que sairia passa de FRACAO_MAX do texto nativo do
     documento, nada sai."""
-    from collections import Counter
 
     def linhas(blocos):
         return [  # o bloco que traz leitura da IA (tabela ou fórmula trocada) fica de fora
@@ -282,8 +437,10 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
         return v - pagina, t[: m.start(g)] + "#" + t[m.end(g) :]
 
     def fixa(ln):
-        """A linha, se ela pode ser cabeçalho fixo: curta, com letra, fora de título, tabela e marca do Lince."""
-        t = ln.strip()
+        """A linha, sem a marca de título, se ela pode ser cabeçalho fixo: curta, com letra, fora de tabela e marca do
+        Lince. O título entra aqui (e só aqui): a linha idêntica na borda de quase toda página é o cabeçalho corrido que
+        o extrator promoveu a título pela fonte grande ("# Carta de Conjuntura | 69 | Nota 22"), não uma seção."""
+        t = _TITULO_FIXO.sub("", ln.strip(), count=1)
         if len(t) > CABECALHO_MAX or t.startswith(("#", "|", "<!--", "> [")) or not re.search(r"[^\W\d]", t):
             return None
         return t
@@ -308,7 +465,23 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
         pos: t for pos, c in por_posicao.items() for t, v in c.most_common(1) if n >= 3 and v >= max(3, FIXA_MIN * n)
     }
     terceira = {0: 2, 1: 2, -1: -3, -2: -3}  # de cada posição da borda, a primeira linha do corpo
-    fixas = {(pos, t) for pos, t in repetidas.items() if pos in terceira and terceira[pos] not in repetidas and fixa(t)}
+    # o título que se repete só sai num documento com seções de verdade: outros títulos, distintos, em número que
+    # acompanha o tamanho do documento (TITULOS_MIN_FRACAO das páginas, no mínimo TITULOS_MIN) e que não se repetem
+    # na maioria das páginas. Num lote de faturas de uma página, "Fatura" no topo de cada uma é o título de cada
+    # documento: um "Observações" numa delas ou um "Itens" em todas não fazem dele cabeçalho corrido
+    paginas_do_titulo = {}
+    for i, blocos in nativas:
+        for b in blocos:
+            for ln in b.split("\n"):
+                if _TITULO_FIXO.match(ln.lstrip()):
+                    paginas_do_titulo.setdefault(ln.strip(), set()).add(i)
+    secoes_de_verdade = {t for t, pags in paginas_do_titulo.items() if len(pags) <= n / 2}
+    com_secoes = len(secoes_de_verdade) >= max(TITULOS_MIN, TITULOS_MIN_FRACAO * n)
+    fixas = {
+        (pos, t)
+        for pos, t in repetidas.items()
+        if pos in terceira and terceira[pos] not in repetidas and fixa(t) and (com_secoes or not _TITULO_FIXO.match(t))
+    }
     extremos = {}
     for i, blocos in nativas:
         cheias = linhas(blocos)
@@ -326,7 +499,7 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
                 tirar[(i, k, j)] = (ln, achadas[0][0])
         for pos, t in fixas:
             if -len(cheias) <= pos < len(cheias) and cheias[pos][2].strip() == t:
-                tirar_fixas[(i, *cheias[pos][:2])] = (cheias[pos][2], t)
+                tirar_fixas[(i, *cheias[pos][:2])] = (cheias[pos][2], fixa(t))
         for k, j, ln, d, forma in extremos[i]:
             if d in numeros:
                 tirar.setdefault((i, k, j), (ln, forma))
@@ -346,6 +519,57 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
     return {c for _, c in tirar.values()}
 
 
+def partes_da_imagem(plano, respostas):
+    """As mesmas partes na montagem e na medida, inclusive a origem de cada página TIFF."""
+    anterior = None
+    for tarefa in plano["tarefas"]:
+        pagina = tarefa.get("pagina")
+        if pagina != anterior:
+            formato = tarefa.get("formato_quadro", "TIFF")
+            unidade = "página" if formato == "TIFF" else "quadro"
+            yield f"<!-- {unidade} {pagina + 1} · {formato} -->"
+            anterior = pagina
+        yield respostas.get(tarefa["id"], "")
+
+
+def medir_alternativas(e, respostas, ordem, limite):
+    """Tamanho estimado da montagem do EPUB e quantidade de respostas no maior prefixo que cabe.
+
+    Cada imagem pode substituir várias alternativas por uma leitura e referências.
+    O custo pode cair. Percorre os lugares uma vez, e cada resposta ou item de lote uma vez.
+    """
+    md, alternativas = e["md"], e["alt_das_tarefas"]
+    iguais = e.get("iguais", {})
+    ids = {t["id"] for t in e.get("tarefas_originais", [])} | iguais.keys()
+    total = len(md) + sum(len(x) + 2 for x in e.get("extras", [])) + 1
+    sem_alt = len(_pendente("imagem", None))
+    reservas = {tid: len(_pendente("imagem", alt)) for tid, alt in alternativas.items()}
+    diferencas = Counter()
+    primeiras = {}
+    for m in re.finditer(r"\{\{IA:(\w+)\}\}", md):
+        tid = m[1]
+        if tid not in ids:
+            continue
+        leitora = iguais.get(tid, tid)
+        reserva = reservas.get(tid, sem_alt)
+        total += 4 + reserva - len(m[0])  # a montagem cerca a marca com duas quebras de cada lado
+        fixo = len(_ancora_leitura(tid))
+        if leitora in primeiras:
+            fixo += len(REPETIDA.format(primeiras[leitora]))
+        else:
+            primeiras[leitora] = tid
+        diferencas[leitora] += fixo - reserva
+    cabem = 0
+    for k, chave in enumerate(ordem, 1):
+        for tid, texto in _textos(e, chave, respostas[chave]).items():
+            # O plano oferece uma única tarefa por leitora, individual ou em lote.
+            if texto and tid in diferencas:
+                total += diferencas[tid] + len(texto)
+        if total <= limite:
+            cabem = k
+    return total, cabem
+
+
 def tamanho_da_saida(e, respostas, medidas=None) -> int:
     """Quanto texto a montagem vai escrever, no máximo: cada marca vira a leitura (a da mesma imagem repetida entra uma
     vez, e as outras posições, a referência) ou a tabela e a fórmula nativas, e cada página leva o comentário e as
@@ -353,8 +577,9 @@ def tamanho_da_saida(e, respostas, medidas=None) -> int:
     montagem o escreve (_textos). `medidas` guarda esse tamanho por chave de resposta entre chamadas com as mesmas
     respostas (a busca do que cabe), para cada uma ser lida uma vez só."""
     if e.get("tipo") == "imagem":  # a imagem solta sai como as leituras das faixas, uma depois da outra
-        return sum(len(respostas.get(t["id"], "")) + 2 for t in e.get("tarefas", []))
-    from collections import Counter
+        return max(0, sum(len(t) + 2 for t in partes_da_imagem(e, respostas)) - 2)
+    if e.get("tipo") == "office" and e.get("alt_das_tarefas"):
+        return medir_alternativas(e, respostas, respostas, SAIDA_MAX)[0]
 
     medidas = {} if medidas is None else medidas
 
@@ -378,14 +603,16 @@ def tamanho_da_saida(e, respostas, medidas=None) -> int:
         return cheia(tid)
 
     total = len(e.get("md", "")) + sum(len(x) + 2 for x in e.get("extras", [])) + 1  # junções e o fim de linha
+    if anotacoes := e.get("anotacoes_planilha"):
+        total += len(anotacoes) + 2
     for tid, n in Counter(re.findall(r"\{\{IA:(\w+)\}\}", e.get("md", ""))).items():
-        primeira = leitura(tid)
-        total += primeira + (n - 1) * leitura(tid)  # a segunda chamada já conta a referência
+        total += leitura(tid) + (n - 1) * leitura(tid)
     for p in e.get("paginas", []):
+        total += len(p.get("campos", "")) + (2 if p.get("campos") else 0)
         # o comentário "<!-- página N · rota -->" e as junções da página com a anterior e do comentário com o texto
         total += len(f"<!-- página {p.get('i', 0) + 1} · {p.get('rota', '')} -->") + 4
         # a região que substitui uma tabela ou fórmula entra na posição da marca, abaixo; as outras, onde a figura está
-        total += len(p.get("md", "")) + sum(
+        total += max(len(p.get("md", "")), sum(len(t) + 2 for t in p.get("nativo_pendente", {}).values())) + sum(
             leitura(r.get("tarefa", ""))
             for r in p.get("regioes", [])
             if "substitui_tabela" not in r and "substitui_formula" not in r

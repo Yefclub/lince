@@ -12,7 +12,7 @@ metadados corporativos e proteção contra texto oculto e prompt injection.
 from ._prazo import prazo_restante
 from .cache import CacheDisco, CacheMemoria, CacheRedis
 from .leitor import VERSAO as __version__
-from .leitor import FormatoNaoSuportado, Leitor, ler
+from .leitor import FormatoNaoSuportado, Leitor, imagens_das_paginas, ler
 from .protecao import DocumentoProtegido, SenhaIncorreta
 from .provedores import FuncaoLeitor, LeitorVisual, OpenAICompativel
 from .tipos import Cobertura, Plano, PrazoEsgotado, RespostaIA, Resultado, TarefaVisual, Uso
@@ -23,6 +23,7 @@ __all__ = [
     "DocumentoProtegido",
     "SenhaIncorreta",
     "ler",
+    "imagens_das_paginas",
     "OpenAICompativel",
     "FuncaoLeitor",
     "LeitorVisual",

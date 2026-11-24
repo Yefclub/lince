@@ -708,6 +708,22 @@ def _rk(v):
     return x / 100 if v & 1 else x
 
 
+def abas_visiveis_xlsb(livro, rels):
+    """(nome, parte) das abas visíveis, pelas relações do BrtBundleSh, inclusive o layout antigo do Beta."""
+    for tipo, d in _registros_xlsb(livro):
+        if tipo == 0x9C and len(d) >= 12 and not struct.unpack_from("<I", d, 0)[0] & 3:
+            for j in (8, 12):
+                rid, k = _texto_largo(d, j)
+                if rid in rels:
+                    yield _texto_largo(d, k)[0], rels[rid]
+                    break
+
+
+def desenhos_da_aba_xlsb(aba):
+    """Ids de relação dos registros BrtDrawing e BrtLegacyDrawing (MS-XLSB 2.4.354 e 2.4.703)."""
+    return (_texto_largo(d, 0)[0] for tipo, d in _registros_xlsb(aba) if tipo in (550, 551))
+
+
 def xlsb_tolerante(path) -> tuple[list[tuple[str, dict[int, dict[int, object]]]], bool]:
     """Abas visíveis do .xlsb, cada uma como {linha: {coluna: valor}}, lidas registro a registro, para quando o
     leitor do corpo recusa o arquivo: linha (BrtRowHdr), células de valor e de fórmula com o resultado guardado, e
@@ -738,19 +754,8 @@ def xlsb_tolerante(path) -> tuple[list[tuple[str, dict[int, dict[int, object]]]]
             parser = etree.XMLParser(resolve_entities=False, no_network=True, load_dtd=False)
             for r in etree.fromstring(z.read("xl/_rels/workbook.bin.rels"), parser):
                 rels[r.get("Id")] = posixpath.normpath(posixpath.join("xl", r.get("Target") or ""))
-        abas = []
-        for tipo, d in _registros_xlsb(z.read("xl/workbook.bin")):
-            if tipo == 0x9C and len(d) >= 12:  # BrtBundleSh: estado, id, relação e nome
-                # a relação vem em d[8:]; há gravador que põe 4 bytes a mais antes dela (o anydoc recusa esse)
-                for j in (8, 12):
-                    rid, k = _texto_largo(d, j)
-                    if rid in rels:
-                        break
-                nome, _ = _texto_largo(d, k)
-                if not struct.unpack_from("<I", d, 0)[0] & 3:
-                    abas.append((nome, rels.get(rid)))
         saida, total, cortado = [], 0, False
-        for nome, parte in abas:
+        for nome, parte in abas_visiveis_xlsb(z.read("xl/workbook.bin"), rels):
             if parte not in nomes:
                 continue
             linhas, linha, largura, r = {}, None, 0, 0

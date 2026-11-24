@@ -270,6 +270,27 @@ def test_formato_nao_suportado_recusa_o_lote_antes_de_entrar_na_fila(api, pdf):
     assert api.app.state.servico.sessoes == {} and api.app.state.servico.vagas == {}
 
 
+def test_contrato_de_perfis_lado_a_lado(api, tmp_path):
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Modelo A", None, None, "Modelo B"])
+    ws.append([])
+    ws.append(["Grupo", "Total", None, "Grupo", "Total"])
+    ws.append(["Norte", 1, None, "Norte", 2])
+    ws["A1"].hyperlink = "https://example.org/modelo--a"
+    arquivo = tmp_path / "blocos.xlsx"
+    wb.save(arquivo)
+    resposta = conforme(enviar(api, [(arquivo.name, arquivo.read_bytes())], {**A, **ESPERA}), "/v1/sessoes", "post")
+    resultado = resposta.json()["itens"][0]["resultado"]
+    assert "https://example.org/modelo--a" in resultado["markdown"]
+    assert [(p["titulo"], p["coluna_inicial"]) for p in resultado["estrutura"]["perfil_tabular"]] == [
+        ("Modelo A", 1),
+        ("Modelo B", 4),
+    ]
+
+
 def test_pedido_recusado_devolve_a_vaga(api, pdf):
     for _ in range(PENDENTES_POR_CLIENTE + 10):  # se a vaga vazasse, viria 429
         assert enviar(api, ("sem_extensao", pdf), A).status_code == 400
@@ -1138,3 +1159,71 @@ def test_espera_cancelada_com_o_trabalho_em_curso_deixa_ele_terminar_e_devolve_a
 
     asyncio.run(principal())
     assert s.vagas == {} and rodou == ["terminou"]
+
+
+def test_estrutura_do_pdf_traz_o_indice_e_as_paginas_visuais_no_contrato(tmp_path):
+    from PIL import Image
+
+    Image.new("RGB", (900, 500), "navy").save(tmp_path / "g.png")
+    p = tmp_path / "relatorio.pdf"
+    c = canvas.Canvas(str(p), pagesize=A4)
+    for n, titulo in enumerate(("Introdução", "Resultados"), 1):
+        c.bookmarkPage(f"s{n}")
+        c.addOutlineEntry(titulo, f"s{n}")
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(60, 780, titulo)
+        if n == 2:
+            c.drawImage(str(tmp_path / "g.png"), 60, 400, width=450, height=250)
+        c.showPage()
+    c.save()
+    api = TestClient(criar_app(["token-a"]))
+
+    r = enviar(api, ("relatorio.pdf", p.read_bytes()), {**A, **ESPERA})
+
+    estrutura = conforme(r, "/v1/sessoes", "post").json()["itens"][0]["resultado"]["estrutura"]
+    assert estrutura["indice"]["fonte"] == "sumario"
+    assert [(x["titulo"], x["pagina"], x["pagina_fim"]) for x in estrutura["indice"]["itens"]] == [
+        ("Introdução", 1, 1),
+        ("Resultados", 2, 2),
+    ]
+    assert estrutura["paginas_visuais"] == [{"pagina": 2, "conteudo": ["imagem"], "alertas": ["nao_lida"]}]
+
+
+def test_tiff_multipagina_preparo_e_montagem_http(api):
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (500, 180), "red").save(
+        buf, "TIFF", save_all=True, append_images=[Image.new("RGB", (500, 180), "blue")]
+    )
+    s = conforme(
+        enviar(api, ("cores.tiff", buf.getvalue()), {**A, **ESPERA}, modo="tarefas"), "/v1/sessoes", "post"
+    ).json()
+    preparo = s["itens"][0]["resultado"]
+    assert [t["pagina"] for t in preparo["tarefas"]] == [1, 2]
+    respostas = {t["id"]: f"Página de cor {t['pagina']}." for t in preparo["tarefas"]}
+    r = _montar(api, {"plano": preparo["plano"], "respostas": respostas}).json()
+    assert r["cobertura"]["paginas"] == 2 and not r["cobertura"]["pendentes"]
+    assert r["markdown"].index("cor 1") < r["markdown"].index("cor 2")
+
+
+@pytest.mark.parametrize("ext", ["gif", "webp"])
+def test_quadros_animados_na_sessao_de_tarefas(api, ext):
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (200, 90), "red").save(
+        buf, format=ext, save_all=True, append_images=[Image.new("RGB", (200, 90), "blue")], duration=90
+    )
+    s = conforme(
+        enviar(api, ("estado." + ext, buf.getvalue()), {**A, **ESPERA}, modo="tarefas"), "/v1/sessoes", "post"
+    ).json()
+    p = s["itens"][0]["resultado"]
+    assert [t["pagina"] for t in p["tarefas"]] == [1, 2]
+    r = _montar(api, {"plano": p["plano"], "respostas": {t["id"]: str(i) for i, t in enumerate(p["tarefas"])}}).json()
+    assert r["cobertura"]["paginas"] == 2 and not r["cobertura"]["pendentes"]
+    assert f"quadro 2 · {ext.upper()}" in r["markdown"]

@@ -27,8 +27,12 @@ def agrupar(tarefas, pasta, max_itens=12):
         if t["modo"] in ("pagina", "tabela"):
             resto.append(t)
             continue
-        w, h = Image.open(f"{pasta}/ia/{t['id']}.png").size
-        (pequenas if w <= 900 and h <= 260 else resto).append(t)
+        with Image.open(f"{pasta}/ia/{t['id']}.png") as imagem:
+            w, h = imagem.size
+            pequena = w <= 900 and h <= 260
+            if pequena and "A" in imagem.getbands():
+                pequena = imagem.getchannel("A").getextrema()[0] == 255
+        (pequenas if pequena else resto).append(t)
     if len(pequenas) < 3:
         return tarefas, {}
     lotes, folha, itens, x, y, alt_linha = {}, [], [], 0, 0, 0
@@ -92,13 +96,12 @@ def _json_do_lote(bruto: str) -> dict:
 
 
 def resposta_aproveitavel(plano, tid, texto: str) -> bool:
-    """A resposta pode ir para o cache? Vazia, ou lote cujo JSON não deu nenhum item, não: senão a falha passageira
-    do provedor ficaria valendo por dias, e cada nova tentativa receberia a mesma pendência."""
+    """Somente leituras completas vão para o cache. Os itens vazios podem ser relidos na próxima tentativa."""
     itens = (plano.get("lotes") or {}).get(tid)
     if itens is None:
         return bool(texto.strip())
     dados = _json_do_lote(texto)
-    return any(_valor_do_item(dados, n).strip() for n, _ in itens)
+    return all(_valor_do_item(dados, n).strip() for n, _ in itens)
 
 
 def _valor_do_item(dados: dict, n) -> str:

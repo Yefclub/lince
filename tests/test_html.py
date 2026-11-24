@@ -39,7 +39,7 @@ def test_imagem_embutida_vai_para_a_ia_e_externa_nunca_e_baixada(tmp_path):
     p = tmp_path / "relatorio.html"
     p.write_text(
         f'<p>Antes.</p><img alt="Gráfico de vendas" src="{_png("navy")}"><p>Meio.</p>'
-        f'<img alt="ícone" src="{_png("red", (16, 16))}">'  # decorativo: não vai para a IA
+        f'<img alt="" src="{_png("red", (16, 16))}">'  # decorativo: não vai para a IA
         '<img alt="Logo do parceiro" src="http://127.0.0.1:9/logo.png"><p>Depois.</p>',
         encoding="utf-8",
     )

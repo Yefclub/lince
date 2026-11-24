@@ -1,3 +1,5 @@
+<img src="docs/midia/lince.png" width="112" alt="Símbolo do Lince">
+
 # Lince
 
 Leitor único de documentos para bases de conhecimento e IA.
@@ -15,7 +17,8 @@ r.metadados         # versão, rodapé, marca d'água, propriedades, comentário
 r.cobertura         # rotas por página, leituras pela IA, leituras do cache, pendências
 r.uso               # custo de cada leitura (para o seu ledger)
 r.estrutura         # páginas, slides, abas (e quais são ocultas), seções com a posição no Markdown (pontos de código)
-                    # e, nas planilhas e no CSV, o perfil de cada tabela: colunas com o tipo, amostra e linhas no texto
+                    # e, nas planilhas e no CSV, o perfil de cada tabela: colunas com o tipo, amostra e linhas no texto;
+                    # no PDF, o índice com as páginas de cada seção e as páginas em que vale ler a imagem original
 ```
 
 ## O que ele faz
@@ -31,6 +34,8 @@ r.estrutura         # páginas, slides, abas (e quais são ocultas), seções co
 | Tabela nativa com estrutura duvidosa | Recorte da tabela lido pela IA, com os valores nativos como âncora |
 | Fórmula escrita como texto no PDF | Recorte do bloco de fórmulas → LaTeX |
 | Página escaneada ou com texto corrompido | Página lida pela IA (dividida em duas quando densa) |
+| GIF e WebP animados | Quadros em ordem, com origem nas tarefas e limites de extração. JPEG respeita a orientação EXIF antes dos recortes. |
+| TIFF multipágina | Cada página segue em ordem, com origem nos recortes. Se a contagem for interrompida por prazo, teto ou diretório ilegível, a cobertura informa até onde o leitor chegou e registra a pendência |
 | Imagem avulsa alta | Fatiada para não ser reduzida até ficar ilegível |
 
 **Esforço máximo** (`Leitor(esforco="max")`): o que a IA marcou como `[ilegível]`, `≈` ou deixou vazio é
@@ -40,7 +45,7 @@ renderizado de novo em 2–3x a resolução e relido com a primeira leitura como
 revisão, código, classificação). No PDF, sai a linha curta da borda da página em que só o número da página muda,
 rotulado como página ("Página 3 de 12", "fls. 3"), a linha que é só o número ("3", "3 de 12", "- 3 -", "(3)",
 registrada com o número trocado por `#`) e a linha idêntica na borda de ao menos 80% das páginas ("Contrato
-123/2026 - Confidencial"). O número sem rótulo no meio de outras palavras fica no texto: no carnê com uma parcela por
+123/2026 - Confidencial"), mesmo quando o extrator a marca como título pela fonte grande. O número sem rótulo no meio de outras palavras fica no texto: no carnê com uma parcela por
 página, "Parcela 3 de 12" é conteúdo. Também vão para os metadados a marca d'água, as propriedades do arquivo, os
 comentários e as alterações rastreadas do Word e as abas ocultas do Excel.
 
@@ -83,6 +88,21 @@ leitor = lince.Leitor(
   que continua sendo o padrão.
 - Falha da IA nunca derruba o documento: a leitura nativa fica e a pendência é registrada.
 - `Uso.custo_usd` traz o custo da chamada quando o provedor informa (`usage.cost`, como no OpenRouter).
+
+### Mapa de evidência do PDF
+
+A transcrição é decidida antes da pergunta, e um gráfico lido com `≈` não volta a ser o gráfico. Para quem responde
+olhar o original só onde precisa, a estrutura do PDF traz:
+
+- `estrutura.indice`: cada seção com a página onde começa e a última que ela pode ocupar (`pagina_fim`), dos
+  marcadores do PDF ou, sem eles, dos títulos do texto (sem cabeçalho corrido, frase em negrito promovida a título,
+  bibliografia e entrada do sumário impresso). Quem busca navega pelo índice antes de ler, como num sumário.
+- `estrutura.paginas_visuais`: as páginas em que o Markdown traz a transcrição de algo que se vê (imagem, desenho,
+  tabela, fórmula, página escaneada) e o que a leitura não garante (`estimado`, `ilegivel`, `nao_lida`).
+- `lince.imagens_das_paginas(arquivo, [12, 13], lado=1568, senha=None)`: as páginas pedidas em PNG, como são exibidas,
+  para mandar ao modelo junto com o Markdown na hora da pergunta. O arquivo não é guardado.
+
+O Markdown não muda: o mapa é só um guia sobre ele.
 
 ### Em duas fases: a IA é de quem chama
 

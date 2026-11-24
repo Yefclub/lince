@@ -659,7 +659,7 @@ wheels = [
 
 [[package]]
 name = "lince"
-version = "0.7.0"
+version = "0.7.1.dev20261124233824"
 source = { editable = "." }
 dependencies = [
     { name = "defusedxml" },
@@ -675,6 +675,7 @@ dependencies = [
     { name = "python-pptx" },
     { name = "resvg-py" },
     { name = "tinycss2" },
+    { name = "xlformat" },
 ]
 
 [package.optional-dependencies]
@@ -724,6 +725,7 @@ requires-dist = [
     { name = "starlette", marker = "extra == 'servidor'", specifier = ">=1.10" },
     { name = "tinycss2", specifier = ">=1.4,<2" },
     { name = "uvicorn", marker = "extra == 'servidor'", specifier = ">=0.54" },
+    { name = "xlformat", specifier = "==0.5.0" },
 ]
 provides-extras = ["servidor", "redis", "emf"]
 
@@ -2144,6 +2146,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d5/a0/8fd707bcb776a7be556bad06a2ea5fb9bd519df78ef8e26f70ccf0f38bff/webencodings-0.6.1.tar.gz", hash = "sha256:565f9ad031c702dae404e27a099e3e09186a3ab1b9520f06d215502b651fd910", size = 15001, upload-time = "2026-08-15T14:22:57.549Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/77/c6/040cbc72480d789a5f40d63fb484d3106554c4dfa2d2b70ad5022057750f/webencodings-0.6.1-py3-none-any.whl", hash = "sha256:7fab6269c8bf237c657876b52058ccb182e861518d1c695c1a9aaa8c1c105d5b", size = 8745, upload-time = "2026-08-15T14:22:56.31Z" },
+]
+
+[[package]]
+name = "xlformat"
+version = "0.5.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/4d/c8/6c100aae9680b9ffa9927b3290da0f823934177a978d543637be3e8f2001/xlformat-0.5.0.tar.gz", hash = "sha256:611c827b6d31782d8436e37e429ff2e29cd8618919839b2e5b8ffcc7f248c826", size = 4731761, upload-time = "2026-11-20T00:41:10.376Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e8/51/33b2b576f6cee6dba3f70e76dc4463c056e3f12b4f8be208cd995b49c0ac/xlformat-0.5.0-py3-none-any.whl", hash = "sha256:9c149d032054759006351f3215593dacf954640bba69f2b6dd2d96c18dc4f372", size = 71539, upload-time = "2026-11-20T00:41:09.146Z" },
 ]
 
 [[package]]

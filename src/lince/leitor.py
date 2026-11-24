@@ -1,5 +1,6 @@
 """Orquestrador: arquivo → extração nativa e roteamento → leituras pela IA (com cache) → markdown + metadados."""
 
+import codecs
 import contextvars
 import json
 import logging
@@ -19,16 +20,18 @@ import anydoc
 
 from ._prazo import LIMITE, prazo_restante
 from ._trava import PDFIUM
-from .agrupamento import agrupar, distribuir_lotes, resposta_aproveitavel
+from .agrupamento import LADO, agrupar, distribuir_lotes, resposta_aproveitavel
 from .cache import Cache, chave
-from .estrutura import secoes
+from .conferencia_visual import avisos_transcricao, potencias
+from .estrutura import indice, secoes
 from .instrucoes import PROMPT_PADRAO, VERSAO_PROMPT, instrucao
-from .limites import LADO_MAX_PX, com_barras_normais, conferir_zip
+from .limites import LADO_MAX_PX, TAREFAS_POR_DOCUMENTO, com_barras_normais, conferir_zip
 from .metadados import metadados_arquivo
-from .montagem import SAIDA_MAX, montar, tamanho_da_saida
+from .montagem import SAIDA_MAX, medir_alternativas, montar, partes_da_imagem, tamanho_da_saida
 from .office import planejar_office
 from .pagina_html import planejar_html, planejar_svg
-from .pdf import de_pe, pagina_visivel, planejar_pdf
+from .pdf import PIXELS_IMAGEM_MAX, de_pe, pagina_visivel, planejar_pdf
+from .pdf import imagens_das_paginas as paginas_em_png
 from .protecao import DocumentoProtegido, aberto, formato_protegido
 from .provedores import LeitorVisual
 from .tipos import Cobertura, Plano, PrazoEsgotado, Resultado, Uso
@@ -181,10 +184,12 @@ class Leitor:
             if self.max_leituras is not None and len(tarefas) > self.max_leituras:
                 cobertura.pendentes += [f"{t['id']}: teto de leituras" for t in tarefas[self.max_leituras :]]
                 tarefas = tarefas[: self.max_leituras]
-            respostas, usos = self._ler_tarefas(plano, tarefas, pasta, cobertura, com_cache=not protegido)
+            respostas, usos, acertos_cache = self._ler_tarefas(
+                plano, tarefas, pasta, cobertura, com_cache=not protegido
+            )
             if self.esforco == "max" and self.ia is not None and plano["tipo"] == "pdf" and not _vencido():
                 respostas = distribuir_lotes(plano, respostas)
-                usos += self._segunda_passada(str(caminho), plano, respostas, cobertura)
+                usos += self._segunda_passada(str(caminho), plano, respostas, cobertura, tarefas, acertos_cache)
             return _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias=self.ia is not None)
 
     # ------------------------------------------------------------------ em duas fases (a IA é de quem chama)
@@ -222,11 +227,11 @@ class Leitor:
             caminho, _ = _com_senha(caminho, senha, pasta)
             plano = self.planejar(caminho, pasta)
             tarefas, pendentes = plano.get("tarefas", []), []
+            faixas = len(tarefas) if plano["tipo"] == "imagem" else None
             if self.max_leituras is not None and len(tarefas) > self.max_leituras:
                 motivo = f"teto de {_tarefas(self.max_leituras)} por documento"
                 pendentes = pendencias_do_teto(tarefas[self.max_leituras :], plano, motivo)
                 tarefas = plano["tarefas"] = tarefas[: self.max_leituras]
-            faixas = len(tarefas) if plano["tipo"] == "imagem" else None
             visuais = []
             for t in tarefas:
                 arquivo = f"{pasta}/ia/{t['id']}.png"
@@ -282,11 +287,12 @@ class Leitor:
 
     def _ler_tarefas(self, plano, tarefas, pasta, cobertura, com_cache=True):
         respostas, usos = {}, []
+        acertos_cache = 0
         if not tarefas:
-            return respostas, usos
+            return respostas, usos, acertos_cache
         if self.ia is None:
             cobertura.pendentes += [f"{t['id']}: sem modelo de visão configurado" for t in tarefas]
-            return respostas, usos
+            return respostas, usos, acertos_cache
         faixas = len(plano["tarefas"]) if plano["tipo"] == "imagem" else None
 
         def um(t):
@@ -297,25 +303,26 @@ class Leitor:
             # a chave é o que muda a resposta: imagem, instrução, modelo e versão do prompt (não a versão do pacote,
             # senão cada release leria e pagaria tudo de novo)
             k = chave(img, instr, getattr(self.ia, "identidade", self.ia.modelo), VERSAO_PROMPT)
-            if com_cache and (txt := self._cache_obter(k)) is not None:
-                return t["id"], txt, Uso(self.ia.modelo, cache=True, tarefa=t["id"])
+            if com_cache and (txt := self._cache_obter(k)) is not None and resposta_aproveitavel(plano, t["id"], txt):
+                return t["id"], txt, Uso(self.ia.modelo, cache=True, tarefa=t["id"]), True
             r = self.ia.ler(img, instr)
             if com_cache and resposta_aproveitavel(plano, t["id"], r.texto):
                 self._cache_guardar(k, r.texto)
             r.uso.tarefa = t["id"]
-            return t["id"], r.texto, r.uso
+            return t["id"], r.texto, r.uso, False
 
         with ThreadPoolExecutor(self.concorrencia) as ex:
             futuros = {ex.submit(contextvars.copy_context().run, um, t): t for t in tarefas}  # o prazo vai junto
             for f, t in futuros.items():
                 try:
-                    tid, txt, uso = f.result()
+                    tid, txt, uso, veio_do_cache = f.result()
                 except PrazoEsgotado:
                     cobertura.pendentes.append(f"{t['id']}: prazo esgotado")
                     continue
                 except Exception as e:  # noqa: BLE001 — leitura falhou: o nativo segue, a pendência fica registrada
                     cobertura.pendentes.append(f"{t['id']}: {type(e).__name__}: {str(e)[:120]}")
                     continue
+                acertos_cache += veio_do_cache
                 respostas[tid] = txt
                 usos.append(uso)
                 if uso.cache:
@@ -324,7 +331,7 @@ class Leitor:
                     cobertura.leituras_ia += 1
                 if self.ao_usar:
                     self.ao_usar(uso)
-        return respostas, usos
+        return respostas, usos, acertos_cache
 
     def _cache_obter(self, k):
         """Cache fora do ar (Redis caído, rede) não derruba a leitura: segue lendo pela IA, como sem cache."""
@@ -345,13 +352,21 @@ class Leitor:
             _avisar_cache(e)
 
     # ------------------------------------------------------------------ esforço máximo
-    def _segunda_passada(self, caminho, plano, R, cobertura):
+    def _segunda_passada(self, caminho, plano, R, cobertura, tarefas, acertos_cache):
         """Releitura ampliada (2–3x) do que saiu ilegível, estimado ou vazio, com a 1ª leitura como contexto."""
         import io
 
         import pypdfium2 as pdfium
 
         alvos = [t for t in plano.get("tarefas_originais", []) if "caixa" in t and _precisa_rever(R.get(t["id"], ""))]
+        if self.max_leituras is not None:
+            # Uma tentativa que falhou também pode ser cobrada. Só o cache devolve saldo.
+            admitidos = {t["id"] for t in tarefas}
+            admitidos.update(it["tarefa"] for t in tarefas for it in t.get("itens", []))
+            saldo = max(0, self.max_leituras - len(tarefas) + acertos_cache)
+            candidatos = [t for t in alvos if t["id"] in admitidos]
+            cobertura.pendentes.extend(f"{t['id']}: teto de releituras ampliadas" for t in candidatos[saldo:])
+            alvos = candidatos[:saldo]
         if not alvos:
             return []
         usos, preparados = [], []
@@ -466,26 +481,34 @@ def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
     """O fim da leitura, igual com a IA do Lince ou com a de quem chama: pendência de resposta vazia, montagem do
     texto e dos metadados, estrutura."""
 
+    pendencias_montagem = []
+
     def montado(respostas):  # o texto e os metadados com estas respostas
+        pendencias_montagem.clear()
         if plano["tipo"] == "imagem":
-            md = "\n\n".join(respostas.get(t["id"], "") for t in plano["tarefas"])
+            md = "\n\n".join(partes_da_imagem(plano, respostas))
             return md, dict(plano.get("meta_arquivo") or {})
-        md = montar(pasta, respostas)
+        md = montar(pasta, respostas, pendencias_montagem)
         return md, json.loads(Path(f"{pasta}/metadados.json").read_text(encoding="utf-8"))
 
     posicao = {t["id"]: k for k, t in enumerate(plano.get("tarefas", []))}
     ordem = sorted(respostas, key=lambda tid: posicao.get(tid, len(posicao)))  # a ordem do plano
     medidas = {}  # o texto de cada resposta é medido uma vez na busca do que cabe
-    if respostas and tamanho_da_saida(plano, respostas, medidas) > SAIDA_MAX:
+    cabem = len(ordem)
+    if respostas and plano["tipo"] == "office" and plano.get("alt_das_tarefas"):
+        _, cabem = medir_alternativas(plano, respostas, ordem, SAIDA_MAX)
+    elif respostas and tamanho_da_saida(plano, respostas, medidas) > SAIDA_MAX:
         # acima do teto de saída, entram as leituras que cabem, na ordem do plano; as outras ficam pendentes, com o
         # motivo, e o texto nativo sai inteiro no lugar delas. A busca é binária: o tamanho só cresce com cada leitura
         cabem, sobra = 0, len(ordem)
         while cabem + 1 < sobra:
             meio = (cabem + sobra) // 2
-            if tamanho_da_saida(plano, {tid: respostas[tid] for tid in ordem[:meio]}, medidas) <= SAIDA_MAX:
+            prefixo = {tid: respostas[tid] for tid in ordem[:meio]}
+            if tamanho_da_saida(plano, prefixo, medidas) <= SAIDA_MAX:
                 cabem = meio
             else:
                 sobra = meio
+    if cabem < len(ordem):
         cobertura.pendentes += [f"{tid}: resultado grande demais" for tid in ordem[cabem:]]
         ordem = ordem[:cabem]
         respostas = {tid: respostas[tid] for tid in ordem}
@@ -495,6 +518,7 @@ def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
         cobertura.pendentes += [f"{tid}: resultado grande demais" for tid in ordem]
         respostas = {}
         md, meta = montado(respostas)
+    cobertura.pendentes.extend(pendencias_montagem)
     if conferir_vazias:  # resposta vazia não pode virar lacuna silenciosa no documento
         lidos = distribuir_lotes(plano, respostas)
         ja = {p.split(":", 1)[0] for p in cobertura.pendentes}
@@ -502,13 +526,68 @@ def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
         ja |= {tid for lid, itens in (plano.get("lotes") or {}).items() if lid in ja for _, tid in itens}
         cobertura.pendentes += [
             f"{t['id']}: resposta vazia da IA"
-            for t in plano.get("tarefas_originais", [])
+            for t in (plano["tarefas"] if plano["tipo"] == "imagem" else plano.get("tarefas_originais", []))
             if t["id"] not in ja and not str(lidos.get(t["id"], "")).strip()
         ]
+    if plano["tipo"] == "imagem" and plano.get("paginas_total", 1) > 1:
+        paginas = {t["id"]: t["pagina"] + 1 for t in plano["tarefas"] if "pagina" in t}
+        for i, p in enumerate(cobertura.pendentes):
+            tid, _, motivo = p.partition(": ")
+            if tid in paginas:
+                cobertura.pendentes[i] = f"{tid}: página {paginas[tid]}: {motivo}"
     r = _com_estrutura(Resultado(md, meta, cobertura, usos), plano)
-    if imagens := _imagens(plano, distribuir_lotes(plano, respostas)):
+    lidos = distribuir_lotes(plano, respostas)
+    if imagens := _imagens(plano, lidos):
         r.estrutura["imagens"] = imagens
+    if plano["tipo"] == "pdf" and (visuais := _paginas_visuais(plano, lidos, cobertura.pendentes)):
+        r.estrutura["paginas_visuais"] = visuais
     return r
+
+
+_MOTIVO_PAGINA = {"escaneada": "escaneada", "texto nativo corrompido": "texto_corrompido"}  # o resto é matemática
+
+
+def _paginas_visuais(plano, lidos, pendentes=None) -> list[dict]:
+    """As páginas do PDF em que o Markdown traz uma transcrição feita pela IA no lugar do que se vê, para quem
+    responde decidir quando mandar a imagem da página ao modelo: o que havia nela (`conteudo`: imagem, desenho,
+    tabela, fórmula, ou a página inteira escaneada, de texto corrompido ou de matemática densa) e o que a leitura
+    deixou de garantir (`alertas`: valor estimado com ≈ fora de fórmula, trecho ilegível, leitura que não veio). Toda
+    posição conta, inclusive a da imagem repetida, com a leitura de quem a leu. Página nativa sem figura fica de fora:
+    o texto dela é o do arquivo."""
+    iguais = plano.get("iguais", {})
+    originais = {t["id"]: t for t in plano.get("tarefas_originais", [])}
+    por_pagina = {}
+    referencias = {p["i"]: p["potencias_visiveis"] for p in plano.get("paginas", []) if p.get("potencias_visiveis")}
+    for posicao in plano.get("posicoes", []):
+        if not isinstance(posicao.get("pagina"), int):
+            continue
+        leitor = iguais.get(posicao["id"], posicao["id"])
+        numero = posicao["pagina"] + 1
+        conteudo, alertas, conferencias = por_pagina.setdefault(numero, (set(), set(), set()))
+        if posicao["modo"] == "pagina":
+            conteudo.add(_MOTIVO_PAGINA.get(originais.get(leitor, {}).get("motivo", ""), "matematica"))
+        else:
+            conteudo.add(posicao["modo"])
+        texto = str(lidos.get(leitor, ""))
+        if not texto.strip():
+            alertas.add("nao_lida")
+        else:
+            ancora = originais.get(leitor, {}).get("ancora", "")
+            ref = referencias.get(posicao["pagina"]) if posicao["modo"] == "pagina" else potencias(ancora)
+            for alerta, motivo in avisos_transcricao(texto, ancora, ref).items():
+                if pendentes is not None:
+                    pendentes.append(f"página {numero}, {leitor}: {motivo}")
+                conferencias.add(alerta)
+            if "≈" in texto and posicao["modo"] != "formula":  # na fórmula, ≈ é o símbolo, não estimativa
+                alertas.add("estimado")
+            if "[ilegível]" in texto or "[illegible]" in texto:
+                alertas.add("ilegivel")
+    return [
+        {"pagina": n, "conteudo": sorted(c)}
+        | ({"alertas": sorted(a)} if a else {})
+        | ({"conferencias": sorted(v)} if v else {})
+        for n, (c, a, v) in sorted(por_pagina.items())
+    ]
 
 
 def _deduplicar(plano, pasta) -> dict[str, str]:
@@ -575,6 +654,10 @@ def _com_estrutura(r: Resultado, plano) -> Resultado:
     if plano["tipo"] == "pdf":
         r.estrutura["paginas"] = r.cobertura.paginas
     r.estrutura.update(secoes(r.markdown, pdf=plano["tipo"] == "pdf", apresentacao=bool(plano.get("slides"))))
+    if plano["tipo"] == "pdf" and (
+        mapa := indice(r.markdown, r.estrutura, plano.get("sumario"), bool(plano.get("sumario_cortado")))
+    ):
+        r.estrutura["indice"] = mapa
     return r
 
 
@@ -632,8 +715,36 @@ def _com_senha(caminho, senha, pasta) -> tuple[str, bool]:
     return lido, lido != str(caminho)
 
 
+def imagens_das_paginas(
+    caminho: str | Path, paginas, lado: int = 1568, senha: str | None = None, prazo: float | None = None
+) -> dict[int, bytes]:
+    """As páginas pedidas do PDF (lista de números a partir de 1) em PNG, de pé, com o maior lado em `lado` pixels,
+    para quem responde ler a página original na hora da pergunta (as de `estrutura.paginas_visuais`, onde o Markdown
+    traz a transcrição de um gráfico, de uma figura ou de um scan). O arquivo não é guardado. Com senha, ele é
+    decifrado numa pasta temporária, apagada no fim; protegido sem senha levanta `DocumentoProtegido`, como na leitura.
+    Pedido fora dos tetos (páginas, lado, pixels da chamada, página pesada demais ou que não abre) levanta ValueError;
+    com `prazo` (segundos), a página que começaria depois dele levanta `PrazoEsgotado`."""
+    if _extensao_lida(str(caminho)) != ".pdf":
+        raise FormatoNaoSuportado("imagens das páginas só de PDF")
+    if prazo is not None and not (math.isfinite(prazo) and prazo > 0):
+        raise ValueError("prazo precisa ser um número de segundos maior que zero")
+    token = LIMITE.set(time.monotonic() + prazo if prazo is not None else None)
+    try:
+        with tempfile.TemporaryDirectory(prefix="lince-") as pasta:
+            lido, _ = _com_senha(caminho, senha, pasta)
+            if senha is None and (formato := formato_protegido(lido)):
+                raise DocumentoProtegido(formato)
+            return paginas_em_png(lido, paginas, lado)
+    finally:
+        LIMITE.reset(token)
+
+
 def _texto(caminho):
     raw = Path(caminho).read_bytes()
+    if raw.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        return raw.decode("utf-32", errors="replace")
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return raw.decode("utf-16", errors="replace")
     for cod in ("utf-8-sig", "cp1252", "latin-1"):
         try:
             return raw.decode(cod)
@@ -644,14 +755,73 @@ def _texto(caminho):
 
 def _plano_imagem(caminho, pasta):
     """Imagem avulsa: faixas que cabem no limite do provedor (imagem alta não é reduzida até ficar ilegível)."""
-    from PIL import Image
+    from PIL import Image, ImageOps
 
-    im = Image.open(caminho).convert("RGB")
-    alt = min(im.height, int(im.width * 0.75)) or im.height
-    tarefas, y, k = [], 0, 1
-    while y < im.height:
-        tid = f"faixa{k}"
-        im.crop((0, max(0, y - 40), im.width, min(im.height, y + alt))).save(f"{pasta}/ia/{tid}.png")
-        tarefas.append({"id": tid, "modo": "pagina", "ancora": ""})
-        y, k = y + alt, k + 1
-    return {"tipo": "imagem", "tarefas": tarefas}
+    tarefas, pendentes = [], []
+    pixels = pagina = 0
+    with Image.open(caminho) as origem:
+        formato = origem.format
+        animacao = formato in ("GIF", "WEBP") and origem.is_animated
+        multipagina = animacao or (formato == "TIFF" and origem.is_animated)
+        if formato == "JPEG":
+            ImageOps.exif_transpose(origem, in_place=True)
+        while True:
+            if animacao and _vencido():
+                pendentes.append(f"contagem de {formato} interrompida após {pagina} quadros: prazo esgotado")
+                break
+            if multipagina and not animacao and (_vencido() or pagina >= TAREFAS_POR_DOCUMENTO):
+                motivo = "prazo esgotado" if _vencido() else f"teto de páginas {formato}"
+                pagina += 1
+                pendentes.append(f"a partir da página {pagina}: {motivo} (contagem do {formato} interrompida)")
+                break
+            try:
+                origem.seek(pagina)
+            except (OSError, EOFError, SyntaxError, ValueError, Image.DecompressionBombError) as erro:
+                if animacao and isinstance(erro, EOFError):
+                    break
+                if not multipagina:
+                    raise
+                pagina += 1
+                pendentes.append(f"a partir da página {pagina}: diretório {formato} ilegível ({type(erro).__name__})")
+                break
+            pagina += 1
+            ultima = not multipagina or (formato == "TIFF" and not origem.tag_v2.next)
+            w, h = origem.size
+            alt = h if max(w, h) <= LADO else min(h, int(w * 0.75)) or h
+            numero = (h + alt - 1) // alt
+            pixels += w * h
+            if multipagina and (
+                pagina > TAREFAS_POR_DOCUMENTO
+                or pixels > PIXELS_IMAGEM_MAX
+                or len(tarefas) + numero > TAREFAS_POR_DOCUMENTO
+            ):
+                pendentes.append(
+                    f"a partir da página {pagina}: teto de extração de imagens {formato} (contagem interrompida)"
+                )
+                break
+            try:
+                quadro = origem.convert("RGB")
+            except (OSError, EOFError, SyntaxError, ValueError, Image.DecompressionBombError) as erro:
+                if not multipagina:
+                    raise
+                pendentes.append(f"página {pagina}: quadro {formato} ilegível ({type(erro).__name__})")
+            else:
+                with quadro as im:
+                    for n, y in enumerate(range(0, h, alt), 1):
+                        if multipagina and _vencido():
+                            pendentes.append(f"a partir da página {pagina}: prazo esgotado (contagem interrompida)")
+                            return {
+                                "tipo": "imagem",
+                                "tarefas": tarefas,
+                                "paginas_total": pagina,
+                                "pendentes": pendentes,
+                            }
+                        tid = f"faixa{len(tarefas) + 1}"
+                        im.crop((0, max(0, y - 40), w, min(h, y + alt))).save(f"{pasta}/ia/{tid}.png")
+                        tarefa = {"id": tid, "modo": "pagina", "ancora": ""}
+                        if multipagina:
+                            tarefa.update(pagina=pagina - 1, faixa=n, faixas_na_pagina=numero, formato_quadro=formato)
+                        tarefas.append(tarefa)
+            if ultima:
+                break
+    return {"tipo": "imagem", "tarefas": tarefas, "paginas_total": pagina, "pendentes": pendentes}
