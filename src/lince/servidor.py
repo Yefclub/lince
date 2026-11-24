@@ -625,6 +625,11 @@ def _conferir_estado(e):
     lista(e.get("tarefas", []), dict, PLANO_TAREFAS_MAX, "tarefas")
     lista(e.get("tarefas_originais", []), dict, PLANO_TAREFAS_MAX, "tarefas_originais")
     lista(e.get("extras", []), str, PLANO_TAREFAS_MAX, "extras")
+    from .xlsx_anotacoes import CARACTERES_MAX
+
+    anotacoes = e.get("anotacoes_planilha", "")
+    if not isinstance(anotacoes, str) or len(anotacoes) > CARACTERES_MAX:
+        raise ValueError("anotações da planilha")
     if not isinstance(e.get("md", ""), str) or not isinstance(e.get("iguais", {}), dict):
         raise ValueError("md ou iguais")
 

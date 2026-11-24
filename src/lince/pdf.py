@@ -28,6 +28,7 @@ from ._prazo import LIMITE, prazo_restante
 from ._trava import PDFIUM
 from .limites import escala
 from .pdf_formulario import abrir_pdf, campos_visiveis
+from .pdf_tabelas import conferir_tabelas
 from .seguranca import NAO_CONFERIDO, texto_oculto_pdf
 from .texto import densidade_matematica, desifenizar, limpar_tabelas, lixo
 from .tipos import PrazoEsgotado
@@ -1059,6 +1060,9 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     dens = densidade_matematica(md)
     nativo = desifenizar(md)
     md, tabelas = limpar_tabelas(nativo)
+    if tabelas and not (rotacao or ocultos or eh_ocr):
+        filetes = [bx for tipo, bx in objs if tipo == c.FPDF_PAGEOBJ_PATH and bx[2] - bx[0] <= 2 < bx[3] - bx[1]]
+        md = conferir_tabelas(md, tabelas, itens_pg, filetes, _tique)
     # só tabela nativa CONFIÁVEL anula um desenho; tabela duvidosa pode ser rótulo de gráfico
     palavras_tabela = set().union(*[tb["palavras"] for tb in tabelas if not tb["complexa"]]) if tabelas else set()
     tabela_de = {}
@@ -1107,20 +1111,36 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
         if ficou:
             pendentes.append(alerta)
     # Tabela nativa duvidosa: recorte da tabela vai para a IA (com o nativo como âncora).
+    itens_conferidos = set()
+    for tb in tabelas:
+        if cx := tb.get("caixa"):
+            _tique()
+            l, b, r, t = cx
+            itens_conferidos.update(
+                id(x) for x in itens_pg if l <= x.x + x.width / 2 <= r and b <= x.y + x.height / 2 <= t
+            )
     for k, tb in enumerate(tabelas):
         _tique()
         if not tb["complexa"]:
+            continue
+        if caixa := tb.get("caixa"):
+            tabela_de[id(caixa)] = k
+            regioes.append(("tabela", caixa))
             continue
         dentro = [
             x
             for x in itens_pg
             if not x.text.startswith("[Image:")
+            and id(x) not in itens_conferidos
             and set(re.findall(r"\w+", x.text.lower()))
             and set(re.findall(r"\w+", x.text.lower())) <= tb["palavras"]
         ]
         if len(dentro) >= 4:
             ys = sorted(x.y for x in dentro)
             lo, hi = ys[len(ys) // 20], ys[-1 - len(ys) // 20]
+            if itens_conferidos:
+                # A outra tabela posicionada já foi excluída da busca: preservar a primeira e a última linha.
+                lo, hi = ys[0], ys[-1]
             caixa = [min(x.x for x in dentro) - 4, lo - 6, W - 30, hi + 14]
             caixa[0] = max(20, min(caixa[0], 60))
             tabela_de[id(caixa)] = k
@@ -1381,6 +1401,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                         "tarefa": tid,
                         "depois_de": linha_acima,
                         "texto_dentro": ancora,
+                        **({"desenho": True} if tipo == "desenho" else {}),
                         # A legenda digital sobre uma foto de fundo é texto da página.
                         **(
                             {"preserva_texto": True}

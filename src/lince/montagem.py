@@ -36,6 +36,9 @@ def _metadados(pasta, plano, corpo, moveis):
         meta[k] = sorted(set(meta.get(k, [])) | v)
     if plano.get("texto_oculto"):
         meta["texto_oculto_removido"] = plano["texto_oculto"]
+    if anotacoes := plano.get("anotacoes_planilha"):
+        # Endereços, URLs e textos de nota são literais. Não sofrem tipografia nem viram marcas da IA.
+        corpo = corpo.rstrip() + "\n\n" + anotacoes
     alertas = alertas_injecao(corpo) + [a for o in plano.get("texto_oculto", []) for a in alertas_injecao(o["texto"])]
     alertas += [o["alerta"] for o in plano.get("texto_oculto", []) if o.get("alerta")]
     if alertas:
@@ -131,6 +134,42 @@ def _cobre_ocr(nativo, visual):
     return True
 
 
+def _texto_do_bloco(bloco):
+    # A geometria dá o título sem o prefixo Markdown. Dois leitores podem atribuir
+    # níveis diferentes ao mesmo título. O conteúdo e a pontuação precisam coincidir.
+    bloco = bloco.strip()
+    if "\n" not in bloco:
+        bloco = re.sub(r"^#{1,6}[ \t]+", "", bloco)
+    return " ".join(bloco.split())
+
+
+def _paragrafos_do_desenho(regioes, blocos, lido):
+    """Um boxe vetorial pode conter parágrafos inteiros. A transcrição deve trazer o
+    mesmo parágrafo com a mesma pontuação, e o recorte deve conter todas as linhas."""
+    desenhos = [r for r in regioes if r.get("desenho") and lido(r["tarefa"])]
+    # Conferência opcional: limita buscas de trecho em páginas e respostas muito grandes.
+    if not desenhos or len(desenhos) > 16 or sum(map(len, blocos)) > 128_000:
+        return set()
+    unicos = Counter(_texto_do_bloco(b) for b in blocos)
+    copiados = set()
+    buscas = 0
+    for r in desenhos:
+        visual, ancora = lido(r["tarefa"]), r["texto_dentro"]
+        if max(len(visual), len(ancora)) > 128_000:
+            continue
+        dentro = " " + " ".join(ancora.split()) + " "
+        for b in visual.split("\n\n"):
+            texto = _texto_do_bloco(b)
+            if not texto or unicos[texto] != 1:
+                continue
+            buscas += 1
+            if buscas > 128:
+                return copiados
+            if f" {texto} " in dentro:
+                copiados.add(texto)
+    return copiados
+
+
 def montar(pasta, respostas, pendentes=None):
     plano = json.load(open(f"{pasta}/plano.json", encoding="utf-8"))
     R = _lidas(plano, respostas, lambda chave: _textos(plano, chave, respostas[chave]))
@@ -214,14 +253,22 @@ def montar(pasta, respostas, pendentes=None):
         md = re.sub(r"\{\{(TABELA|FORMULA):(\d+)\}\}", troca, p["md"])
         blocos = [b for b in md.split("\n\n") if b.strip()]
         # tira do nativo o texto que pertence à figura (rótulos de eixo etc.)
-        dentro = " ".join(
-            r["texto_dentro"]
+        # Em um boxe vetorial os próprios parágrafos aparecem na âncora. Só a
+        # correspondência literal na transcrição confirma que já estão na saída.
+        figuras = [
+            r
             for r in p["regioes"]
-            if not r.get("preserva_texto") and "substitui_tabela" not in r and "substitui_formula" not in r
-        )
-        palavras_dentro = set(re.findall(r"\w+", dentro.lower()))
+            if not r.get("desenho")
+            and not r.get("preserva_texto")
+            and "substitui_tabela" not in r
+            and "substitui_formula" not in r
+        ]
+        palavras_dentro = set(re.findall(r"\w+", " ".join(r["texto_dentro"] for r in figuras).lower()))
+        copiados = _paragrafos_do_desenho(p["regioes"], blocos, lido)
         limpos = []
         for b in blocos:
+            if copiados and _texto_do_bloco(b) in copiados:
+                continue
             pal = re.findall(r"\w+", b.lower())
             if (
                 pal
@@ -474,6 +521,8 @@ def tamanho_da_saida(e, respostas, medidas=None) -> int:
         return cheia(tid)
 
     total = len(e.get("md", "")) + sum(len(x) + 2 for x in e.get("extras", [])) + 1  # junções e o fim de linha
+    if anotacoes := e.get("anotacoes_planilha"):
+        total += len(anotacoes) + 2
     for tid, n in Counter(re.findall(r"\{\{IA:(\w+)\}\}", e.get("md", ""))).items():
         primeira = leitura(tid)
         total += primeira + (n - 1) * leitura(tid)  # a segunda chamada já conta a referência
