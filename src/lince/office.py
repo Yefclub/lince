@@ -1,6 +1,7 @@
 """Office (DOCX, PPTX, XLSX, ODF, RTF, EPUB, legados): anydoc + gráficos nativos, setas de fluxograma e imagens."""
 
 import hashlib
+import html
 import io  # noqa: F401
 import json  # noqa: F401
 import os  # noqa: F401
@@ -350,7 +351,7 @@ def planejar_office(path, pasta, ext=None):
         # como .docx, é conferido), e o anydoc recebe esse formato explícito
         formato = "csv" if ext in (".csv", ".tsv") else anydoc.format_from_bytes(dados)
         if formato == "docx":
-            dados = (limpeza := limpar_docx(dados)).dados
+            dados = (limpeza := limpar_docx(dados, formatar_texto=True)).dados
         elif formato == "pptx":
             dados = (limpeza := limpar_pptx(dados)).dados
         if ext in PPTX:
@@ -395,7 +396,7 @@ def planejar_office(path, pasta, ext=None):
     elif doc is None:
         (md, perfis), ilegiveis[:0] = md_xlsb, ilegiveis_xlsb
     else:
-        md = serializar(doc, ler_imagem)[0]
+        md = serializar(doc, ler_imagem, links=formato in ("docx", "rtf"))[0]
         perfis = _perfis(doc) if ext in PLANILHAS else []
         if limpeza is not None:  # a rede de segurança: o que o anydoc leu e a conferência não viu é falha
             lido = re.sub(rf"{marca}\d+X", " ", texto_lido(doc))
@@ -1090,7 +1091,26 @@ def texto_lido(doc) -> str:
     return "".join(out)
 
 
-def serializar(doc, ler_imagem):
+def _link_markdown(rotulo, alvo):
+    """Conserva o destino como dado, sem buscar o recurso."""
+    from urllib.parse import quote
+
+    if alvo is None or not alvo.value:
+        return rotulo
+    destino = alvo.value.strip()
+    if alvo.kind == "anchor":
+        destino = "#" + destino.lstrip("#")
+    esquema = re.match(r"^([a-z][a-z0-9+.-]*):", destino, flags=re.I)
+    if esquema and esquema[1].lower() not in ("http", "https", "mailto", "ftp", "tel"):
+        return rotulo
+    if not destino or any(ord(c) < 32 for c in destino):
+        return rotulo
+    destino = quote(destino, safe="/:?#@!$&'*+,;=%~")
+    texto = (rotulo or destino).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+    return f"[{texto}]({destino})"
+
+
+def serializar(doc, ler_imagem, *, links=False):
     cobertura = {"pendente": []}
     assets = {a.id: a for a in doc.assets}
     n_img = {"n": 0}
@@ -1102,7 +1122,10 @@ def serializar(doc, ler_imagem):
             if k == "text":
                 out.append(x.text or "")
             elif k == "link":
-                out.append(inl(x.content))
+                rotulo = inl(x.content)
+                out.append(_link_markdown(rotulo, x.target) if links else rotulo)
+            elif k == "anchor" and links and x.anchor:
+                out.append(f'<a id="{html.escape(x.anchor, quote=True)}"></a>')
             elif k == "image":
                 n_img["n"] += 1
                 src = x.source

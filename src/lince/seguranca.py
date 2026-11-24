@@ -1504,14 +1504,14 @@ def _deslocamento(pos, margem):
 _BORDA = re.compile(r"word/(header|footer)\d*\.xml")
 
 
-def limpar_docx(dados: bytes) -> Limpeza:
+def limpar_docx(dados: bytes, *, formatar_texto=False) -> Limpeza:
     """Texto do Word que a IA leria e o humano não vê, esvaziado no próprio XML antes da conversão: corpo, caixas de
     texto, notas de rodapé e de fim, comentários, cabeçalho e rodapé, achados pelas relações do pacote, como o anydoc
     acha. Só as partes alteradas são regravadas; texto visível igual a um oculto fica onde está. A parte que não pode
     ser lida vai para `falhas` e fica como estava."""
     try:
         with zipfile.ZipFile(io.BytesIO(dados)) as z:
-            ocultos, limpas, falhas, vistas = _conferir_word(z)
+            ocultos, limpas, falhas, vistas = _conferir_word(z, formatar_texto=formatar_texto)
             return Limpeza(ocultos, _regravar(z, limpas) if limpas else dados, falhas, frozenset(vistas))
     except MemoryError:
         raise
@@ -1530,7 +1530,7 @@ def bordas_sem_oculto(z) -> dict:
         return {}
 
 
-def _conferir_word(z, so_metadados=False) -> tuple:
+def _conferir_word(z, so_metadados=False, formatar_texto=False) -> tuple:
     """As partes que o anydoc lê (a principal pelo officeDocument; estilos e notas pelas relações dela) e as que os
     metadados leem (cabeçalho, rodapé e comentários, pelas relações e pelo nome)."""
     pac = _Pacote(z)
@@ -1585,7 +1585,18 @@ def _conferir_word(z, so_metadados=False) -> tuple:
         emitido = _emitido_word(raiz, papel) if papel in ("corpo", "nota") else None
         try:
             achados, mudou = _conferir_parte(
-                raiz, estilos, tema, atras, geometria, cobre, papel, imagem(nome), emitido, vistas, conta
+                raiz,
+                estilos,
+                tema,
+                atras,
+                geometria,
+                cobre,
+                papel,
+                imagem(nome),
+                emitido,
+                vistas,
+                conta,
+                formatar_texto,
             )
         except _Teto as e:  # a parte fica como está e vira falha, com o teto no motivo
             pac.falhou(nome, e)
@@ -1656,7 +1667,40 @@ def _lido(r, papel, ramos) -> bool:
     return True
 
 
-def _conferir_parte(raiz, estilos, tema, pagina, geometria, faixas, papel, imagem, emitido, vistas, conta) -> tuple:
+_SOBRESCRITOS = str.maketrans("0123456789+-=()", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾")
+_SUBSCRITOS = str.maketrans("0123456789+-=()", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎")
+
+
+def _formatar_run_visivel(run, textos, estilos, lugar):
+    """Projeta no documento temporário só a semântica que o conversor não entrega."""
+    from html import escape
+
+    rpr = run.find(f"{_W}rPr")
+    alinhamento = estilos.run(rpr, lugar, "vertAlign")
+    valor = alinhamento.get(f"{_W}val") if alinhamento is not None and alinhamento is not _INCERTO else None
+    tag = {"superscript": "sup", "subscript": "sub"}.get(valor)
+    riscado = estilos.alternante(rpr, lugar, "strike") or _ligado(estilos.run(rpr, lugar, "dstrike"))
+    if not tag and not riscado:
+        return False
+    for t in textos:
+        original = t.text
+        if not original or t.tag != f"{_W}t":
+            continue
+        if tag:
+            mapa = _SOBRESCRITOS if tag == "sup" else _SUBSCRITOS
+            if all(ord(c) in mapa or c.isspace() for c in original):
+                texto = original.translate(mapa)
+            else:
+                texto = f"<{tag}>{escape(original, quote=False)}</{tag}>"
+        else:
+            texto = escape(original, quote=False)
+        t.text = f"<del>{texto}</del>" if riscado else texto
+    return True
+
+
+def _conferir_parte(
+    raiz, estilos, tema, pagina, geometria, faixas, papel, imagem, emitido, vistas, conta, formatar_texto
+) -> tuple:
     """Esvazia o texto dos runs ocultos da parte (w:t do run, em todos os ramos de mc:AlternateContent dele, e m:t da
     fórmula); devolve o que saiu do que é lido e se a parte mudou. Com o que o anydoc emite da parte (`emitido`), junta
     em `vistas` as palavras do que foi conferido e ele escreve, depois da limpeza."""
@@ -1679,6 +1723,8 @@ def _conferir_parte(raiz, estilos, tema, pagina, geometria, faixas, papel, image
             mudou = True
             if _lido(r, papel, ramos):
                 achados.append((motivo, txt))
+        elif formatar_texto and emitido is not None and r.tag == f"{_W}r":
+            mudou |= _formatar_run_visivel(r, textos, estilos, pars[par])
     if emitido is not None:
         lidos = emitido.textos & {t for textos in runs.values() for t in textos}  # o lido que foi conferido
         _registrar(raiz.iter(f"{_W}p"), lidos, vistas)
