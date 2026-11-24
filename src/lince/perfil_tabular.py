@@ -6,6 +6,7 @@ tem. Determinístico (sem IA), com tetos declarados: coluna além do teto marca 
 texto marca `extracao_cortada`."""
 
 import re
+from itertools import chain, groupby, islice
 
 AMOSTRA_LINHAS = 5
 COLUNAS_MAX = 64  # planilha larga: o perfil lista as primeiras e declara o corte
@@ -14,7 +15,7 @@ CARACTERES_MAX = 120  # por valor no cabeçalho e na amostra
 
 # milhar em grupos de 3 com um separador só e decimal com o outro (1.234.567,89 ou 1,234.5); IP e versão são texto
 _NUMERO = re.compile(
-    r"[+-]?(?:\d{1,3}([.,])\d{3}(?:\1\d{3})*(?:(?!\1)[.,]\d+)?|\d+(?:[.,]\d+)?|[.,]\d+)(?:[eE][+-]?\d+)?%?"
+    r"[+-]?(?:\d{1,3}([., \u00a0\u202f])\d{3}(?:\1\d{3})*(?:(?!\1)[.,]\d+)?|\d+(?:[.,]\d+)?|[.,]\d+)(?:[eE][+-]?\d+)?%?"
 )
 _DATA = re.compile(  # ISO (como o leitor escreve), dd/mm/aaaa e hora
     r"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?|\d{1,2}/\d{1,2}/\d{2,4}|\d{2}:\d{2}(?::\d{2})?"
@@ -48,7 +49,7 @@ class Aba:
         self.linhas, self.colunas_cortadas = 0, False
         self.inicio, self.separada = 0, False
 
-    def linha(self, celulas: list[str]) -> None:
+    def linha(self, celulas: list[str], numeros=()) -> None:
         fim = len(celulas)
         while fim and not celulas[fim - 1].strip():
             fim -= 1  # colunas vazias à direita não são colunas
@@ -80,8 +81,10 @@ class Aba:
             self.amostra.append([_curto(c) for c in celulas])
         if self.linhas <= LINHAS_OBSERVADAS_MAX:
             self.tipos += [{} for _ in range(len(celulas) - len(self.tipos))]
-            for contagem, c in zip(self.tipos, celulas, strict=False):
+            for i, (contagem, c) in enumerate(zip(self.tipos, celulas, strict=False), self.inicio):
                 t = tipo(c)
+                if i in numeros and t not in ("vazio", "data"):
+                    t = "numero"  # uma moeda, ou zero exibido como traço, conserva o tipo de origem
                 contagem[t] = contagem.get(t, 0) + 1
 
     def montar(self, cortada=False) -> dict:
@@ -105,3 +108,82 @@ class Aba:
         if cortada:
             perfil["extracao_cortada"] = True
         return perfil
+
+
+def _blocos(previa):
+    """Tabelas paralelas: títulos próprios acima de duas ou mais sequências iguais de rótulos."""
+    for n, (linha, _) in enumerate(previa[1:], 1):
+        grupos = [list(g) for cheio, g in groupby(range(len(linha)), key=lambda i: bool(linha[i].strip())) if cheio]
+        if len(grupos) < 2 or len(grupos[0]) < 2:
+            continue
+        rotulos = [linha[i] for i in grupos[0]]
+        if len(set(rotulos)) < 2 or not all(tipo(c) == "texto" for c in rotulos):
+            continue
+        if any([linha[i] for i in g] != rotulos for g in grupos[1:]):
+            continue
+        blocos = []
+        anterior = 0
+        for g in grupos:
+            # O título deve vir de uma coluna própria do bloco; links à direita ficam fora.
+            candidatos = [
+                i for i in range(anterior, g[0] + 1) if any(i < len(l) and l[i].strip() for l, _ in previa[:n])
+            ]
+            if not candidatos:
+                break
+            inicio = candidatos[0]
+            titulo = " ".join(l[inicio].strip() for l, _ in previa[:n] if inicio < len(l) and l[inicio].strip())
+            blocos.append((inicio, g[-1] + 1, titulo[:512]))
+            anterior = g[-1] + 1
+        if len(blocos) != len(grupos):
+            continue
+        # Uma tabela com um único rótulo de linha pode repetir cabeçalhos em grupos de medidas.
+        # Só separam blocos os títulos alinhados entre si e com a mesma margem para o cabeçalho.
+        if len({g[0] - b[0] for g, b in zip(grupos, blocos, strict=True)}) != 1:
+            continue
+        if not any(all(i < len(l) and l[i].strip() for i, _, _ in blocos) for l, _ in previa[:n]):
+            continue
+        fim = n + 1
+        usados = {i for g in grupos for i in g}
+        while fim < len(previa):
+            prox = previa[fim][0]
+            if {i for i, c in enumerate(prox) if c.strip()} != usados or not all(
+                tipo(prox[i]) == "texto" for i in usados
+            ):
+                break
+            fragmentos = [prox[i] for i in grupos[0]]
+            if not all([prox[i] for i in grupo] == fragmentos for grupo in grupos[1:]):
+                break
+            fim += 1
+        if fim == len(previa) or any(c.strip() for c in previa[fim][0]):
+            # Sem separação do corpo, linhas textuais coincidentes também podem ser observações.
+            fim = n + 1
+        return n, fim, blocos
+    return None
+
+
+def perfis_xlsx(nome, linhas, colunas, cortada=False):
+    """Cada linha traz os valores exibidos e as posições numéricas. A sondagem de cabeçalho é limitada."""
+    linhas = iter(linhas)
+    previa = list(islice(linhas, 24))
+    # A janela de largura também limita o custo da heurística em uma aba muito larga.
+    blocos = _blocos(previa) if all(len(l) <= 2 * COLUNAS_MAX for l, _ in previa) else None
+    if not blocos:
+        aba = Aba(nome)
+        for linha, numeros in chain(previa, linhas):
+            aba.linha(linha, numeros)
+        return [aba.montar(cortada)]
+    n, fim, faixas = blocos
+    abas = []
+    for inicio, limite, _ in faixas:
+        aba = Aba(nome)
+        aba.cabecalho = [
+            _curto(" ".join(l[i] for l, _ in previa[n:fim] if i < len(l) and l[i])) for i in range(inicio, limite)
+        ]
+        abas.append(aba)
+    for linha, numeros in chain(previa[fim:], linhas):
+        for aba, (inicio, limite, _) in zip(abas, faixas, strict=True):
+            aba.linha(linha[inicio:limite], {i - inicio for i in numeros if inicio <= i < limite})
+    return [
+        dict(aba.montar(cortada), titulo=titulo, coluna_inicial=colunas[inicio])
+        for aba, (inicio, _, titulo) in zip(abas, faixas, strict=True)
+    ]

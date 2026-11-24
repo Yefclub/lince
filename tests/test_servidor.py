@@ -270,6 +270,27 @@ def test_formato_nao_suportado_recusa_o_lote_antes_de_entrar_na_fila(api, pdf):
     assert api.app.state.servico.sessoes == {} and api.app.state.servico.vagas == {}
 
 
+def test_contrato_de_perfis_lado_a_lado(api, tmp_path):
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Modelo A", None, None, "Modelo B"])
+    ws.append([])
+    ws.append(["Grupo", "Total", None, "Grupo", "Total"])
+    ws.append(["Norte", 1, None, "Norte", 2])
+    ws["A1"].hyperlink = "https://example.org/modelo--a"
+    arquivo = tmp_path / "blocos.xlsx"
+    wb.save(arquivo)
+    resposta = conforme(enviar(api, [(arquivo.name, arquivo.read_bytes())], {**A, **ESPERA}), "/v1/sessoes", "post")
+    resultado = resposta.json()["itens"][0]["resultado"]
+    assert "https://example.org/modelo--a" in resultado["markdown"]
+    assert [(p["titulo"], p["coluna_inicial"]) for p in resultado["estrutura"]["perfil_tabular"]] == [
+        ("Modelo A", 1),
+        ("Modelo B", 4),
+    ]
+
+
 def test_pedido_recusado_devolve_a_vaga(api, pdf):
     for _ in range(PENDENTES_POR_CLIENTE + 10):  # se a vaga vazasse, viria 429
         assert enviar(api, ("sem_extensao", pdf), A).status_code == 400

@@ -14,7 +14,7 @@ from xml.etree import ElementTree as ET  # noqa: F401
 
 from lxml import etree
 
-from . import legados, perfil_tabular
+from . import legados, perfil_tabular, xlsx_anotacoes
 from .limites import DocumentoRecusado, xml_ou_nada
 from .metadados import BINARIOS_OLE, ERROS_DE_PARTE, ODF
 from .seguranca import NAO_CONFERIDO, XMLIlegivel, _xml, fora_da_conferencia, limpar_docx, limpar_pptx
@@ -553,7 +553,7 @@ def planejar_office(path, pasta, ext=None):
         (md, perfis), ilegiveis[:0] = md_xlsb, ilegiveis_xlsb
     else:
         md = serializar(doc, ler_imagem, links=formato in ("docx", "rtf"))[0]
-        perfis = _perfis(doc) if ext in PLANILHAS else []
+        perfis = _perfis(doc) if ext in PLANILHAS - {".xlsx", ".xlsm"} else []
         if limpeza is not None:  # a rede de segurança: o que o anydoc leu e a conferência não viu é falha
             lido = re.sub(rf"{marca}G?\d+X", " ", texto_lido(doc))
             if falha := fora_da_conferencia(limpeza.vistas, lido):
@@ -627,8 +627,19 @@ def planejar_office(path, pasta, ext=None):
             seguranca.append(
                 {"tecnicas": sorted({m for m, _ in ocultos}), "texto": " ".join(t for _, t in ocultos)[:500]}
             )
-    extras = []
+    extras, anotacoes = [], []
     if ext in (".xlsx", ".xlsm"):  # o anydoc não extrai imagem de planilha: as partes de desenho, com aba e célula
+
+        def anotacoes_planilha():
+            nonlocal perfis
+            cortadas = {p["aba"] for p in perfis if p.get("extracao_cortada")}
+            grades = xlsx_anotacoes.extrair(path, limites_formulas, cortadas, anotacoes, pendentes)
+            if doc is not None:
+                perfis = _perfis(doc, grades)
+
+        _complemento(anotacoes_planilha, "anotações da planilha", pendentes)
+        if doc is not None and not perfis:
+            perfis = _perfis(doc)
         _complemento(
             lambda: _formulas_xlsx(path, limites_formulas, extras, pendentes), "fórmulas da planilha", ilegiveis
         )
@@ -713,6 +724,7 @@ def planejar_office(path, pasta, ext=None):
         "tipo": "office",
         "md": md,
         "extras": extras,
+        "anotacoes_planilha": "\n".join(anotacoes),
         "tarefas": tarefas,
         "texto_oculto": seguranca,
         "ilegiveis": ilegiveis,
@@ -903,7 +915,7 @@ def _formulas_xlsx(path, limites, extras, pendentes):
                         pendentes.append(aviso)
 
 
-def _alvos(z, parte, nomes, *tipos) -> dict:
+def _alvos(z, parte, nomes, *tipos, externos=False) -> dict:
     """Id -> parte do zip das relações de `parte` (alvo relativo à pasta dela, ou absoluto a partir da raiz)."""
     pasta, arquivo = posixpath.split(parte)
     rels = posixpath.join(pasta, "_rels", arquivo + ".rels")
@@ -911,9 +923,13 @@ def _alvos(z, parte, nomes, *tipos) -> dict:
     out = {}
     for r in raiz.iter(f"{_PKG}Relationship") if raiz is not None else ():
         alvo = r.get("Target") or ""
-        if r.get("TargetMode") != "External" and (not tipos or r.get("Type", "").rsplit("/", 1)[-1] in tipos):
+        if (r.get("TargetMode") == "External") == externos and (
+            not tipos or r.get("Type", "").rsplit("/", 1)[-1] in tipos
+        ):
             out[r.get("Id")] = (
-                alvo.lstrip("/") if alvo.startswith("/") else posixpath.normpath(posixpath.join(pasta, alvo))
+                alvo
+                if externos
+                else (alvo.lstrip("/") if alvo.startswith("/") else posixpath.normpath(posixpath.join(pasta, alvo)))
             )
     return out
 
@@ -1132,7 +1148,7 @@ def _xlsx_em_fluxo(path, ilegiveis, limites_formulas=None) -> tuple[str, list[di
                 continue
             ws.reset_dimensions()  # lê as linhas que existem, não as que a <dimension> declara
             linhas, largura, cortada, vazias, inicio = [], 0, False, 0, None
-            formatos_invalidos = []
+            formatos_invalidos, numeros = [], {}
             for n_linha, celulas in enumerate(ws.iter_rows(), 1):
                 varridas += len(celulas) + 1
                 if varridas > _VARREDURA_MAX:
@@ -1155,6 +1171,7 @@ def _xlsx_em_fluxo(path, ilegiveis, limites_formulas=None) -> tuple[str, list[di
                 if limites_formulas is not None:
                     limites_formulas[ws.title] = n_linha
                 linhas += [[]] * vazias + [valores[: cheias[-1] + 1]]
+                numeros[len(linhas) - 1] = [i for i, c in enumerate(celulas) if type(c.value) in (int, float)]
                 largura, vazias = nova, 0
                 inicio = cheias[0] if inicio is None else min(inicio, cheias[0])
             total += largura * len(linhas)
@@ -1174,13 +1191,15 @@ def _xlsx_em_fluxo(path, ilegiveis, limites_formulas=None) -> tuple[str, list[di
             ]  # colunas à esquerda vazias saem
             tabela = ["| " + " | ".join(corpo[0]) + " |", "|" + " --- |" * (largura - inicio)]
             tabela += ["| " + " | ".join(linha) + " |" for linha in corpo[1:]]
-            aba = perfil_tabular.Aba(ws.title)
-            for linha in corpo:
-                aba.linha([c.replace("\\|", "|") for c in linha])
-            perfis.append(aba.montar(cortada))
+            linhas_perfil = (
+                ([c.replace("\\|", "|") for c in linha], {i - inicio for i in numeros.get(n, ()) if i >= inicio})
+                for n, linha in enumerate(corpo)
+            )
+            perfis_aba = perfil_tabular.perfis_xlsx(ws.title, linhas_perfil, range(inicio + 1, largura + 1), cortada)
+            perfis.extend(perfis_aba)
             texto = titulo + "\n".join(tabela)
             if cortada:
-                com_dado = perfis[-1]["linhas_extraidas"]
+                com_dado = max(p["linhas_extraidas"] for p in perfis_aba)
                 aviso = f"aba {ws.title} entregue com {com_dado} linhas de dados por limite de extração"
                 texto += (
                     f"\n\n[TRUNCADO: {aviso}. O restante NÃO está nesta leitura; não afirme nada sobre ele. Para a"
@@ -1240,7 +1259,7 @@ def _texto_simples(blocos) -> str:
     return "\n\n".join(t for t in (inl(b.content) for b in blocos or []) if t.strip()).replace("\n", " ").strip()
 
 
-def _perfis(doc) -> list[dict]:
+def _perfis(doc, grades=None) -> list[dict]:
     """Perfil de cada tabela da planilha lida pelo anydoc, com o nome da aba pelo título que a precede (planilha de
     aba única e CSV vêm sem título: o nome fica None)."""
     perfis, nome = [], None
@@ -1248,10 +1267,21 @@ def _perfis(doc) -> list[dict]:
         if b.kind == "heading":  # o título da aba traz o nome exato, espaços inclusive
             nome = "".join(x.text or "" for x in b.content or [] if x.kind == "text")
         elif b.kind == "table":
-            aba = perfil_tabular.Aba(nome)
-            for linha in b.table.grid:
-                aba.linha([_texto_simples(s.cell.blocks) if s.kind == "origin" and s.cell else "" for s in linha])
-            perfis.append(aba.montar())
+            linhas = (
+                [_texto_simples(s.cell.blocks) if s.kind == "origin" and s.cell else "" for s in linha]
+                for linha in b.table.grid
+            )
+            grade = grades.get(nome) if grades else None
+            if nome is None and grades and len(grades) == 1:
+                grade = next(iter(grades.values()))
+            if grade:
+                tipadas, colunas = grade.projetar(linhas)
+                perfis.extend(perfil_tabular.perfis_xlsx(nome, tipadas, colunas))
+            else:
+                aba = perfil_tabular.Aba(nome)
+                for linha in linhas:
+                    aba.linha(linha)
+                perfis.append(aba.montar())
             nome = None
     return perfis
 
@@ -1452,18 +1482,22 @@ def texto_lido(doc) -> str:
 
 def _link_markdown(rotulo, alvo):
     """Conserva o destino como dado, sem buscar o recurso."""
-    from urllib.parse import quote
-
     if alvo is None or not alvo.value:
         return rotulo
     destino = alvo.value.strip()
     if alvo.kind == "anchor":
         destino = "#" + destino.lstrip("#")
+    return _destino_markdown(rotulo, destino) or rotulo
+
+
+def _destino_markdown(rotulo, destino):
+    from urllib.parse import quote
+
     esquema = re.match(r"^([a-z][a-z0-9+.-]*):", destino, flags=re.I)
     if esquema and esquema[1].lower() not in ("http", "https", "mailto", "ftp", "tel"):
-        return rotulo
+        return ""
     if not destino or any(ord(c) < 32 for c in destino):
-        return rotulo
+        return ""
     destino = quote(destino, safe="/:?#@!$&'*+,;=%~")
     texto = (rotulo or destino).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
     return f"[{texto}]({destino})"
