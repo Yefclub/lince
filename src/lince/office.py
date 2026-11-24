@@ -1195,7 +1195,7 @@ def _xlsx_em_fluxo(path, ilegiveis, limites_formulas=None) -> tuple[str, list[di
                 ([c.replace("\\|", "|") for c in linha], {i - inicio for i in numeros.get(n, ()) if i >= inicio})
                 for n, linha in enumerate(corpo)
             )
-            perfis_aba = perfil_tabular.perfis_xlsx(ws.title, linhas_perfil, inicio + 1, cortada)
+            perfis_aba = perfil_tabular.perfis_xlsx(ws.title, linhas_perfil, range(inicio + 1, largura + 1), cortada)
             perfis.extend(perfis_aba)
             texto = titulo + "\n".join(tabela)
             if cortada:
@@ -1275,12 +1275,8 @@ def _perfis(doc, grades=None) -> list[dict]:
             if nome is None and grades and len(grades) == 1:
                 grade = next(iter(grades.values()))
             if grade:
-                origem = grade.primeira_coluna
-                tipadas = (
-                    (linha, {col - origem for col in grade.numeros.get(n, {})})
-                    for n, linha in enumerate(linhas, grade.primeira_linha)
-                )
-                perfis.extend(perfil_tabular.perfis_xlsx(nome, tipadas, origem))
+                tipadas, colunas = grade.projetar(linhas)
+                perfis.extend(perfil_tabular.perfis_xlsx(nome, tipadas, colunas))
             else:
                 aba = perfil_tabular.Aba(nome)
                 for linha in linhas:

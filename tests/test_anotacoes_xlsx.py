@@ -29,7 +29,7 @@ def test_links_notas_e_validacoes_identificam_a_celula_da_aba_visivel(leitura):
     ws = wb.active
     ws.title = "Campos"
     ws["B4"] = "Identificador"
-    ws["B4"].hyperlink = "https://example.org/campo--manual"
+    ws["B4"].hyperlink = Hyperlink(ref="B4", target="https://example.org/campo--manual", display="Manual de referência")
     ws["B4"].comment = Comment("Usar o código completo da publicação.", "Editora")
     ws["B5"] = "Índice"
     ws["B5"].hyperlink = Hyperlink(ref="B5", location="Campos!B4")
@@ -41,7 +41,7 @@ def test_links_notas_e_validacoes_identificam_a_celula_da_aba_visivel(leitura):
     oculta.sheet_state = "hidden"
     oculta["A1"].comment = Comment("Texto fora da leitura.", "Editora")
     md = leitura(wb).markdown
-    assert "Campos!B4" in md and "https://example.org/campo--manual" in md and "Campos!B5" in md
+    assert "Campos!B4" in md and "[Manual de referência](https://example.org/campo--manual)" in md and "Campos!B5" in md
     assert "Usar o código completo da publicação." in md and "Texto fora da leitura." not in md
     assert all(x in md for x in ("Campos!C5:C501", "textLength", "lessThanOrEqual", "100", dv.error))
 
@@ -145,3 +145,39 @@ def test_expressao_fora_do_subconjunto_conserva_regra_sem_afirmar_negrito(leitur
     md = leitura(wb).markdown
     assert "COUNTIF(A:A,1)>2" in md and "aplicação não avaliada" in md
     assert "regra satisfeita" not in md
+
+
+def test_dados_textuais_em_blocos_paralelos_permanecem_na_amostra(leitura):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Equipe A", None, None, "Equipe B"])
+    ws.append(["Região", "Categoria", None, "Região", "Categoria"])
+    ws.append(["Norte", "Azul", None, "Sul", "Verde"])
+    ws.append(["Leste", "Rosa", None, "Oeste", "Ouro"])
+    a, b = leitura(wb).estrutura["perfil_tabular"]
+    assert a["cabecalho"] == b["cabecalho"] == ["Região", "Categoria"]
+    assert a["amostra"] == [["Norte", "Azul"], ["Leste", "Rosa"]]
+    assert b["amostra"] == [["Sul", "Verde"], ["Oeste", "Ouro"]]
+    assert a["linhas_extraidas"] == b["linhas_extraidas"] == 2
+
+
+def test_anotacoes_e_tipos_seguem_as_celulas_entregues_da_aba(leitura):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Interno", "Símbolo", "Saldo"])
+    ws.append([42, "-", 0])
+    ws.append([43, "Oculto na linha", "erro"])
+    ws.append([44, "-", 0])
+    ws.column_dimensions["A"].hidden = True
+    ws.row_dimensions[3].hidden = True
+    ws["A2"].comment = Comment("Nota da coluna interna", "Editora")
+    ws["C3"].comment = Comment("Nota da linha interna", "Editora")
+    ws["C4"].comment = Comment("Nota do saldo", "Editora")
+    for ref in ["C2", "C4"]:
+        ws[ref].number_format = '0;[Red]-0;"-"'
+    r = leitura(wb)
+    assert ("Nota da coluna interna" in r.markdown) == ("| Interno |" in r.markdown)
+    assert ("Nota da linha interna" in r.markdown) == ("Oculto na linha" in r.markdown)
+    assert "Nota do saldo" in r.markdown
+    tipos = {c["nome"]: c["tipo"] for c in r.estrutura["perfil_tabular"][0]["colunas"]}
+    assert tipos["Símbolo"] == "texto" and tipos["Saldo"] == "numero"

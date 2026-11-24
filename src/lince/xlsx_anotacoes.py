@@ -3,7 +3,10 @@
 import math
 import re
 import zipfile
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
+from functools import cached_property
+from itertools import count
 
 from lxml import etree
 from openpyxl.utils import coordinate_to_tuple, get_column_letter, range_boundaries
@@ -97,7 +100,56 @@ class Grade:
 
     primeira_linha: int = 1_048_577
     primeira_coluna: int = 16_385
+    ultima_coluna: int = 0
     numeros: dict = field(default_factory=dict)
+    colunas_ocultas: set = field(default_factory=set)
+    linhas_ocultas: set = field(default_factory=set)
+
+    def ler_colunas_ocultas(self, el):
+        # Ranges sobrepostos não multiplicam o trabalho pelo número de colunas de cada um.
+        intervalos = sorted(
+            (max(1, int(c.get("min"))), min(16_384, int(c.get("max"))))
+            for c in el.iterfind("{*}col")
+            if c.get("hidden") in ("1", "true")
+        )
+        anterior = 0
+        for inicio, fim in intervalos:
+            self.colunas_ocultas.update(range(max(inicio, anterior + 1), fim + 1))
+            anterior = max(fim, anterior)
+
+    def visivel(self, ref):
+        if not self.colunas_ocultas and not self.linhas_ocultas:
+            return True
+        for faixa in ref.split():
+            try:
+                c1, l1, c2, l2 = range_boundaries(faixa)
+            except ValueError:
+                continue
+            # Célula ou intervalo integralmente oculto não aparece no corpo do anydoc.
+            cols, linhas = self.ocultas_ordenadas
+            if self._alguma_visivel(c1 or 1, c2 or 16384, cols) and self._alguma_visivel(
+                l1 or 1, l2 or 1048576, linhas
+            ):
+                return True
+        return False
+
+    @cached_property
+    def ocultas_ordenadas(self):
+        # Hiperlinks, regras e notas são lidos depois da grade e consultam intervalos sem expandi-los.
+        return sorted(self.colunas_ocultas), sorted(self.linhas_ocultas)
+
+    @staticmethod
+    def _alguma_visivel(inicio, fim, ocultas):
+        return fim - inicio + 1 > bisect_right(ocultas, fim) - bisect_left(ocultas, inicio)
+
+    def projetar(self, linhas):
+        colunas = [i for i in range(self.primeira_coluna, self.ultima_coluna + 1) if i not in self.colunas_ocultas]
+        indice = {c: j for j, c in enumerate(colunas)}
+        visiveis = (n for n in count(self.primeira_linha) if n not in self.linhas_ocultas)
+        tipadas = (
+            (linha, {indice[c] for c in self.numeros.get(n, {})}) for linha, n in zip(linhas, visiveis, strict=False)
+        )
+        return tipadas, colunas
 
     def linha(self, el, n_linha, compartilhadas, nome, saida, estilos, ler_numeros):
         coluna = 0
@@ -108,6 +160,8 @@ class Grade:
             else:
                 linha, coluna = n_linha, coluna + 1
                 ref = f"{get_column_letter(coluna)}{linha}"
+            if coluna in self.colunas_ocultas:
+                continue
             bruto = c.findtext("{*}v")
             tipo = c.get("t", "n")
             recuo, rotulo = 0, ""
@@ -123,6 +177,7 @@ class Grade:
                 continue
             self.primeira_linha = min(self.primeira_linha, linha)
             self.primeira_coluna = min(self.primeira_coluna, coluna)
+            self.ultima_coluna = max(self.ultima_coluna, coluna)
             if recuo > 0:
                 saida.adicionar(f"{nome}!{ref}", f"recuo do texto: {recuo} espaços em {_literal(rotulo)}.")
             if (nivel := estilos.get(c.get("s"))) and tipo in ("s", "str", "inlineStr"):
@@ -257,21 +312,28 @@ def extrair(path, limites, cortadas, extras, pendentes):
                 if limites is None:
                     grades[nome] = grade
                 destinos = _alvos(z, parte, nomes, "hyperlink", externos=True)
-                tags = ["row", "hyperlink", "dataValidation", "conditionalFormatting"]
+                tags = ["cols", "row", "hyperlink", "dataValidation", "conditionalFormatting"]
                 for el in _elementos(z, parte, tags):
                     tag = etree.QName(el).localname
+                    if tag == "cols":
+                        if limites is None:  # a tabela do anydoc compacta as linhas e colunas ocultas
+                            grade.ler_colunas_ocultas(el)
+                        continue
                     if tag == "row":
                         n_linha = int(el.get("r", n_linha + 1))
                         varridas += 1 + len(el)
                         if varridas > _VARREDURA_MAX:
                             raise _Limite
+                        if limites is None and el.get("hidden") in ("1", "true"):
+                            grade.linhas_ocultas.add(n_linha)
+                            continue
                         if teto is None or n_linha <= teto:
                             grade.linha(el, n_linha, especiais, nome, saida, recuos, limites is None or bool(negritos))
                         continue
                     ref = el.get("ref") or el.get("sqref", "")
                     if teto is not None:
                         ref = _recortar(ref, teto)
-                    if not ref:
+                    if not ref or not grade.visivel(ref):
                         continue
                     onde = f"{nome}!{ref}"
                     if tag == "hyperlink":
@@ -281,8 +343,11 @@ def extrair(path, limites, cortadas, extras, pendentes):
                         if local:
                             destino += "#" + local
                         if destino:
+                            rotulo = el.get("display") or ref
                             saida.adicionar(
-                                onde, "hiperlink: " + (_destino_markdown(ref, destino) or _literal(destino))
+                                onde,
+                                "hiperlink: "
+                                + (_destino_markdown(rotulo, destino) or f"{_literal(rotulo)} → {_literal(destino)}"),
                             )
                         else:
                             saida.avisar("hiperlink sem destino legível", onde)
@@ -293,7 +358,7 @@ def extrair(path, limites, cortadas, extras, pendentes):
                 for comentarios in _alvos(z, parte, nomes, "comments").values():
                     for nota in _elementos(z, comentarios, ["comment"]):
                         ref = nota.get("ref", "")
-                        if teto is None or _recortar(ref, teto):
+                        if grade.visivel(ref) and (teto is None or _recortar(ref, teto)):
                             saida.adicionar(f"{nome}!{ref}", "nota: " + _literal(_texto(nota)))
                 if limites is not None:
                     grade.numeros.clear()

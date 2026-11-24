@@ -150,12 +150,18 @@ def _blocos(previa):
                 tipo(prox[i]) == "texto" for i in usados
             ):
                 break
+            fragmentos = [prox[i] for i in grupos[0]]
+            if not all([prox[i] for i in grupo] == fragmentos for grupo in grupos[1:]):
+                break
             fim += 1
+        if fim == len(previa) or any(c.strip() for c in previa[fim][0]):
+            # Sem separação do corpo, linhas textuais coincidentes também podem ser observações.
+            fim = n + 1
         return n, fim, blocos
     return None
 
 
-def perfis_xlsx(nome, linhas, coluna_inicial, cortada=False):
+def perfis_xlsx(nome, linhas, colunas, cortada=False):
     """Cada linha traz os valores exibidos e as posições numéricas. A sondagem de cabeçalho é limitada."""
     linhas = iter(linhas)
     previa = list(islice(linhas, 24))
@@ -178,6 +184,6 @@ def perfis_xlsx(nome, linhas, coluna_inicial, cortada=False):
         for aba, (inicio, limite, _) in zip(abas, faixas, strict=True):
             aba.linha(linha[inicio:limite], {i - inicio for i in numeros if inicio <= i < limite})
     return [
-        dict(aba.montar(cortada), titulo=titulo, coluna_inicial=coluna_inicial + inicio)
+        dict(aba.montar(cortada), titulo=titulo, coluna_inicial=colunas[inicio])
         for aba, (inicio, _, titulo) in zip(abas, faixas, strict=True)
     ]
