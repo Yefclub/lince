@@ -26,7 +26,7 @@ from .estrutura import indice, secoes
 from .instrucoes import PROMPT_PADRAO, VERSAO_PROMPT, instrucao
 from .limites import LADO_MAX_PX, TAREFAS_POR_DOCUMENTO, com_barras_normais, conferir_zip
 from .metadados import metadados_arquivo
-from .montagem import SAIDA_MAX, montar, partes_da_imagem, tamanho_da_saida
+from .montagem import SAIDA_MAX, medir_alternativas, montar, partes_da_imagem, tamanho_da_saida
 from .office import planejar_office
 from .pagina_html import planejar_html, planejar_svg
 from .pdf import PIXELS_IMAGEM_MAX, de_pe, pagina_visivel, planejar_pdf
@@ -493,16 +493,21 @@ def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
     posicao = {t["id"]: k for k, t in enumerate(plano.get("tarefas", []))}
     ordem = sorted(respostas, key=lambda tid: posicao.get(tid, len(posicao)))  # a ordem do plano
     medidas = {}  # o texto de cada resposta é medido uma vez na busca do que cabe
-    if respostas and tamanho_da_saida(plano, respostas, medidas) > SAIDA_MAX:
+    cabem = len(ordem)
+    if respostas and plano["tipo"] == "office" and plano.get("alt_das_tarefas"):
+        _, cabem = medir_alternativas(plano, respostas, ordem, SAIDA_MAX)
+    elif respostas and tamanho_da_saida(plano, respostas, medidas) > SAIDA_MAX:
         # acima do teto de saída, entram as leituras que cabem, na ordem do plano; as outras ficam pendentes, com o
         # motivo, e o texto nativo sai inteiro no lugar delas. A busca é binária: o tamanho só cresce com cada leitura
         cabem, sobra = 0, len(ordem)
         while cabem + 1 < sobra:
             meio = (cabem + sobra) // 2
-            if tamanho_da_saida(plano, {tid: respostas[tid] for tid in ordem[:meio]}, medidas) <= SAIDA_MAX:
+            prefixo = {tid: respostas[tid] for tid in ordem[:meio]}
+            if tamanho_da_saida(plano, prefixo, medidas) <= SAIDA_MAX:
                 cabem = meio
             else:
                 sobra = meio
+    if cabem < len(ordem):
         cobertura.pendentes += [f"{tid}: resultado grande demais" for tid in ordem[cabem:]]
         ordem = ordem[:cabem]
         respostas = {tid: respostas[tid] for tid in ordem}

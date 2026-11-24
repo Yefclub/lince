@@ -77,8 +77,39 @@ def acabamento(txt: str) -> str:
     return "".join(saida)
 
 
+_HIFENS = re.compile(r"(?<=\w)--(?=\w)")
+_ANCORA_OU_HIFENS = re.compile(r'<a id="[^"\n]*"></a>|\]\(#|(?<=\w)--(?=\w)')
+_DELIMITADOR_DESTINO = re.compile(r"\\[^\n]|[()\s]")
+
+
+def _travessoes(t):
+    if "--" not in t:
+        return t
+    if "](#" not in t and '<a id="' not in t:
+        return _HIFENS.sub("—", t)
+    partes, inicio, protegido = [], 0, 0
+    for m in _ANCORA_OU_HIFENS.finditer(t):
+        if m.start() < protegido:
+            continue
+        if m[0] == "](#":
+            # O conversor conserva parênteses internos balanceados e escapa espaços no fragmento.
+            nivel, protegido = 1, len(t)
+            for d in _DELIMITADOR_DESTINO.finditer(t, m.end()):
+                if d[0].isspace():
+                    protegido = d.start()
+                    break
+                nivel += (d[0] == "(") - (d[0] == ")")
+                if not nivel:
+                    protegido = d.end()
+                    break
+        elif m[0] == "--":
+            partes.extend([t[inicio : m.start()], "—"])
+            inicio = m.end()
+    return "".join([*partes, t[inicio:]])
+
+
 def _limpar(t: str) -> str:
-    t = re.sub(r"(?<=\w)--(?=\w)", "—", t)  # travessão datilografado
+    t = _travessoes(t)
     t = re.sub(r"(?m)^[ \t]*\\[ \t]*$", "", t)  # parágrafo vazio vira "\" no Markdown: some
     return re.sub(r"\n{3,}", "\n\n", t)
 
@@ -97,6 +128,15 @@ def _textos(plano, chave, resposta) -> dict[str, str]:
     """O texto que a montagem escreve para cada tarefa da resposta `chave`: o item do lote tirado do JSON e a trava de
     repetição. A mesma função para montar e para medir antes (tamanho_da_saida): a estimativa mede o texto real."""
     return {tid: sem_repeticao(t).strip() for tid, t in por_tarefa(plano, chave, resposta).items()}
+
+
+def _pendente(rotulo, alt):
+    marca = f"> [{rotulo}: pendente]"
+    return f"{marca} [texto alternativo: {alt}]" if alt else marca
+
+
+def _ancora_leitura(tid):
+    return f"<!-- lido pela IA: {tid} -->\n"
 
 
 def _cobre_ocr(nativo, visual):
@@ -183,7 +223,9 @@ def montar(pasta, respostas, pendentes=None):
     def bloco_ia(tid, rotulo):
         # provisório até o corpo estar pronto: na ordem do texto, a primeira posição recebe a leitura e as outras a
         # referência; o texto da IA também não passa pelo corte de cabeçalho nem pelo filtro de rótulos da figura
-        return f"<!-- lido pela IA: {tid} {marca} -->" if lido(tid) else f"> [{rotulo}: pendente]"
+        if lido(tid):
+            return f"<!-- lido pela IA: {tid} {marca} -->"
+        return _pendente(rotulo, plano.get("alt_das_tarefas", {}).get(tid))
 
     def leituras(corpo):
         primeira = {}
@@ -192,9 +234,9 @@ def montar(pasta, respostas, pendentes=None):
             tid = m.group(1)
             leitora = iguais.get(tid, tid)
             if leitora in primeira:
-                return f"<!-- lido pela IA: {tid} -->\n" + REPETIDA.format(primeira[leitora])
+                return _ancora_leitura(tid) + REPETIDA.format(primeira[leitora])
             primeira[leitora] = tid
-            return f"<!-- lido pela IA: {tid} -->\n{lido(tid)}"
+            return _ancora_leitura(tid) + lido(tid)
 
         return re.sub(rf"<!-- lido pela IA: (\S+) {marca} -->", troca, corpo)  # numa passada: a leitura não é varrida
 
@@ -490,6 +532,44 @@ def partes_da_imagem(plano, respostas):
         yield respostas.get(tarefa["id"], "")
 
 
+def medir_alternativas(e, respostas, ordem, limite):
+    """Tamanho estimado da montagem do EPUB e quantidade de respostas no maior prefixo que cabe.
+
+    Cada imagem pode substituir várias alternativas por uma leitura e referências.
+    O custo pode cair. Percorre os lugares uma vez, e cada resposta ou item de lote uma vez.
+    """
+    md, alternativas = e["md"], e["alt_das_tarefas"]
+    iguais = e.get("iguais", {})
+    ids = {t["id"] for t in e.get("tarefas_originais", [])} | iguais.keys()
+    total = len(md) + sum(len(x) + 2 for x in e.get("extras", [])) + 1
+    sem_alt = len(_pendente("imagem", None))
+    reservas = {tid: len(_pendente("imagem", alt)) for tid, alt in alternativas.items()}
+    diferencas = Counter()
+    primeiras = {}
+    for m in re.finditer(r"\{\{IA:(\w+)\}\}", md):
+        tid = m[1]
+        if tid not in ids:
+            continue
+        leitora = iguais.get(tid, tid)
+        reserva = reservas.get(tid, sem_alt)
+        total += 4 + reserva - len(m[0])  # a montagem cerca a marca com duas quebras de cada lado
+        fixo = len(_ancora_leitura(tid))
+        if leitora in primeiras:
+            fixo += len(REPETIDA.format(primeiras[leitora]))
+        else:
+            primeiras[leitora] = tid
+        diferencas[leitora] += fixo - reserva
+    cabem = 0
+    for k, chave in enumerate(ordem, 1):
+        for tid, texto in _textos(e, chave, respostas[chave]).items():
+            # O plano oferece uma única tarefa por leitora, individual ou em lote.
+            if texto and tid in diferencas:
+                total += diferencas[tid] + len(texto)
+        if total <= limite:
+            cabem = k
+    return total, cabem
+
+
 def tamanho_da_saida(e, respostas, medidas=None) -> int:
     """Quanto texto a montagem vai escrever, no máximo: cada marca vira a leitura (a da mesma imagem repetida entra uma
     vez, e as outras posições, a referência) ou a tabela e a fórmula nativas, e cada página leva o comentário e as
@@ -498,6 +578,8 @@ def tamanho_da_saida(e, respostas, medidas=None) -> int:
     respostas (a busca do que cabe), para cada uma ser lida uma vez só."""
     if e.get("tipo") == "imagem":  # a imagem solta sai como as leituras das faixas, uma depois da outra
         return max(0, sum(len(t) + 2 for t in partes_da_imagem(e, respostas)) - 2)
+    if e.get("tipo") == "office" and e.get("alt_das_tarefas"):
+        return medir_alternativas(e, respostas, respostas, SAIDA_MAX)[0]
 
     medidas = {} if medidas is None else medidas
 
@@ -524,8 +606,7 @@ def tamanho_da_saida(e, respostas, medidas=None) -> int:
     if anotacoes := e.get("anotacoes_planilha"):
         total += len(anotacoes) + 2
     for tid, n in Counter(re.findall(r"\{\{IA:(\w+)\}\}", e.get("md", ""))).items():
-        primeira = leitura(tid)
-        total += primeira + (n - 1) * leitura(tid)  # a segunda chamada já conta a referência
+        total += leitura(tid) + (n - 1) * leitura(tid)
     for p in e.get("paginas", []):
         total += len(p.get("campos", "")) + (2 if p.get("campos") else 0)
         # o comentário "<!-- página N · rota -->" e as junções da página com a anterior e do comentário com o texto

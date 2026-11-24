@@ -121,6 +121,71 @@ def decodificar(dados: bytes) -> str:
         return dados.decode("cp1252", "replace")
 
 
+def _ancoras_do_documento(raiz, prefixo):
+    """Conserva a posição dos destinos de links locais que o conversor não leva ao Markdown."""
+    from html import escape
+    from urllib.parse import unquote
+
+    fragmentos = {href[1:] for el in raiz.iter("a") if (href := el.get("href", "")).startswith("#") and len(href) > 1}
+    marcas = {}
+    if not fragmentos:
+        return marcas
+    candidatos = fragmentos | {unquote(f) for f in fragmentos}
+    ids = {el.get("id") for el in raiz.iter() if el.get("id") in candidatos}
+    destinos_existentes = ids | {el.get("name") for el in raiz.iter("a") if el.get("name") in candidatos}
+    alvos = {f if f in destinos_existentes else unquote(f) for f in fragmentos} & destinos_existentes
+    for el in list(raiz.iter()):
+        ident, nome = el.get("id"), el.get("name") if el.tag == "a" else None
+        # Na navegação HTML um id existente tem prioridade sobre o name de qualquer âncora.
+        destinos = [v for v in (ident, nome if nome not in ids else None) if v in alvos]
+        if not destinos:
+            continue
+        alvos.difference_update(destinos)
+        marca = f"{prefixo}A{len(marcas)}X"
+        marcas[marca] = "".join(f'<a id="{escape(v, quote=True)}"></a>' for v in destinos)
+        pre = next(el.iterancestors("pre", "code"), None)
+        if pre is not None:
+            pre = next(pre.iterancestors("pre"), pre)
+            pos = etree.Element("p" if pre.tag == "pre" else "span")
+            pos.text = marca
+            pre.addprevious(pos)
+        elif el.tag in ("td", "th", "li", "body"):
+            el.text = marca + (el.text or "")
+        elif el.tag in ("tr", "tbody", "thead", "tfoot", "col", "colgroup"):
+            # Não inserir um pseudo-elemento entre linhas ou células da grade.
+            celula = next(el.iter("td", "th"), None)
+            if celula is not None:
+                celula.text = marca + (celula.text or "")
+            elif (tabela := next(el.iterancestors("table"), None)) is not None:
+                pos = etree.Element("p")
+                pos.text = marca
+                tabela.addprevious(pos)
+        elif el.getparent() is not None:
+            bloco = el.tag in (
+                "section",
+                "article",
+                "nav",
+                "div",
+                "table",
+                "pre",
+                "p",
+                "h1",
+                "h2",
+                "h3",
+                "h4",
+                "h5",
+                "h6",
+            )
+            pos = etree.Element("p" if bloco else "span")
+            pos.text = marca
+            el.addprevious(pos)
+        else:
+            corpo = raiz.find("body")
+            if corpo is not None:
+                corpo.text = marca + (corpo.text or "")
+    return marcas
+
+
 def planejar_html(path, pasta) -> dict:
     """Plano no formato do Office: Markdown com marcas {{IA:id}} onde vai a leitura de cada imagem embutida, e as
     propriedades do <head> (lidas no mesmo parse)."""
@@ -139,6 +204,7 @@ def planejar_html(path, pasta) -> dict:
     herdado = {}
     ocultos = _tirar_oculto(raiz, herdado)
     prefixo = _prefixo_livre(texto)
+    ancoras = _ancoras_do_documento(raiz, prefixo)
     # o desenho sai da árvore já limpa: só mostra texto que ficou no corpo; SVG que herda o invisível não é desenhado
     externos = [s for s in raiz.iter("svg") if next(s.iterancestors("svg"), None) is None]  # só o mais externo
     copias = {svg: de_html(svg) if herdado.get(svg) is False else None for svg in externos}
@@ -169,7 +235,7 @@ def planejar_html(path, pasta) -> dict:
             desenhos[marca := f"{prefixo}S{k}X"] = f"{{{{IA:{tid}}}}}"
             troca.text = marca + troca.text
         svg.getparent().replace(svg, troca)
-    marcas = _imagens(raiz, pasta, plano["tarefas"], prefixo) | desenhos
+    marcas = _imagens(raiz, pasta, plano["tarefas"], prefixo) | desenhos | ancoras
     for a in raiz.iter("a"):  # link para data: carregaria o arquivo inteiro em base64 para o texto
         if (a.get("href") or "").strip().lower().startswith("data:"):
             del a.attrib["href"]
@@ -183,7 +249,7 @@ def planejar_html(path, pasta) -> dict:
     r = html_to_markdown.convert(lxml_html.tostring(raiz, encoding="unicode"), opcoes)
     md = (r.content or "").strip()
     if marcas:  # uma passada só: um replace por marca seria quadrático com milhares de imagens
-        md = re.sub(prefixo + r"S?\d+X", lambda m: marcas.get(m.group(0), m.group(0)), md)
+        md = re.sub(prefixo + r"[AS]?\d+X", lambda m: marcas.get(m.group(0), m.group(0)), md)
     plano["md"] = md
     if r.warnings:
         plano["ilegiveis"] += sorted({f"html: {w.message}"[:200] for w in r.warnings})
