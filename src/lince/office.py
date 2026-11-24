@@ -150,7 +150,7 @@ def _series_ooxml(tipo_el, xy, abas, pendentes):
     return series
 
 
-def graficos_ooxml(path):
+def graficos_ooxml(path, partes=None):
     """Gráfico nativo do Office: tipo, título, séries e valores do cache — dado exato. Sem cache (gráfico gravado
     por biblioteca), os valores vêm do intervalo na planilha, lidos depois de todos os gráficos, uma vez por aba."""
     saldo_intervalos = saldo_tabelas = _CELULAS_GRAFICOS_MAX
@@ -165,7 +165,9 @@ def graficos_ooxml(path):
                 if livro is not None
                 else set()
             )
-        for nome in sorted(n for n in z.namelist() if re.search(r"/charts/chart\d+\.xml$", n)):
+        if partes is None:
+            partes = sorted(n for n in z.namelist() if re.search(r"/charts/chart\d+\.xml$", n))
+        for nome in partes:
             root = xml_ou_nada(z.read(nome))
             if root is None or root.find(".//c:plotArea", NS) is None:
                 continue  # gráfico malformado ou hostil: a leitura segue sem ele
@@ -544,8 +546,9 @@ def planejar_office(path, pasta, ext=None):
         tarefas.append({"id": tid, "modo": "imagem", "ancora": onde})
         return f"{{{{IA:{tid}}}}}"
 
+    limites_formulas = {} if grande else None
     if grande:
-        md, perfis = _xlsx_em_fluxo(path, ilegiveis)
+        md, perfis = _xlsx_em_fluxo(path, ilegiveis, limites_formulas)
     elif doc is None:
         (md, perfis), ilegiveis[:0] = md_xlsb, ilegiveis_xlsb
     else:
@@ -626,6 +629,9 @@ def planejar_office(path, pasta, ext=None):
             )
     extras = []
     if ext in (".xlsx", ".xlsm"):  # o anydoc não extrai imagem de planilha: as partes de desenho, com aba e célula
+        _complemento(
+            lambda: _formulas_xlsx(path, limites_formulas, extras, pendentes), "fórmulas da planilha", ilegiveis
+        )
 
         def imagens_planilha():
             nonlocal md
@@ -650,6 +656,15 @@ def planejar_office(path, pasta, ext=None):
             "gráficos",
             ilegiveis,
         )
+    if ext == ".xlsb":
+        falhas_desenhos = []
+        _complemento(
+            lambda: _desenhos_xlsb(path, extras, falhas_desenhos, saldo_graficos),
+            "desenhos da planilha",
+            falhas_desenhos,
+        )
+        ilegiveis.extend(falhas_desenhos)
+        pendentes.extend(falhas_desenhos)
     if ext == ".xls":  # o gráfico do Excel 97-2003: tipo, título e séries; os valores já estão nas células
 
         def graficos_xls():
@@ -801,7 +816,94 @@ _PKG = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 _A_BLIP = "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
 
 
-def _alvos(z, parte, nomes) -> dict:
+def _formulas_xlsx(path, limites, extras, pendentes):
+    """Localiza as células de fórmula e distingue <v> salvo de cache ausente. Na rota grande, até a última linha
+    lida de cada aba. Os endereços são amostras limitadas por aba, mesmo se todas as células forem fórmulas."""
+    from openpyxl.utils import column_index_from_string, get_column_letter
+
+    with zipfile.ZipFile(path) as z:
+        nomes = set(z.namelist())
+        parte_livro = next(iter(_alvos(z, "", nomes, "officeDocument").values()), "xl/workbook.xml")
+        if parte_livro not in nomes:
+            return
+        livro = xml_ou_nada(z.read(parte_livro))
+        alvos = _alvos(z, parte_livro, nomes)
+        for aba in livro.findall(".//{*}sheets/{*}sheet") if livro is not None else ():
+            rid = aba.get(f"{_REL}id") or aba.get("{http://purl.oclc.org/ooxml/officeDocument/relationships}id")
+            nome, parte = aba.get("name"), alvos.get(rid)
+            if (
+                aba.get("state", "visible") != "visible"
+                or parte not in nomes
+                or (limites is not None and nome not in limites)
+            ):
+                continue
+            totais, enderecos = [0, 0], [[], []]
+            linha = 0
+            mostrar_expressao, depois_da_grade = True, False
+            with z.open(parte) as arquivo:
+                for _, el in etree.iterparse(
+                    arquivo,
+                    resolve_entities=False,
+                    load_dtd=False,
+                    no_network=True,
+                ):
+                    if el.tag.endswith("}sheetProtection") and el.get("sheet") in ("1", "true"):
+                        mostrar_expressao = False
+                        break
+                    if el.tag.endswith("}sheetData"):
+                        depois_da_grade = True
+                    if not el.tag.endswith("}row"):
+                        if depois_da_grade:
+                            el.clear()
+                            while el.getprevious() is not None:
+                                del el.getparent()[0]
+                        continue
+                    linha = int(el.get("r", linha + 1))
+                    if limites is not None and linha > limites[nome]:
+                        # A proteção fica depois da grade. Preserva os endereços sem percorrer a aba cortada até o fim.
+                        mostrar_expressao = False
+                        break
+                    ultima_ref, sem_ref = "", 0
+                    for c in el.iterfind("{*}c"):
+                        if endereco := c.get("r"):
+                            ultima_ref, sem_ref = endereco, 0
+                        else:
+                            sem_ref += 1
+                        formula = c.find("{*}f")
+                        if formula is not None:
+                            v = c.find("{*}v")
+                            salvo = v is not None and (v.text is not None or c.get("t") == "str")
+                            totais[salvo] += 1
+                            if len(enderecos[salvo]) < 32:
+                                if not endereco:
+                                    coluna = (
+                                        column_index_from_string(ultima_ref.rstrip("0123456789")) if ultima_ref else 0
+                                    )
+                                    endereco = f"{get_column_letter(coluna + sem_ref)}{linha}"
+                                expressao_md = ""
+                                if formula.text:
+                                    expressao = " ".join(formula.text.splitlines())
+                                    if len(expressao) > CARACTERES_POR_CELULA_MAX:
+                                        expressao = expressao[:CARACTERES_POR_CELULA_MAX] + "…"
+                                    crases = max((len(m) for m in re.findall(r"`+", expressao)), default=0) + 1
+                                    marca = "`" * crases
+                                    expressao_md = f" {marca} ={expressao} {marca}"
+                                enderecos[salvo].append((endereco, expressao_md))
+                    el.clear()
+                    while el.getprevious() is not None:
+                        del el.getparent()[0]
+            for salvo, quantidade in enumerate(totais):
+                if quantidade:
+                    estado = "com resultado salvo no arquivo (sem recálculo)" if salvo else "sem resultado salvo"
+                    itens = [e + f if mostrar_expressao else e for e, f in enderecos[salvo]]
+                    amostra = ", ".join(itens) + (", …" if quantidade > len(itens) else "")
+                    aviso = f"Aba {nome} — células de fórmula {estado} ({quantidade}): {amostra}."
+                    extras.append(aviso)
+                    if not salvo:
+                        pendentes.append(aviso)
+
+
+def _alvos(z, parte, nomes, *tipos) -> dict:
     """Id -> parte do zip das relações de `parte` (alvo relativo à pasta dela, ou absoluto a partir da raiz)."""
     pasta, arquivo = posixpath.split(parte)
     rels = posixpath.join(pasta, "_rels", arquivo + ".rels")
@@ -809,11 +911,93 @@ def _alvos(z, parte, nomes) -> dict:
     out = {}
     for r in raiz.iter(f"{_PKG}Relationship") if raiz is not None else ():
         alvo = r.get("Target") or ""
-        if r.get("TargetMode") != "External":
+        if r.get("TargetMode") != "External" and (not tipos or r.get("Type", "").rsplit("/", 1)[-1] in tipos):
             out[r.get("Id")] = (
                 alvo.lstrip("/") if alvo.startswith("/") else posixpath.normpath(posixpath.join(pasta, alvo))
             )
     return out
+
+
+def _objetos_visiveis_xlsb(raiz):
+    """Formas e quadros gráficos na ordem do desenho. Um grupo oculto esconde também todo o seu conteúdo."""
+    fila = [raiz]
+    while fila:
+        el = fila.pop()
+        if el.tag in (f"{_XDR}grpSp", f"{_XDR}sp", f"{_XDR}graphicFrame"):
+            prop = el.find(f"*/{_XDR}cNvPr")
+            if prop is not None and prop.get("hidden") in ("1", "true"):
+                continue
+            if el.tag != f"{_XDR}grpSp":
+                yield el
+                continue
+        fila.extend(reversed(el))
+
+
+def _desenhos_xlsb(path, extras, ilegiveis, saldo):
+    graficos, vistos = {}, set()
+    with zipfile.ZipFile(path) as z:
+        nomes = set(z.namelist())
+        livro = "xl/workbook.bin"
+        if livro not in nomes:
+            return
+        abas = legados.abas_visiveis_xlsb(z.read(livro), _alvos(z, livro, nomes))
+        for nome, parte in abas:
+            desenhos = _alvos(z, parte, nomes, "drawing", "vmlDrawing")
+            if not desenhos or parte not in nomes:
+                continue
+            for rid in legados.desenhos_da_aba_xlsb(z.read(parte)):
+                desenho = desenhos.get(rid)
+                if desenho in vistos:
+                    continue
+                vistos.add(desenho)
+                raiz = xml_ou_nada(z.read(desenho)) if desenho in nomes else None
+                if raiz is None:
+                    ilegiveis.append(f"aba {nome}: desenho {rid} ilegível")
+                    continue
+                if raiz.tag != f"{_XDR}wsDr":
+                    if desenho.lower().endswith(".vml"):
+                        # Notas de célula também têm uma v:textbox: não são caixas de texto do desenho.
+                        if not any(
+                            forma.find("{*}ClientData[@ObjectType='Note']") is None
+                            and (forma.find("{*}textbox") is not None or forma.find("{*}textpath") is not None)
+                            for forma in raiz.iter()
+                        ):
+                            continue
+                    ilegiveis.append(f"aba {nome}: desenho {desenho} em formato sem suporte")
+                    continue
+                rels = _alvos(z, desenho, nomes, "chart")
+                for forma in _objetos_visiveis_xlsb(raiz):
+                    if forma.tag == f"{_XDR}graphicFrame":
+                        for grafico in forma.iter(f"{{{NS['c']}}}chart"):
+                            alvo = rels.get(grafico.get(f"{_REL}id"))
+                            if alvo in nomes:
+                                graficos[alvo] = nome
+                            else:
+                                ilegiveis.append(f"aba {nome}: gráfico sem parte interna legível")
+                        continue
+                    paragrafos = []
+                    for p in forma.findall(f"{_XDR}txBody/a:p", NS):
+                        trechos = []
+                        for t in p.iter():
+                            if t.tag == f"{{{NS['a']}}}t":
+                                trechos.append(t.text or "")
+                            elif t.tag == f"{{{NS['a']}}}br":
+                                trechos.append("\n")
+                        paragrafos.append("".join(trechos))
+                    texto = "\n".join(paragrafos).strip()
+                    if texto:
+                        extras.append(f"**Texto de forma (aba {nome}):**\n\n{texto}")
+                    elif forma.get("textlink"):
+                        ilegiveis.append(f"aba {nome}: forma com texto vinculado sem cópia salva em {desenho}")
+    lidos = set()
+    for g in graficos_ooxml(path, graficos) if graficos else ():
+        parte = g["parte"]
+        lidos.add(parte)
+        extras.append(f"Aba {graficos[parte]}\n\n" + grafico_md(g, saldo, ilegiveis))
+        if any(not s["vals"].quantidade for s in g["series"]):
+            ilegiveis.append(f"aba {graficos[parte]}: gráfico {parte} com série sem valores em cache")
+    for parte in graficos.keys() - lidos:
+        ilegiveis.append(f"aba {graficos[parte]}: gráfico {parte} ilegível ou com tipo sem suporte")
 
 
 def _imagens_xlsx(path, ilegiveis) -> list[tuple[str, str, bytes]]:
@@ -909,7 +1093,24 @@ def _celula(v) -> str:
     return texto.replace("|", "\\|")
 
 
-def _xlsx_em_fluxo(path, ilegiveis) -> tuple[str, list[dict]]:
+def _numero_formatado(celula, formatos_invalidos):
+    from xlformat import format_value
+
+    valor = celula.value
+    if type(valor) not in (int, float) or not (mascara := celula.number_format) or mascara == "General":
+        return _celula(valor)
+    # O Excel admite até 255 caracteres no formato numérico. Uma máscara inválida preserva o valor original.
+    if len(mascara) <= 255:
+        try:
+            return _celula(format_value(valor, mascara))
+        except (ValueError, ArithmeticError):
+            pass
+    if not formatos_invalidos:
+        formatos_invalidos.append(celula.coordinate)
+    return _celula(valor)
+
+
+def _xlsx_em_fluxo(path, ilegiveis, limites_formulas=None) -> tuple[str, list[dict]]:
     """Corpo da planilha grande, aba por aba (as ocultas e as vazias ficam de fora, como no leitor do corpo), em
     tabela Markdown, lida em fluxo. Acima dos tetos, o resto da aba (ou as abas seguintes) não entra, e o aviso fica
     no próprio texto e em `ilegiveis`: quem lê nunca toma o recorte pelo todo. Os tetos contam as células que saem
@@ -931,13 +1132,17 @@ def _xlsx_em_fluxo(path, ilegiveis) -> tuple[str, list[dict]]:
                 continue
             ws.reset_dimensions()  # lê as linhas que existem, não as que a <dimension> declara
             linhas, largura, cortada, vazias, inicio = [], 0, False, 0, None
-            for valores in ws.iter_rows(values_only=True):
-                varridas += len(valores) + 1
+            formatos_invalidos = []
+            for n_linha, celulas in enumerate(ws.iter_rows(), 1):
+                varridas += len(celulas) + 1
                 if varridas > _VARREDURA_MAX:
                     cortada, esgotado = True, f"teto de {_VARREDURA_MAX} células varridas do documento"
                     break
-                cheias = [i for i, v in enumerate(valores) if _celula(v)]
+                valores = [_numero_formatado(c, formatos_invalidos) for c in celulas]
+                cheias = [i for i, v in enumerate(valores) if v]
                 if not cheias:
+                    if limites_formulas is not None:
+                        limites_formulas[ws.title] = n_linha
                     vazias += bool(linhas)  # linha vazia entre linhas com dados entra na tabela, como no corpo
                     continue
                 nova, n = max(largura, cheias[-1] + 1), len(linhas) + vazias + 1
@@ -947,10 +1152,16 @@ def _xlsx_em_fluxo(path, ilegiveis) -> tuple[str, list[dict]]:
                 if n > LINHAS_POR_ABA_MAX + 1 or nova * n > CELULAS_POR_ABA_MAX:
                     cortada = True
                     break
-                linhas += [[]] * vazias + [[_celula(v) for v in valores[: cheias[-1] + 1]]]
+                if limites_formulas is not None:
+                    limites_formulas[ws.title] = n_linha
+                linhas += [[]] * vazias + [valores[: cheias[-1] + 1]]
                 largura, vazias = nova, 0
                 inicio = cheias[0] if inicio is None else min(inicio, cheias[0])
             total += largura * len(linhas)
+            if formatos_invalidos:
+                ilegiveis.append(
+                    f"aba {ws.title}: formato numérico ilegível a partir de {formatos_invalidos[0]}; valor bruto"
+                )
             if not linhas:
                 if cortada:  # o teto chegou antes da primeira linha: a aba não some sem aviso
                     aviso = f"aba {ws.title}: {esgotado} atingido antes dela"
@@ -969,7 +1180,7 @@ def _xlsx_em_fluxo(path, ilegiveis) -> tuple[str, list[dict]]:
             perfis.append(aba.montar(cortada))
             texto = titulo + "\n".join(tabela)
             if cortada:
-                com_dado = sum(1 for linha in linhas[1:] if any(linha))  # o mesmo número do perfil
+                com_dado = perfis[-1]["linhas_extraidas"]
                 aviso = f"aba {ws.title} entregue com {com_dado} linhas de dados por limite de extração"
                 texto += (
                     f"\n\n[TRUNCADO: {aviso}. O restante NÃO está nesta leitura; não afirme nada sobre ele. Para a"
@@ -1307,7 +1518,7 @@ def serializar(doc, ler_imagem, *, links=False):
                 out.append("#" * (b.level or 1) + " " + inl(b.content))
             elif k == "paragraph":
                 txt = inl(b.content)
-                out.append("\\" + txt if txt[:1] in ">#-+|" else txt)
+                out.append("\\" + txt if txt and txt[0] in ">#-+|" else txt)
             elif k == "list":
                 for i, it in enumerate(b.list.items):
                     corpo = blocos(it.blocks, prof + 1).strip().replace("\n", "\n  ")

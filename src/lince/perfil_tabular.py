@@ -41,19 +41,34 @@ def _curto(texto: str) -> str:
 
 
 class Aba:
-    """Acumula o perfil de uma aba linha a linha: a primeira linha com valor é o cabeçalho; as seguintes com valor
-    contam em `linhas_extraidas` (as linhas com dado que estão no texto)."""
+    """Acumula a tabela linha a linha. Uma coluna de notas à esquerda pode conter o título e o rodapé."""
 
     def __init__(self, nome):
         self.nome, self.cabecalho, self.tipos, self.amostra = nome, None, [], []
         self.linhas, self.colunas_cortadas = 0, False
+        self.inicio, self.separada = 0, False
 
     def linha(self, celulas: list[str]) -> None:
         fim = len(celulas)
         while fim and not celulas[fim - 1].strip():
             fim -= 1  # colunas vazias à direita não são colunas
         if not fim:
+            self.separada = True
             return  # linha vazia não é dado nem cabeçalho
+        if self.separada and self.linhas == 0 and self.cabecalho and sum(bool(c.strip()) for c in self.cabecalho) == 1:
+            rotulos = [(i, c.strip()) for i, c in enumerate(celulas[:fim]) if c.strip()]
+            if (
+                len(self.cabecalho) <= rotulos[0][0]
+                and len({c for _, c in rotulos}) >= 2
+                and all(tipo(c) == "texto" for _, c in rotulos)
+            ):
+                # Título isolado, depois rótulos distintos em outras colunas. As notas ficam fora da tabela.
+                self.inicio, self.cabecalho = rotulos[0][0], None
+        if fim <= self.inicio:
+            return  # linha só na margem do título; continua integral no Markdown
+        self.separada = False
+        celulas = celulas[self.inicio : fim]
+        fim = len(celulas)
         if fim > COLUNAS_MAX:
             self.colunas_cortadas = True
         celulas = celulas[: min(fim, COLUNAS_MAX)]

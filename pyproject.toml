@@ -10,6 +10,7 @@ dependencies = [
   "pdf-inspector==1.25.2",     # MIT — texto e tabelas do PDF, posições
   "pypdfium2>=5.14,<6",        # Apache-2.0/BSD-3 — objetos da página, recorte, renderização
   "openpyxl>=3.1.5,<4",        # MIT — imagens e gráficos de XLSX
+  "xlformat==0.5.0",           # MIT — exibição de números com o formato do Excel na leitura em fluxo
   "python-pptx>=1.0.2,<2",     # MIT — setas de fluxograma em PPTX
   "Pillow>=13",                # MIT-CMU — imagem
   "defusedxml>=0.7",           # PSF — o openpyxl só lê XML com proteção se ele estiver instalado
