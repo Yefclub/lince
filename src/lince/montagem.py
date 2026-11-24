@@ -6,6 +6,7 @@ import json  # noqa: F401
 import os  # noqa: F401
 import re  # noqa: F401
 import zipfile  # noqa: F401
+from collections import Counter
 from xml.etree import ElementTree as ET  # noqa: F401
 
 from .agrupamento import por_tarefa
@@ -95,7 +96,29 @@ def _textos(plano, chave, resposta) -> dict[str, str]:
     return {tid: sem_repeticao(t).strip() for tid, t in por_tarefa(plano, chave, resposta).items()}
 
 
-def montar(pasta, respostas):
+def _cobre_ocr(nativo, visual):
+    # A mesma tabela pode trocar a ordem das células. Conta ocorrências, sem exigir a mesma
+    # ordem nem grafia perfeita do OCR. Uma legenda ou resposta curta conserva a reserva.
+    # A comparação é de uma única folha, com teto para as listas e os contadores de palavras.
+    if max(len(nativo), len(visual)) > 128_000:
+        return False
+
+    def palavras(texto):
+        return re.findall(r"\w+", re.sub(r"<[^<>]{1,256}>", " ", texto).casefold())
+
+    original, lida = palavras(nativo), Counter(palavras(visual))
+    if not original or (Counter(original) & lida).total() < 0.8 * len(original):
+        return False
+    # A maioria global também ocorreria se a transcrição acabasse antes de um parágrafo inteiro.
+    # Cada trecho precisa ter correspondência local, mesmo quando a tabela muda a ordem das linhas.
+    for i in range(0, len(original), 40):
+        trecho = original[i : i + 40]
+        if (Counter(trecho) & lida).total() < 0.7 * len(trecho):
+            return False
+    return True
+
+
+def montar(pasta, respostas, pendentes=None):
     plano = json.load(open(f"{pasta}/plano.json", encoding="utf-8"))
     R = _lidas(plano, respostas, lambda chave: _textos(plano, chave, respostas[chave]))
     iguais = plano.get("iguais", {})  # a mesma imagem em outro lugar: a mesma leitura
@@ -141,6 +164,15 @@ def montar(pasta, respostas):
     paginas = []  # por página: o texto já pronto (escaneada) ou (cabeçalho, blocos nativos, inserções da IA)
     for p in plano["paginas"]:
         cab = f"<!-- página {p['i'] + 1} · {p['rota']} -->"
+        if tid := p.get("ocr_da_imagem"):
+            visual = lido(tid)
+            partes_ocr = [cab, bloco_ia(tid, "figura")]
+            if not visual or not _cobre_ocr(p["md"], visual):
+                partes_ocr.append(p["md"])
+                if visual and pendentes is not None:
+                    pendentes.append(f"página {p['i'] + 1}: transcrição visual parcial, mantida a camada de OCR")
+            paginas.append("\n\n".join(partes_ocr))
+            continue
         if p["rota"] == "pagina":
             ids = p.get("tarefas") or [p["tarefa"]]
             partes_pagina = []
@@ -170,7 +202,9 @@ def montar(pasta, respostas):
         blocos = [b for b in md.split("\n\n") if b.strip()]
         # tira do nativo o texto que pertence à figura (rótulos de eixo etc.)
         dentro = " ".join(
-            r["texto_dentro"] for r in p["regioes"] if "substitui_tabela" not in r and "substitui_formula" not in r
+            r["texto_dentro"]
+            for r in p["regioes"]
+            if not r.get("preserva_texto") and "substitui_tabela" not in r and "substitui_formula" not in r
         )
         palavras_dentro = set(re.findall(r"\w+", dentro.lower()))
         limpos = []
@@ -198,9 +232,11 @@ def montar(pasta, respostas):
         paginas.append((cab, limpos, inserir))
     moveis = _sem_cabecalho_corrido([(k, pg[1]) for k, pg in enumerate(paginas) if not isinstance(pg, str)])
     partes = []
-    for pg in paginas:
+    for pg, pagina in zip(paginas, plano["paginas"], strict=True):
         if isinstance(pg, str):
             partes.append(pg)
+            if campos := pagina.get("campos"):
+                partes.append(campos)
             continue
         cab, limpos, inserir = pg
         saida = [cab] + inserir.get(-1, [])
@@ -211,6 +247,8 @@ def montar(pasta, respostas):
                 saida.append(texto)
             for k in range(a, b):
                 saida.extend(inserir.get(k, []))
+        if campos := pagina.get("campos"):
+            saida.append(campos)
         partes.append("\n\n".join(saida))
     return _metadados(pasta, plano, acabamento(leituras("\n\n".join(partes))), moveis)
 
@@ -258,7 +296,6 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
     passam por aqui, título (linha com #) só sai como cabeçalho fixo (idêntico na borda de FIXA_MIN das páginas, num
     documento com seções de verdade: veja `com_secoes`) e, se o que sairia passa de FRACAO_MAX do texto nativo do
     documento, nada sai."""
-    from collections import Counter
 
     def linhas(blocos):
         return [  # o bloco que traz leitura da IA (tabela ou fórmula trocada) fica de fora
@@ -399,7 +436,6 @@ def tamanho_da_saida(e, respostas, medidas=None) -> int:
     respostas (a busca do que cabe), para cada uma ser lida uma vez só."""
     if e.get("tipo") == "imagem":  # a imagem solta sai como as leituras das faixas, uma depois da outra
         return max(0, sum(len(t) + 2 for t in partes_da_imagem(e, respostas)) - 2)
-    from collections import Counter
 
     medidas = {} if medidas is None else medidas
 
@@ -427,6 +463,7 @@ def tamanho_da_saida(e, respostas, medidas=None) -> int:
         primeira = leitura(tid)
         total += primeira + (n - 1) * leitura(tid)  # a segunda chamada já conta a referência
     for p in e.get("paginas", []):
+        total += len(p.get("campos", "")) + (2 if p.get("campos") else 0)
         # o comentário "<!-- página N · rota -->" e as junções da página com a anterior e do comentário com o texto
         total += len(f"<!-- página {p.get('i', 0) + 1} · {p.get('rota', '')} -->") + 4
         # a região que substitui uma tabela ou fórmula entra na posição da marca, abaixo; as outras, onde a figura está

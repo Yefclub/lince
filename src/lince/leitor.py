@@ -479,11 +479,14 @@ def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
     """O fim da leitura, igual com a IA do Lince ou com a de quem chama: pendência de resposta vazia, montagem do
     texto e dos metadados, estrutura."""
 
+    pendencias_montagem = []
+
     def montado(respostas):  # o texto e os metadados com estas respostas
+        pendencias_montagem.clear()
         if plano["tipo"] == "imagem":
             md = "\n\n".join(partes_da_imagem(plano, respostas))
             return md, dict(plano.get("meta_arquivo") or {})
-        md = montar(pasta, respostas)
+        md = montar(pasta, respostas, pendencias_montagem)
         return md, json.loads(Path(f"{pasta}/metadados.json").read_text(encoding="utf-8"))
 
     posicao = {t["id"]: k for k, t in enumerate(plano.get("tarefas", []))}
@@ -508,6 +511,7 @@ def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
         cobertura.pendentes += [f"{tid}: resultado grande demais" for tid in ordem]
         respostas = {}
         md, meta = montado(respostas)
+    cobertura.pendentes.extend(pendencias_montagem)
     if conferir_vazias:  # resposta vazia não pode virar lacuna silenciosa no documento
         lidos = distribuir_lotes(plano, respostas)
         ja = {p.split(":", 1)[0] for p in cobertura.pendentes}

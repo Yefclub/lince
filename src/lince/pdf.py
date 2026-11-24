@@ -27,6 +27,7 @@ from . import paralelo
 from ._prazo import LIMITE, prazo_restante
 from ._trava import PDFIUM
 from .limites import escala
+from .pdf_formulario import abrir_pdf, campos_visiveis
 from .seguranca import NAO_CONFERIDO, texto_oculto_pdf
 from .texto import densidade_matematica, desifenizar, limpar_tabelas, lixo
 from .tipos import PrazoEsgotado
@@ -187,7 +188,7 @@ def planejar_pdf(path, pasta):
     try:
         with PDFIUM:
             fim = time.monotonic() + VEZ_S
-            doc = pdfium.PdfDocument(path)
+            doc = abrir_pdf(path)
             # O /Count declarado: a PDFium confia nele, e as páginas do arquivo que ficam fora dele não abrem (como num
             # visualizador). Elas não são lidas nem contadas: só a árvore de páginas inteira diria quantas são, e
             # percorrê-la é o que o pdf_inspector faz com o arquivo, sem teto nem prazo.
@@ -262,7 +263,7 @@ def planejar_pdf(path, pasta):
                     if recorte or ultima:
                         t = time.monotonic()
                         with PDFIUM:
-                            img = _renderizar(doc, i, recorte[0]) if recorte else None
+                            img = _renderizar(doc, i, recorte[0], recorte[2]) if recorte else None
                             if ultima:
                                 doc.close()  # na mesma vez: um PDF curto pega a trava só duas vezes
                                 doc = None
@@ -271,7 +272,7 @@ def planejar_pdf(path, pasta):
                         t = time.monotonic()
                         # os recortes e os arquivos, fora da trava, antes da próxima página
                         if motivo := _aplicar_recorte(recorte, img, tarefas, cache, seguranca, pendentes, marcas):
-                            paginas[-1] = _so_o_texto(i, md_de.get(i, ""))
+                            paginas[-1] = _so_o_texto(i, md_de.get(i, ""), col["formulario"][0])
                             _marcar(so_texto, i, i + 1, motivo)
                         etapas["recortar"] += time.monotonic() - t
                 if parada is not None:
@@ -326,7 +327,7 @@ def _analisar(doc, i, col, md, eh_ocr, itens, pasta, tarefas, cache, seguranca, 
     finally:
         _ANALISE.fim = None
     del seguranca[marcas[0] :], pendentes[marcas[1] :]
-    return _so_o_texto(i, md), None, motivo
+    return _so_o_texto(i, md, col["formulario"][0]), None, motivo
 
 
 def _aplicar_recorte(recorte, img, tarefas, cache, seguranca, pendentes, marcas):
@@ -461,6 +462,8 @@ def _juntar(r, pasta, paginas, tarefas, cache, seguranca, pendentes, so_texto):
             cache[chave] = t["id"]
         tarefas.append(t)
     if trocas:
+        if (ocr := info.get("ocr_da_imagem")) in trocas:
+            info["ocr_da_imagem"] = trocas[ocr]
         info["regioes"] = [
             {"tarefa": trocas[x["tarefa"]], "depois_de": "", "texto_dentro": "", "repetida": True}
             if x["tarefa"] in trocas
@@ -489,7 +492,7 @@ def _doc_do_processo(caminho, leitura, fechar):
     if doc is None:
         while len(_DOCS) >= DOCS_ABERTOS:
             _DOCS.popitem(last=False)[1].close()
-        doc = pdfium.PdfDocument(caminho)
+        doc = abrir_pdf(caminho)
     _DOCS[leitura] = doc
     return doc
 
@@ -543,13 +546,13 @@ def _pagina_no_processo(caminho, leitura, fechar, i, md, eh_ocr, itens, pasta, l
         if recorte:
             t = time.monotonic()
             with PDFIUM:
-                img = _renderizar(doc, i, recorte[0])
+                img = _renderizar(doc, i, recorte[0], recorte[2])
             gastos["renderizar"] += time.monotonic() - t
             t = time.monotonic()
             motivo = _aplicar_recorte(recorte, img, tarefas, cache, seguranca, pendentes, (0, 0))
             gastos["recortar"] += time.monotonic() - t
             if motivo:
-                return {"i": i, "info": _so_o_texto(i, md), "motivo": motivo, "etapas": gastos}
+                return {"i": i, "info": _so_o_texto(i, md, col["formulario"][0]), "motivo": motivo, "etapas": gastos}
         chaves = {tid: chave for chave, tid in cache.items()}
         return {"i": i, "info": info, "tarefas": tarefas, "seguranca": seguranca, "pendentes": pendentes,
                 "chaves": chaves, "etapas": gastos}  # fmt: skip
@@ -603,12 +606,15 @@ def _coleta(doc, i):
         return None
     try:
         objs, (ox, oy) = [], _origem_visivel(page)
-        for tipo, _raw, (l, b, r, t) in objetos(page):  # para no primeiro objeto além do teto
+        texto_visivel = False
+        for tipo, raw, (l, b, r, t) in objetos(page):  # para no primeiro objeto além do teto
             if len(objs) == OBJETOS_MAX:
                 return PESADA
             # na origem da área visível, como as posições do pdf_inspector e a página renderizada (MediaBox ou CropBox
             # com a origem fora do zero, comum em desenho exportado de CAD)
             objs.append((tipo, (l - ox, b - oy, r - ox, t - oy)))
+            if not texto_visivel and tipo == c.FPDF_PAGEOBJ_TEXT:
+                texto_visivel = c.FPDFTextObj_GetTextRenderMode(raw) != 3
         W, H = page.get_size()
         return {
             "W": W,
@@ -617,19 +623,23 @@ def _coleta(doc, i):
             "origem": (ox, oy),
             "objs": objs,
             "n": c.FPDFPage_CountObjects(page.raw),
-            "fundo": page.render(scale=escala(W, H, 0.5)).to_pil().convert("RGB"),  # uma cópia, sem a PDFium
+            "fundo": page.render(scale=escala(W, H, 0.5), may_draw_forms=False)
+            .to_pil()
+            .convert("RGB"),  # uma cópia, sem a PDFium
             "texto": texto_pdfium(page),
+            "formulario": campos_visiveis(doc, page),
+            "texto_visivel": texto_visivel,
         }
     finally:
         page.close()
 
 
-def _renderizar(doc, i, fator):
+def _renderizar(doc, i, fator, desenhar_campos):
     """A página `i` renderizada na escala `fator` e convertida pelo Pillow: uma cópia, que não depende mais da PDFium.
     Chamar com a trava."""
     page = pagina_visivel(doc, i)
     try:
-        return page.render(scale=fator).to_pil().convert("RGB")
+        return page.render(scale=fator, may_draw_forms=desenhar_campos).to_pil().convert("RGB")
     finally:
         page.close()
 
@@ -657,7 +667,7 @@ def imagens_das_paginas(caminho, paginas, lado=1568) -> dict[int, bytes]:
     imagens, doc = {}, None
     try:
         with PDFIUM:
-            doc = pdfium.PdfDocument(str(caminho))
+            doc = abrir_pdf(str(caminho))
             total = len(doc)
         if fora := [n for n in pedidas if not 1 <= n <= total]:
             raise ValueError(f"o documento tem {total} páginas; fora dele: {fora}")
@@ -743,11 +753,12 @@ def _so_texto(i):
     return "prazo esgotado" if _vencido() else None
 
 
-def _so_o_texto(i, md):
-    """A página só com o texto do pdf_inspector: sem figuras, páginas escaneadas nem texto oculto conferido."""
+def _so_o_texto(i, md, campos=""):
+    """A página só com o texto e os campos já coletados, sem análise visual."""
     md, tabelas = limpar_tabelas(desifenizar(md))
     return {"i": i, "rota": "nativa", "densidade_mat": 0, "origem_texto": "pdf-inspector", "md": md,
-            "tabelas": [tb["md"] for tb in tabelas], "formulas": [], "regioes": []}  # fmt: skip
+            "tabelas": [tb["md"] for tb in tabelas], "formulas": [], "regioes": [],
+            **({"campos": campos} if campos else {})}  # fmt: skip
 
 
 def _extrair(dados, a):
@@ -974,6 +985,45 @@ def _coincide(obj, x, l0, b0):
     return True
 
 
+def _duas_colunas(md, itens, largura):
+    """Desfaz linhas unidas pelo extrator só quando cada lado tem título e texto independentes.
+    Confere cada bloco contra os dois itens: Markdown mais rico, tags de estrutura, tabelas e
+    conteúdo sem correspondência geométrica mantêm a ordem estabelecida pelo extrator."""
+    if not 6 <= len(itens) <= 1000 or len(itens) % 2:
+        return md
+    if any(x.mcid is not None or x.rotation or x.render_mode != 0 for x in itens):
+        return md
+    esquerda = sorted((x for x in itens if x.x + x.width <= largura * 0.48), key=lambda x: -x.y)
+    direita = sorted((x for x in itens if x.x >= largura * 0.52), key=lambda x: -x.y)
+    if not (len(esquerda) == len(direita) == len(itens) // 2):
+        return md
+    for coluna in (esquerda, direita):
+        titulo, *corpo = coluna
+        if not titulo.is_bold or not all(titulo.font_size >= x.font_size * 1.15 for x in corpo):
+            return md
+        if any(not x.text.strip() or not any(c.isalpha() for c in x.text) for x in coluna):
+            return md
+    linhas = []
+    for a, b in zip(esquerda, direita, strict=True):
+        if abs(a.y - b.y) > min(a.height, b.height) / 4:
+            return md
+        linhas.append(f"{a.text.strip()} {b.text.strip()}")
+    blocos = md.strip().split("\n\n")
+    plano = " ".join(re.sub(r"^#{1,6} ", "", bloco) for bloco in blocos)
+    negrito = plano.startswith(f"**{linhas[0]}**")
+    if negrito:
+        plano = plano.replace(f"**{linhas[0]}**", linhas[0], 1)
+    if plano != " ".join(linhas):
+        return md
+    prefixo = re.match(r"^(?:#{1,6} )?", blocos[0])[0]
+    saida = []
+    for titulo, *corpo in (esquerda, direita):
+        nome = titulo.text.strip()
+        saida.append(f"**{nome}**" if negrito else prefixo + nome)
+        saida.extend(x.text.strip() for x in corpo)
+    return "\n\n".join(saida)
+
+
 def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca, pendentes):
     """Roteamento de uma página: texto, regiões visuais, tabela duvidosa, fórmula e texto oculto, sobre a coleta dela
     (`_coleta`). Roda sem a trava: a análise em Python, por mais que custe numa página hostil, não faz outro PDF
@@ -1001,6 +1051,11 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     origem_texto = "pdf-inspector"
     if eh_ocr and len(alt.strip()) > 200 and lixo(alt) < 0.02:
         md, origem_texto = alt, "pdfium"  # p.ex. a p.4 do manual da Falcon
+    campos, campos_visuais, erro_campos = col["formulario"]
+    if erro_campos:
+        pendentes.append(f"página {i + 1}: {erro_campos}")
+    if not (eh_ocr or rotacao or ocultos or campos) and all(tipo == c.FPDF_PAGEOBJ_TEXT for tipo, _ in objs):
+        md = _duas_colunas(md, itens_pg, W)
     dens = densidade_matematica(md)
     nativo = desifenizar(md)
     md, tabelas = limpar_tabelas(nativo)
@@ -1171,6 +1226,10 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
             regioes.append(("formula", caixa))
     # região toda fora da área visível (objeto fora da folha, comum em desenho de CAD) não tem o que recortar
     regioes = [(tp, g) for tp, g in regioes if g[0] < W and g[2] > 0 and g[1] < H and g[3] > 0]
+    regioes.extend(("imagem", caixa) for caixa in campos_visuais)
+    # Formulário com widgets apenas: os campos fornecem o texto, e o que só tem aparência vai como recorte.
+    if (campos or campos_visuais) and not objs:
+        precisa_pagina = False
     rota = "pagina" if precisa_pagina else ("regioes" if regioes else "nativa")
     info = {
         "i": i,
@@ -1182,6 +1241,8 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
         "formulas": originais_formula,
         "regioes": [],
     }
+    if campos:
+        info["campos"] = campos
     if rota == "nativa":
         return info, None
     retrato = (H >= W) if rotacao in (0, 180) else (W >= H)  # como é exibida: a de pé ganha o dobro e é dividida
@@ -1265,6 +1326,16 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
         else:
             full = img
             itens = [t for t in itens_pg if not t.text.startswith("[Image:")]
+            # A camada invisível de um scan representa a mesma folha que o recorte. Uma foto
+            # parcial, uma imagem composta de fatias ou um texto digital sobreposto não bastam.
+            so_ocr = (
+                not registro
+                and origem_texto == "pdfium"
+                and len(regioes) == 1
+                and not col["texto_visivel"]
+                and any(tipo == c.FPDF_PAGEOBJ_TEXT for tipo, _ in objs)
+                and any(_sobrepoe((0, 0, W, H), bx) >= 0.99999 for bx in imgs)
+            )
             for j, (tipo, cx) in enumerate(regioes, 1):
                 l, b, r, t = cx
                 m = 6
@@ -1279,6 +1350,8 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                 tid = f"p{i + 1:03d}-r{j}"
                 recorte = de_pe(full.crop(box), rotacao)  # de pé, como a página é exibida
                 chave = hashlib.sha256(recorte.tobytes()).hexdigest()
+                if so_ocr and tipo == "imagem":
+                    info["ocr_da_imagem"] = cache.get(chave, tid)
                 if chave in cache:  # mesma imagem já lida (logo do cabeçalho etc.)
                     info["regioes"].append(
                         {"tarefa": cache[chave], "depois_de": "", "texto_dentro": "", "repetida": True}
@@ -1308,12 +1381,18 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                         "tarefa": tid,
                         "depois_de": linha_acima,
                         "texto_dentro": ancora,
+                        # A legenda digital sobre uma foto de fundo é texto da página.
+                        **(
+                            {"preserva_texto": True}
+                            if tipo == "imagem" and col["texto_visivel"] and _sobrepoe((0, 0, W, H), cx) >= 0.99999
+                            else {}
+                        ),
                         **({"substitui_tabela": tabela_de[id(cx)]} if tipo == "tabela" else {}),
                         **({"substitui_formula": formula_de[id(cx)]} if tipo == "formula" else {}),
                     }
                 )
 
-    return info, (fator, recortar)
+    return info, (fator, recortar, bool(campos_visuais))
 
 
 def _sobrepoe(a, b):
