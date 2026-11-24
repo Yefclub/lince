@@ -22,6 +22,7 @@ from ._prazo import LIMITE, prazo_restante
 from ._trava import PDFIUM
 from .agrupamento import LADO, agrupar, distribuir_lotes, resposta_aproveitavel
 from .cache import Cache, chave
+from .conferencia_visual import avisos_transcricao, potencias
 from .estrutura import indice, secoes
 from .instrucoes import PROMPT_PADRAO, VERSAO_PROMPT, instrucao
 from .limites import LADO_MAX_PX, TAREFAS_POR_DOCUMENTO, com_barras_normais, conferir_zip
@@ -533,7 +534,7 @@ def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
     lidos = distribuir_lotes(plano, respostas)
     if imagens := _imagens(plano, lidos):
         r.estrutura["imagens"] = imagens
-    if plano["tipo"] == "pdf" and (visuais := _paginas_visuais(plano, lidos)):
+    if plano["tipo"] == "pdf" and (visuais := _paginas_visuais(plano, lidos, cobertura.pendentes)):
         r.estrutura["paginas_visuais"] = visuais
     return r
 
@@ -541,7 +542,7 @@ def _resultado(pasta, plano, respostas, cobertura, usos, conferir_vazias):
 _MOTIVO_PAGINA = {"escaneada": "escaneada", "texto nativo corrompido": "texto_corrompido"}  # o resto é matemática
 
 
-def _paginas_visuais(plano, lidos) -> list[dict]:
+def _paginas_visuais(plano, lidos, pendentes=None) -> list[dict]:
     """As páginas do PDF em que o Markdown traz uma transcrição feita pela IA no lugar do que se vê, para quem
     responde decidir quando mandar a imagem da página ao modelo: o que havia nela (`conteudo`: imagem, desenho,
     tabela, fórmula, ou a página inteira escaneada, de texto corrompido ou de matemática densa) e o que a leitura
@@ -551,11 +552,13 @@ def _paginas_visuais(plano, lidos) -> list[dict]:
     iguais = plano.get("iguais", {})
     originais = {t["id"]: t for t in plano.get("tarefas_originais", [])}
     por_pagina = {}
+    referencias = {p["i"]: p["potencias_visiveis"] for p in plano.get("paginas", []) if p.get("potencias_visiveis")}
     for posicao in plano.get("posicoes", []):
         if not isinstance(posicao.get("pagina"), int):
             continue
         leitor = iguais.get(posicao["id"], posicao["id"])
-        conteudo, alertas = por_pagina.setdefault(posicao["pagina"] + 1, (set(), set()))
+        numero = posicao["pagina"] + 1
+        conteudo, alertas = por_pagina.setdefault(numero, (set(), set()))
         if posicao["modo"] == "pagina":
             conteudo.add(_MOTIVO_PAGINA.get(originais.get(leitor, {}).get("motivo", ""), "matematica"))
         else:
@@ -564,6 +567,12 @@ def _paginas_visuais(plano, lidos) -> list[dict]:
         if not texto.strip():
             alertas.add("nao_lida")
         else:
+            ancora = originais.get(leitor, {}).get("ancora", "")
+            ref = referencias.get(posicao["pagina"]) if posicao["modo"] == "pagina" else potencias(ancora)
+            for alerta, motivo in avisos_transcricao(texto, ancora, ref).items():
+                if pendentes is not None:
+                    pendentes.append(f"página {numero}, {leitor}: {motivo}")
+                alertas.add(alerta)
             if "≈" in texto and posicao["modo"] != "formula":  # na fórmula, ≈ é o símbolo, não estimativa
                 alertas.add("estimado")
             if "[ilegível]" in texto or "[illegible]" in texto:

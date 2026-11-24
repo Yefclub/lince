@@ -26,6 +26,7 @@ import pypdfium2.raw as c  # noqa: F401
 from . import paralelo
 from ._prazo import LIMITE, prazo_restante
 from ._trava import PDFIUM
+from .conferencia_visual import potencias
 from .limites import escala
 from .pdf_formulario import abrir_pdf, campos_visiveis
 from .pdf_tabelas import conferir_tabelas
@@ -1261,6 +1262,9 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
         "formulas": originais_formula,
         "regioes": [],
     }
+    if rota == "pagina" and not registro and col.get("texto_visivel"):
+        if referencias := potencias(col["texto"], camada_pdf=True):
+            info["potencias_visiveis"] = referencias
     if campos:
         info["campos"] = campos
     if rota == "nativa":
