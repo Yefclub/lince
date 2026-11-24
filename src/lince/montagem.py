@@ -36,6 +36,9 @@ def _metadados(pasta, plano, corpo, moveis):
         meta[k] = sorted(set(meta.get(k, [])) | v)
     if plano.get("texto_oculto"):
         meta["texto_oculto_removido"] = plano["texto_oculto"]
+    if anotacoes := plano.get("anotacoes_planilha"):
+        # Endereços, URLs e textos de nota são literais. Não sofrem tipografia nem viram marcas da IA.
+        corpo = corpo.rstrip() + "\n\n" + anotacoes
     alertas = alertas_injecao(corpo) + [a for o in plano.get("texto_oculto", []) for a in alertas_injecao(o["texto"])]
     alertas += [o["alerta"] for o in plano.get("texto_oculto", []) if o.get("alerta")]
     if alertas:
@@ -474,6 +477,8 @@ def tamanho_da_saida(e, respostas, medidas=None) -> int:
         return cheia(tid)
 
     total = len(e.get("md", "")) + sum(len(x) + 2 for x in e.get("extras", [])) + 1  # junções e o fim de linha
+    if anotacoes := e.get("anotacoes_planilha"):
+        total += len(anotacoes) + 2
     for tid, n in Counter(re.findall(r"\{\{IA:(\w+)\}\}", e.get("md", ""))).items():
         primeira = leitura(tid)
         total += primeira + (n - 1) * leitura(tid)  # a segunda chamada já conta a referência
