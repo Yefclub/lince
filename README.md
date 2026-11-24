@@ -1,3 +1,5 @@
+<img src="docs/midia/lince.png" width="112" alt="Símbolo do Lince">
+
 # Lince
 
 Leitor único de documentos para bases de conhecimento e IA.
@@ -5,6 +7,8 @@ Leitor único de documentos para bases de conhecimento e IA.
 O Lince usa o texto nativo do arquivo sempre que ele é bom e chama o modelo de visão da sua plataforma
 **só onde precisa**: imagem, gráfico, diagrama, tabela duvidosa, fórmula e página escaneada. A saída é um
 Markdown pronto para busca e para LLM, mais metadados e um relatório do que foi lido de onde.
+
+[Assista à demonstração do Lince (44 s, MP4)](docs/midia/como-o-lince-le.mp4). Acompanhe um [relatório público do Banco Central](https://www.bcb.gov.br/content/ri/relatorioinflacao/202412/ri202412b1p.pdf) desde a extração do texto até a montagem do Markdown. O exemplo usa a resposta visual gravada para a página 2 e mostra como as regiões sem resposta aparecem na cobertura.
 
 ```python
 import lince
