@@ -110,6 +110,10 @@ def test_imagem_de_pagina_com_ocr_tem_reserva_e_preserva_texto_digital(tmp_path)
     assert linhas[-1] in parcial.markdown and any(
         "transcrição visual parcial" in p for p in parcial.cobertura.pendentes
     )
+    for nove in ("\n".join(linhas[:-1]), "# Registros\n" + "\n".join(reversed(linhas[:-1]))):
+        quase = leitor.concluir(plano, {t.id: nove for t in plano.tarefas})
+        assert linhas[-1] in quase.markdown
+        assert any("transcrição visual parcial" in p for p in quase.cobertura.pendentes)
     sem_ia = leitor.concluir(plano, {})
     assert linhas[0] in sem_ia.markdown and sem_ia.cobertura.pendentes
 

@@ -107,7 +107,20 @@ def _cobre_ocr(nativo, visual):
         return re.findall(r"\w+", re.sub(r"<[^<>]{1,256}>", " ", texto).casefold())
 
     original, lida = palavras(nativo), Counter(palavras(visual))
-    if not original or (Counter(original) & lida).total() < 0.8 * len(original):
+    frequencias = Counter(original)
+    if lida < frequencias:  # transcreveu só um subconjunto literal, mesmo reordenado
+        return False
+    if not original or (frequencias & lida).total() < 0.8 * len(original):
+        return False
+
+    # Numa lista de registros reconhecidos literalmente, basta faltar uma linha para perder
+    # uma medição. Também vale se a visão acrescentou um título ou mudou a ordem dos registros.
+    def registros(texto):
+        return Counter(tuple(ws) for ln in texto.splitlines() if len(ws := palavras(ln)) >= 3)
+
+    nativas = registros(nativo)
+    iguais = (nativas & registros(visual)).total()
+    if 2 <= iguais < nativas.total() and iguais >= nativas.total() / 2:
         return False
     # A maioria global também ocorreria se a transcrição acabasse antes de um parágrafo inteiro.
     # Cada trecho precisa ter correspondência local, mesmo quando a tabela muda a ordem das linhas.
