@@ -1002,7 +1002,8 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     if eh_ocr and len(alt.strip()) > 200 and lixo(alt) < 0.02:
         md, origem_texto = alt, "pdfium"  # p.ex. a p.4 do manual da Falcon
     dens = densidade_matematica(md)
-    md, tabelas = limpar_tabelas(desifenizar(md))
+    nativo = desifenizar(md)
+    md, tabelas = limpar_tabelas(nativo)
     # só tabela nativa CONFIÁVEL anula um desenho; tabela duvidosa pode ser rótulo de gráfico
     palavras_tabela = set().union(*[tb["palavras"] for tb in tabelas if not tb["complexa"]]) if tabelas else set()
     tabela_de = {}
@@ -1193,6 +1194,9 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
             # a página inteira vai para a IA como é exibida
             img = de_pe(img, rotacao)
             # Duas metades com sobreposição: o dobro de resolução por leitura (o provedor reduz acima de ~1568 px).
+            # Texto que já passou pela conferência de ocultos. A camada de OCR rejeitada
+            # e o texto cuja limpeza ficou incerta não servem de reserva.
+            pode_usar_nativo = (not eh_ocr or origem_texto == "pdfium") and not (registro and ficou)
             metades = [(0, img.height)]
             if img.height >= img.width:
                 # Linhas de texto pela projeção horizontal; só divide página densa, numa faixa sem tinta.
@@ -1204,8 +1208,19 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                 if linhas_txt > 55:
                     meio = alt // 2
                     vazias = [y for y in range(int(alt * 0.35), int(alt * 0.65)) if tinta[y] <= 1]
-                    corte = 4 * (min(vazias, key=lambda y: abs(y - meio)) if vazias else meio)
-                    metades = [(0, min(img.height, corte + 24)), (max(0, corte - 24), img.height)]
+                    if pode_usar_nativo and nativo.strip():
+                        # A reserva por faixa precisa de uma fronteira sem texto compartilhado.
+                        # Confirmar no bitmap original: a projeção reduzida só indica candidatos.
+                        for linha in sorted(vazias, key=lambda y: abs(y - meio)):
+                            _tique()
+                            corte = 4 * linha
+                            minimo, _ = img.crop((0, corte - 1, img.width, corte + 1)).convert("L").getextrema()
+                            if minimo >= 245:
+                                metades = [(0, corte + 1), (corte - 1, img.height)]
+                                break
+                    else:
+                        corte = 4 * (min(vazias, key=lambda y: abs(y - meio)) if vazias else meio)
+                        metades = [(0, min(img.height, corte + 24)), (max(0, corte - 24), img.height)]
             motivo = (
                 "escaneada"
                 if eh_ocr
@@ -1227,6 +1242,25 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                         "caixa": _caixa_da_faixa(frac, W, H, rotacao),
                     }
                 )
+                if pode_usar_nativo:
+                    if len(metades) == 1:
+                        trecho = "\n\n".join(b for b in nativo.split("\n\n") if lixo(b) <= 0.02)
+                    else:
+                        # O centro do item determina uma só metade, sem as margens sobrepostas do PNG.
+                        divisao = corte / img.height
+                        partes = _caixa_da_faixa((0, divisao), W, H, rotacao)
+                        l, b, r, t = partes
+                        trecho = " ".join(
+                            item.text
+                            for item in itens_pg
+                            if not item.text.startswith("[Image:")
+                            and lixo(item.text) <= 0.02
+                            and (
+                                (l <= item.x + item.width / 2 <= r and b <= item.y + item.height / 2 <= t) == (s == "a")
+                            )
+                        )
+                    if trecho.strip():
+                        info.setdefault("nativo_pendente", {})[tid] = trecho
                 info["tarefas"].append(tid)
         else:
             full = img

@@ -143,7 +143,13 @@ def montar(pasta, respostas):
         cab = f"<!-- página {p['i'] + 1} · {p['rota']} -->"
         if p["rota"] == "pagina":
             ids = p.get("tarefas") or [p["tarefa"]]
-            paginas.append(cab + "\n" + "\n\n".join(bloco_ia(t, "página") for t in ids))
+            partes_pagina = []
+            for tid in ids:
+                bloco = bloco_ia(tid, "página")
+                if not lido(tid) and (nativo := p.get("nativo_pendente", {}).get(tid)):
+                    bloco = nativo + "\n\n" + bloco
+                partes_pagina.append(bloco)
+            paginas.append(cab + "\n" + "\n\n".join(partes_pagina))
             continue
         tabelas = p.get("tabelas", [])
         trocadas = {
@@ -413,7 +419,7 @@ def tamanho_da_saida(e, respostas, medidas=None) -> int:
         # o comentário "<!-- página N · rota -->" e as junções da página com a anterior e do comentário com o texto
         total += len(f"<!-- página {p.get('i', 0) + 1} · {p.get('rota', '')} -->") + 4
         # a região que substitui uma tabela ou fórmula entra na posição da marca, abaixo; as outras, onde a figura está
-        total += len(p.get("md", "")) + sum(
+        total += max(len(p.get("md", "")), sum(len(t) + 2 for t in p.get("nativo_pendente", {}).values())) + sum(
             leitura(r.get("tarefa", ""))
             for r in p.get("regioes", [])
             if "substitui_tabela" not in r and "substitui_formula" not in r
