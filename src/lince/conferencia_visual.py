@@ -105,7 +105,9 @@ def _tabelas(texto):
                 raise ValueError("tabela aninhada")
             linhas = []
             corpo = False
-            for grupo, trs in groupby(tabela.xpath("./tr | ./thead/tr | ./tbody/tr"), key=lambda tr: tr.getparent()):
+            for grupo, trs in groupby(
+                tabela.xpath("./tr | ./thead/tr | ./tbody/tr | ./tfoot/tr"), key=lambda tr: tr.getparent()
+            ):
                 for i, tr in enumerate(trs):
                     campos = [
                         _Celula(
@@ -117,7 +119,15 @@ def _tabelas(texto):
                         for c in tr
                         if c.tag in ("th", "td")
                     ]
-                    cab = grupo.tag == "thead" or (not corpo and bool(campos) and all(c.titulo for c in campos))
+                    if grupo.tag == "tfoot":
+                        # Legendas esclarecem a cor. Valores e totais do rodapé também precisam de condição.
+                        if not any(re.match(r"^[\[(+−-]*\d", c.texto) for c in campos) and not (
+                            campos and re.match(r"^(?:sub)?tot(?:al|ais)\b", campos[0].texto, re.I)
+                        ):
+                            continue
+                        cab = False
+                    else:
+                        cab = grupo.tag == "thead" or (not corpo and bool(campos) and all(c.titulo for c in campos))
                     corpo |= not cab
                     linhas.append((i == 0, cab, campos))
             yield linhas

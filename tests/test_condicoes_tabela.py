@@ -63,3 +63,13 @@ def test_quebras_no_cabecalho_e_conflito_de_classificacao():
     )
     assert not pendente(tabela)
     assert pendente(tabela.replace("admitido", "admitido (projeção)"))
+
+
+def test_totais_no_rodape_exigem_as_condicoes():
+    inicio = (
+        "<table><thead><tr><th>Indicador</th><th>2025</th><th>2026</th></tr></thead>"
+        "<tbody><tr><th>IPCA</th><td>7,0 (efetivo)</td><td>8,0 (projeção)</td></tr></tbody>"
+    )
+    fim = "<tfoot><tr><th>Total</th><td>7,1</td><td>8,2</td></tr></tfoot></table>"
+    assert pendente(inicio + fim)
+    assert not pendente(inicio + fim.replace("7,1", "7,1 (efetivo)").replace("8,2", "8,2 (projeção)"))
