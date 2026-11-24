@@ -12,6 +12,7 @@ from typing import NamedTuple
 from xml.etree import ElementTree as ET  # noqa: F401
 
 from .limites import escala
+from .texto import romano
 
 PADROES_INJECAO = [
     # "ignore todas as instruções anteriores", "ignore all the previous rules", "ignore as orientações acima"
@@ -263,13 +264,33 @@ _MATEMATICA = (f"{_M}oMathPara", f"{_M}oMath")
 _RECUSAS_DE_NOTA = ("separator", "continuationSeparator", "continuationNotice")
 
 
-def _emitido_word(raiz, papel) -> _Emitido:
+class _CampoDeCaixa(NamedTuple):
+    inicio: object
+    caixa: object
+    instrucao: list
+
+    def projetar(self):
+        codigo = "".join(self.instrucao).split(maxsplit=1)
+        if not codigo or codigo[0].upper() != "FORMCHECKBOX":
+            return None
+        estado = self.caixa.find(f"{_W}checked")
+        if estado is None:
+            estado = self.caixa.find(f"{_W}default")
+        # No próprio run, para a conferência aplicar também o estilo da caixa.
+        t = self.inicio.makeelement(f"{_W}t")
+        t.text = "[x]" if _ligado(estado) else "[ ]"
+        self.inicio.addprevious(t)
+        return t
+
+
+def _emitido_word(raiz, papel, formatar_caixas=False) -> tuple[_Emitido, bool]:
     """O percurso do anydoc numa parte do Word (formats/docx/content.rs), para a rede comparar só o que ele de fato
     escreve: o corpo (w:body) ou cada nota que não é separador; nos blocos, parágrafo, tabela (sem a célula coberta
     pela mesclagem vertical), sdt e customXml; no parágrafo, o run, o hiperlink, o campo simples e os embrulhos que
     ele percorre (w:del e w:moveFrom, não); no run, o w:t filho, fora da instrução de um campo (entre o begin e o
     separate); no desenho, as caixas de texto e, sem elas, o gráfico ou o SmartArt."""
     out = _Emitido(set(), [], [])
+    mudou = False
 
     def blocos(el):
         for f in el:
@@ -290,7 +311,7 @@ def _emitido_word(raiz, papel) -> _Emitido:
                 blocos(f)
 
     def inline(el, campos, mostra):
-        """`campos`: em cada campo aberto, se já passou do separate; o texto só sai com todos no resultado."""
+        """O texto só sai quando todos os campos abertos já passaram do separate (estado True)."""
         for f in el:
             if f.tag == f"{_MC}AlternateContent":
                 if (ramo := _ramo_lido(f, _LIDOS_WORD)) is not None:
@@ -298,12 +319,12 @@ def _emitido_word(raiz, papel) -> _Emitido:
             elif f.tag == f"{_M}oMathPara":
                 out.textos.update(f.iter(f"{_M}t"))
             elif f.tag == f"{_M}oMath":
-                if mostra and all(campos):
+                if mostra and all(c is True for c in campos):
                     out.textos.update(f.iter(f"{_M}t"))
             elif f.tag == f"{_W}r":
                 run(f, campos, mostra)
             elif f.tag in (f"{_W}hyperlink", f"{_W}fldSimple"):  # leitura própria, que sai inteira no lugar
-                inline(f, [], mostra and all(campos))
+                inline(f, [], mostra and all(c is True for c in campos))
             elif f.tag == f"{_W}sdt":
                 if (conteudo := f.find(f"{_W}sdtContent")) is not None:
                     inline(conteudo, campos, mostra)
@@ -311,23 +332,34 @@ def _emitido_word(raiz, papel) -> _Emitido:
                 inline(f, campos, mostra)
 
     def run(r, campos, mostra):
+        nonlocal mudou
         for f in r:
             if f.tag == f"{_MC}AlternateContent":
                 if (ramo := _ramo_lido(f, _LIDOS_WORD)) is not None:
                     run(ramo, campos, mostra)
             elif f.tag == f"{_W}t":
-                if mostra and all(campos):
+                if mostra and all(c is True for c in campos):
                     out.textos.add(f)
             elif f.tag in (f"{_W}drawing", f"{_W}pict", f"{_W}object"):
                 desenho(f)
+            elif f.tag == f"{_W}instrText" and campos and isinstance(campos[-1], _CampoDeCaixa):
+                campos[-1].instrucao.append(f.text or "")
             elif f.tag == f"{_W}fldChar":
                 tipo = _attr(f, _W[1:-1], "fldCharType")
                 if tipo == "begin":
-                    campos.append(False)
-                elif tipo == "separate" and campos:
-                    campos[-1] = True
-                elif tipo == "end" and campos:
-                    campos.pop()
+                    caixa = f.find(f"{_W}ffData/{_W}checkBox") if formatar_caixas else None
+                    campos.append(_CampoDeCaixa(f, caixa, []) if caixa is not None else False)
+                elif campos and tipo in ("separate", "end"):
+                    campo = campos.pop()
+                    marcador = campo.projetar() if isinstance(campo, _CampoDeCaixa) else None
+                    if marcador is not None:
+                        if mostra and all(c is True for c in campos):
+                            out.textos.add(marcador)
+                        mudou = True
+                    if tipo == "separate":
+                        if marcador is not None:
+                            f.getparent().remove(f)  # o estado da caixa substitui o resultado em cache
+                        campos.append(marcador is None)
 
     def desenho(el):
         caixas = []
@@ -371,7 +403,7 @@ def _emitido_word(raiz, papel) -> _Emitido:
         for nota in raiz.iterfind(f"{_W}{_local(raiz)[:-1]}"):
             if _attr(nota, _W[1:-1], "type") not in _RECUSAS_DE_NOTA and _attr(nota, _W[1:-1], "id") is not None:
                 blocos(nota)
-    return out
+    return out, mudou
 
 
 def _qualificado(el, local):
@@ -422,7 +454,7 @@ def _celulas(pai, linha):
             _celulas(f, linha)
 
 
-def _rotulos(numeracao, estilos, pprs) -> set:
+def _rotulos(numeracao, estilos, pprs, marca_letra=None) -> tuple[set, bool]:
     """As palavras do rótulo de numeração dos parágrafos que o anydoc emite (resolve_numbering e numbering.rs): o
     lvlText do nível de cada parágrafo numerado, pela instância (w:num, com lvlOverride e numStyleLink), e os romanos
     quando um nível citado no rótulo (%1, %2...) é romano. O nível que nenhum parágrafo usa não conta."""
@@ -475,6 +507,7 @@ def _rotulos(numeracao, estilos, pprs) -> set:
         achado = el.find(caminho) if el is not None else None
         return _attr(achado, _W[1:-1], "val") if achado is not None else None
 
+    projecoes = {}
     for ppr in pprs:
         nid, ilvl = _inteiro(valor(ppr, f"{_W}numPr/{_W}numId")), _inteiro(valor(ppr, f"{_W}numPr/{_W}ilvl"))
         estilo = valor(ppr, f"{_W}pStyle")
@@ -486,14 +519,51 @@ def _rotulos(numeracao, estilos, pprs) -> set:
             ligados = {valor(lvl, f"{_W}pStyle"): k for k, lvl in sorted(niveis.items(), reverse=True) if k < 9}
             cadeia = (st.get(f"{_W}styleId") for st in estilos._cadeia(estilo))
             ilvl = next((ligados[sid] for sid in cadeia if sid in ligados), 0)
-        lvl = niveis.get(min(ilvl or 0, 8))
+        ilvl = min(ilvl or 0, 8)
+        lvl = niveis.get(ilvl)
         if lvl is None or (valor(lvl, f"{_W}numFmt") or "bullet") in ("bullet", "none"):
             continue  # o marcador do tópico não é rótulo; o nível sem numeração não escreve nada
         texto = valor(lvl, f"{_W}lvlText") or ""
         out.append(texto)
         citados = (niveis.get(int(k) - 1) for k in re.findall(r"%([1-9])", texto))
         romano |= any(valor(c, f"{_W}numFmt") in ("lowerRoman", "upperRoman") for c in citados if c is not None)
-    return palavras(" ".join(out)) | (_romanos() if romano else set())
+        chave = nid, ilvl
+        if marca_letra and chave not in projecoes and not _ligado(lvl.find(f"{_W}isLgl")):
+            # Delimita só o contador alfabético, inclusive quando ele pertence ao nível pai. Os literais da
+            # máscara e os números romanos podem conter as mesmas letras e têm de ficar intactos.
+            def marcar(m):
+                origem = niveis.get(int(m[1]) - 1)
+                if valor(origem, f"{_W}numFmt") in ("lowerLetter", "upperLetter"):
+                    return marca_letra + m[0] + ":"
+                return m[0]
+
+            padrao = texto or f"%{ilvl + 1}."
+            projecoes[chave] = (lvl, re.sub(r"%([1-9])", marcar, padrao), padrao)
+    mudou = False
+    for (nid, ilvl), (lvl, marcado, original) in projecoes.items():
+        if marcado == original:
+            continue
+        num = diretos[nid][1]
+        sobre = next((s for s in reversed(num.findall(f"{_W}lvlOverride")) if s.get(f"{_W}ilvl") == str(ilvl)), None)
+        if sobre is None:
+            sobre = num.makeelement(f"{_W}lvlOverride", {f"{_W}ilvl": str(ilvl)})
+            num.append(sobre)
+        copia = sobre.find(f"{_W}lvl")
+        if copia is None:
+            # Uma instância pode sobrescrever o formato de um nível citado por outra. A máscara é portanto
+            # própria da instância. Bastam as propriedades escalares que o conversor lê no nível.
+            copia = lvl.makeelement(f"{_W}lvl", {f"{_W}ilvl": str(ilvl)})
+            for nome in ("start", "numFmt", "lvlRestart", "pStyle"):
+                if (v := valor(lvl, f"{_W}{nome}")) is not None:
+                    copia.append(lvl.makeelement(f"{_W}{nome}", {f"{_W}val": v}))
+            sobre.append(copia)
+        texto_nivel = copia.find(f"{_W}lvlText")
+        if texto_nivel is None:
+            texto_nivel = copia.makeelement(f"{_W}lvlText")
+            copia.append(texto_nivel)
+        texto_nivel.set(f"{_W}val", marcado)
+        mudou = True
+    return palavras(" ".join(out)) | (_romanos() if romano else set()), mudou
 
 
 def _xml(dados):
@@ -1504,14 +1574,14 @@ def _deslocamento(pos, margem):
 _BORDA = re.compile(r"word/(header|footer)\d*\.xml")
 
 
-def limpar_docx(dados: bytes, *, formatar_texto=False) -> Limpeza:
+def limpar_docx(dados: bytes, *, formatar_texto=False, marca_letra=None) -> Limpeza:
     """Texto do Word que a IA leria e o humano não vê, esvaziado no próprio XML antes da conversão: corpo, caixas de
     texto, notas de rodapé e de fim, comentários, cabeçalho e rodapé, achados pelas relações do pacote, como o anydoc
     acha. Só as partes alteradas são regravadas; texto visível igual a um oculto fica onde está. A parte que não pode
     ser lida vai para `falhas` e fica como estava."""
     try:
         with zipfile.ZipFile(io.BytesIO(dados)) as z:
-            ocultos, limpas, falhas, vistas = _conferir_word(z, formatar_texto=formatar_texto)
+            ocultos, limpas, falhas, vistas = _conferir_word(z, formatar_texto=formatar_texto, marca_letra=marca_letra)
             return Limpeza(ocultos, _regravar(z, limpas) if limpas else dados, falhas, frozenset(vistas))
     except MemoryError:
         raise
@@ -1530,7 +1600,7 @@ def bordas_sem_oculto(z) -> dict:
         return {}
 
 
-def _conferir_word(z, so_metadados=False, formatar_texto=False) -> tuple:
+def _conferir_word(z, so_metadados=False, formatar_texto=False, marca_letra=None) -> tuple:
     """As partes que o anydoc lê (a principal pelo officeDocument; estilos e notas pelas relações dela) e as que os
     metadados leem (cabeçalho, rodapé e comentários, pelas relações e pelo nome)."""
     pac = _Pacote(z)
@@ -1582,7 +1652,7 @@ def _conferir_word(z, so_metadados=False, formatar_texto=False) -> tuple:
         atras = (255, 255, 255) if papel == "comentario" else pagina  # o comentário fica no balão, fora da página
         cobre = faixas if papel == "corpo" else [(-1, 1 << 62)] if faixas and papel == "nota" else ()
         # o anydoc lê o corpo e as notas; o resto, só os metadados
-        emitido = _emitido_word(raiz, papel) if papel in ("corpo", "nota") else None
+        emitido, caixas = _emitido_word(raiz, papel, formatar_texto) if papel in ("corpo", "nota") else (None, False)
         try:
             achados, mudou = _conferir_parte(
                 raiz,
@@ -1602,29 +1672,24 @@ def _conferir_word(z, so_metadados=False, formatar_texto=False) -> tuple:
             pac.falhou(nome, e)
             continue
         ocultos += achados
-        if mudou:
+        if mudou or caixas:
             limpas[nome] = _serializar(raiz, z.read(nome))
         if emitido is not None:
             pprs += emitido.pprs
             _fontes_sem_estilo(pac, nome, emitido.fontes, vistas)
-    if not so_metadados and (numeracao := pac.arvore(tipo("numbering", "numbering.xml"))) is not None:
-        vistas |= _rotulos(numeracao, estilos, pprs)  # o rótulo do título numerado ("Cláusula 1.", "IV.")
+    nome_num = tipo("numbering", "numbering.xml")
+    if not so_metadados and (numeracao := pac.arvore(nome_num)) is not None:
+        palavras_rotulo, mudou = _rotulos(numeracao, estilos, pprs, marca_letra)
+        vistas |= palavras_rotulo
+        if mudou:
+            limpas[nome_num] = _serializar(numeracao, z.read(nome_num))
     return ocultos, limpas, pac.falhas, vistas
 
 
 @functools.cache
 def _romanos() -> frozenset:
     """Os números romanos de 1 a 3999 (o anydoc escreve os maiores em algarismos), em minúsculas."""
-    valores = ((1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
-               (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"))  # fmt: skip
-    out = set()
-    for n in range(1, 4000):
-        romano = ""
-        for valor, letras in valores:
-            while n >= valor:
-                romano, n = romano + letras, n - valor
-        out.add(romano)
-    return frozenset(out)
+    return frozenset(romano(n) for n in range(1, 4000))
 
 
 class _Paragrafo(NamedTuple):

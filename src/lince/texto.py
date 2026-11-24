@@ -11,6 +11,19 @@ from xml.etree import ElementTree as ET  # noqa: F401
 MATH_SIMBOLOS = set("∑∫∏√∇∂±≤≥≠≈∞∈∉⊂⊆∀∃→←⇒⇔·×÷∝αβγδεζηθικλμνξπρστυφχψωΓΔΘΛΞΠΣΦΨΩ")
 
 
+def romano(n: int) -> str:
+    """Numeração romana minúscula de 1 a 3999. Fora dessa faixa o anydoc usa algarismos."""
+    if not 1 <= n <= 3999:
+        return str(n)
+    valores = ((1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
+               (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"))  # fmt: skip
+    rotulo = ""
+    for valor, letras in valores:
+        quantidade, n = divmod(n, valor)
+        rotulo += quantidade * letras
+    return rotulo
+
+
 def densidade_matematica(md):
     if not md:
         return 0.0
