@@ -532,11 +532,15 @@ def planejar_office(path, pasta, ext=None):
     svgs, sentinela = [], f"LINCE{secrets.token_hex(8)}S"  # desenhos vetoriais, juntos no fim, num lote só
     vistas = set()  # imagens já lidas (sha256): o armazém dos binários não as repete
 
-    def ler_imagem(data, mime, onde):
+    alternativas = {}
+
+    def ler_imagem(data, mime, onde, alt=""):
         """A imagem vira tarefa da IA; a que não abre (formato quebrado) fica marcada no lugar e registrada, nunca
         derruba o documento. SVG, EMF e WMF ficam com uma marca provisória e são desenhados no fim, num lote só."""
         from PIL import Image
 
+        if alt:
+            alternativas[onde] = alt
         vistas.add(hashlib.sha256(data).digest())
         tid = f"img{len(tarefas) + 1:02d}"
         try:
@@ -547,7 +551,7 @@ def planejar_office(path, pasta, ext=None):
             if "svg" in (mime or "").lower() or _metafile(data, mime):
                 svgs.append((data, mime, onde))
                 return f"{sentinela}{len(svgs) - 1}X"
-            return _nao_lida(onde, mime, ilegiveis)
+            return _nao_lida(onde, mime, ilegiveis) + (f" [texto alternativo: {alt}]" if alt else "")
         tarefas.append({"id": tid, "modo": "imagem", "ancora": onde})
         return f"{{{{IA:{tid}}}}}"
 
@@ -726,7 +730,7 @@ def planejar_office(path, pasta, ext=None):
 
         _complemento(diagramas, "diagramas de formas", ilegiveis)
     if svgs:
-        md = re.sub(rf"{sentinela}(\d+)X", _desenhar_svgs(svgs, pasta, tarefas, ilegiveis, pendentes), md)
+        md = re.sub(rf"{sentinela}(\d+)X", _desenhar_svgs(svgs, pasta, tarefas, ilegiveis, pendentes, alternativas), md)
     return {
         "tipo": "office",
         "md": md,
@@ -736,6 +740,11 @@ def planejar_office(path, pasta, ext=None):
         "texto_oculto": seguranca,
         "ilegiveis": ilegiveis,
         "perfil_tabular": perfis,
+        **(
+            {"alt_das_tarefas": {t["id"]: alternativas[t["ancora"]] for t in tarefas if t["ancora"] in alternativas}}
+            if alternativas
+            else {}
+        ),
         "pendentes": pendentes,
         "slides": ext in PPTX,  # só a apresentação tem <!-- slide N --> com a posição na estrutura
     }
@@ -1394,7 +1403,7 @@ def _metafile(data, mime) -> str | None:
     return (mime or "").lower() if (mime or "").lower() in _METAFILES else None
 
 
-def _desenhar_svgs(svgs, pasta, tarefas, ilegiveis, pendentes):
+def _desenhar_svgs(svgs, pasta, tarefas, ilegiveis, pendentes, alternativas):
     """Desenha os SVG, EMF e WMF do documento num lote só (o teto de tempo é do documento) e até DESENHOS_MAX;
     devolve a troca de cada marca provisória pela tarefa da IA ou pela marca de imagem não lida."""
     from lxml import etree
@@ -1428,7 +1437,16 @@ def _desenhar_svgs(svgs, pasta, tarefas, ilegiveis, pendentes):
             if feito.startswith("sem "):  # falta o desenhista: dá para resolver instalando, fica pendente
                 extra = ' (instale "lince[emf]")' if feito == "sem metafile-render" else ""
                 pendentes.append(f"{onde}: {_FORMATOS.get(mime, mime)} não desenhado, {feito}{extra}")
-    return lambda m: trocas[int(m.group(1))]
+
+    def substituir(m):
+        k = int(m.group(1))
+        marca = trocas[k]
+        alt = alternativas.get(svgs[k][2])
+        if alt and not marca.startswith("{{IA:"):
+            return f"{marca} [texto alternativo: {alt}]"
+        return marca
+
+    return substituir
 
 
 def _complemento(funcao, nome, ilegiveis):
@@ -1562,6 +1580,7 @@ def _rotulo_word(lista, item, numero, letras):
 
 
 def serializar(doc, ler_imagem, *, links=False, formato=None, marca_slide=None, letras=None):
+    epub = formato == "epub"
     cobertura = {"pendente": []}
     assets = {a.id: a for a in doc.assets}
     n_img = {"n": 0}
@@ -1599,14 +1618,22 @@ def serializar(doc, ler_imagem, *, links=False, formato=None, marca_slide=None, 
                     if not a.media_type.startswith("image/"):
                         cobertura["pendente"].append(f"{onde}: {a.media_type}")
                         out.append(f"[{onde}: objeto {a.media_type}]")
-                    elif min(_tam(a.data)) < 48:
+                    elif min(_tam(a.data)) < 48 and not (epub and x.alt):
                         cobertura["pendente"].append(f"{onde}: decorativa")
                     else:
-                        out.append(ler_imagem(a.data, a.media_type, onde))
+                        if epub and x.alt:
+                            alt = (
+                                html.escape(" ".join(x.alt.split()), quote=False)
+                                .replace("{", "&#123;")
+                                .replace("}", "&#125;")
+                            )
+                            out.append(ler_imagem(a.data, a.media_type, onde, alt))
+                        else:
+                            out.append(ler_imagem(a.data, a.media_type, onde))
                 else:
                     out.append(f"[{onde}: {x.alt or 'sem fonte'}]")
             elif k == "line_break":
-                out.append(" ")
+                out.append("  \n" if epub else " ")
             elif k == "math":
                 out.append(f"${x.text}$")
             elif k == "note_ref":
@@ -1626,13 +1653,19 @@ def serializar(doc, ler_imagem, *, links=False, formato=None, marca_slide=None, 
                 out.append("\\" + txt if txt and txt[0] in ">#-+|" else txt)
             elif k == "list":
                 for i, it in enumerate(b.list.items):
-                    corpo = blocos(it.blocks, prof + 1).strip().replace("\n", "\n  ")
+                    corpo = blocos(it.blocks, prof + 1).strip()
+                    if not epub:
+                        corpo = corpo.replace("\n", "\n  ")
                     marca = "-" if b.list.marker == "bullet" else f"{b.list.start + i}."
                     if formato == "docx":
                         marca = _rotulo_word(b.list, it, b.list.start + i, letras)
                         if b.list.marker != "bullet" and marca and corpo.startswith(marca + " "):
                             corpo = corpo[len(marca) + 1 :]
-                    out.append("  " * prof + f"{marca} {corpo}")
+                    if epub:
+                        recuo = " " * (len(marca) + 1)
+                        out.append(f"{marca} " + corpo.replace("\n", "\n" + recuo))
+                    else:
+                        out.append("  " * prof + f"{marca} {corpo}")
             elif k == "table":
                 linhas = []
                 for row in b.table.grid:
