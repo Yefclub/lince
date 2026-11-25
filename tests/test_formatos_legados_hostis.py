@@ -1049,3 +1049,45 @@ def test_xlsx_com_dtd_em_qualquer_parte_ou_livro_que_nao_existe_e_recusado(tmp_p
 
     with pytest.raises(DocumentoRecusado, match="aba oculta"):
         office._partes_das_abas_ocultas(sem_livro)
+
+
+def test_xlsx_com_parte_que_nao_abre_ou_estado_fora_da_especificacao_e_recusado(tmp_path):
+    """A parte quebrada ao lado do livro não interrompe a conferência dele; o livro quebrado não pode ser conferido;
+    o estado "Hidden" o leitor do corpo lê como visível."""
+
+    def quebrar(p, nome):  # grava a parte sem compressão e troca um byte: o CRC não bate mais
+        with zipfile.ZipFile(p) as z:
+            partes = {i.filename: z.read(i) for i in z.infolist()}
+        partes[nome] = partes.get(nome, b"<a/>") + b"<!--" + b"x" * 64 + b"-->"
+        with zipfile.ZipFile(p, "w") as z:
+            for n, dados in partes.items():
+                z.writestr(n, dados, compress_type=zipfile.ZIP_STORED if n == nome else zipfile.ZIP_DEFLATED)
+        dados = bytearray(p.read_bytes())
+        dados[dados.rindex(b"x" * 64)] = ord("y")
+        p.write_bytes(bytes(dados))
+
+    p = tmp_path / "crc.xlsx"
+    _xlsx_oculto(p, dtd=True)
+    quebrar(p, "0lixo.xml")
+
+    with pytest.raises(DocumentoRecusado, match="aba oculta"):
+        lince.ler(p)
+
+    livro = tmp_path / "livro_crc.xlsx"
+    _xlsx_oculto(livro)
+    quebrar(livro, "xl/workbook.xml")
+
+    with pytest.raises(DocumentoRecusado, match="que não abre"):
+        office._partes_das_abas_ocultas(livro)
+
+    estado = tmp_path / "estado.xlsx"
+    _xlsx_oculto(estado)
+    with zipfile.ZipFile(estado) as z:
+        partes = {i.filename: z.read(i) for i in z.infolist()}
+    partes["xl/workbook.xml"] = partes["xl/workbook.xml"].replace(b'state="hidden"', b'state="Hidden"')
+    with zipfile.ZipFile(estado, "w") as z:
+        for nome, dados in partes.items():
+            z.writestr(nome, dados)
+
+    with pytest.raises(DocumentoRecusado, match="aba oculta"):
+        lince.ler(estado)

@@ -1368,9 +1368,9 @@ def livros_do_pacote(z, nomes) -> list[str]:
     return alvos or ["xl/workbook.xml"]
 
 
-def _dtd_no_prologo(z, parte) -> bool:
+def _dtd_no_prologo(z, parte) -> bool | None:
     """Se a parte é XML com DTD: o expat lê só até o primeiro elemento, onde o DTD já teria vindo (a parte binária
-    para no primeiro byte que não é XML)."""
+    para no primeiro byte que não é XML). None: a parte não abre (CRC, cifra, método) e não pôde ser conferida."""
     from xml.parsers import expat
 
     class _Pronto(Exception):
@@ -1393,6 +1393,10 @@ def _dtd_no_prologo(z, parte) -> bool:
                 parser.Parse(bloco, False)
     except (_Pronto, expat.ExpatError):
         pass
+    except MemoryError:
+        raise
+    except Exception:  # noqa: BLE001 — zipfile e zlib levantam de tudo com a parte quebrada
+        return None
     return bool(achou)
 
 
@@ -1405,8 +1409,14 @@ def _partes_das_abas_ocultas(path) -> set[str]:
         # falha fechada, sem depender de qual parte o leitor do corpo toma por livro: DTD em qualquer parte (a entidade
         # no estado da aba) ou um livro que as relações apontam e não existe com esse nome
         recusa = "planilha com XML fora do padrão que pode esconder aba: a aba oculta não pôde ser separada do corpo"
-        if any(_dtd_no_prologo(z, parte) for parte in sorted(nomes)):
+        conferidas = {parte: _dtd_no_prologo(z, parte) for parte in sorted(nomes)}
+        if any(conferidas.values()):
             raise DocumentoRecusado(recusa)
+        # a parte quebrada fica de fora da conferência (a mídia cifrada não impede a leitura); se é o livro, não
+        if quebrado := [p for p in livros_do_pacote(z, nomes) if p in nomes and conferidas[p] is None]:
+            raise DocumentoRecusado(
+                f"planilha com o livro {quebrado[0][:80]} que não abre: a aba oculta não foi conferida"
+            )
         apontados = _alvos(z, "", nomes, "officeDocument").values()
         if apontados and not any(a in nomes for a in apontados):
             raise DocumentoRecusado(recusa)
@@ -1423,9 +1433,11 @@ def _partes_das_abas_ocultas(path) -> set[str]:
             return saida
         abas = _alvos(z, lugar, nomes)
         for aba in livro.iter():
-            if aba.tag.rsplit("}", 1)[-1] != "sheet" or aba.get("state", "visible") == "visible":
+            if aba.tag.rsplit("}", 1)[-1] != "sheet":
                 continue
-            if (parte := abas.get(aba.get(f"{_REL}id"))) not in nomes:
+            if (estado := aba.get("state", "visible")) not in ("visible", "hidden", "veryHidden"):
+                raise DocumentoRecusado(recusa)  # fora da especificação: o leitor do corpo a lê como visível
+            if estado == "visible" or (parte := abas.get(aba.get(f"{_REL}id"))) not in nomes:
                 continue
             for desenho in (d for d in _alvos(z, parte, nomes).values() if "/drawings/" in d and d in nomes):
                 saida.add(desenho)
