@@ -423,7 +423,9 @@ Cabeçalho e rodapé de `.docx`, `.docm`, `.doc`, `.rtf`, `.xlsx`, `.xlsm`, `.xl
 saem do corpo e ficam nos metadados, em `cabeçalho/rodapé`, com número de página e data legíveis
 (`Página [página] de [páginas]`). Abas ocultas do `.xlsx`, do `.xls` e do `.ods` ficam em `abas_ocultas`, e o começo do
 conteúdo delas (até 500 caracteres) vai para `texto_oculto_removido`, fora do corpo e conferido contra prompt
-injection. As notas de célula do `.xls` e do `.ods` saem como as do `.xlsx`. Arquivo com macro
+injection. Gráfico e imagem de aba oculta também ficam fora do corpo; no `.xls`, que não diz de que aba é cada
+imagem, as imagens de um arquivo com aba oculta ficam de fora, registradas em `partes_ilegiveis`. As notas de célula
+do `.xls` e do `.ods` saem como as do `.xlsx`. Arquivo com macro
 ganha `macros: true`: VBA no Office (OOXML, inclusive `.xlsb`, e `.doc`, `.xls`, `.ppt`, `.pps` e `.pot`), macro do Excel 4.0
 (`.xlsx`, `.xlsm`, `.xlsb` e `.xls`) e macro do LibreOffice. A macro nunca é executada.
 

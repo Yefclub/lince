@@ -4,10 +4,14 @@ arquivo, nada que some e nada oculto no corpo (review da issue 150)."""
 import re
 import time
 import zipfile
+from pathlib import Path
 
+import pytest
 from openpyxl import Workbook
 
 import lince
+from lince import xlsx_anotacoes
+from lince.limites import DocumentoRecusado
 from lince.office import _tabelas_no_lugar_das_celulas
 
 T, O, X, S = (
@@ -16,6 +20,7 @@ T, O, X, S = (
     "urn:oasis:names:tc:opendocument:xmlns:text:1.0",
     "urn:oasis:names:tc:opendocument:xmlns:style:1.0",
 )
+REAIS = Path(__file__).parent / "fixtures" / "reais"
 CEL = '<table:table-cell office:value-type="string"><text:p>{}</text:p></table:table-cell>'
 
 
@@ -297,38 +302,145 @@ def _tabela(nome, estilo, conteudo):
     return f'<table:table table:name="{nome}" table:style-name="{estilo}">{conteudo}</table:table>'
 
 
-def test_aba_oculta_de_ods_com_xml_que_o_parser_recusa_sai_do_corpo_mesmo_assim(tmp_path):
-    """O leitor do corpo aceita DTD com entidade e prefixo sem namespace; o parser seguro, não. A falha tem de ser
-    fechada: a aba oculta sai do corpo pela varredura tolerante, e o registro diz que o conteúdo não foi conferido."""
+def test_ods_com_xml_que_o_parser_recusa_e_que_pode_esconder_aba_e_recusado(tmp_path):
+    """O leitor do corpo aceita DTD com entidade e prefixo sem namespace; o parser seguro, não. Sem ele, a aba oculta
+    não pode ser separada do corpo com certeza: o documento é recusado, nunca lido com ela dentro."""
     tabelas = _tabela("Resumo", "ta1", _linha("visível")) + _tabela("Oculta", "ta2", _linha("SEGREDO"))
-    for nome, conteudo in (
-        ("dtd.ods", _conteudo_ods(tabelas, antes='<!DOCTYPE office:document-content [<!ENTITY e "x">]>')),
-        (
-            "prefixo.ods",
-            _conteudo_ods(
-                _tabela("Resumo", "ta1", _linha("visível") + "<x:y/>")[:-14]
-                + "</table:table>"
-                + _tabela("Oculta", "ta2", _linha("SEGREDO"))
-            ),
-        ),
-    ):
+    casos = {
+        "dtd.ods": _conteudo_ods(tabelas, antes='<!DOCTYPE office:document-content [<!ENTITY e "x">]>'),
+        "prefixo.ods": _conteudo_ods(tabelas.replace("</table:table>", "<x:y/></table:table>", 1)),
+    }
+    for nome, conteudo in casos.items():
         p = tmp_path / nome
         _ods_cru(p, conteudo)
+
+        with pytest.raises(DocumentoRecusado, match="aba oculta"):
+            lince.ler(p)
+
+
+def test_ods_com_xml_que_o_parser_recusa_sem_aba_oculta_segue_e_registra(tmp_path):
+    p = tmp_path / "prefixo.ods"
+    conteudo = _conteudo_ods(_tabela("Resumo", "ta1", _linha("visível") + "<x:y/>"))
+    _ods_cru(p, conteudo.replace('<style:table-properties table:display="false"/>', ""))
+
+    r = lince.ler(p)
+
+    assert "visível" in r.markdown
+    assert any(i.startswith("notas de célula:") for i in r.metadados["partes_ilegiveis"])
+
+
+def test_aba_oculta_sai_pela_posicao_seja_qual_for_o_nome(tmp_path):
+    """Nome com espaço nas bordas, com referência de caractere, vazio, igual ao de uma visível (vazia ou não): o
+    leitor do corpo escreve cada um de um jeito, e nada disso decide o que sai."""
+    for nome, abas in {
+        "espacos.ods": [("Resumo", False, _linha("visível")), (" Resumo ", True, _linha("SEGREDO"))],
+        "charref.ods": [("Resumo", False, _linha("visível")), ("Ocult&#97;", True, _linha("SEGREDO"))],
+        "vazio.ods": [("Resumo", False, _linha("visível")), ("", True, _linha("SEGREDO"))],
+        "igual.ods": [("Resumo", True, _linha("SEGREDO")), ("Resumo", False, _linha("visível"))],
+        "igual_vazia.ods": [
+            ("Resumo", False, ""),
+            ("Resumo", True, _linha("SEGREDO")),
+            ("Fim", False, _linha("visível")),
+        ],
+    }.items():
+        p = tmp_path / nome
+        _ods(p, abas)
 
         r = lince.ler(p)
 
         assert "SEGREDO" not in r.markdown and "visível" in r.markdown, nome
-        assert r.metadados["abas_ocultas"] == ["Oculta"]
-        assert any("sem o conteúdo conferido" in i for i in r.metadados["partes_ilegiveis"])
+        assert r.metadados["texto_oculto_removido"][0]["texto"].endswith(": SEGREDO"), nome
 
 
-def test_aba_oculta_com_o_nome_de_uma_visivel_nao_apaga_a_visivel(tmp_path):
-    p = tmp_path / "mesmo_nome.ods"
-    _ods(p, [("Resumo", False, _linha("visível")), ("Resumo", True, _linha("SEGREDO"))])
+def test_tabela_com_prefixo_redeclarado_conta_como_aba(tmp_path):
+    """O mesmo namespace com outro prefixo, declarado na própria tabela, ainda é uma aba (e oculta)."""
+    oculta = (
+        f'<t2:table xmlns:t2="{T}" t2:name="Oculta" t2:style-name="ta2">'
+        "<t2:table-row><t2:table-cell><text:p>SEGREDO</text:p></t2:table-cell></t2:table-row></t2:table>"
+    )
+    p = tmp_path / "prefixo.ods"
+    _ods_cru(p, _conteudo_ods(_tabela("Resumo", "ta1", _linha("visível")) + oculta))
 
-    md = lince.ler(p).markdown
+    r = lince.ler(p)
 
-    assert "visível" in md and "SEGREDO" not in md
+    assert "SEGREDO" not in r.markdown and "visível" in r.markdown
+    assert r.metadados["abas_ocultas"] == ["Oculta"]
+
+
+def test_teto_das_notas_nao_para_a_busca_das_abas_ocultas(tmp_path):
+    nota = (
+        "<table:table-row><table:table-cell><office:annotation><text:p>nota {}</text:p></office:annotation>"
+        "<text:p>v</text:p></table:table-cell></table:table-row>"
+    )
+    notas = "".join(nota.format(k) for k in range(xlsx_anotacoes.ANOTACOES_MAX + 50))
+    p = tmp_path / "notas.ods"
+    _ods(p, [("Resumo", False, _linha("visível") + notas), ("Oculta", True, _linha("SEGREDO"))])
+
+    r = lince.ler(p)
+
+    assert "SEGREDO" not in r.markdown and r.metadados["abas_ocultas"] == ["Oculta"]
+    assert any("anotações restantes omitidas" in p for p in r.cobertura.pendentes)
+
+
+def test_imagem_de_aba_oculta_do_ods_nao_vai_para_a_ia(tmp_path):
+    import io
+
+    from PIL import Image
+
+    def png(semente):
+        b = io.BytesIO()
+        Image.effect_noise((120, 80), 40 + semente).convert("RGB").save(b, "PNG")
+        return b.getvalue()
+
+    quadro = '<draw:frame><draw:image xlink:href="Pictures/{}.png"/></draw:frame>'
+    tabelas = _tabela("Resumo", "ta1", _linha("visível") + quadro.format("visivel"))
+    tabelas += _tabela("Oculta", "ta2", _linha("SEGREDO") + quadro.format("oculta"))
+    p = tmp_path / "imagens.ods"
+    _ods_cru(p, _conteudo_ods(tabelas), [("Pictures/visivel.png", png(1)), ("Pictures/oculta.png", png(2))])
+
+    plano = lince.Leitor().preparar(p)
+
+    assert [t.onde for t in plano.tarefas] == ["aba Resumo"]
+
+
+def test_grafico_e_imagem_de_aba_oculta_do_xls_ficam_fora_do_corpo():
+    r = lince.ler(REAIS / "lince_aba_oculta_grafico.xls")
+
+    assert "Vendas visíveis" in r.markdown and "Janeiro" in r.markdown
+    assert "SEGREDO" not in r.markdown and "{{IA:" not in r.markdown
+    assert r.metadados["partes_ilegiveis"] == [
+        "imagens do documento: há aba oculta, e o armazém não diz de que aba cada imagem é; ficaram de fora"
+    ]
+
+
+def test_xlsx_com_dtd_no_livro_e_recusado(tmp_path):
+    """Com a entidade no estado da aba, o leitor do corpo lê a aba oculta como visível."""
+    base, p = tmp_path / "base.xlsx", tmp_path / "dtd.xlsx"
+    wb = Workbook()
+    wb.active.append(["visível"])
+    wb.create_sheet("Oculta").append(["SEGREDO"])
+    wb["Oculta"].sheet_state = "hidden"
+    wb.save(base)
+    with zipfile.ZipFile(base) as entrada, zipfile.ZipFile(p, "w") as saida:
+        for parte in entrada.infolist():
+            dados = entrada.read(parte)
+            if parte.filename == "xl/workbook.xml":
+                dados = dados.replace(b"?>", b'?><!DOCTYPE workbook [<!ENTITY h "hidden">]>', 1)
+                dados = dados.replace(b'state="hidden"', b'state="&h;"')
+            saida.writestr(parte, dados)
+
+    with pytest.raises(DocumentoRecusado, match="aba oculta"):
+        lince.ler(p)
+
+
+def test_teto_das_celulas_das_tabelas_do_ppt_fica_registrado(monkeypatch):
+    from lince import legados
+
+    monkeypatch.setattr(legados, "_CELULAS_MAX", 4)
+
+    r = lince.ler(REAIS / "lince_tabela.ppt")
+
+    assert "tabelas dos slides: mais de 4 células; as demais ficaram como texto" in r.metadados["partes_ilegiveis"]
 
 
 def test_grafico_de_aba_oculta_do_ods_fica_fora_do_corpo(tmp_path):
@@ -432,7 +544,8 @@ def test_titulo_com_acento_escrito_em_rtf_e_reconhecido_pelo_nome_do_estilo(tmp_
 
 
 def test_aba_oculta_com_muitas_celulas_vazias_nao_trava(tmp_path):
-    """Mil linhas que vão até a última coluna: o leitor em fluxo devolve 16 milhões de células vazias."""
+    """Cinco mil linhas que vão até a última coluna, sem valor: o leitor em fluxo devolve 80 milhões de células vazias,
+    e só o teto de células para a varredura (o de texto não enche)."""
     base, p = tmp_path / "base.xlsx", tmp_path / "larga.xlsx"
     wb = Workbook()
     wb.active.append(["visível"])
@@ -440,7 +553,7 @@ def test_aba_oculta_com_muitas_celulas_vazias_nao_trava(tmp_path):
     oculta.append(["começo"])
     oculta.sheet_state = "hidden"
     wb.save(base)
-    linhas = b"".join(b'<row r="%d"><c r="XFD%d"><v>1</v></c></row>' % (k, k) for k in range(2, 1002))
+    linhas = b"".join(b'<row r="%d"><c r="XFD%d"/></row>' % (k, k) for k in range(2, 5002))
     with zipfile.ZipFile(base) as entrada, zipfile.ZipFile(p, "w", zipfile.ZIP_DEFLATED) as saida:
         for parte in entrada.infolist():
             dados = entrada.read(parte)
@@ -497,3 +610,35 @@ def test_tabelas_do_ppt_acima_do_teto_ficam_ate_o_teto_e_registram_o_resto():
 
     assert len(tabelas) == 40 and not completo  # as 40 primeiras inteiras, nenhuma cortada no meio
     assert tabelas[0][0] == ["c00", "c01", "c02", "c03", "c04", "c05", "c06", "c07", "c08", "c09"]
+
+
+def test_teto_das_notas_do_xls_nao_para_a_busca_das_abas_ocultas(monkeypatch):
+    monkeypatch.setattr(xlsx_anotacoes, "ANOTACOES_MAX", 0)  # a primeira nota, na aba visível, já passa do teto
+
+    r = lince.ler(REAIS / "lince_nota_celula.xls")
+
+    assert r.metadados["texto_oculto_removido"][0]["texto"].startswith("aba Apoio: Nota escondida")
+    assert any("anotações restantes omitidas" in p for p in r.cobertura.pendentes)
+
+
+def test_tabela_dentro_de_celula_nao_conta_como_aba(tmp_path):
+    """A tabela dentro de uma célula não é aba: contada como uma, desalinha as posições das abas ocultas."""
+    dentro = (
+        '<table:table-row><table:table-cell><table:table table:name="Sub">'
+        + _linha("subtabela")
+        + "</table:table></table:table-cell></table:table-row>"
+    )
+    p = tmp_path / "subtabela.ods"
+    _ods(
+        p,
+        [
+            ("Resumo", False, _linha("visível") + dentro),
+            ("Oculta", True, _linha("SEGREDO")),
+            ("Fim", False, _linha("fim")),
+        ],
+    )
+
+    r = lince.ler(p)
+
+    assert "SEGREDO" not in r.markdown and "visível" in r.markdown and "fim" in r.markdown
+    assert r.metadados["abas_ocultas"] == ["Oculta"]

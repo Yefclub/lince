@@ -74,7 +74,7 @@ def test_titulo_de_eixo_e_rotulo_de_dado_nao_viram_titulo_nem_serie():
     titulo_sem_texto = TEXT + BEGIN + _link(1) + END
     rotulo = SERIES + BEGIN + _texto("Norte") + TEXT + BEGIN + _texto("42") + _link(4) + END + END
     [g], corte = _ler(BAR + rotulo + eixo + titulo_sem_texto)
-    assert g == {"tipo": "barras", "titulo": "", "series": ["Norte"]} and corte is None
+    assert g == {"tipo": "barras", "titulo": "", "series": ["Norte"], "oculto": False} and corte is None
     [g], _ = _ler(BAR + eixo + TEXT + BEGIN + _texto("Receita") + _link(1) + END)
     assert g["titulo"] == "Receita"
     sem_link = TEXT + BEGIN + _texto("Mês") + END  # texto sem OBJECTLINK não fica esperando o próximo TEXT

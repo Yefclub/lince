@@ -582,10 +582,28 @@ def planejar_office(path, pasta, ext=None):
     ilegiveis, graficos_pptx = [], {}
     saldo_graficos = [_CELULAS_GRAFICOS_MAX]
     limpeza = None  # o texto oculto sai do próprio XML, antes da conversão: nunca por busca no Markdown montado
+    tarefas, pendentes = [], []  # pendentes: o que entra em cobertura.pendentes, com o motivo
+    # o conteúdo da aba oculta não vai para o corpo (como o texto oculto): vai para os metadados, conferido como ele.
+    # No .xls e no .ods a mesma passada lê as notas de célula, que o anydoc não entrega (o .xlsx as tem mais adiante)
+    ocultas, anotacoes, objetos_ocultos, partes_ocultas, ods_lido = [], [], set(), set(), path
+    if ext == ".ods":
+        # o anydoc entrega a aba oculta do LibreOffice no corpo: ela sai do próprio arquivo antes, pela posição. Fora
+        # do _complemento: a recusa (aba oculta que não pôde ser separada) derruba o documento
+        try:
+            ods = xlsx_anotacoes.planilha_ods(path, anotacoes, pendentes)
+        except DocumentoRecusado:
+            raise
+        except Exception as e:  # noqa: BLE001 — XML que não fala em display: não há aba oculta, e o corpo segue
+            ilegiveis.append(f"notas de célula: {type(e).__name__}")
+        else:
+            ocultas.extend(ods.ocultas)
+            objetos_ocultos = ods.objetos
+            if ods.sem_ocultas is not None:
+                ods_lido = io.BytesIO(ods.sem_ocultas)
     if grande:
         doc = None
     else:
-        dados = open(path, "rb").read()
+        dados = ods_lido.getvalue() if isinstance(ods_lido, io.BytesIO) else open(path, "rb").read()
         # a limpeza segue o formato que o anydoc vai ler, pelo conteúdo (um Word gravado como .doc, ou uma apresentação
         # como .docx, é conferido), e o anydoc recebe esse formato explícito
         formato = "csv" if ext in (".csv", ".tsv") else anydoc.format_from_bytes(dados)
@@ -620,31 +638,17 @@ def planejar_office(path, pasta, ext=None):
                 raise
             except Exception:  # noqa: BLE001 — o leitor tolerante também não abre: vale o erro do leitor do corpo
                 raise recusa from None
-    tarefas, pendentes = [], []  # pendentes: o que entra em cobertura.pendentes, com o motivo
-    # o conteúdo da aba oculta não vai para o corpo (como o texto oculto): vai para os metadados, conferido como ele.
-    # No .xls e no .ods a mesma passada lê as notas de célula, que o anydoc não entrega (o .xlsx as tem mais adiante)
-    ocultas, anotacoes, objetos_ocultos, partes_ocultas = [], [], set(), set()
     if ext in (".xlsx", ".xlsm"):
-        _complemento(lambda: ocultas.extend(_abas_ocultas_xlsx(path)), "abas ocultas", ilegiveis)
-        _complemento(lambda: partes_ocultas.update(_partes_das_abas_ocultas(path)), "abas ocultas", ilegiveis)
-    elif ext == ".xls":
-        leitor_xls = xlsx_anotacoes.planilha_xls
-        _complemento(lambda: ocultas.extend(leitor_xls(path, anotacoes, pendentes)), "abas ocultas e notas", ilegiveis)
-    elif ext == ".ods":
-        # fora do _complemento: a recusa (aba oculta que não pôde ser separada do corpo) derruba o documento
-        try:
-            ods = xlsx_anotacoes.planilha_ods(path, anotacoes, pendentes)
+        try:  # fora do _complemento: a recusa derruba o documento
+            partes_ocultas = _partes_das_abas_ocultas(path)
         except DocumentoRecusado:
             raise
         except Exception as e:  # noqa: BLE001 — pacote fora do padrão: o corpo segue, e a falha fica registrada
-            ilegiveis.append(f"abas ocultas e notas: {type(e).__name__}")
-        else:
-            ocultas.extend(ods.ocultas)
-            objetos_ocultos = ods.objetos
-            if not ods.conferido:
-                ilegiveis.append(
-                    "abas ocultas: XML fora do padrão; elas saíram do corpo sem o conteúdo conferido nem as notas lidas"
-                )
+            ilegiveis.append(f"abas ocultas: {type(e).__name__}")
+        _complemento(lambda: ocultas.extend(_abas_ocultas_xlsx(path)), "abas ocultas", ilegiveis)
+    elif ext == ".xls":
+        leitor_xls = xlsx_anotacoes.planilha_xls
+        _complemento(lambda: ocultas.extend(leitor_xls(path, anotacoes, pendentes)), "abas ocultas e notas", ilegiveis)
     svgs, sentinela = [], f"LINCE{secrets.token_hex(8)}S"  # desenhos vetoriais, juntos no fim, num lote só
     vistas = set()  # imagens já lidas (sha256): o armazém dos binários não as repete
 
@@ -677,8 +681,6 @@ def planejar_office(path, pasta, ext=None):
     elif doc is None:
         (md, perfis), ilegiveis[:0] = md_xlsb, ilegiveis_xlsb
     else:
-        if ext == ".ods" and ocultas:  # o anydoc entrega a aba oculta do LibreOffice no corpo; a do Excel, não
-            doc = _sem_abas(doc, {(nome.strip(), posicao) for nome, posicao, _ in ocultas})
         md = serializar(doc, ler_imagem, formato=formato, marca_slide=marca if ext in PPTX else None, letras=letras)[0]
         perfis = _perfis(doc) if ext in PLANILHAS - {".xlsx", ".xlsm"} else []
         if limpeza is not None:  # a rede de segurança: o que o anydoc leu e a conferência não viu é falha
@@ -815,10 +817,7 @@ def planejar_office(path, pasta, ext=None):
 
         def imagens_ods():
             nonlocal md
-            escondidas = {f"aba {nome}" for nome, _, _ in ocultas}
-            for onde, mime, dados in _imagens_ods(path, ilegiveis):
-                if onde in escondidas:  # a imagem da aba oculta fica fora do corpo, como as células dela
-                    continue
+            for onde, mime, dados in _imagens_ods(ods_lido, ilegiveis):  # sem as abas ocultas
                 if (marca := hashlib.sha256(dados).digest()) in vistas or min(_tam(dados)) < 48:
                     continue
                 vistas.add(marca)
@@ -857,7 +856,7 @@ def planejar_office(path, pasta, ext=None):
                 graficos, corte = legados.graficos_xls(o, os.path.getsize(path))
             if corte:
                 ilegiveis.append(f"gráficos: {corte}")
-            for g in graficos:
+            for g in (g for g in graficos if not g["oculto"]):  # o de aba oculta fica fora do corpo, como ela
                 linhas = [f"**Gráfico ({g['tipo'] or 'tipo não identificado'}): {g['titulo'] or 'sem título'}**"]
                 if g["series"]:
                     linhas.append("Séries: " + ", ".join(g["series"]) + ".")
@@ -1359,8 +1358,14 @@ def _partes_das_abas_ocultas(path) -> set[str]:
     saida = set()
     with zipfile.ZipFile(path) as z:
         nomes = set(z.namelist())
-        livro = xml_ou_nada(z.read("xl/workbook.xml")) if "xl/workbook.xml" in nomes else None
-        if livro is None:
+        bruto = z.read("xl/workbook.xml") if "xl/workbook.xml" in nomes else b""
+        # falha fechada: com DTD (entidade no estado da aba) ou XML que o parser recusa, o anydoc pode ler a aba oculta
+        # como visível, e ela não pode ser separada do corpo
+        if b"<!DOCTYPE" in bruto or (livro := xml_ou_nada(bruto)) is None:
+            if b"<!DOCTYPE" in bruto or b"state" in bruto:
+                raise DocumentoRecusado(
+                    "planilha com XML fora do padrão que pode esconder aba: a aba oculta não pôde ser separada do corpo"
+                )
             return saida
         abas = _alvos(z, "xl/workbook.xml", nomes)
         for aba in livro.iter():
@@ -1372,23 +1377,6 @@ def _partes_das_abas_ocultas(path) -> set[str]:
                 saida.add(desenho)
                 saida.update(_alvos(z, desenho, nomes).values())
     return saida
-
-
-def _sem_abas(doc, nomes):
-    """O documento do anydoc sem as abas de `nomes`, pares (nome, posição entre as abas com esse nome): cada aba do .ods
-    é um título de nível 2 com o nome dela e os blocos até o próximo título desse nível. A posição separa a aba oculta
-    de uma visível com o mesmo nome, que o arquivo fora do padrão pode ter."""
-    from types import SimpleNamespace
-
-    blocos, pulando, vistos = [], False, Counter()
-    for b in doc.blocks:
-        if b.kind == "heading" and b.level == 2:
-            nome = "".join(x.text or "" for x in b.content or [] if x.kind == "text").strip()
-            pulando = (nome, vistos[nome]) in nomes
-            vistos[nome] += 1
-        if not pulando:
-            blocos.append(b)
-    return SimpleNamespace(blocks=blocos, assets=doc.assets, notes=doc.notes)
 
 
 PLANILHAS = {".xlsx", ".xlsm", ".xlsb", ".xls", ".ods", ".csv", ".tsv"}  # as que ganham perfil tabular

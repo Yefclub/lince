@@ -82,6 +82,10 @@ pelo LibreOffice 24.2. Serve para provar a leitura da tabela, que o formato guar
 aba oculta com outra nota, montada com openpyxl e convertida para Excel 97-2003 pelo LibreOffice 24.2. O autor das
 notas sai como "Unknown Author". Sem dado de pessoa ou empresa.
 
+`lince_aba_oculta_grafico.xls`: planilha com dados fictícios (Janeiro, Fevereiro), um gráfico de barras na aba
+visível e outro gráfico, uma imagem de ruído e valores marcados "SEGREDO" numa aba oculta, montada com openpyxl e
+convertida para Excel 97-2003 pelo LibreOffice 24.2, com perfil de usuário vazio. Sem dado de pessoa ou empresa.
+
 `lince_protegido.odt`, `lince_protegido.ods`, `lince_protegido.doc` e `lince_protegido.xls`: um texto fictício
 ("Relatório protegido do Lince: a leitura só sai com a senha.", e na planilha com o valor 42) gravado com a senha
 `Girafa-Azul-26` pelo LibreOffice 24.2, com perfil de usuário vazio (sem autor). O ODF sai cifrado no padrão ODF 1.2

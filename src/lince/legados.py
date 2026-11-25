@@ -237,10 +237,13 @@ def _bmp_do_dib(dib: bytes) -> bytes | None:
     return b"BM" + struct.pack("<IHHI", 14 + len(dib), 0, 0, 14 + tam_cab + paleta) + dib
 
 
-def _desenhos_xls(b, orcamento) -> bytes:
-    """O armazém de imagens do Excel vem em MSODRAWINGGROUP, partido em CONTINUE a cada 8 KB: remonta os pedaços."""
-    partes, juntando = [], False
+def _desenhos_xls(b, orcamento) -> tuple[bytes, bool]:
+    """O armazém de imagens do Excel vem em MSODRAWINGGROUP, partido em CONTINUE a cada 8 KB: remonta os pedaços. E
+    se alguma aba é oculta (BOUNDSHEET): o armazém é do arquivo todo e não diz de que aba é cada imagem."""
+    partes, juntando, oculta = [], False, False
     for tipo, d in _registros(b, 0, orcamento):
+        if tipo == _BOUNDSHEET and len(d) >= 5 and d[4] & 3:
+            oculta = True
         if tipo == _MSODRAWINGGROUP:
             partes.append(d)
             juntando = True
@@ -248,7 +251,7 @@ def _desenhos_xls(b, orcamento) -> bytes:
             partes.append(d)
         else:
             juntando = False
-    return b"".join(partes)
+    return b"".join(partes), oculta
 
 
 def imagens(o, teto) -> tuple[list[tuple[str, bytes]], str | None]:
@@ -263,7 +266,9 @@ def imagens(o, teto) -> tuple[list[tuple[str, bytes]], str | None]:
             b = ler_stream(o, nome, teto)
             orcamento = Orcamento(len(b))
             if nome in ("Workbook", "Book") and len(b) >= 8 and struct.unpack_from("<H", b, 0)[0] == _BOF:
-                b = _desenhos_xls(b, orcamento)
+                b, oculta = _desenhos_xls(b, orcamento)
+                if oculta and _CANDIDATO.search(b):  # a imagem da aba oculta não pode ir para o corpo nem para a IA
+                    return saida, "há aba oculta, e o armazém não diz de que aba cada imagem é; ficaram de fora"
             for mime, dados in _blips(b, orcamento):
                 if (marca := hashlib.sha256(dados).digest()) not in vistas and dados:
                     if len(saida) >= IMAGENS_MAX:  # há mais uma: só agora é corte
@@ -298,21 +303,30 @@ def graficos_xls(o, teto) -> tuple[list[dict], str | None]:
     que o corpo já lê. Andando registro a registro com o orçamento do stream; cada SERIESTEXT é classificado pelo
     bloco em que está (BEGIN/END depois de SERIES ou TEXT), e o do TEXT ligado ao gráfico (OBJECTLINK com
     wLinkObj = 1) é o título; o texto de outro TEXT (título de eixo, rótulo de dado) não vaza para ele. Um gráfico
-    dentro do gráfico (BOF aninhado) é pulado."""
+    dentro do gráfico (BOF aninhado) é pulado. "oculto" diz se o gráfico é de uma aba oculta (ou é uma)."""
     b = ler_stream(o, "Workbook" if o.exists("Workbook") else "Book", teto)
     if len(b) < 8 or struct.unpack_from("<H", b, 0)[0] != _BOF or struct.unpack_from("<H", b, 4)[0] != 0x0600:
         return [], None  # só BIFF8: o Excel 5/95 grava gráfico de outro jeito
     saida, atual, profundidade, blocos, anterior, pendente = [], None, 0, [], None, None
+    estados, na_oculta, fim = {}, False, 0  # estados: início de cada aba (BOUNDSHEET.lbPlyPos) → hsState
     for tipo, d in _registros(b, 0, Orcamento(len(b))):
+        inicio, fim = fim, fim + 4 + len(d)
         if tipo == _FILEPASS:
             return saida, None  # protegida por senha: o resto é cifrado
+        if tipo == _BOUNDSHEET and len(d) >= 5:
+            estados[struct.unpack_from("<I", d, 0)[0]] = d[4] & 3
         if tipo == _BOF:
             if atual is not None:
                 profundidade += 1
             elif len(d) >= 4 and struct.unpack_from("<H", d, 2)[0] == _CHART_BOF:
                 if len(saida) >= GRAFICOS_XLS_MAX:
                     return saida, f"mais de {GRAFICOS_XLS_MAX} gráficos; o resto ficou de fora"
-                atual, profundidade, blocos, pendente = {"tipo": "", "titulo": "", "series": []}, 0, [], None
+                # a folha de gráfico é uma aba; o gráfico embutido é da aba em que está
+                oculto = bool(estados[inicio]) if inicio in estados else na_oculta
+                atual = {"tipo": "", "titulo": "", "series": [], "oculto": oculto}
+                profundidade, blocos, pendente = 0, [], None
+            else:
+                na_oculta = bool(estados.get(inicio, 0))
         elif atual is None:
             pass
         elif tipo == _EOF:
