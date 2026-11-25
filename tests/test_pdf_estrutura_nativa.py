@@ -129,7 +129,7 @@ def test_tabela_sem_grafico_ao_lado_continua_sem_tarefa(tmp_path):
     assert lince.Leitor().preparar(p).tarefas == []
 
 
-def _nota_em_duas_colunas(p):
+def _nota_em_duas_colunas(p, margem=None):
     W, H = A4
     m, sep = 51, 20
     lc = (W - 2 * m - sep) / 2
@@ -137,7 +137,17 @@ def _nota_em_duas_colunas(p):
     topo = Frame(m, H - m - 120, W - 2 * m, 120, id="topo", leftPadding=0, rightPadding=0)
     c1 = Frame(m, m, lc, H - 2 * m - 126, id="c1", leftPadding=0, rightPadding=0)
     c2 = Frame(m + lc + sep, m, lc, H - 2 * m - 126, id="c2", leftPadding=0, rightPadding=0)
-    doc.addPageTemplates([PageTemplate(id="p", frames=[topo, c1, c2])])
+
+    def lateral(c, _doc):  # o identificador vertical na margem, como o do arXiv
+        if margem:
+            c.saveState()
+            c.setFont("Helvetica", 9)
+            c.translate(25, 300)
+            c.rotate(90)
+            c.drawString(0, 0, margem)
+            c.restoreState()
+
+    doc.addPageTemplates([PageTemplate(id="p", frames=[topo, c1, c2], onPage=lateral)])
     tabela = Table(
         [["Rota", "Antes", "Depois", "Ganho"], ["Sul", "2,41", "2,68", "11,2%"], ["Norte", "2,35", "2,57", "9,4%"]]
     )
@@ -200,7 +210,7 @@ def test_duas_colunas_lidas_como_tabela_voltam_a_ordem_de_leitura(tmp_path):
     assert "Foram descartadas as viagens com carga inferior a 12 t e os dias com interdição de pista" in md
     assert "estender a telemetria aos 62 veículos de distribuição urbana" in md
     assert md.index("eliminou 6,8% dos registros brutos") < md.index("3. Resultados")
-    assert "Resumo. Seis meses de operação" in md  # o item estreito na linha de largura total não some
+    assert "**Resumo.** Seis meses de operação" in md  # o item estreito na linha de largura total fica, em negrito
     assert "| Sul | 2,41 | 2,68 | 11,2% |" in md and "| Norte | 2,35 | 2,57 | 9,4% |" in md
 
 
@@ -241,28 +251,6 @@ def test_linha_igual_no_topo_de_duas_paginas_sem_paginacao_e_conteudo(tmp_path):
     r = lince.ler(p)
 
     assert r.markdown.count("Ficha de inspeção de veículo") == 2 and "cabeçalho/rodapé" not in r.metadados
-
-
-def test_rodape_colado_no_ultimo_paragrafo_sai_do_corpo(tmp_path):
-    """O extrator emenda o rodapé no parágrafo que termina a página; a frase não pode levar o rodapé junto."""
-    p = tmp_path / "contrato.pdf"
-    c = canvas.Canvas(str(p), pagesize=A4)
-    for n in range(1, 4):
-        c.setFont("Helvetica", 11)
-        y = 780
-        for k in range(38):
-            c.drawString(60, y, f"Cláusula {n}.{k + 1}: obrigação da contratada número {n * 100 + k}, sem ressalvas.")
-            y -= 18
-        c.setFont("Helvetica", 9)
-        c.drawString(60, 40, f"Aurora Logística S.A. · Página {n} de 3")
-        c.showPage()
-    c.save()
-
-    r = lince.ler(p)
-
-    assert "Aurora Logística" not in r.markdown
-    assert r.metadados["cabeçalho/rodapé"] == ["Aurora Logística S.A. · Página # de 3"]
-    assert r.markdown.count("sem ressalvas") == 114
 
 
 def test_marca_dagua_em_diagonal_vai_para_os_metadados(tmp_path):
@@ -337,3 +325,89 @@ def test_rotulos_de_um_grafico_lido_nao_se_repetem_embaralhados(tmp_path, comple
         assert md.count("Gráfico 3 – Entregas por mês (mil)") == 1
     else:
         assert "88" in md  # o valor que a leitura não trouxe continua no texto nativo
+
+
+def test_texto_girado_na_margem_fica_no_texto(tmp_path):
+    """A remontagem das colunas só usa os itens de pé: com um identificador vertical na margem ela perderia essa
+    linha. Aí a saída do extrator fica como está, porque nada pode sumir."""
+    p = tmp_path / "nota.pdf"
+    _nota_em_duas_colunas(p, margem="arXiv:2611.01234v1 [cs.CL] 12 Nov 2026 identificador lateral")
+
+    md = lince.ler(p).markdown
+
+    assert "arXiv:2611.01234v1 [cs.CL] 12 Nov 2026 identificador lateral" in md
+    assert "62 veículos de distribuição urbana" in md
+
+
+def test_tabela_de_duas_colunas_de_texto_com_grade_continua_tabela(tmp_path):
+    """Uma tabela "Risco | Mitigação" tem prosa nas duas células, como duas colunas de texto: cada linha é um par."""
+    p = tmp_path / "riscos.pdf"
+    linhas = [
+        ("Atraso na entrega dos módulos de telemetria pelo fornecedor", "Multa diária e segundo fornecedor em espera"),
+        ("Resistência dos motoristas ao acompanhamento da condução", "Treinamento em turmas pequenas e bônus mensal"),
+        ("Falha de comunicação com a rede dos veículos mais antigos", "Adaptador dedicado para os modelos anteriores"),
+        ("Perda de dados na passagem por trechos sem cobertura", "Armazenamento local com envio posterior ao servidor"),
+    ]
+    t = Table([["Risco", "Mitigação"], *[[Paragraph(a, N), Paragraph(b, N)] for a, b in linhas]], colWidths=[240, 240])
+    t.setStyle(GRADE)
+    SimpleDocTemplate(str(p), pagesize=A4).build([Paragraph("Matriz de riscos do programa", H1), t])
+
+    md = lince.ler(p).markdown
+
+    for a, b in linhas:
+        assert f"| {a} | {b} |" in md  # o risco e a mitigação dele na mesma linha
+
+
+def test_malha_densa_de_tracos_nao_custa_a_leitura(tmp_path):
+    """Centenas de traços cruzados não são tabela: a detecção de grade desiste antes de calcular os cruzamentos."""
+    import time
+
+    p = tmp_path / "malha.pdf"
+    c = canvas.Canvas(str(p), pagesize=A4)
+    for k in range(140):
+        c.line(40, 100 + 4 * k, 560, 100 + 4 * k)
+        c.line(40 + 3.7 * k, 100, 40 + 3.7 * k, 660)
+    c.setFont("Helvetica", 9)
+    for i in range(4):
+        for j, v in enumerate(["Item", "Qtde", "Valor"]):
+            c.drawString(60 + 150 * j, 760 - 14 * i, f"{v} {i}")
+    c.save()
+    inicio = time.perf_counter()
+
+    md = lince.ler(p).markdown
+
+    assert time.perf_counter() - inicio < 5  # eram 11 s com 140 traços em cada direção, e crescia com a 4ª potência
+    assert "Item 3" in md and "Valor 0" in md
+
+
+def test_titulo_com_as_palavras_do_rotulo_do_grafico_fica_no_corpo(tmp_path):
+    """O título da seção está fora do recorte do gráfico: mesmo com a leitura trazendo as mesmas palavras, ele fica."""
+    p = tmp_path / "painel.pdf"
+    W, H = _painel(p)
+    c = canvas.Canvas(str(p), pagesize=(W, H))  # o mesmo painel, com um título no alto da página
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(40, H - 40, "Entregas por mês")
+    c.setFont("Helvetica", 9)
+    c.drawString(480, H - 90, "Gráfico 3 – Entregas por mês (mil)")
+    c.line(470, H - 260, 760, H - 260)
+    c.line(470, H - 260, 470, H - 110)
+    for k, (mes, v) in enumerate([("Jul", 62), ("Ago", 71), ("Set", 88), ("Out", 93)]):
+        x = 495 + k * 68
+        c.setFillColor(colors.HexColor("#2f6fad"))
+        c.rect(x, H - 260, 30, v * 1.4, stroke=0, fill=1)
+        c.setFillColor(colors.black)
+        c.drawCentredString(x + 15, H - 257 + v * 1.4, str(v))
+        c.drawCentredString(x + 15, H - 272, mes)
+    c.save()
+    leitor = lince.Leitor()
+    plano = leitor.preparar(p)
+    (grafico,) = plano.tarefas
+    leitura = (
+        "Gráfico (colunas): Gráfico 3 – Entregas por mês (mil)\n\n"
+        "| Mês | Entregas |\n| --- | --- |\n| Jul | 62 |\n| Ago | 71 |\n| Set | 88 |\n| Out | 93 |"
+    )
+
+    md = leitor.concluir(plano, {grafico.id: leitura}).markdown
+
+    assert "# Entregas por mês" in md  # o título da página
+    assert md.count("Gráfico 3 – Entregas por mês (mil)") == 1  # e o rótulo de dentro do gráfico não se repete

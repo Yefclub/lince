@@ -13,7 +13,7 @@ from collections import Counter
 PALAVRAS_DE_PROSA = 5  # célula com isto ou mais de palavras é linha de parágrafo, não valor de tabela
 LINHAS_DE_PROSA_MIN = 3  # linhas da "tabela" com prosa nos dois lados para ela ser duas colunas de texto
 ITENS_POR_LADO_MIN = 6
-ITENS_MAX = 4000
+ITENS_MAX = 1500  # a remontagem compara cada item com as linhas de largura total
 TITULO_PRINCIPAL = 1.5  # o título com este tanto do corpo do texto é o da página (#); abaixo disso, de seção (##)
 _ITEM_DE_LISTA = re.compile(r"(\d{1,3}(\.\d{1,3}){0,3}[.)]|[a-z][.)]|[-•–▪◦])\s")  # "3.2.", "a)", "•": item novo
 CALHA_MIN = 5  # pontos: espaço em branco entre as colunas
@@ -93,18 +93,24 @@ def _linhas(itens):
 
 
 def _texto(itens):
+    misto = not all(x.is_bold for x in itens)  # o negrito de um trecho da linha fica; o da linha toda é título
     partes = []
     for k, x in enumerate(itens):
         t = " ".join(x.text.split())
+        if not t:
+            continue
+        if misto and x.is_bold:
+            t = f"**{t}**"
         if (
             k
+            and partes
             and x.x - (itens[k - 1].x + itens[k - 1].width) < 0.15 * x.font_size
             and x.font_size < itens[k - 1].font_size
         ):
             partes[-1] += t  # índice ou expoente colado na base
         else:
             partes.append(t)
-    return " ".join(p for p in partes if p)
+    return " ".join(partes).replace("** **", " ")
 
 
 def _celulas(ln, corpo):
@@ -168,9 +174,36 @@ def blocos_de_texto(itens, corpo):
     return out
 
 
-def refazer(itens, W):
-    """Markdown da página na ordem de leitura das duas colunas, ou None se a geometria não confirma as colunas (aí a
-    saída do extrator fica como está)."""
+def _corrido(linhas) -> bool:
+    """Texto corrido: a maioria das linhas termina no meio da frase. Células de uma tabela são unidades fechadas."""
+    textos = [_texto(ln["itens"]) for ln in linhas]
+    textos = [t for t in textos if _prosa(t) >= 3]
+    abertas = sum(not t.rstrip("*").endswith((".", "!", "?", ":", ";")) for t in textos)
+    return len(textos) >= 4 and abertas >= 0.5 * len(textos)
+
+
+def _inicios(linhas, corpo):
+    """A altura de cada começo de bloco: a primeira linha e as que vêm depois de um espaço maior que o da entrelinha."""
+    return [ln["t"] for k, ln in enumerate(linhas) if not k or linhas[k - 1]["b"] - ln["t"] > 0.5 * corpo]
+
+
+def _linhas_de_tabela(esquerda, direita, corpo) -> bool:
+    """Os blocos dos dois lados começam na mesma altura: são as linhas de uma tabela de duas colunas de texto ("Risco |
+    Mitigação"), e ler um lado inteiro antes do outro separaria cada linha do seu par."""
+    a, b = _inicios(esquerda, corpo), _inicios(direita, corpo)
+    if min(len(a), len(b)) < 3:
+        return False
+    pares = sum(any(abs(y - v) <= 2 for v in b) for y in a)
+    return pares >= 0.7 * max(len(a), len(b))
+
+
+def refazer(md, itens, W, tique):
+    """Markdown da página na ordem de leitura das duas colunas, ou None se a geometria não confirma duas colunas de
+    texto corrido (aí a saída do extrator fica como está). Nada some: se alguma letra do texto do extrator não
+    estiver na página remontada (texto girado na margem, item sem largura), a remontagem é recusada; a marcação que
+    só o extrator tem (links) também a impede."""
+    if "](" in md:
+        return None
     itens = [x for x in itens if x.text.strip() and not x.text.startswith("[Image:") and not x.rotation and x.width > 0]
     if not 2 * ITENS_POR_LADO_MIN <= len(itens) <= ITENS_MAX or any(x.render_mode != 0 for x in itens):
         return None
@@ -181,11 +214,25 @@ def refazer(itens, W):
     for x in itens:
         pesos[round(x.font_size * 2) / 2] += len(x.text)
     corpo = pesos.most_common(1)[0][0]
+    esquerda = _linhas([x for x in itens if x.x + x.width <= a + 1])
+    direita = _linhas([x for x in itens if x.x >= b - 1])
+    if not (_corrido(esquerda) and _corrido(direita)) or _linhas_de_tabela(esquerda, direita, corpo):
+        return None
     inteiros = sorted((x for x in itens if x.x < a - 1 and x.x + x.width > b + 1), key=lambda x: -x.y)
-    return _intercalar(itens, inteiros, a, b, corpo)
+    novo = _intercalar(itens, inteiros, a, b, corpo, tique)
+    # letra por letra, e não palavra por palavra: o extrator separa o índice da base ("C" e "0") e a remontagem junta
+    if novo is None or _letras(md) - _letras(novo):
+        return None
+    return novo
 
 
-def _intercalar(itens, inteiros, a, b, corpo):
+def _letras(md) -> Counter:
+    """As letras e os algarismos do texto, sem a marcação do Markdown e do HTML embutido: o que duas montagens da
+    mesma página precisam ter em comum, qualquer que seja a ordem e o corte das palavras."""
+    return Counter(ch for ch in re.sub(r"</?(su[bp]|u|br)\s*/?>", " ", md).lower() if ch.isalnum())
+
+
+def _intercalar(itens, inteiros, a, b, corpo, tique):
     """Percorre a página de cima para baixo: cada grupo de linhas de largura total é um bloco; entre dois grupos, as
     duas colunas, uma depois da outra."""
     meio = (a + b) / 2
@@ -193,21 +240,21 @@ def _intercalar(itens, inteiros, a, b, corpo):
     resto = [x for x in itens if id(x) not in ids]
     # também é de largura total o item estreito na altura de uma linha assim ("Resumo." em negrito no começo dela) e
     # a continuação curta dela: a última linha do título ou do parágrafo, logo abaixo, no mesmo corpo e na mesma margem
-    cheios, mudou = list(inteiros), True
-    while mudou:
-        mudou = False
-        for x in list(resto):
-            meio_y = x.y + x.height / 2
-            for v in cheios:
-                na_linha = v.y - 0.2 * v.height <= meio_y <= v.y + v.height
-                continua = (
-                    abs(v.font_size - x.font_size) <= 0.6 and 0 < v.y - x.y <= 1.6 * x.font_size and abs(v.x - x.x) <= 2
-                )
-                if na_linha or continua:
-                    cheios.append(x)
-                    resto.remove(x)
-                    mudou = True
-                    break
+    # de cima para baixo, numa passada: a continuação está sempre abaixo da linha que ela continua
+    cheios = list(inteiros)
+    for x in sorted(resto, key=lambda x: -x.y):
+        tique()
+        meio_y = x.y + x.height / 2
+        for v in cheios:
+            na_linha = v.y - 0.2 * v.height <= meio_y <= v.y + v.height
+            continua = (
+                abs(v.font_size - x.font_size) <= 0.6 and 0 < v.y - x.y <= 1.6 * x.font_size and abs(v.x - x.x) <= 2
+            )
+            if na_linha or continua:
+                cheios.append(x)
+                break
+    ids = {id(x) for x in cheios}
+    resto = [x for x in resto if id(x) not in ids]
     cheios.sort(key=lambda x: -x.y)
     grupos = []  # linhas de largura total seguidas, sem nada de coluna entre elas
     for x in cheios:

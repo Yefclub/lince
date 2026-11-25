@@ -18,6 +18,7 @@ from .pdf_colunas import blocos_de_texto as blocos
 ESPESSURA_MAX = 2.5  # pontos: traço mais grosso que isso é preenchimento, não linha de grade
 COMPRIMENTO_MIN = 6
 TOLERANCIA = 3  # pontos: folga para encostar arestas e achar cruzamentos, a mesma do pdfplumber
+CRUZAMENTOS_MAX = 3000  # traços horizontais × verticais: uma tabela de 120 linhas e 24 colunas ainda cabe
 TRACOS_MAX = 2048  # grade maior que isso é planta ou malha de desenho: fica com o leitor geral
 CONTEUDO_MIN = 0.6  # fração das palavras da tabela do extrator que precisa estar nas grades para elas a substituírem
 COBERTURA_MIN = 0.9  # fração das palavras da grade que a tabela do extrator precisa ter para ser a mesma tabela
@@ -59,7 +60,13 @@ def grades(tracos, itens, tique):
     texto em 4 células é tabela; um quadro em volta de um parágrafo não é."""
     if not 4 <= len(tracos) <= TRACOS_MAX:
         return []
-    arestas = merge_edges(_arestas(tracos), TOLERANCIA, TOLERANCIA, TOLERANCIA, TOLERANCIA)
+    arestas = _arestas(tracos)
+    deitadas = sum(e["orientation"] == "h" for e in arestas)
+    # o custo da detecção cresce com os cruzamentos possíveis: a malha densa de um desenho técnico ou de um arquivo
+    # hostil não é tabela, e fica com o leitor geral
+    if deitadas * (len(arestas) - deitadas) > CRUZAMENTOS_MAX:
+        return []
+    arestas = merge_edges(arestas, TOLERANCIA, TOLERANCIA, TOLERANCIA, TOLERANCIA)
     if len(arestas) < 4:
         return []
     tique()
@@ -81,6 +88,7 @@ def grades(tracos, itens, tique):
         ]
         prontas, bases = [], {}
         for x0, y0, x1, y1 in tabela:
+            tique()
             i, j = _indice(ys, y0), _indice(xs, x0)
             ni, nj = _indice(ys, y1) - i, _indice(xs, x1) - j
             if ni < 1 or nj < 1:

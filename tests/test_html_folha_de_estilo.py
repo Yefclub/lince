@@ -52,3 +52,33 @@ def test_folha_sem_regra_que_esconde_nao_muda_nada(tmp_path):
     )
 
     assert "Texto em destaque." in r.markdown and "texto_oculto_removido" not in r.metadados
+
+
+def test_folha_dentro_de_noscript_e_de_template_nao_vale(tmp_path):
+    p = tmp_path / "pagina.html"
+    p.write_text(
+        "<!DOCTYPE html><html><head><noscript><style>.a{display:none}</style></noscript></head><body>"
+        '<template><style>.b{display:none}</style></template><p class="a">texto com a classe a</p>'
+        '<p class="b">texto com a classe b</p></body></html>',
+        encoding="utf-8",
+    )
+
+    r = lince.ler(p)
+
+    assert "texto com a classe a" in r.markdown and "texto com a classe b" in r.markdown
+
+
+def test_folha_grande_demais_para_conferir_fica_registrada(tmp_path):
+    """Casar milhares de regras com milhares de elementos custaria minutos: a folha não é avaliada, e isso fica dito
+    nos metadados em vez de passar em silêncio."""
+    import time
+
+    regras = "".join(f"[data-a{k}] p:not(.z{k}){{display:none}}" for k in range(1200))
+    corpo = "".join(f"<div><p>parágrafo {k}</p></div>" for k in range(1500))
+    inicio = time.perf_counter()
+
+    r = _ler(tmp_path, regras, corpo)
+
+    assert time.perf_counter() - inicio < 10
+    assert "parágrafo 1499" in r.markdown
+    assert any("folha <style> grande demais" in aviso for aviso in r.metadados["partes_ilegiveis"])

@@ -180,25 +180,20 @@ def _caixa(itens):
     ]
 
 
-def caixa_do_bloco_principal(itens, W):
-    """Caixa da tabela que o extrator não deixou localizar célula a célula: o maior bloco contínuo dos itens que têm
-    as palavras dela. Um item solto com as mesmas palavras em outro canto da página (o total de outra tabela, o rótulo
-    de um gráfico) fica de fora pela distância, e não por um corte fixo que levava junto a primeira e a última linha;
-    a largura é a dos itens, não a da página, para o recorte não invadir o que está ao lado."""
-
-    def maior_bloco(candidatos, inicio, fim, folga):
-        blocos = []
-        for x in sorted(candidatos, key=inicio):
-            if blocos and inicio(x) - blocos[-1][0] <= folga:
-                blocos[-1][0] = max(blocos[-1][0], fim(x))
-                blocos[-1][1].append(x)
-            else:
-                blocos.append([fim(x), [x]])
-        return max(blocos, key=lambda b: len(b[1]))[1]
-
+def caixa_do_bloco_principal(itens):
+    """Caixa da tabela que o extrator não deixou localizar célula a célula: o maior bloco contínuo de linhas dos itens
+    que têm as palavras dela. Um item solto com as mesmas palavras em outra altura da página (o total de outra
+    tabela, o rótulo de um gráfico) fica de fora pela distância, e não por um corte fixo que levava junto a primeira e
+    a última linha; a largura é a dos itens do bloco, de ponta a ponta, não a da página."""
     altura = sorted(x.height for x in itens)[len(itens) // 2] or 10
-    bloco = maior_bloco(itens, lambda x: x.y, lambda x: x.y + x.height, 3 * altura)
-    bloco = maior_bloco(bloco, lambda x: x.x, lambda x: x.x + x.width, 0.12 * W)
+    blocos = []
+    for x in sorted(itens, key=lambda x: x.y):
+        if blocos and x.y - blocos[-1][0] <= 3 * altura:
+            blocos[-1][0] = max(blocos[-1][0], x.y + x.height)
+            blocos[-1][1].append(x)
+        else:
+            blocos.append([x.y + x.height, [x]])
+    bloco = max(blocos, key=lambda b: len(b[1]))[1]
     if len(bloco) < 4:
         return None
     l, b, r, t = _caixa(bloco)

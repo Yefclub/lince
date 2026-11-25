@@ -273,26 +273,43 @@ ROTULO_MAX = 300  # caracteres: acima disso o bloco é um parágrafo, conferido 
 
 def _rotulos_lidos(regioes, blocos, lido):
     """Os blocos curtos do texto nativo que são rótulos de um desenho já lido: todas as palavras e números do bloco
-    estão dentro do recorte e também na leitura, na mesma quantidade. O extrator junta rótulos de caixas vizinhas
+    estão dentro do recorte e também na leitura, na mesma quantidade, e o bloco não pode ser um texto de fora do
+    recorte (o título da seção com as mesmas palavras do rótulo fica). O extrator junta rótulos de caixas vizinhas
     numa linha sem sentido ("Custo por OTIF NPS Avarias entrega 93,9% 71 0,42%"); com a leitura completa, repetir
     essa linha só suja o texto. Se faltar uma palavra na leitura, o bloco fica."""
     lidos = set()
     for r in regioes:
         if not r.get("desenho") or r.get("preserva_texto") or not (visual := lido(r["tarefa"])):
             continue
-        if max(len(visual), len(r["texto_dentro"])) > 128_000:
+        if "texto_fora" not in r or max(len(visual), len(r["texto_dentro"])) > 128_000:
             continue
         # o que a leitura mandou para os metadados ([[cabeçalho: …]]) sai do corpo: não cobre o texto nativo
         corpo_lido = re.sub(r"\[\[(cabeçalho|rodapé|marca d'água|controle):.*?\]\]", " ", visual)
         na_leitura = Counter(_PALAVRA.findall(corpo_lido.lower()))
         no_recorte = Counter(_PALAVRA.findall(r["texto_dentro"].lower()))
+        fora = Counter(_PALAVRA.findall(r["texto_fora"].lower()))
         for b in blocos:
             texto = _texto_do_bloco(b)
             palavras = Counter(_PALAVRA.findall(texto.lower()))
-            if palavras and len(texto) <= ROTULO_MAX and palavras <= no_recorte and palavras <= na_leitura:
-                no_recorte -= palavras  # cada rótulo do recorte responde por um bloco só
+            if not palavras or len(texto) > ROTULO_MAX or palavras <= fora:
+                continue  # o bloco pode ser um texto de fora do recorte: fica
+            if palavras <= no_recorte and palavras <= na_leitura:
+                no_recorte -= palavras  # cada rótulo do recorte e cada trecho da leitura respondem por um bloco só
+                na_leitura -= palavras
                 lidos.add(texto)
     return lidos
+
+
+_NUMERO = re.compile(r"\d[\d.,]*\d|\d")
+
+
+def _cobre_numeros(nativo, visual):
+    """A leitura de uma tabela traz todos os números que a tabela nativa tem, e não marca nada como ilegível. Sem
+    isso (recorte que cortou uma linha, leitura que parou no meio), trocar a tabela nativa pela leitura perderia
+    valores que o arquivo tem."""
+    if "[ilegível" in visual or "[illegible" in visual:
+        return False
+    return not (Counter(_NUMERO.findall(nativo)) - Counter(_NUMERO.findall(visual)))
 
 
 def montar(pasta, respostas, pendentes=None):
@@ -381,7 +398,11 @@ def montar(pasta, respostas, pendentes=None):
             if k is None or not (visual := lido(tid)):
                 continue
             estrutura = r.get("estrutura_tabela_confirmada", True)
-            if not r.get("tabela_confirmada") or (estrutura and _cobre_tabela(tabelas[k], visual)):
+            if r.get("tabela_confirmada"):
+                cobre = estrutura and _cobre_tabela(tabelas[k], visual)
+            else:  # a tabela duvidosa não tem as células certas para conferir, mas os números dela são os do arquivo
+                cobre = _cobre_numeros(tabelas[k], visual)
+            if cobre:
                 trocadas[k] = tid
             else:
                 complementadas[k] = tid

@@ -205,7 +205,7 @@ def planejar_html(path, pasta) -> dict:
         plano["ilegiveis"].append(f"html: aninhado além de {PROFUNDIDADE_MAX} níveis; o resto ficou de fora")
     plano["propriedades"] = _propriedades(raiz)
     herdado = {}
-    ocultos = _tirar_oculto(raiz, herdado)
+    ocultos = _tirar_oculto(raiz, herdado, plano["ilegiveis"])
     prefixo = _prefixo_livre(texto)
     ancoras = _ancoras_do_documento(raiz, prefixo)
     # o desenho sai da árvore já limpa: só mostra texto que ficou no corpo; SVG que herda o invisível não é desenhado
@@ -377,12 +377,23 @@ FOLHA_MAX = 512 * 1024  # caracteres de CSS nas folhas <style> de uma página; a
 REGRAS_MAX = 5000
 
 
-def _regras_da_folha(raiz) -> dict:
+CASAMENTOS_MAX = 1_000_000  # elementos × regras: o custo de casar seletor sem índice (atributo, universal)
+FOLHA_NAO_CONFERIDA = "html: folha <style> grande demais; o texto escondido por regra dela não foi conferido"
+
+
+def _regras_da_folha(raiz, avisos) -> dict:
     """Para cada elemento, as declarações das folhas <style> que valem para ele (só as propriedades que escondem), na
     ordem da cascata: especificidade do seletor e, no empate, ordem de escrita. Regra-arroba (@media, @supports) fica
-    de fora: depende de onde a página é vista. Pseudo-elemento não é o elemento."""
-    folhas = [e.text or "" for e in raiz.iter("style") if next(e.iterancestors("svg"), None) is None]
-    if not any(f.strip() for f in folhas) or sum(map(len, folhas)) > FOLHA_MAX:
+    de fora: depende de onde a página é vista. Pseudo-elemento não é o elemento. O <style> dentro de <noscript> e de
+    <template> não vale (o navegador não o aplica). A folha acima dos tetos não é avaliada, e isso fica em `avisos`:
+    quem lê sabe que a conferência não cobriu a folha."""
+    folhas = [
+        e.text or "" for e in raiz.iter("style") if next(e.iterancestors("svg", "noscript", "template"), None) is None
+    ]
+    if not any(f.strip() for f in folhas):
+        return {}
+    if sum(map(len, folhas)) > FOLHA_MAX:
+        avisos.append(FOLHA_NAO_CONFERIDA)
         return {}
     casador, n = cssselect2.Matcher(), 0
     for folha in folhas:
@@ -397,8 +408,6 @@ def _regras_da_folha(raiz) -> dict:
             if not declaracoes:
                 continue
             n += 1
-            if n > REGRAS_MAX:
-                return {}
             try:
                 seletores = cssselect2.compile_selector_list(regra.prelude)
             except cssselect2.SelectorError:
@@ -406,6 +415,9 @@ def _regras_da_folha(raiz) -> dict:
             for seletor in seletores:
                 casador.add_selector(seletor, declaracoes)
     if not n:
+        return {}
+    if n > REGRAS_MAX or n * sum(1 for e in raiz.iter() if isinstance(e.tag, str)) > CASAMENTOS_MAX:
+        avisos.append(FOLHA_NAO_CONFERIDA)
         return {}
     regras = {}
     for w in cssselect2.ElementWrapper.from_html_root(raiz).iter_subtree():
@@ -435,7 +447,7 @@ def _efetivas(el, em_svg, pai_px, raiz_px, folha=()) -> dict:
     return efetivas
 
 
-def _tirar_oculto(raiz, svgs=None) -> list:
+def _tirar_oculto(raiz, svgs=None, avisos=None) -> list:
     """Tira o que não aparece (scripts, estilos, <noscript>, partes do SVG que não são desenhadas) e o texto
     escondido, antes de olhar as imagens: imagem dentro de bloco oculto não é paga nem lida. Percurso com pilha, sem
     recursão, levando o estado herdado (tamanho da fonte em px, invisível): o texto de um nó escondido sai mesmo que
@@ -444,7 +456,7 @@ def _tirar_oculto(raiz, svgs=None) -> list:
     árvore, o SVG só mostra texto que ficou no corpo. Em `svgs` (opcional) fica, para cada <svg> mais externo, se ele
     herda o invisível do HTML."""
     ocultos, raiz_px = [], 16.0
-    folha = _regras_da_folha(raiz) if raiz.tag != "svg" else {}
+    folha = _regras_da_folha(raiz, avisos if avisos is not None else []) if raiz.tag != "svg" else {}
     pilha = [(raiz, 16.0, False, None)]  # (elemento, fonte herdada em px, invisível, <svg> mais externo ou None)
     while pilha:
         el, px, invisivel, dono = pilha.pop()

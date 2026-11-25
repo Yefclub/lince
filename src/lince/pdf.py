@@ -35,6 +35,7 @@ from .pdf_figuras import agrupar_figuras, faixa_ilustrada, paineis_panorama, pap
 from .pdf_formulario import abrir_pdf, campos_visiveis, com_rotulos
 from .pdf_formulas import localizar_formulas
 from .pdf_grade import aplicar as aplicar_grades
+from .pdf_grade import grades as grades_da_pagina
 from .pdf_recortes import interseccao, janela_retangular, renderizar_regiao, validar_regiao
 from .pdf_tabelas import caixa_do_bloco_principal, conferir_tabelas
 from .pdf_tabelas_layout import conferir_blocos, texto_de_rotulos
@@ -1115,12 +1116,15 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
         pendentes.append(f"página {i + 1}: {erro_campos}")
     if not (eh_ocr or rotacao or ocultos or campos) and all(tipo == c.FPDF_PAGEOBJ_TEXT for tipo, _ in objs):
         md = _duas_colunas(md, itens_pg, W)
+    md, marcas_dagua = _sem_marca_dagua(md, itens_pg)
     if not (eh_ocr or rotacao or campos) and (
         colunas_confundidas(limpar_tabelas(md)[1]) or colunas_fundidas(md, itens_pg, W)
     ):
-        if refeito := refazer_colunas(itens_pg, W):
+        # a tabela de duas colunas de texto com grade é tabela: as linhas dela dão as células mais adiante
+        tracos_pg = [bx for tipo, bx in objs if tipo == c.FPDF_PAGEOBJ_PATH]
+        em_grade = set().union(*(g["itens"] for g in grades_da_pagina(tracos_pg, itens_pg, _tique)), set())
+        if len(em_grade) < 0.2 * len(itens_pg) and (refeito := refazer_colunas(md, itens_pg, W, _tique)):
             md = refeito
-    md, marcas_dagua = _sem_marca_dagua(md, itens_pg)
     md = _bordas_soltas(md, itens_pg, H)
     dens = densidade_matematica(md)
     nativo = desifenizar(md)
@@ -1218,7 +1222,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
             and set(re.findall(r"\w+", x.text.lower()))
             and set(re.findall(r"\w+", x.text.lower())) <= tb["palavras"]
         ]
-        if len(dentro) >= 4 and (caixa := caixa_do_bloco_principal(dentro, W)):
+        if len(dentro) >= 4 and (caixa := caixa_do_bloco_principal(dentro)):
             tabela_de[id(caixa)] = k
             regioes.append(("tabela", caixa))
     papeis = col.get("papeis", {})
@@ -1340,10 +1344,20 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
         desenhos_legiveis = [
             g for tipo, g in regioes if tipo == "desenho" and (max(g[2] - g[0], g[3] - g[1]) + 12) * fator <= 1568
         ]
+        # a imagem quase toda dentro de um desenho é lida com ele: o desenho cresce até contê-la inteira
+        maiores = {}
+        for tipo, g in regioes:
+            if tipo == "imagem" and id(g) not in recortes_exatos:
+                for d in desenhos_legiveis:
+                    if 0.9 <= _sobrepoe(g, d) < 1 and id(d) not in recortes_exatos:
+                        d0 = maiores.get(id(d), d)
+                        maiores[id(d)] = [min(d0[0], g[0]), min(d0[1], g[1]), max(d0[2], g[2]), max(d0[3], g[3])]
+        regioes = [(tipo, maiores.get(id(g), g) if tipo == "desenho" else g) for tipo, g in regioes]
+        desenhos_legiveis = [maiores.get(id(d), d) for d in desenhos_legiveis]
         regioes = [
             (tipo, g)
             for tipo, g in regioes
-            if tipo != "imagem" or not any(_sobrepoe(g, d) >= 0.9 for d in desenhos_legiveis)
+            if tipo != "imagem" or not any(_sobrepoe(g, d) >= 1 for d in desenhos_legiveis)
         ]
     # região toda fora da área visível (objeto fora da folha, comum em desenho de CAD) não tem o que recortar
     regioes = [(tp, g) for tp, g in regioes if g[0] < W and g[2] > 0 and g[1] < H and g[3] > 0]
@@ -1558,7 +1572,11 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                         "tarefa": tid,
                         "depois_de": linha_acima,
                         "texto_dentro": ancora,
-                        **({"desenho": True} if tipo == "desenho" else {}),
+                        **(
+                            {"desenho": True, "texto_fora": " ".join(x.text for x in itens if x not in dentro)[:20000]}
+                            if tipo == "desenho"
+                            else {}
+                        ),
                         # A legenda digital sobre uma foto de fundo é texto da página.
                         **(
                             {"preserva_texto": True}
