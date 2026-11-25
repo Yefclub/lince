@@ -1091,3 +1091,22 @@ def test_xlsx_com_parte_que_nao_abre_ou_estado_fora_da_especificacao_e_recusado(
 
     with pytest.raises(DocumentoRecusado, match="aba oculta"):
         lince.ler(estado)
+
+
+def test_xlsx_com_as_relacoes_do_pacote_quebradas_e_recusado(tmp_path):
+    """Sem o _rels/.rels, o livro não pode ser achado como o leitor do corpo o acha: recusa, não erro cru."""
+    p = tmp_path / "rels.xlsx"
+    _xlsx_oculto(p)
+    with zipfile.ZipFile(p) as z:
+        partes = {i.filename: z.read(i) for i in z.infolist()}
+    with zipfile.ZipFile(p, "w") as z:
+        for nome, dados in partes.items():
+            if nome == "_rels/.rels":
+                dados = dados.replace(b"</Relationships>", b"<!--" + b"x" * 64 + b"--></Relationships>")
+            z.writestr(nome, dados, compress_type=zipfile.ZIP_STORED if nome == "_rels/.rels" else zipfile.ZIP_DEFLATED)
+    dados = bytearray(p.read_bytes())
+    dados[dados.rindex(b"x" * 64)] = ord("y")  # o CRC das relações não bate mais
+    p.write_bytes(bytes(dados))
+
+    with pytest.raises(DocumentoRecusado, match="relações que não abrem"):
+        lince.ler(p)

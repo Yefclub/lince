@@ -1364,8 +1364,19 @@ def _abas_ocultas_xlsx(path) -> list[tuple[str, str]]:
 def livros_do_pacote(z, nomes) -> list[str]:
     """As partes que podem ser o livro: os alvos officeDocument do _rels/.rels, que o leitor do corpo segue; sem
     nenhum, o lugar de sempre."""
-    alvos = [a for a in _alvos(z, "", nomes, "officeDocument").values() if a in nomes]
+    alvos = [a for a in _apontados_como_livro(z, nomes) if a in nomes]
     return alvos or ["xl/workbook.xml"]
+
+
+def _apontados_como_livro(z, nomes) -> list[str]:
+    """Os alvos officeDocument do _rels/.rels. Se ele não abre (CRC, cifra), o livro não pode ser achado como o
+    leitor do corpo o acha: o documento é recusado."""
+    try:
+        return list(_alvos(z, "", nomes, "officeDocument").values())
+    except (MemoryError, DocumentoRecusado):
+        raise
+    except Exception as e:  # noqa: BLE001 — zipfile e zlib levantam de tudo com a parte quebrada
+        raise DocumentoRecusado(f"pacote com as relações que não abrem ({type(e).__name__})") from None
 
 
 def _dtd_no_prologo(z, parte) -> bool | None:
@@ -1417,7 +1428,7 @@ def _partes_das_abas_ocultas(path) -> set[str]:
             raise DocumentoRecusado(
                 f"planilha com o livro {quebrado[0][:80]} que não abre: a aba oculta não foi conferida"
             )
-        apontados = _alvos(z, "", nomes, "officeDocument").values()
+        apontados = _apontados_como_livro(z, nomes)
         if apontados and not any(a in nomes for a in apontados):
             raise DocumentoRecusado(recusa)
         livro = lugar = None
