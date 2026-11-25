@@ -10,6 +10,7 @@ from collections import Counter
 from xml.etree import ElementTree as ET  # noqa: F401
 
 from .agrupamento import por_tarefa
+from .cobertura_scan import parece_parcial
 from .seguranca import alertas_injecao
 from .texto import NUM_PAGINA, grupos_de_frases, sem_repeticao
 
@@ -20,6 +21,8 @@ from .texto import NUM_PAGINA, grupos_de_frases, sem_repeticao
 # quarto do que um token pode reter no servidor.
 SAIDA_MAX = 16 * 1024 * 1024
 REPETIDA = "_(mesma imagem lida acima: {})_"  # nas outras posições da mesma imagem: a leitura está na âncora citada
+_TABELA_VISUAL = "**Leitura visual complementar**\n\n"
+_TABELA_NATIVA = "\n\n**Texto nativo de referência**\n\n"
 
 
 def _metadados(pasta, plano, corpo, moveis):
@@ -139,6 +142,28 @@ def _ancora_leitura(tid):
     return f"<!-- lido pela IA: {tid} -->\n"
 
 
+def _digital_do_scan(digital, visuais):
+    if not digital:
+        return {}
+
+    def normalizar(linha):
+        linha = re.sub(r"^(?:#{1,6}|>)\s+|^\[\[(?:cabeçalho|rodapé):\s*|\]\]$", "", linha.strip())
+        return " ".join(linha.strip("*_`").split())
+
+    lidas = {tid: Counter(normalizar(linha) for linha in visual.splitlines()) for tid, visual in visuais.items()}
+    restantes = {}
+    for pos, textos in digital.items():
+        for texto, candidatas in textos:
+            linha = normalizar(texto)
+            for tid in candidatas:
+                if lidas[tid][linha]:
+                    lidas[tid][linha] -= 1
+                    break
+            else:
+                restantes.setdefault(pos, []).append(texto)
+    return restantes
+
+
 def _cobre_ocr(nativo, visual):
     # A mesma tabela pode trocar a ordem das células. Conta ocorrências, sem exigir a mesma
     # ordem nem grafia perfeita do OCR. Uma legenda ou resposta curta conserva a reserva.
@@ -183,10 +208,39 @@ def _texto_do_bloco(bloco):
     return " ".join(bloco.split())
 
 
-def _paragrafos_do_desenho(regioes, blocos, lido):
+def _cobre_tabela(nativo, visual):
+    """Confere as linhas por célula e as notas por parágrafo antes de trocar a âncora nativa."""
+    if max(len(nativo), len(visual)) > 128_000:
+        return False
+
+    def partes(md):
+        linhas, texto = Counter(), []
+        for bloco in md.split("\n\n"):
+            if not bloco.lstrip().startswith("|"):
+                texto.append(_texto_do_bloco(bloco).strip("*_ "))
+                continue
+            for linha in bloco.splitlines():
+                celulas = tuple(" ".join(c.split()).strip("*_ ") for c in linha.strip().strip("|").split("|"))
+                if any(not re.fullmatch(r":?-{2,}:?|", c) for c in celulas):
+                    linhas[celulas] += 1
+        return linhas, " ".join(texto)
+
+    linhas_esperadas, texto_esperado = partes(nativo)
+    linhas_lidas, texto_lido = partes(visual)
+    return linhas_esperadas <= linhas_lidas and texto_esperado in texto_lido
+
+
+def _paragrafos_reproduzidos(regioes, blocos, lido):
     """Um boxe vetorial pode conter parágrafos inteiros. A transcrição deve trazer o
     mesmo parágrafo com a mesma pontuação, e o recorte deve conter todas as linhas."""
-    desenhos = [r for r in regioes if r.get("desenho") and lido(r["tarefa"])]
+    desenhos = [
+        r
+        for r in regioes
+        if "substitui_tabela" not in r
+        and "substitui_formula" not in r
+        and not r.get("preserva_texto")
+        and lido(r["tarefa"])
+    ]
     # Conferência opcional: limita buscas de trecho em páginas e respostas muito grandes.
     if not desenhos or len(desenhos) > 16 or sum(map(len, blocos)) > 128_000:
         return set()
@@ -270,17 +324,38 @@ def montar(pasta, respostas, pendentes=None):
         if p["rota"] == "pagina":
             ids = p.get("tarefas") or [p["tarefa"]]
             partes_pagina = []
+            sinais_scan = p.get("sinais_scan", {})
             for tid in ids:
                 bloco = bloco_ia(tid, "página")
-                if not lido(tid) and (nativo := p.get("nativo_pendente", {}).get(tid)):
+                visual = lido(tid)
+                if not visual and (nativo := p.get("nativo_pendente", {}).get(tid)):
                     bloco = nativo + "\n\n" + bloco
+                if pendentes is not None and visual and tid in sinais_scan:
+                    parte, limiar = sinais_scan[tid]
+                    local = f"página {p['i'] + 1}" + (f", faixa {parte}" if parte != "1/1" else "")
+                    if parece_parcial(visual, limiar):
+                        pendentes.append(f"{local} ({tid}): possível transcrição visual parcial pelo volume de texto")
+                    elif limiar:
+                        pendentes.append(f"{local} ({tid}): integralidade da transcrição visual não verificada")
                 partes_pagina.append(bloco)
-            paginas.append(cab + "\n" + "\n\n".join(partes_pagina))
+            digitais = _digital_do_scan(p.get("digital_scan"), {tid: lido(tid) for tid in ids})
+            blocos = [x for pos, parte in enumerate(partes_pagina) for x in [*digitais.get(str(pos), []), parte]]
+            blocos.extend(digitais.get(str(len(partes_pagina)), []))
+            paginas.append(cab + "\n" + "\n\n".join(blocos))
             continue
         tabelas = p.get("tabelas", [])
-        trocadas = {
-            r["substitui_tabela"]: r["tarefa"] for r in p["regioes"] if "substitui_tabela" in r and lido(r["tarefa"])
-        }
+        trocadas, complementadas = {}, {}
+        for r in p["regioes"]:
+            k, tid = r.get("substitui_tabela"), r["tarefa"]
+            if k is None or not (visual := lido(tid)):
+                continue
+            estrutura = r.get("estrutura_tabela_confirmada", True)
+            if not r.get("tabela_confirmada") or (estrutura and _cobre_tabela(tabelas[k], visual)):
+                trocadas[k] = tid
+            else:
+                complementadas[k] = tid
+                if pendentes is not None:
+                    pendentes.append(f"{tid}: integralidade da transcrição da tabela não verificada")
         formulas = p.get("formulas", [])
         f_lidas = {
             r["substitui_formula"]: r["tarefa"] for r in p["regioes"] if "substitui_formula" in r and lido(r["tarefa"])
@@ -289,39 +364,17 @@ def montar(pasta, respostas, pendentes=None):
         def troca(m):  # numa passada só: o texto que entra (resposta, tabela) não é varrido de novo
             k = int(m.group(2))
             if m.group(1) == "TABELA":
+                if k in complementadas:
+                    return _TABELA_VISUAL + bloco_ia(complementadas[k], "tabela") + _TABELA_NATIVA + tabelas[k]
                 return bloco_ia(trocadas[k], "tabela") if k in trocadas else tabelas[k] if k < len(tabelas) else m[0]
             return bloco_ia(f_lidas[k], "fórmula") if k in f_lidas else formulas[k] if k < len(formulas) else m[0]
 
         md = re.sub(r"\{\{(TABELA|FORMULA):(\d+)\}\}", troca, p["md"])
         blocos = [b for b in md.split("\n\n") if b.strip()]
-        # tira do nativo o texto que pertence à figura (rótulos de eixo etc.)
-        # Em um boxe vetorial os próprios parágrafos aparecem na âncora. Só a
-        # correspondência literal na transcrição confirma que já estão na saída.
-        figuras = [
-            r
-            for r in p["regioes"]
-            if not r.get("desenho")
-            and not r.get("preserva_texto")
-            and "substitui_tabela" not in r
-            and "substitui_formula" not in r
-        ]
-        palavras_dentro = set(re.findall(r"\w+", " ".join(r["texto_dentro"] for r in figuras).lower()))
-        copiados = _paragrafos_do_desenho(p["regioes"], blocos, lido)
-        limpos = []
-        for b in blocos:
-            if copiados and _texto_do_bloco(b) in copiados:
-                continue
-            pal = re.findall(r"\w+", b.lower())
-            if (
-                pal
-                and palavras_dentro
-                and sum(w in palavras_dentro for w in pal) / len(pal) > 0.8
-                and len(pal) < 60
-                and "lido pela IA" not in b
-                and not b.lstrip().startswith("|")
-            ):
-                continue
-            limpos.append(b)
+        # Vocabulário coincidente não prova que a IA leu o trecho. Isso vale tanto para uma
+        # foto com legenda digital quanto para o texto sobre um desenho.
+        copiados = _paragrafos_reproduzidos(p["regioes"], blocos, lido)
+        limpos = [b for b in blocos if not copiados or _texto_do_bloco(b) not in copiados]
         inserir = {}
         for r in p["regioes"]:
             if r.get("repetida") or "substitui_tabela" in r or "substitui_formula" in r:
@@ -571,8 +624,8 @@ def medir_alternativas(e, respostas, ordem, limite):
 
 
 def tamanho_da_saida(e, respostas, medidas=None) -> int:
-    """Quanto texto a montagem vai escrever, no máximo: cada marca vira a leitura (a da mesma imagem repetida entra uma
-    vez, e as outras posições, a referência) ou a tabela e a fórmula nativas, e cada página leva o comentário e as
+    """Limite de texto da montagem: cada marca leva a leitura e, quando preciso, a reserva nativa. A leitura da mesma
+    imagem repetida entra uma vez, e as outras posições levam a referência. Cada página leva o comentário e as
     junções. Conta antes de montar, para a saída ter teto como a entrada tem, com o texto de cada leitura medido como a
     montagem o escreve (_textos). `medidas` guarda esse tamanho por chave de resposta entre chamadas com as mesmas
     respostas (a busca do que cabe), para cada uma ser lida uma vez só."""
@@ -619,19 +672,26 @@ def tamanho_da_saida(e, respostas, medidas=None) -> int:
         )
         if p.get("rota") == "pagina":  # página escaneada: cada metade lida entra inteira
             total += sum(leitura(t) for t in (p.get("tarefas") or [p.get("tarefa", "")]))
+            total += sum(len(t) + 2 for linhas in p.get("digital_scan", {}).values() for t, _ in linhas)
         nativos = {"TABELA": p.get("tabelas", []), "FORMULA": p.get("formulas", [])}
         trocam = {  # a região lida que entra no lugar de cada marca; sem ela, a marca leva o nativo
-            ("TABELA", int(r["substitui_tabela"])): r.get("tarefa", "")
+            ("TABELA", int(r["substitui_tabela"])): (r.get("tarefa", ""), r.get("tabela_confirmada"))
             for r in p.get("regioes", [])
             if "substitui_tabela" in r
         } | {
-            ("FORMULA", int(r["substitui_formula"])): r.get("tarefa", "")
+            ("FORMULA", int(r["substitui_formula"])): (r.get("tarefa", ""), False)
             for r in p.get("regioes", [])
             if "substitui_formula" in r
         }
         for tipo, k in re.findall(r"\{\{(TABELA|FORMULA):(\d+)\}\}", p.get("md", "")):
             k = int(k)
             nativo = nativos[tipo]
-            lida = leitura(trocam[tipo, k]) if (tipo, k) in trocam else 0
-            total += max(len(nativo[k]) if k < len(nativo) else 0, lida)
+            tamanho_nativo = len(nativo[k]) if k < len(nativo) else 0
+            tid, pode_complementar = trocam.get((tipo, k), ("", False))
+            lida = leitura(tid) if (tipo, k) in trocam else 0
+            leitora = iguais.get(tid, tid)
+            if pode_complementar and R.get(leitora if leitora in R else tid):
+                total += tamanho_nativo + lida + len(_TABELA_VISUAL) + len(_TABELA_NATIVA)
+            else:
+                total += max(tamanho_nativo, lida)
     return total

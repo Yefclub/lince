@@ -716,11 +716,18 @@ def _com_senha(caminho, senha, pasta) -> tuple[str, bool]:
 
 
 def imagens_das_paginas(
-    caminho: str | Path, paginas, lado: int = 1568, senha: str | None = None, prazo: float | None = None
+    caminho: str | Path,
+    paginas,
+    lado: int = 1568,
+    senha: str | None = None,
+    prazo: float | None = None,
+    *,
+    regiao: tuple[float, float, float, float] | None = None,
 ) -> dict[int, bytes]:
     """As páginas pedidas do PDF (lista de números a partir de 1) em PNG, de pé, com o maior lado em `lado` pixels,
     para quem responde ler a página original na hora da pergunta (as de `estrutura.paginas_visuais`, onde o Markdown
-    traz a transcrição de um gráfico, de uma figura ou de um scan). O arquivo não é guardado. Com senha, ele é
+    traz a transcrição de um gráfico, de uma figura ou de um scan). Com `regiao=(x0, y0, x1, y1)`, lê diretamente
+    do PDF a mesma área normalizada das páginas, de cima para baixo, na orientação exibida. Com senha, o PDF é
     decifrado numa pasta temporária, apagada no fim; protegido sem senha levanta `DocumentoProtegido`, como na leitura.
     Pedido fora dos tetos (páginas, lado, pixels da chamada, página pesada demais ou que não abre) levanta ValueError;
     com `prazo` (segundos), a página que começaria depois dele levanta `PrazoEsgotado`."""
@@ -734,7 +741,7 @@ def imagens_das_paginas(
             lido, _ = _com_senha(caminho, senha, pasta)
             if senha is None and (formato := formato_protegido(lido)):
                 raise DocumentoProtegido(formato)
-            return paginas_em_png(lido, paginas, lado)
+            return paginas_em_png(lido, paginas, lado, regiao=regiao)
     finally:
         LIMITE.reset(token)
 

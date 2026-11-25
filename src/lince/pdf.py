@@ -28,8 +28,12 @@ from ._prazo import LIMITE, prazo_restante
 from ._trava import PDFIUM
 from .conferencia_visual import potencias
 from .limites import escala
+from .pdf_figuras import agrupar_figuras, faixa_ilustrada, paineis_panorama, papel_retangulo
 from .pdf_formulario import abrir_pdf, campos_visiveis
+from .pdf_formulas import localizar_formulas
+from .pdf_recortes import interseccao, janela_retangular, renderizar_regiao, validar_regiao
 from .pdf_tabelas import conferir_tabelas
+from .pdf_tabelas_layout import conferir_blocos, texto_de_rotulos
 from .seguranca import NAO_CONFERIDO, texto_oculto_pdf
 from .texto import densidade_matematica, desifenizar, limpar_tabelas, lixo
 from .tipos import PrazoEsgotado
@@ -122,45 +126,8 @@ def texto_pdfium(page):
     return tp.get_text_bounded()
 
 
-def regioes_vetoriais(objs, W, H):
-    """Agrupa desenhos (path) que não são régua de tabela nem faixa de linha."""
-    caixas, faixas = [], []
-    for tipo, (l, b, r, t) in objs:
-        if tipo != c.FPDF_PAGEOBJ_PATH:
-            continue
-        w, h = r - l, t - b
-        if w < 2.5 or h < 2.5:  # filete de tabela / sublinhado
-            continue
-        if w > 0.9 * W and h > 0.9 * H:  # moldura da página
-            continue
-        if w > 0.4 * W and h < 40:  # faixa larga e fina: fundo de linha de tabela OU barra horizontal
-            faixas.append([l, b, r, t])
-            continue
-        caixas.append([l, b, r, t])
-    # Fundo de linha de tabela tem a mesma largura em todas as linhas; barras de gráfico variam.
-    por_inicio = defaultdict(list)
-    for f in faixas:
-        por_inicio[round(f[0] / 4)].append(f)
-    for grupo in por_inicio.values():
-        larguras = {round((f[2] - f[0]) / 3) for f in grupo}
-        if len(grupo) >= 3 and len(larguras) >= 3:
-            caixas += grupo
-    # união por proximidade (12 pt)
-    grupos = []
-    for bx in caixas:
-        _tique()
-        bx = list(bx)
-        mudou = True
-        while mudou:
-            mudou = False
-            for g in grupos:
-                if not (bx[2] + 24 < g[0] or g[2] + 24 < bx[0] or bx[3] + 24 < g[1] or g[3] + 24 < bx[1]):
-                    bx = [min(bx[0], g[0]), min(bx[1], g[1]), max(bx[2], g[2]), max(bx[3], g[3])]
-                    grupos.remove(g)
-                    mudou = True
-                    break
-        grupos.append(bx)
-    return [g for g in grupos if (g[2] - g[0]) * (g[3] - g[1]) / (W * H) >= 0.03]
+def regioes_vetoriais(objs, W, H, itens=(), papeis=None, fundo=None):
+    return agrupar_figuras(objs, W, H, itens, papeis or {}, _tique, fundo)
 
 
 def planejar_pdf(path, pasta):
@@ -608,22 +575,28 @@ def _coleta(doc, i):
         return None
     try:
         objs, (ox, oy) = [], _origem_visivel(page)
+        papeis = {}
+        caminhos_visiveis = {}
+        W, H = page.get_size()
         texto_visivel = False
-        for tipo, raw, (l, b, r, t) in objetos(page):  # para no primeiro objeto além do teto
+        for tipo, raw, (l, b, r, t) in objetos(page, limitar_imagens=True, caminhos_visiveis=caminhos_visiveis):
             if len(objs) == OBJETOS_MAX:
                 return PESADA
             # na origem da área visível, como as posições do pdf_inspector e a página renderizada (MediaBox ou CropBox
             # com a origem fora do zero, comum em desenho exportado de CAD)
             objs.append((tipo, (l - ox, b - oy, r - ox, t - oy)))
+            if tipo == c.FPDF_PAGEOBJ_PATH and (papel := papel_retangulo(raw, objs[-1][1], W, H)):
+                papeis[len(objs) - 1] = papel
             if not texto_visivel and tipo == c.FPDF_PAGEOBJ_TEXT:
                 texto_visivel = c.FPDFTextObj_GetTextRenderMode(raw) != 3
-        W, H = page.get_size()
         return {
             "W": W,
             "H": H,
             "rotacao": page.rotacao_exibida,
             "origem": (ox, oy),
             "objs": objs,
+            "papeis": papeis,
+            "caminhos_visiveis": {k: (l - ox, b - oy, r - ox, t - oy) for k, (l, b, r, t) in caminhos_visiveis.items()},
             "n": c.FPDFPage_CountObjects(page.raw),
             "fundo": page.render(scale=escala(W, H, 0.5), may_draw_forms=False)
             .to_pil()
@@ -646,7 +619,7 @@ def _renderizar(doc, i, fator, desenhar_campos):
         page.close()
 
 
-def imagens_das_paginas(caminho, paginas, lado=1568) -> dict[int, bytes]:
+def imagens_das_paginas(caminho, paginas, lado=1568, *, regiao=None) -> dict[int, bytes]:
     """As páginas pedidas (lista de números a partir de 1) em PNG, como são exibidas (de pé), com o maior lado em
     `lado` pixels: a evidência original para quem lê na hora da pergunta as páginas que o Markdown só descreve
     (`paginas_visuais`). Recusa com ValueError, antes de renderizar: pedido vazio ou acima de PAGINAS_IMAGEM_MAX
@@ -654,6 +627,8 @@ def imagens_das_paginas(caminho, paginas, lado=1568) -> dict[int, bytes]:
     PIXELS_IMAGEM_MAX na chamada; e, na vez de cada página, a que não abre ou passa de OBJETOS_MAX objetos (a mesma
     página pesada que a leitura não analisa). O prazo do contexto (`prazo_restante`) é conferido antes de cada página:
     esgotado, levanta PrazoEsgotado. A PDFium fica com a trava só durante a renderização de cada página."""
+    if regiao is not None:
+        validar_regiao(regiao)
     pedidas = list(itertools.islice(paginas, PAGINAS_IMAGEM_MAX + 1))  # o iterável enorme para no teto
     if not all(isinstance(n, int) and not isinstance(n, bool) for n in pedidas):
         raise ValueError("as páginas são números inteiros a partir de 1")
@@ -684,9 +659,13 @@ def imagens_das_paginas(caminho, paginas, lado=1568) -> dict[int, bytes]:
                 try:
                     if any(k >= OBJETOS_MAX for k, _ in enumerate(objetos(page))):
                         raise ValueError(f"a página {n} tem conteúdo demais para virar imagem")
-                    W, H = page.get_size()
-                    img = page.render(scale=escala(W, H, lado / max(W, H, 1))).to_pil().convert("RGB")
-                    rotacao = page.rotacao_exibida
+                    if regiao is None:
+                        W, H = page.get_size()
+                        img = page.render(scale=escala(W, H, lado / max(W, H, 1))).to_pil().convert("RGB")
+                        rotacao = page.rotacao_exibida
+                    else:
+                        img = renderizar_regiao(page, lado, regiao)
+                        rotacao = 0  # a janela já foi renderizada de pé
                 finally:
                     page.close()
             saida = io.BytesIO()
@@ -1026,6 +1005,20 @@ def _duas_colunas(md, itens, largura):
     return "\n\n".join(saida)
 
 
+def _texto_das_celulas(doc, i, caixas):
+    # O item do extrator às vezes abrange vários meses. Lê os caracteres entre os filetes do cabeçalho.
+    with PDFIUM:
+        pagina = pagina_visivel(doc, i)
+        try:
+            x, y, _, _ = pagina.get_bbox()
+            texto = pagina.get_textpage()
+            return [" ".join(texto.get_text_bounded(l + x, b + y, r + x, t + y).split()) for l, b, r, t in caixas]
+        except pdfium.PdfiumError:
+            return []
+        finally:
+            pagina.close()
+
+
 def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca, pendentes):
     """Roteamento de uma página: texto, regiões visuais, tabela duvidosa, fórmula e texto oculto, sobre a coleta dela
     (`_coleta`). Roda sem a trava: a análise em Python, por mais que custe numa página hostil, não faz outro PDF
@@ -1035,7 +1028,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     W, H, objs, rotacao = col["W"], col["H"], col["objs"], col["rotacao"]
     # Imagens vizinhas viram um grupo: texto fatiado em imagens ("Version 8 –
     # March 2025" da capa da Falcon são 6 fatias) e logotipo pequeno contam.
-    imgs = [list(bx) for tipo, bx in objs if tipo == c.FPDF_PAGEOBJ_IMAGE]
+    imgs = [list(bx) for tipo, bx in objs if tipo == c.FPDF_PAGEOBJ_IMAGE and bx[0] < bx[2] and bx[1] < bx[3]]
     itens_txt = [x for x in itens_pg if not x.text.startswith("[Image:")]
     ocultos = texto_oculto_pdf(col["fundo"], itens_txt, imgs, W, H, tique=_tique)
     alt = col["texto"] if eh_ocr else ""
@@ -1061,10 +1054,14 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     dens = densidade_matematica(md)
     nativo = desifenizar(md)
     md, tabelas = limpar_tabelas(nativo)
-    if tabelas and not (rotacao or ocultos or eh_ocr):
-        filetes = [bx for tipo, bx in objs if tipo == c.FPDF_PAGEOBJ_PATH and bx[2] - bx[0] <= 2 < bx[3] - bx[1]]
-        marcas = [bx for tipo, bx in objs if tipo in (c.FPDF_PAGEOBJ_PATH, c.FPDF_PAGEOBJ_IMAGE)]
-        md = conferir_tabelas(md, tabelas, itens_pg, filetes, _tique, marcas)
+    if tabelas and not (rotacao or sobrou or eh_ocr):
+        tracos = [bx for tipo, bx in objs if tipo == c.FPDF_PAGEOBJ_PATH]
+        filetes = [bx for bx in tracos if bx[2] - bx[0] <= 2 < bx[3] - bx[1]]
+        if not ocultos:
+            marcas = [bx for tipo, bx in objs if tipo in (c.FPDF_PAGEOBJ_PATH, c.FPDF_PAGEOBJ_IMAGE)]
+            md = conferir_tabelas(md, tabelas, itens_pg, filetes, _tique, marcas)
+        ler_celulas = (lambda caixas: _texto_das_celulas(doc, i, caixas)) if not ocultos else lambda caixas: []
+        md = conferir_blocos(md, tabelas, itens_pg, filetes, tracos, W, H, _tique, ler_celulas)
     # só tabela nativa CONFIÁVEL anula um desenho; tabela duvidosa pode ser rótulo de gráfico
     palavras_tabela = set().union(*[tb["palavras"] for tb in tabelas if not tb["complexa"]]) if tabelas else set()
     tabela_de = {}
@@ -1086,6 +1083,17 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     for l, b, r, t in sorted(grupos, key=lambda g: -g[3]):
         linha_de_texto = (t - b) >= 8 and (r - l) / max(t - b, 1) >= 4
         if (r - l) * (t - b) / (W * H) >= 0.005 or linha_de_texto:
+            # Uma ilustração de fundo quase da largura da folha pode começar no meio
+            # de uma coluna digital. Inclui as linhas realmente atravessadas por sua borda.
+            if W > 2 * H and r - l >= 0.8 * W and t - b >= 0.9 * H:
+                cruzam = [
+                    x
+                    for x in itens_txt
+                    if x.width > 0 and b <= x.y <= t and (x.x < l < x.x + x.width or x.x < r < x.x + x.width)
+                ]
+                if cruzam:
+                    l = min(l, min(x.x for x in cruzam))
+                    r = max(r, max(x.x + x.width for x in cruzam))
             regioes.append(("imagem", [l, b, r, t]))
     registro = [(m, x.text) for m, x in ocultos]
     # Texto que o extrator descartou (ex.: modo de renderização invisível) mas a camada de texto tem:
@@ -1147,56 +1155,49 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
             caixa[0] = max(20, min(caixa[0], 60))
             tabela_de[id(caixa)] = k
             regioes.append(("tabela", caixa))
-    for g in regioes_vetoriais(objs, W, H):
+    papeis = col.get("papeis", {})
+    imagens = [g for tp, g in regioes if tp == "imagem"]
+    recortes_exatos = set()
+    panorama = paineis_panorama(objs, W, H, itens_pg, papeis, imagens, _tique)
+    if not panorama:
+        caminhos_visiveis = col.get("caminhos_visiveis")
+        objetos_figuras = (
+            [(tp, caminhos_visiveis.get(k, g)) for k, (tp, g) in enumerate(objs)] if caminhos_visiveis else objs
+        )
+        figuras = regioes_vetoriais(objetos_figuras, W, H, itens_pg, papeis, col["fundo"])
+        if faixa := faixa_ilustrada(objs, W, H, itens_pg, papeis, imagens):
+            base, corpo = faixa
+            if len(figuras) == 1 and _sobrepoe(corpo, figuras[0][0]) >= 0.9:
+                panorama = base, [corpo]
+    if panorama:
+        imagem, paineis = panorama
+        recortes_exatos = {id(imagem), *(id(g) for g in paineis)}
+        regioes = [(tp, imagem if tp == "imagem" else g) for tp, g in regioes]
+        figuras = [(g, g, True) for g in paineis]
+    for g, desenho, figura_identificada in figuras:
         _tique()
         if any(_sobrepoe(g, rr) > 0.5 for tp, rr in regioes if tp == "imagem"):
             continue
-        # desenho sobre "tabela duvidosa": a tabela eram os rótulos do gráfico — o desenho fica
+        # Desenho sobre uma tabela duvidosa: conserva os rótulos como texto e deixa o desenho para a IA.
         for tp, rr in list(regioes):
-            if tp == "tabela" and _sobrepoe(rr, g) > 0.5:
+            if tp == "tabela" and not tabelas[tabela_de[id(rr)]].get("confirmada") and _sobrepoe(rr, g) > 0.5:
                 regioes.remove((tp, rr))
-                tabelas[tabela_de[id(rr)]]["md"] = ""
+                tabela = tabelas[tabela_de[id(rr)]]
+                tabela["md"] = texto_de_rotulos(tabela)
+                tabela["complexa"] = False
+                tabela["rotulos"] = True
         # Tabela desenhada já sai como tabela no nativo: não é figura.
         dentro = re.findall(
             r"\w+", " ".join(x.text for x in itens_pg if g[0] <= x.x <= g[2] and g[1] <= x.y <= g[3]).lower()
         )
-        if dentro and sum(w in palavras_tabela for w in dentro) / len(dentro) > 0.6:
+        if not figura_identificada and dentro and sum(w in palavras_tabela for w in dentro) / len(dentro) > 0.6:
             continue
-        # Rótulos de eixo, legenda e título ficam fora dos traços: amplia para o texto vizinho.
-        for _ in range(2):
-            perto = [x for x in itens_pg if g[0] - 40 <= x.x <= g[2] + 40 and g[1] - 30 <= x.y <= g[3] + 30]
-            if perto:
-                g = [
-                    min(g[0], min(x.x for x in perto)),
-                    min(g[1], min(x.y for x in perto) - 4),
-                    max(g[2], max(x.x + x.width for x in perto)),
-                    max(g[3], max(x.y + x.height for x in perto)),
-                ]
-        regioes.append(("desenho", g))
-    # Um gráfico partido em pedaços (rótulos entre as barras) volta a ser uma região só.
-    mudou = True
-    while mudou:
-        mudou = False
-        des = [k for k, (tp, _) in enumerate(regioes) if tp == "desenho"]
-        for a in des:
-            _tique()
-            for b in des:
-                if a < b:
-                    A, Bx = regioes[a][1], regioes[b][1]
-                    if not (A[2] + 20 < Bx[0] or Bx[2] + 20 < A[0] or A[3] + 20 < Bx[1] or Bx[3] + 20 < A[1]):
-                        regioes[a] = (
-                            "desenho",
-                            [min(A[0], Bx[0]), min(A[1], Bx[1]), max(A[2], Bx[2]), max(A[3], Bx[3])],
-                        )
-                        del regioes[b]
-                        mudou = True
-                        break
-            if mudou:
-                break
-    # Tabela nativa que cai quase toda dentro de um gráfico são os rótulos dele: sai do texto
-    # (a leitura do gráfico traz os valores no lugar certo).
+        regioes.append(("desenho", desenho))
+    # Quando a tabela nativa contém rótulos do gráfico, só a estrutura tabular sai do texto.
     for k, tb in enumerate(tabelas):
         _tique()
+        if tb.get("confirmada") or tb.get("rotulos"):
+            continue
         caixas = [g for tp, g in regioes if tp in ("desenho", "imagem")]
         itens_tb = [
             x
@@ -1210,14 +1211,15 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
             / len(itens_tb)
             > 0.7
         ):
-            tb["md"] = ""
+            tb["md"] = texto_de_rotulos(tb)
             tb["complexa"] = False
             regioes[:] = [(tp, g) for tp, g in regioes if not (tp == "tabela" and tabela_de.get(id(g)) == k)]
     lixo_nativo = lixo(md) if md.strip() else 0.0
     # fórmulas escritas como texto (sub/sobrescrito, Σ, ×, ÷): o nativo embaralha a notação
+    blocos_md = md.split("\n\n")
     formulas = [
-        b
-        for b in md.split("\n\n")
+        (j, b)
+        for j, b in enumerate(blocos_md)
         if len(b) >= 15
         and "|" not in b
         and "=" in b
@@ -1228,24 +1230,50 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     formula_de, originais_formula = {}, []
     if formulas and not precisa_pagina:
         itens_txt = [x for x in itens_pg if not x.text.startswith("[Image:")]
-        for bloco in formulas:
+        localizadas = localizar_formulas((bloco for _, bloco in formulas), itens_txt, W, _tique)
+        for j, bloco in formulas:
             _tique()
-            limpo = re.sub(r"</?su[bp]>|[*_]", "", bloco)
-            dentro = [x for x in itens_txt if len(x.text.strip()) >= 1 and x.text.strip() in limpo]
-            if not dentro:
-                continue
-            ys = [x.y for x in dentro]
+            if limites := localizadas.get(bloco):
+                l, b, r, t = limites
+            else:
+                # A ordem dos glifos nem sempre corresponde à do extrator (p.ex. em frações).
+                # A imagem aproximada continua disponível, com a incerteza registrada.
+                limpo = re.sub(r"</?su[bp]>|[*_]", "", bloco)
+                dentro = [x for x in itens_txt if x.text.strip() and x.text.strip() in limpo]
+                pendentes.append(f"página {i + 1}: localização da fórmula não confirmada")
+                if not dentro:
+                    continue
+                l, b = min(x.x for x in dentro), min(x.y for x in dentro)
+                r, t = max(x.x + x.width for x in dentro), max(x.y + x.height for x in dentro)
+            margem_formula = 2 if limites else 8
             caixa = [
-                max(20, min(x.x for x in dentro) - 6),
-                min(ys) - 8,
-                min(W - 10, max(x.x + x.width for x in dentro) + 6),
-                max(x.y + x.height for x in dentro) + 8,
+                max(0, l - margem_formula),
+                max(0, b - 8),  # a tipografia pode estender a base de frações e colchetes abaixo dos glifos
+                min(W, r + margem_formula),
+                min(H, t + margem_formula),
             ]
-            k = len(originais_formula)
-            originais_formula.append(bloco)
-            md = md.replace(bloco, f"{{{{FORMULA:{k}}}}}", 1)
-            formula_de[id(caixa)] = k
+            if limites:
+                recortes_exatos.add(id(caixa))
+            indice = None
+            if limites:
+                indice = len(originais_formula)
+                originais_formula.append(bloco)
+                blocos_md[j] = f"{{{{FORMULA:{indice}}}}}"
+            formula_de[id(caixa)] = (bloco, indice)
             regioes.append(("formula", caixa))
+        md = "\n\n".join(blocos_md)
+    # Na escala normal, o desenho já contém os mesmos pixels das fotos internas (p.ex. espectrogramas).
+    # Em um mapa grande, preserve o detalhe raster separado, pois o provedor pode reduzir o quadro inteiro.
+    if not precisa_pagina and not eh_ocr and imgs:
+        fator = escala(W, H, 2.0)
+        desenhos_legiveis = [
+            g for tipo, g in regioes if tipo == "desenho" and (max(g[2] - g[0], g[3] - g[1]) + 12) * fator <= 1568
+        ]
+        regioes = [
+            (tipo, g)
+            for tipo, g in regioes
+            if tipo != "imagem" or not any(_sobrepoe(g, d) >= 1 for d in desenhos_legiveis)
+        ]
     # região toda fora da área visível (objeto fora da folha, comum em desenho de CAD) não tem o que recortar
     regioes = [(tp, g) for tp, g in regioes if g[0] < W and g[2] > 0 and g[1] < H and g[3] > 0]
     regioes.extend(("imagem", caixa) for caixa in campos_visuais)
@@ -1272,12 +1300,34 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
         return info, None
     retrato = (H >= W) if rotacao in (0, 180) else (W >= H)  # como é exibida: a de pé ganha o dobro e é dividida
     fator = (2 * 1568 / max(W, H) if retrato else 1568 / max(W, H)) if rota == "pagina" else escala(W, H, 2.0)
+    texto_fora_do_scan = []
+    if (
+        rota == "pagina"
+        and eh_ocr
+        and origem_texto != "pdfium"
+        and not (registro and ficou)
+        and col.get("texto_visivel")
+        and 1 <= sum(tipo == c.FPDF_PAGEOBJ_TEXT for tipo, _ in objs) <= 128
+    ):
+        # A geometria e a opacidade vêm dos objetos pintados, não da camada
+        # extraída. O PDF é fechado antes dos recortes na última página.
+        with PDFIUM:
+            textos = _objetos_de_texto(doc, i)
+        ox, oy = col["origem"]
+        texto_fora_do_scan = [
+            ((l - ox, b - oy, r - ox, t - oy), rgba[:3])
+            for _, (l, b, r, t), modo, rgba in textos
+            if modo == 0 and rgba is not None and rgba[3] >= 128
+        ]
 
     def recortar(img):
         """Recortes, arquivos e tarefas da página, com a imagem renderizada na escala `fator`: quem chama roda fora da
         trava, na ordem das páginas (as tarefas e o cache de recortes repetidos saem na mesma ordem de antes)."""
         if rota == "pagina":
+            from .cobertura_scan import limiar_de_texto, texto_digital_fora_do_raster
+
             # a página inteira vai para a IA como é exibida
+            digital = texto_digital_fora_do_raster(img, itens_pg, texto_fora_do_scan, imgs, W, H, rotacao, _tique)
             img = de_pe(img, rotacao)
             # Duas metades com sobreposição: o dobro de resolução por leitura (o provedor reduz acima de ~1568 px).
             # Texto que já passou pela conferência de ocultos. A camada de OCR rejeitada
@@ -1307,21 +1357,40 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                     else:
                         corte = 4 * (min(vazias, key=lambda y: abs(y - meio)) if vazias else meio)
                         metades = [(0, min(img.height, corte + 24)), (max(0, corte - 24), img.height)]
+            sufixos = ("a", "b") if len(metades) > 1 else ("",)
+            ids = [f"p{i + 1:03d}{s}" for s in sufixos]
+            for inicio, fim, texto in digital:
+                # Um texto entre os centros das faixas fica entre as leituras.
+                centro = (inicio + fim) / 2
+                pos = sum((y0 + y1) / 2 < centro * img.height for y0, y1 in metades)
+                # Uma ocorrência visual só substitui a digital se o PNG dela
+                # contém a caixa inteira. Na sobreposição, prioriza a faixa mais próxima.
+                candidatas = [
+                    (abs((y0 + y1) / 2 - centro * img.height), tid)
+                    for tid, (y0, y1) in zip(ids, metades, strict=True)
+                    if y0 <= inicio * img.height and fim * img.height <= y1
+                ]
+                info.setdefault("digital_scan", {}).setdefault(str(pos), []).append(
+                    [texto, [tid for _, tid in sorted(candidatas)]]
+                )
             motivo = (
                 "escaneada"
                 if eh_ocr
                 else ("texto nativo corrompido" if lixo_nativo > 0.02 else f"matemática densa ({dens:.1f})")
             )
             info["tarefas"] = []
-            for s, (y0, y1) in zip("ab", metades, strict=False):
-                tid = f"p{i + 1:03d}{s if len(metades) > 1 else ''}"
-                img.crop((0, y0, img.width, y1)).save(f"{pasta}/ia/{tid}.png")
+            for num, (tid, (y0, y1)) in enumerate(zip(ids, metades, strict=True), 1):
+                parte = f"{num}/{len(metades)}"
+                faixa = img.crop((0, y0, img.width, y1))
+                if eh_ocr and not pode_usar_nativo and (limiar := limiar_de_texto(faixa)):
+                    info.setdefault("sinais_scan", {})[tid] = [parte, limiar]
+                faixa.save(f"{pasta}/ia/{tid}.png")
                 frac = (y0 / img.height, y1 / img.height)
                 tarefas.append(
                     {
                         "id": tid,
                         "modo": "pagina",
-                        "parte": f"{'ab'.index(s) + 1}/{len(metades)}",
+                        "parte": parte,
                         "motivo": motivo,
                         "ancora": md[:6000],
                         "pagina": i,
@@ -1342,7 +1411,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                             if not item.text.startswith("[Image:")
                             and lixo(item.text) <= 0.02
                             and (
-                                (l <= item.x + item.width / 2 <= r and b <= item.y + item.height / 2 <= t) == (s == "a")
+                                (l <= item.x + item.width / 2 <= r and b <= item.y + item.height / 2 <= t) == (num == 1)
                             )
                         )
                     if trecho.strip():
@@ -1363,12 +1432,22 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
             )
             for j, (tipo, cx) in enumerate(regioes, 1):
                 l, b, r, t = cx
-                m = 6
+                m = 0 if id(cx) in recortes_exatos else 6
+                visivel = [max(0, l - m), max(0, b - m), min(W, r + m), min(H, t + m)]
+                if tipo == "desenho" and m:
+                    # A margem do recorte não deve cortar a última linha de uma seção vizinha.
+                    for x in itens:
+                        if x.x < r and x.x + x.width > l:
+                            if x.y >= t:
+                                # O inspetor fornece a base tipográfica: os descendentes podem cair abaixo dela.
+                                visivel[3] = max(t, min(visivel[3], x.y - 0.3 * x.height - 1))
+                            if visivel[1] < x.y + x.height <= b:
+                                visivel[1] = min(b, x.y + x.height + 1)
                 box = (
-                    max(0, int((l - m) * fator)),
-                    max(0, int((H - t - m) * fator)),
-                    min(full.width, int((r + m) * fator)),
-                    min(full.height, int((H - b + m) * fator)),
+                    max(0, int(visivel[0] * fator)),
+                    max(0, int((H - visivel[3]) * fator)),
+                    min(full.width, int(visivel[2] * fator)),
+                    min(full.height, int((H - visivel[1]) * fator)),
                 )
                 if box[2] <= box[0] or box[3] <= box[1]:  # nada visível desta região na imagem renderizada
                     continue
@@ -1389,7 +1468,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                 if tipo == "tabela":
                     ancora = tabelas[tabela_de[id(cx)]]["md"]
                 if tipo == "formula":
-                    ancora = originais_formula[formula_de[id(cx)]]
+                    ancora, indice_formula = formula_de[id(cx)]
                 acima = [x for x in itens if x.y >= t and not (l <= x.x <= r and b <= x.y <= t)]
                 linha_acima = min(acima, key=lambda x: x.y).text.strip()[:25] if acima else ""
                 tarefas.append(
@@ -1398,7 +1477,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                         "modo": tipo,
                         "ancora": ancora[:3000],
                         "pagina": i,
-                        "caixa": [l - m, b - m, r + m, t + m],
+                        "caixa": visivel,
                     }
                 )
                 info["regioes"].append(
@@ -1410,11 +1489,27 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                         # A legenda digital sobre uma foto de fundo é texto da página.
                         **(
                             {"preserva_texto": True}
-                            if tipo == "imagem" and col["texto_visivel"] and _sobrepoe((0, 0, W, H), cx) >= 0.99999
+                            if tipo == "imagem"
+                            and col["texto_visivel"]
+                            and (id(cx) in recortes_exatos or _sobrepoe((0, 0, W, H), cx) >= 0.99999)
                             else {}
                         ),
                         **({"substitui_tabela": tabela_de[id(cx)]} if tipo == "tabela" else {}),
-                        **({"substitui_formula": formula_de[id(cx)]} if tipo == "formula" else {}),
+                        **(
+                            {
+                                "tabela_confirmada": True,
+                                "estrutura_tabela_confirmada": tabelas[tabela_de[id(cx)]]["estrutura_confirmada"],
+                            }
+                            if tipo == "tabela" and tabelas[tabela_de[id(cx)]].get("confirmada")
+                            else {}
+                        ),
+                        **(
+                            {"substitui_formula": indice_formula}
+                            if tipo == "formula" and indice_formula is not None
+                            else {"preserva_texto": True}
+                            if tipo == "formula"
+                            else {}
+                        ),
                     }
                 )
 
@@ -1454,18 +1549,42 @@ def _transform(box, m):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def objetos(page):
+def objetos(page, *, limitar_imagens=False, caminhos_visiveis=None):
     """Gera (tipo, raw, caixa_na_pagina)."""
+    janela_pagina = page.get_bbox() if limitar_imagens or caminhos_visiveis is not None else None
+    area_minima = 0
+    if caminhos_visiveis is not None:
+        l, b, r, t = janela_pagina
+        area_minima = 0.012 * (r - l) * (t - b)
+    indice = -1
 
-    def walk(raws, m):
+    def walk(raws, m, janela):
+        nonlocal indice
         for raw in raws:
+            indice += 1
             tipo = c.FPDFPageObj_GetType(raw)
             box = _bounds(raw)
-            yield tipo, raw, (_transform(box, m) if m else box)
+            box = _transform(box, m) if m else box
+            limite = janela
+            if limitar_imagens and tipo in (c.FPDF_PAGEOBJ_FORM, c.FPDF_PAGEOBJ_IMAGE):
+                recorte = janela_retangular(raw)
+                if recorte is not None:
+                    recorte = _transform(recorte, m) if m else recorte
+                    limite = interseccao(limite, recorte)
+                if tipo == c.FPDF_PAGEOBJ_IMAGE:
+                    box = interseccao(box, limite)
+            if caminhos_visiveis is not None and tipo == c.FPDF_PAGEOBJ_PATH:
+                l, b, r, t = box
+                if (r - l) * (t - b) >= area_minima and (recorte := janela_retangular(raw)) is not None:
+                    recorte = _transform(recorte, m) if m else recorte
+                    visivel = interseccao(box, interseccao(janela, recorte))
+                    if visivel != box:
+                        caminhos_visiveis[indice] = visivel
+            yield tipo, raw, box
             if tipo == c.FPDF_PAGEOBJ_FORM:
                 mm = _compose(_matrix(raw), m) if m else _matrix(raw)
                 n = c.FPDFFormObj_CountObjects(raw)
-                yield from walk((c.FPDFFormObj_GetObject(raw, k) for k in range(n)), mm)
+                yield from walk((c.FPDFFormObj_GetObject(raw, k) for k in range(n)), mm, limite)
 
     n = c.FPDFPage_CountObjects(page.raw)
-    yield from walk((c.FPDFPage_GetObject(page.raw, k) for k in range(n)), None)
+    yield from walk((c.FPDFPage_GetObject(page.raw, k) for k in range(n)), None, janela_pagina)
