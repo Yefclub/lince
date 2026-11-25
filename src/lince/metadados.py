@@ -21,14 +21,12 @@ from .seguranca import bordas_sem_oculto
 
 def metadados_arquivo(path, ext=None):
     """Metadados que a empresa precisa e que não estão no corpo: propriedades do arquivo, comentários e alterações
-    rastreadas (DOCX), abas ocultas (XLSX, XLS e ODS). `ext` é o formato já decidido. As propriedades do PDF saem do
-    plano (`planejar_pdf`), lidas na mesma vez da PDFium que abre o documento."""
+    rastreadas (DOCX), abas ocultas (XLSX e XLS; as do ODS vêm do plano). `ext` é o formato já decidido. As
+    propriedades do PDF saem do plano (`planejar_pdf`), lidas na mesma vez da PDFium que abre o documento."""
     meta = {}
     ext = ext or os.path.splitext(path)[1].lower()
     if ext in ODF:
         meta = _metadados_odf(path, meta, ext)
-        if ext == ".ods" and (ocultas := _abas_ocultas_ods(path)):
-            meta["abas_ocultas"] = ocultas
         if estrutura := estrutura_arquivo(path, ext):
             meta["estrutura"] = estrutura
         return meta
@@ -309,16 +307,6 @@ def _texto_odf(el) -> str:
             pilha.append(("el", f))
         partes.append(x.text or "")
     return "".join(partes)
-
-
-def _abas_ocultas_ods(path) -> list[str]:
-    """Nomes das abas ocultas do .ods, pela mesma passada que tira o conteúdo delas do corpo."""
-    from .xlsx_anotacoes import planilha_ods
-
-    try:
-        return [nome for nome, _ in planilha_ods(path, None, [])]
-    except Exception:  # noqa: BLE001 — a falha de leitura das abas ocultas já fica registrada pelo leitor do corpo
-        return []
 
 
 def _metadados_odf(path, meta, ext):

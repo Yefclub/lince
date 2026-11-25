@@ -765,8 +765,20 @@ def _entradas_do_grupo(dados, inicio, fim):
                 return
 
 
-def titulos_rtf(dados: bytes, ler_rtf) -> tuple[list[tuple[int, str]], bool]:
-    """(nível, texto) de cada parágrafo com estilo de título, na ordem do documento, e se todos foram lidos. O nível
+def _nome_do_estilo(entrada: bytes) -> str:
+    """O nome do estilo, com os acentos que o RTF escreve como \\'ed ou \\u237?: "Título 2", não "T tulo 2"."""
+    texto = re.sub(rb"\\'([0-9a-fA-F]{2})", lambda m: bytes([int(m[1], 16)]), entrada).decode("cp1252", "replace")
+    texto = re.sub(r"\\u(-?\d{1,5}) ?\??", lambda m: chr(int(m[1]) % 65536), texto)
+    return re.sub(r"\\[a-z]+-?\d* ?", " ", texto)
+
+
+RELIDOS_MAX = 64 * 1024 * 1024  # bytes do prólogo relidos pelo leitor do corpo, um por título; o arquivo pequeno com a
+# tabela de fontes do Word (6 KB) e 80 títulos passa longe, e a tabela de fontes hostil de 1 MB para em 64 títulos
+
+
+def titulos_rtf(dados: bytes, ler_rtf) -> tuple[list[tuple[int, str]], str | None]:
+    """(nível, texto) de cada parágrafo com estilo de título, na ordem do documento, e o motivo de ter parado antes do
+    fim (None: todos foram lidos). O nível
     vem do nome do estilo na folha de estilos ("Heading 2", "Título 2"), de 1 a 6; o estilo com \\outlinelevelN o
     leitor do corpo já marca como título. O texto do
     parágrafo é lido pelo mesmo leitor do corpo (`ler_rtf`), num RTF mínimo com o prólogo e a tabela de fontes do
@@ -774,7 +786,7 @@ def titulos_rtf(dados: bytes, ler_rtf) -> tuple[list[tuple[int, str]], bool]:
     os \\par do corpo uma vez cada."""
     m = re.search(rb"\{\\stylesheet", dados)
     if not m or (fim_estilos := _fim_do_grupo(dados, m.end())) < 0:
-        return [], True
+        return [], None
     niveis = {}
     for a, b in _entradas_do_grupo(dados, m.start(), fim_estilos):
         entrada = dados[a : min(b, a + 4096)]
@@ -783,11 +795,11 @@ def titulos_rtf(dados: bytes, ler_rtf) -> tuple[list[tuple[int, str]], bool]:
             continue
         # o \\outlinelevel o leitor do corpo já usa; o nome do estilo, não
         if not re.search(rb"\\outlinelevel\d", entrada) and (
-            titulo := _NOME_DE_TITULO.search(re.sub(r"\\[a-z]+-?\d* ?", " ", entrada.decode("latin-1")))
+            titulo := _NOME_DE_TITULO.search(_nome_do_estilo(entrada))
         ):
             niveis[int(estilo.group(1))] = int(titulo.group(2))
     if not niveis:
-        return [], True
+        return [], None
     cab = re.match(rb"\{\\rtf1(?:\\[a-z]+-?\d* ?)*", dados)
     prologo = cab.group(0) if cab else b"{\\rtf1"
     if (f := re.search(rb"\{\\fonttbl", dados)) and (fim := _fim_do_grupo(dados, f.end())) > 0:
@@ -802,13 +814,15 @@ def titulos_rtf(dados: bytes, ler_rtf) -> tuple[list[tuple[int, str]], bool]:
         estilo = _USO_DE_ESTILO.search(dados, p.end(), min(fim_par, p.end() + 400))
         if not estilo or int(estilo.group(1)) not in niveis or fim_par - p.start() > _PARAGRAFO_TITULO_MAX:
             continue
+        if len(saida) >= TITULOS_MAX:
+            return saida, f"teto de {TITULOS_MAX} títulos lidos"
         lidos += len(prologo) + fim_par - p.start()
-        if len(saida) >= TITULOS_MAX or lidos > _RELEITURA_MAX * len(dados):
-            return saida, False
+        if lidos > max(_RELEITURA_MAX * len(dados), RELIDOS_MAX):
+            return saida, "tabela de fontes grande demais para reler a cada título"
         texto = " ".join(" ".join(ler_rtf(prologo + dados[p.start() : fim_par] + b"\\par}")).split())
         if texto:
             saida.append((niveis[int(estilo.group(1))], texto))
-    return saida, True
+    return saida, None
 
 
 # ---------------------------------------------------------------------------------------------------- XLSB tolerante

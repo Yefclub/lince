@@ -274,12 +274,14 @@ def _celulas(linha, teto, cortes, saldo) -> tuple[list[str], bool]:
     return out, False
 
 
-def graficos_odf(path, ilegiveis) -> list[dict]:
+def graficos_odf(path, ilegiveis, ocultos=frozenset()) -> list[dict]:
     """Gráfico do LibreOffice (.ods, .odp, .odt): cada objeto embutido com office:chart traz tipo, título e a tabela
     local com os dados que ele desenha. Mesmo formato de graficos_ooxml."""
     out, saldo = [], [_CARACTERES_GRAFICOS_MAX]
     with zipfile.ZipFile(path) as z:
         for nome in sorted(n for n in z.namelist() if re.fullmatch(r"(?:[^/]+/)*Object \d+/content\.xml", n)):
+            if nome.rsplit("/", 1)[0] in ocultos:  # o gráfico de uma aba oculta fica fora do corpo, como ela
+                continue
             try:
                 g = _grafico_odf(z, nome, ilegiveis, saldo)
                 if g is not None:  # o que vai para a leitura é a tabela pronta: ela paga o orçamento inteira
@@ -621,12 +623,28 @@ def planejar_office(path, pasta, ext=None):
     tarefas, pendentes = [], []  # pendentes: o que entra em cobertura.pendentes, com o motivo
     # o conteúdo da aba oculta não vai para o corpo (como o texto oculto): vai para os metadados, conferido como ele.
     # No .xls e no .ods a mesma passada lê as notas de célula, que o anydoc não entrega (o .xlsx as tem mais adiante)
-    ocultas, anotacoes = [], []
+    ocultas, anotacoes, objetos_ocultos, partes_ocultas = [], [], set(), set()
     if ext in (".xlsx", ".xlsm"):
         _complemento(lambda: ocultas.extend(_abas_ocultas_xlsx(path)), "abas ocultas", ilegiveis)
-    elif ext in (".xls", ".ods"):
-        leitor = xlsx_anotacoes.planilha_xls if ext == ".xls" else xlsx_anotacoes.planilha_ods
-        _complemento(lambda: ocultas.extend(leitor(path, anotacoes, pendentes)), "abas ocultas e notas", ilegiveis)
+        _complemento(lambda: partes_ocultas.update(_partes_das_abas_ocultas(path)), "abas ocultas", ilegiveis)
+    elif ext == ".xls":
+        leitor_xls = xlsx_anotacoes.planilha_xls
+        _complemento(lambda: ocultas.extend(leitor_xls(path, anotacoes, pendentes)), "abas ocultas e notas", ilegiveis)
+    elif ext == ".ods":
+        # fora do _complemento: a recusa (aba oculta que não pôde ser separada do corpo) derruba o documento
+        try:
+            ods = xlsx_anotacoes.planilha_ods(path, anotacoes, pendentes)
+        except DocumentoRecusado:
+            raise
+        except Exception as e:  # noqa: BLE001 — pacote fora do padrão: o corpo segue, e a falha fica registrada
+            ilegiveis.append(f"abas ocultas e notas: {type(e).__name__}")
+        else:
+            ocultas.extend(ods.ocultas)
+            objetos_ocultos = ods.objetos
+            if not ods.conferido:
+                ilegiveis.append(
+                    "abas ocultas: XML fora do padrão; elas saíram do corpo sem o conteúdo conferido nem as notas lidas"
+                )
     svgs, sentinela = [], f"LINCE{secrets.token_hex(8)}S"  # desenhos vetoriais, juntos no fim, num lote só
     vistas = set()  # imagens já lidas (sha256): o armazém dos binários não as repete
 
@@ -660,7 +678,7 @@ def planejar_office(path, pasta, ext=None):
         (md, perfis), ilegiveis[:0] = md_xlsb, ilegiveis_xlsb
     else:
         if ext == ".ods" and ocultas:  # o anydoc entrega a aba oculta do LibreOffice no corpo; a do Excel, não
-            doc = _sem_abas(doc, {nome.strip() for nome, _ in ocultas})
+            doc = _sem_abas(doc, {(nome.strip(), posicao) for nome, posicao, _ in ocultas})
         md = serializar(doc, ler_imagem, formato=formato, marca_slide=marca if ext in PPTX else None, letras=letras)[0]
         perfis = _perfis(doc) if ext in PLANILHAS - {".xlsx", ".xlsm"} else []
         if limpeza is not None:  # a rede de segurança: o que o anydoc leu e a conferência não viu é falha
@@ -736,12 +754,10 @@ def planejar_office(path, pasta, ext=None):
             from .metadados import _linhas_rtf
 
             with open(path, "rb") as f:
-                achados, completo = legados.titulos_rtf(f.read(), _linhas_rtf)
+                achados, corte = legados.titulos_rtf(f.read(), _linhas_rtf)
             md = _com_titulos(md, achados)
-            if not completo:
-                ilegiveis.append(
-                    f"títulos: teto de {legados.TITULOS_MAX} títulos lidos; os seguintes ficaram como texto"
-                )
+            if corte:
+                ilegiveis.append(f"títulos: {corte}; os seguintes ficaram como texto")
 
         _complemento(titulos, "títulos", ilegiveis)
     if ext in (".docx", ".docm", ".rtf") or ext in ODF:  # o leitor do corpo não entrega a imagem do cabeçalho
@@ -769,7 +785,7 @@ def planejar_office(path, pasta, ext=None):
             seguranca.append(
                 {"tecnicas": sorted({m for m, _ in ocultos}), "texto": " ".join(t for _, t in ocultos)[:500]}
             )
-    for nome, texto in ocultas:
+    for nome, _, texto in ocultas:
         if texto:
             seguranca.append({"tecnicas": ["aba oculta"], "texto": f"aba {nome}: {texto}"[:500]})
     extras = []
@@ -791,7 +807,7 @@ def planejar_office(path, pasta, ext=None):
 
         def imagens_planilha():
             nonlocal md
-            for onde, mime, dados in _imagens_xlsx(path, ilegiveis):
+            for onde, mime, dados in _imagens_xlsx(path, ilegiveis, partes_ocultas):
                 md += f"\n\n**Imagem ({onde}):**\n\n" + ler_imagem(dados, mime, onde)
 
         _complemento(imagens_planilha, "imagens da planilha", ilegiveis)
@@ -799,7 +815,10 @@ def planejar_office(path, pasta, ext=None):
 
         def imagens_ods():
             nonlocal md
+            escondidas = {f"aba {nome}" for nome, _, _ in ocultas}
             for onde, mime, dados in _imagens_ods(path, ilegiveis):
+                if onde in escondidas:  # a imagem da aba oculta fica fora do corpo, como as células dela
+                    continue
                 if (marca := hashlib.sha256(dados).digest()) in vistas or min(_tam(dados)) < 48:
                     continue
                 vistas.add(marca)
@@ -807,8 +826,14 @@ def planejar_office(path, pasta, ext=None):
 
         _complemento(imagens_ods, "imagens da planilha", ilegiveis)
     if ext in (".xlsx", ".xlsm", ".docx"):
+
+        def graficos_visiveis():
+            with zipfile.ZipFile(path) as z:
+                partes = sorted(n for n in z.namelist() if re.search(r"/charts/chart\d+\.xml$", n))
+            return graficos_ooxml(path, [p for p in partes if p not in partes_ocultas])
+
         _complemento(
-            lambda: extras.extend(grafico_md(g, saldo_graficos, ilegiveis) for g in graficos_ooxml(path)),
+            lambda: extras.extend(grafico_md(g, saldo_graficos, ilegiveis) for g in graficos_visiveis()),
             "gráficos",
             ilegiveis,
         )
@@ -841,7 +866,11 @@ def planejar_office(path, pasta, ext=None):
 
         _complemento(graficos_xls, "gráficos", ilegiveis)
     if ext in ODF:  # o leitor do corpo não entrega o gráfico do LibreOffice: tipo, título e os dados que ele desenha
-        _complemento(lambda: extras.extend(grafico_md(g) for g in graficos_odf(path, ilegiveis)), "gráficos", ilegiveis)
+        _complemento(
+            lambda: extras.extend(grafico_md(g) for g in graficos_odf(path, ilegiveis, objetos_ocultos)),
+            "gráficos",
+            ilegiveis,
+        )
     if ext == ".odp":  # o leitor do corpo entrega as caixas soltas, sem as ligações
 
         def diagramas_odp():
@@ -885,6 +914,7 @@ def planejar_office(path, pasta, ext=None):
         "tarefas": tarefas,
         "texto_oculto": seguranca,
         "ilegiveis": ilegiveis,
+        **({"abas_ocultas": [nome for nome, _, _ in ocultas]} if ext == ".ods" and ocultas else {}),
         "perfil_tabular": perfis,
         **(
             {"alt_das_tarefas": {t["id"]: alternativas[t["ancora"]] for t in tarefas if t["ancora"] in alternativas}}
@@ -1178,7 +1208,7 @@ def _desenhos_xlsb(path, extras, ilegiveis, saldo):
         ilegiveis.append(f"aba {graficos[parte]}: gráfico {parte} ilegível ou com tipo sem suporte")
 
 
-def _imagens_xlsx(path, ilegiveis) -> list[tuple[str, str, bytes]]:
+def _imagens_xlsx(path, ilegiveis, ocultas=frozenset()) -> list[tuple[str, str, bytes]]:
     """(onde, MIME, bytes) das imagens das abas do .xlsx, na ordem das abas e das âncoras, lidas direto das partes de
     desenho do pacote (workbook -> aba -> drawing -> mídia), sem carregar as células: a planilha pode ter milhões.
     A âncora dá a célula do canto da imagem. Mesma mídia, uma vez; até legados.IMAGENS_MAX."""
@@ -1194,7 +1224,9 @@ def _imagens_xlsx(path, ilegiveis) -> list[tuple[str, str, bytes]]:
         for aba in livro.iter():
             if aba.tag.rsplit("}", 1)[-1] != "sheet" or (parte := abas.get(aba.get(f"{_REL}id"))) not in nomes:
                 continue
-            for desenho in (d for d in _alvos(z, parte, nomes).values() if "/drawings/" in d and d in nomes):
+            for desenho in (
+                d for d in _alvos(z, parte, nomes).values() if "/drawings/" in d and d in nomes and d not in ocultas
+            ):
                 raiz, midias = xml_ou_nada(z.read(desenho)), _alvos(z, desenho, nomes)
                 for ancora in list(raiz) if raiz is not None else ():
                     blip = ancora.find(f".//{_A_BLIP}")
@@ -1218,32 +1250,35 @@ def _imagens_xlsx(path, ilegiveis) -> list[tuple[str, str, bytes]]:
 PPTX = {".pptx", ".pptm", ".ppsx", ".ppsm"}
 
 
+def _texto_comparavel(texto):
+    """O texto sem a marcação que o leitor do corpo põe ou tira (ênfase, escape, código) e com os espaços
+    normalizados: o título lido do RTF e o bloco do Markdown passam pela mesma regra."""
+    return " ".join(re.sub(r"[*_`\\]", "", texto).split())
+
+
 def _com_titulos(md, titulos):
-    """Marca como título, na ordem do documento, o bloco do Markdown que tem o texto de cada título (sem a ênfase que
-    o leitor do corpo pôs), com ou sem a numeração de lista antes. Só quando o texto aparece em tantos blocos quantos
-    são os títulos com ele: um parágrafo comum com o mesmo texto deixa o título como texto, em vez de marcar o bloco
-    errado."""
+    """Marca como título, na ordem do documento, o bloco do Markdown que tem o texto de cada título, com ou sem a
+    numeração de lista antes. Só quando o texto aparece em tantos blocos quantos são os títulos com ele: um parágrafo
+    comum com o mesmo texto deixa o título como texto, em vez de marcar o bloco errado."""
     blocos = md.split("\n\n")
-
-    def chave(bloco):
-        if "\n" in bloco.strip():
-            return None
-        limpo = " ".join(re.sub(r"^#{1,6}\s+|[*_]", "", bloco).split())
-        # a numeração da lista ("1. ", "2.3 ") vem da tabela de listas, fora do parágrafo: ela fica no título
-        return re.sub(r"^\d{1,3}(?:\.\d{1,3})*[.)]?\s+", "", limpo), limpo
-
     onde = {}
     for j, b in enumerate(blocos):
-        if (c := chave(b)) is not None:
-            onde.setdefault(c[0], []).append(j)
-    quantos, vistos = Counter(texto for _, texto in titulos), Counter()
-    for nivel, texto in titulos:
+        if "\n" in b.strip():
+            continue
+        limpo = _texto_comparavel(re.sub(r"^#{1,6}\s+", "", b))
+        # a numeração da lista ("1. ", "2.3 ") vem da tabela de listas, fora do parágrafo: ela fica no título
+        sem_numero = re.sub(r"^\d{1,3}(?:\.\d{1,3})*[.)]?\s+", "", limpo)
+        for chave in {limpo, sem_numero}:
+            onde.setdefault(chave, []).append(j)
+    pedidos = [(nivel, _texto_comparavel(texto)) for nivel, texto in titulos]
+    quantos, vistos = Counter(texto for _, texto in pedidos), Counter()
+    for nivel, texto in pedidos:
         lugares = onde.get(texto, [])
         if len(lugares) != quantos[texto]:
             continue
         j = lugares[vistos[texto]]  # o n-ésimo título com esse texto é o n-ésimo bloco com ele
         vistos[texto] += 1
-        blocos[j] = "#" * nivel + " " + chave(blocos[j])[1]
+        blocos[j] = "#" * nivel + " " + re.sub(r"^#{1,6}\s+", "", blocos[j]).strip()
     return "\n\n".join(blocos)
 
 
@@ -1292,7 +1327,7 @@ def _tabelas_no_lugar_das_celulas(md, tabelas):
 
 
 def _abas_ocultas_xlsx(path) -> list[tuple[str, str]]:
-    """(nome, começo do texto) de cada aba oculta ou muito oculta do .xlsx, lida em fluxo pelo openpyxl, com os tetos
+    """(nome, 0, começo do texto) de cada aba oculta ou muito oculta do .xlsx, lida em fluxo pelo openpyxl, com os tetos
     de linhas, células e caracteres: o openpyxl devolve uma linha vazia para cada número de linha que falta, então a
     linha vazia também conta."""
     from openpyxl import load_workbook
@@ -1312,22 +1347,45 @@ def _abas_ocultas_xlsx(path) -> list[tuple[str, str]]:
                         break
                 if oculta.cheia():
                     break
-            out.append((ws.title, oculta.texto()))
+            out.append((ws.title, 0, oculta.texto()))
     finally:
         wb.close()
     return out
 
 
+def _partes_das_abas_ocultas(path) -> set[str]:
+    """Os desenhos das abas ocultas do .xlsx e os gráficos e imagens deles: o que é da aba oculta fica fora do corpo
+    como as células dela."""
+    saida = set()
+    with zipfile.ZipFile(path) as z:
+        nomes = set(z.namelist())
+        livro = xml_ou_nada(z.read("xl/workbook.xml")) if "xl/workbook.xml" in nomes else None
+        if livro is None:
+            return saida
+        abas = _alvos(z, "xl/workbook.xml", nomes)
+        for aba in livro.iter():
+            if aba.tag.rsplit("}", 1)[-1] != "sheet" or aba.get("state", "visible") == "visible":
+                continue
+            if (parte := abas.get(aba.get(f"{_REL}id"))) not in nomes:
+                continue
+            for desenho in (d for d in _alvos(z, parte, nomes).values() if "/drawings/" in d and d in nomes):
+                saida.add(desenho)
+                saida.update(_alvos(z, desenho, nomes).values())
+    return saida
+
+
 def _sem_abas(doc, nomes):
-    """O documento do anydoc sem as abas de `nomes`: cada aba do .ods é um título de nível 2 com o nome dela e os
-    blocos até o próximo título desse nível."""
+    """O documento do anydoc sem as abas de `nomes`, pares (nome, posição entre as abas com esse nome): cada aba do .ods
+    é um título de nível 2 com o nome dela e os blocos até o próximo título desse nível. A posição separa a aba oculta
+    de uma visível com o mesmo nome, que o arquivo fora do padrão pode ter."""
     from types import SimpleNamespace
 
-    blocos, pulando = [], False
+    blocos, pulando, vistos = [], False, Counter()
     for b in doc.blocks:
         if b.kind == "heading" and b.level == 2:
             nome = "".join(x.text or "" for x in b.content or [] if x.kind == "text").strip()
-            pulando = nome in nomes
+            pulando = (nome, vistos[nome]) in nomes
+            vistos[nome] += 1
         if not pulando:
             blocos.append(b)
     return SimpleNamespace(blocks=blocos, assets=doc.assets, notes=doc.notes)

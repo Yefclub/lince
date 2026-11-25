@@ -272,3 +272,228 @@ def test_slide_do_odp_com_formas_demais_fica_sem_diagrama(tmp_path):
     md = lince.ler(p).markdown
 
     assert time.perf_counter() - inicio < 5 and "Diagrama do slide" not in md
+
+
+def _ods_cru(p, conteudo, extras=()):
+    with zipfile.ZipFile(p, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("mimetype", "application/vnd.oasis.opendocument.spreadsheet", compress_type=zipfile.ZIP_STORED)
+        z.writestr("content.xml", conteudo)
+        for nome, dados in extras:
+            z.writestr(nome, dados)
+
+
+def _conteudo_ods(tabelas, antes="", depois=""):
+    return (
+        f'<?xml version="1.0" encoding="UTF-8"?>{antes}<office:document-content xmlns:office="{O}" xmlns:style="{S}"'
+        f' xmlns:table="{T}" xmlns:text="{X}" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"'
+        ' xmlns:xlink="http://www.w3.org/1999/xlink" office:version="1.3"><office:automatic-styles>'
+        '<style:style style:name="ta2" style:family="table"><style:table-properties table:display="false"/>'
+        f"</style:style></office:automatic-styles><office:body><office:spreadsheet>{tabelas}</office:spreadsheet>"
+        f"</office:body></office:document-content>{depois}"
+    )
+
+
+def _tabela(nome, estilo, conteudo):
+    return f'<table:table table:name="{nome}" table:style-name="{estilo}">{conteudo}</table:table>'
+
+
+def test_aba_oculta_de_ods_com_xml_que_o_parser_recusa_sai_do_corpo_mesmo_assim(tmp_path):
+    """O leitor do corpo aceita DTD com entidade e prefixo sem namespace; o parser seguro, não. A falha tem de ser
+    fechada: a aba oculta sai do corpo pela varredura tolerante, e o registro diz que o conteúdo não foi conferido."""
+    tabelas = _tabela("Resumo", "ta1", _linha("visível")) + _tabela("Oculta", "ta2", _linha("SEGREDO"))
+    for nome, conteudo in (
+        ("dtd.ods", _conteudo_ods(tabelas, antes='<!DOCTYPE office:document-content [<!ENTITY e "x">]>')),
+        (
+            "prefixo.ods",
+            _conteudo_ods(
+                _tabela("Resumo", "ta1", _linha("visível") + "<x:y/>")[:-14]
+                + "</table:table>"
+                + _tabela("Oculta", "ta2", _linha("SEGREDO"))
+            ),
+        ),
+    ):
+        p = tmp_path / nome
+        _ods_cru(p, conteudo)
+
+        r = lince.ler(p)
+
+        assert "SEGREDO" not in r.markdown and "visível" in r.markdown, nome
+        assert r.metadados["abas_ocultas"] == ["Oculta"]
+        assert any("sem o conteúdo conferido" in i for i in r.metadados["partes_ilegiveis"])
+
+
+def test_aba_oculta_com_o_nome_de_uma_visivel_nao_apaga_a_visivel(tmp_path):
+    p = tmp_path / "mesmo_nome.ods"
+    _ods(p, [("Resumo", False, _linha("visível")), ("Resumo", True, _linha("SEGREDO"))])
+
+    md = lince.ler(p).markdown
+
+    assert "visível" in md and "SEGREDO" not in md
+
+
+def test_grafico_de_aba_oculta_do_ods_fica_fora_do_corpo(tmp_path):
+    c = "urn:oasis:names:tc:opendocument:xmlns:chart:1.0"
+    grafico = (
+        f'<?xml version="1.0" encoding="UTF-8"?><office:document-content xmlns:office="{O}" xmlns:chart="{c}"'
+        f' xmlns:table="{T}" xmlns:text="{X}"><office:body><office:chart><chart:chart chart:class="chart:bar">'
+        "<chart:title><text:p>{}</text:p></chart:title><table:table><table:table-rows>"
+        "<table:table-row><table:table-cell><text:p>Mês</text:p></table:table-cell><table:table-cell><text:p>Valor"
+        "</text:p></table:table-cell></table:table-row><table:table-row><table:table-cell><text:p>{}</text:p>"
+        "</table:table-cell><table:table-cell><text:p>7</text:p></table:table-cell></table:table-row>"
+        "</table:table-rows></table:table></chart:chart></office:chart></office:body></office:document-content>"
+    )
+    objeto = '<draw:frame><draw:object xlink:href="./{}"/></draw:frame>'
+    tabelas = _tabela("Resumo", "ta1", "<table:shapes>" + objeto.format("Object 1") + "</table:shapes>" + _linha("v"))
+    tabelas += _tabela("Oculta", "ta2", "<table:shapes>" + objeto.format("Object 2") + "</table:shapes>" + _linha("x"))
+    p = tmp_path / "graficos.ods"
+    _ods_cru(
+        p,
+        _conteudo_ods(tabelas),
+        [
+            ("Object 1/content.xml", grafico.format("Vendas visíveis", "Janeiro")),
+            ("Object 2/content.xml", grafico.format("TITULOSEGREDO", "SEGREDO1")),
+        ],
+    )
+
+    md = lince.ler(p).markdown
+
+    assert "Vendas visíveis" in md and "Janeiro" in md
+    assert "SEGREDO" not in md
+
+
+def test_grafico_e_imagem_de_aba_oculta_do_xlsx_ficam_fora_do_corpo(tmp_path):
+    import io
+
+    from openpyxl.chart import BarChart, Reference
+    from openpyxl.drawing.image import Image as ImagemXl
+    from PIL import Image
+
+    wb = Workbook()
+    wb.active.title = "Resumo"
+    wb.active.append(["visível"])
+    oculta = wb.create_sheet("Oculta")
+    for linha in (["Mês", "Valor"], ["SEGREDO1", 5], ["SEGREDO2", 9]):
+        oculta.append(linha)
+    g = BarChart()
+    g.title = "TITULOSEGREDO"
+    g.add_data(Reference(oculta, min_col=2, min_row=1, max_row=3), titles_from_data=True)
+    g.set_categories(Reference(oculta, min_col=1, min_row=2, max_row=3))
+    oculta.add_chart(g, "D2")
+    png = io.BytesIO()
+    Image.effect_noise((120, 80), 60).convert("RGB").save(png, "PNG")
+    oculta.add_image(ImagemXl(io.BytesIO(png.getvalue())), "D20")
+    oculta.sheet_state = "hidden"
+    p = tmp_path / "grafico_oculto.xlsx"
+    wb.save(p)
+
+    plano = lince.Leitor().preparar(p)
+    md = lince.Leitor().concluir(plano, {}).markdown
+
+    assert "SEGREDO" not in md and "visível" in md
+    assert plano.tarefas == []  # a imagem da aba oculta não vai para a IA
+
+
+def test_rtf_do_word_com_tabela_de_fontes_grande_marca_todos_os_titulos(tmp_path):
+    """O prólogo (a tabela de fontes) é relido a cada título: contado contra o tamanho do arquivo, cortava a maior
+    parte dos títulos de um documento comum do Word."""
+    fontes = "".join(
+        rf"{{\f{k}\froman\fcharset0\fprq2{{\*\panose 02020603050405020304}}Fonte Numero {k} Regular;}}"
+        for k in range(60)
+    )
+    cab = r"{\rtf1\ansi\ansicpg1252\deff0{\fonttbl" + fontes + r"}{\stylesheet{\s0 Normal;}{\s1 heading 1;}}"
+    corpo = "".join(
+        rf"\pard\s1 Secao numero {k} do relatorio\par\pard\s0 {'texto corrido ' * 25}\par" for k in range(80)
+    )
+    p = tmp_path / "word.rtf"
+    p.write_text(cab + corpo + "}", encoding="latin-1")
+
+    r = lince.ler(p)
+
+    assert len(re.findall(r"(?m)^# Secao numero", r.markdown)) == 80
+    assert "partes_ilegiveis" not in r.metadados
+
+
+def test_rtf_com_titulos_demais_registra_o_teto(tmp_path):
+    p = tmp_path / "muitos.rtf"
+    _rtf(p, "", "".join(rf"\pard\s1 Titulo {k}\par\pard\s0 texto\par" for k in range(600)))
+
+    r = lince.ler(p)
+
+    assert len(re.findall(r"(?m)^# Titulo", r.markdown)) == 512
+    assert r.markdown.count("texto") == 600  # nada some: os títulos depois do teto ficam como texto
+    assert r.metadados["partes_ilegiveis"] == ["títulos: teto de 512 títulos lidos; os seguintes ficaram como texto"]
+
+
+def test_titulo_com_acento_escrito_em_rtf_e_reconhecido_pelo_nome_do_estilo(tmp_path):
+    p = tmp_path / "acento.rtf"
+    _rtf(p, r"{\s4 T\'edtulo 2;}", r"\pard\s4 Escopo do contrato\par\pard\s0 corpo\par")
+
+    assert "## Escopo do contrato" in lince.ler(p).markdown
+
+
+def test_aba_oculta_com_muitas_celulas_vazias_nao_trava(tmp_path):
+    """Mil linhas que vão até a última coluna: o leitor em fluxo devolve 16 milhões de células vazias."""
+    base, p = tmp_path / "base.xlsx", tmp_path / "larga.xlsx"
+    wb = Workbook()
+    wb.active.append(["visível"])
+    oculta = wb.create_sheet("Oculta")
+    oculta.append(["começo"])
+    oculta.sheet_state = "hidden"
+    wb.save(base)
+    linhas = b"".join(b'<row r="%d"><c r="XFD%d"><v>1</v></c></row>' % (k, k) for k in range(2, 1002))
+    with zipfile.ZipFile(base) as entrada, zipfile.ZipFile(p, "w", zipfile.ZIP_DEFLATED) as saida:
+        for parte in entrada.infolist():
+            dados = entrada.read(parte)
+            if parte.filename == "xl/worksheets/sheet2.xml":
+                dados = re.sub(rb"<dimension[^>]*/>", b"", dados).replace(b"</sheetData>", linhas + b"</sheetData>")
+            saida.writestr(parte, dados)
+    inicio = time.perf_counter()
+
+    r = lince.ler(p)
+
+    assert time.perf_counter() - inicio < 10
+    assert r.metadados["texto_oculto_removido"][0]["texto"].startswith("aba Oculta: começo")
+
+
+class _OleFalso:
+    """O stream "PowerPoint Document" de um .ppt, sem o resto do arquivo OLE."""
+
+    def __init__(self, dados):
+        self.dados = dados
+
+    def get_size(self, nome):
+        return len(self.dados)
+
+    def openstream(self, nome):
+        import io
+
+        return io.BytesIO(self.dados)
+
+
+def _registro(tipo, corpo, conteiner=False):
+    import struct
+
+    return struct.pack("<HHI", 0x000F if conteiner else 0, tipo, len(corpo)) + corpo
+
+
+def _tabela_ppt(n_linhas, n_colunas):
+    import struct
+
+    formas = b""
+    for i in range(n_linhas):
+        for j in range(n_colunas):
+            ancora = _registro(0xF00F, struct.pack("<iiii", 100 * j, 50 * i, 100 * j + 90, 50 * i + 40))
+            texto = _registro(0xF00D, _registro(0x0FA0, f"c{i}{j}".encode("utf-16-le")), conteiner=True)
+            formas += _registro(0xF004, ancora + texto, conteiner=True)
+    return _registro(0xF003, formas, conteiner=True)
+
+
+def test_tabelas_do_ppt_acima_do_teto_ficam_ate_o_teto_e_registram_o_resto():
+    from lince import legados
+
+    dados = b"".join(_tabela_ppt(10, 10) for _ in range(50))  # 5.000 células: o teto é 4.096
+
+    tabelas, completo = legados.tabelas_ppt(_OleFalso(dados), len(dados))
+
+    assert len(tabelas) == 40 and not completo  # as 40 primeiras inteiras, nenhuma cortada no meio
+    assert tabelas[0][0] == ["c00", "c01", "c02", "c03", "c04", "c05", "c06", "c07", "c08", "c09"]

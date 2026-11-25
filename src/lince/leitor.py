@@ -130,6 +130,8 @@ class Leitor:
         plano["meta_arquivo"] = metadados_arquivo(caminho, ext)
         if plano.get("propriedades"):  # HTML, SVG e PDF já tiram as propriedades na leitura do corpo
             plano["meta_arquivo"]["propriedades"] = plano.pop("propriedades")
+        if plano.get("abas_ocultas"):  # as do .ods saem da mesma passada que as tira do corpo
+            plano["meta_arquivo"]["abas_ocultas"] = plano.pop("abas_ocultas")
         if plano.get("ilegiveis"):
             plano["meta_arquivo"].setdefault("partes_ilegiveis", []).extend(plano["ilegiveis"])
         if perfis := plano.pop("perfil_tabular", None):

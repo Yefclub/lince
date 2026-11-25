@@ -4,9 +4,11 @@ import math
 import re
 import zipfile
 from bisect import bisect_left, bisect_right
+from collections import Counter
 from dataclasses import dataclass, field
 from functools import cached_property
 from itertools import count
+from typing import NamedTuple
 
 from lxml import etree
 from openpyxl.utils import coordinate_to_tuple, get_column_letter, range_boundaries
@@ -392,8 +394,8 @@ OCULTA_CELULAS_MAX = 20_000  # células varridas de cada aba oculta
 class _Oculta:
     """O começo do texto de uma aba oculta, com os tetos: o registro guarda só isso, e a varredura para nele."""
 
-    def __init__(self, nome):
-        self.nome, self.partes, self.tamanho, self.linhas, self.celulas = nome, [], 0, 0, 0
+    def __init__(self, nome, posicao=0):
+        self.nome, self.posicao, self.partes, self.tamanho, self.linhas, self.celulas = nome, posicao, [], 0, 0, 0
 
     def cheia(self):
         return self.tamanho > OCULTA_TEXTO_MAX or self.linhas > OCULTA_LINHAS_MAX or self.celulas > OCULTA_CELULAS_MAX
@@ -413,9 +415,10 @@ class _Oculta:
 
 
 def planilha_xls(path, extras, pendentes) -> list[tuple[str, str]]:
-    """Notas de célula das abas visíveis do .xls, no formato das do .xlsx, e (nome, começo do texto, com as notas) de
-    cada aba oculta, pelo xlrd. Uma aba por vez é carregada e descarregada; o .xls tem no máximo 65.536 linhas por
-    aba, e o leitor do corpo já recusou a grade grande demais. A aba que o xlrd não lê fica registrada pelo nome."""
+    """Notas de célula das abas visíveis do .xls, no formato das do .xlsx, e (nome, 0, começo do texto, com as notas)
+    de cada aba oculta, pelo xlrd. Uma aba por vez é carregada e descarregada; o .xls tem no máximo 65.536 linhas por
+    aba, e o leitor do corpo já recusou a grade grande demais. A aba que o xlrd não lê fica registrada pelo número
+    (o nome vem com ela); o leitor do corpo do .xls não põe a aba oculta no corpo."""
     import xlrd
 
     saida, ocultas = _Saida(extras, pendentes), []
@@ -425,7 +428,9 @@ def planilha_xls(path, extras, pendentes) -> list[tuple[str, str]]:
             try:
                 aba = livro.sheet_by_index(k)
             except Exception as e:  # noqa: BLE001 — registro fora do padrão numa aba: as outras seguem
-                pendentes.append(f"notas de célula: aba {k + 1} não lida ({type(e).__name__})")
+                pendentes.append(
+                    f"aba {k + 1}: não lida pelo leitor das abas ocultas e das notas de célula ({type(e).__name__})"
+                )
                 continue
             try:
                 if aba.visibility:  # 1 oculta, 2 muito oculta
@@ -440,7 +445,7 @@ def planilha_xls(path, extras, pendentes) -> list[tuple[str, str]]:
                                 break
                         if oculta.cheia():
                             break
-                    ocultas.append((aba.name, oculta.texto()))
+                    ocultas.append((aba.name, 0, oculta.texto()))
                     continue
                 for (linha, coluna), nota in sorted(aba.cell_note_map.items()):
                     if texto := (nota.text or "").strip():
@@ -462,34 +467,98 @@ _ODS_STYLE = "{urn:oasis:names:tc:opendocument:xmlns:style:1.0}"
 _ODS_REPETICAO_MAX = 1_048_576  # linhas e colunas que uma repetição pode pular (o tamanho máximo de uma aba)
 
 
-def planilha_ods(path, extras, pendentes) -> list[tuple[str, str]]:
+class Ods(NamedTuple):
+    """O que a passada pelo content.xml do .ods diz das abas ocultas: (nome, posição entre as abas com esse nome,
+    começo do texto) de cada uma, os objetos embutidos dentro delas (gráficos, "Object 3") e se o conteúdo delas foi
+    conferido (False: o XML não abriu, e só os nomes vieram da varredura tolerante)."""
+
+    ocultas: list
+    objetos: set
+    conferido: bool
+
+
+_DRAW = "{urn:oasis:names:tc:opendocument:xmlns:drawing:1.0}"
+_LIMPAR = {
+    f"{_ODS_TB}{t}" for t in ("table-cell", "covered-table-cell", "table-row", "table-column", "table", "table-rows")
+}
+_XLINK = "{http://www.w3.org/1999/xlink}href"
+# varredura tolerante, para o content.xml que o parser XML recusa e o leitor do corpo aceita: qualquer prefixo
+_ABRE_ESTILO = re.compile(rb"<([\w.-]+):style\s([^>]*)>")
+_ABRE_TABELA = re.compile(rb"<([\w.-]+):table\s([^>]*)>")
+_ATRIBUTO = re.compile(rb"(?:^|\s)[\w.-]+:([\w.-]+)\s*=\s*(\"[^\"]*\"|'[^']*')")
+_ESCONDE = re.compile(rb":display\s*=\s*[\"']false[\"']")
+
+
+def _atributos(tag: bytes) -> dict:
+    return {m.group(1).decode("latin-1"): m.group(2)[1:-1].decode("utf-8", "replace") for m in _ATRIBUTO.finditer(tag)}
+
+
+def ocultas_ods_tolerante(dados: bytes) -> list:
+    """(nome, posição) das abas ocultas pelo texto do content.xml, sem parser XML: os estilos com display="false" e
+    as tabelas que os usam. Linear no arquivo. Se há display="false" que não leva a nenhuma aba, a dúvida não pode
+    virar texto oculto no corpo: o documento é recusado."""
+    escondidos = set()
+    for m in _ABRE_ESTILO.finditer(dados):
+        fim = dados.find(b":style>", m.end(), m.end() + 4096)
+        trecho = dados[m.start() : fim if fim > 0 else m.end() + 4096]
+        if _ESCONDE.search(trecho) and (nome := _atributos(m.group(2)).get("name")):
+            escondidos.add(nome)
+    vistos, saida = Counter(), []
+    for m in _ABRE_TABELA.finditer(dados):
+        a = _atributos(m.group(2))
+        if "name" not in a:
+            continue
+        nome = a["name"]
+        vistos[nome] += 1
+        if a.get("style-name") in escondidos:
+            saida.append((nome, vistos[nome] - 1, ""))
+    if not saida and _ESCONDE.search(dados):
+        from .limites import DocumentoRecusado
+
+        raise DocumentoRecusado("planilha com aba oculta num XML fora do padrão: a aba não pôde ser separada do corpo")
+    return saida
+
+
+def planilha_ods(path, extras, pendentes) -> Ods:
     """O mesmo que `planilha_xls`, para o .ods, numa passada em fluxo pelo content.xml: a aba é oculta quando o estilo
     dela tem table:display="false"; a nota de célula é o office:annotation, sem o autor e a data. A posição conta as
-    repetições de linha e de coluna. Cada célula é limpa ao fechar: a planilha pode ser enorme. Com `extras` None,
-    só os nomes das abas ocultas importam (os metadados)."""
+    repetições de linha e de coluna. Célula, linha, coluna e aba são limpas ao fechar: a planilha pode ser enorme.
+    Com `extras` None, a nota das abas visíveis não é guardada.
+
+    Falha fechada: se o parser recusa o XML (DTD, entidade, prefixo sem namespace) e o leitor do corpo o aceita, os
+    nomes das abas ocultas vêm da varredura tolerante, para elas saírem do corpo mesmo sem o conteúdo conferido."""
     from defusedxml.ElementTree import iterparse
 
     saida = _Saida(extras if extras is not None else [], pendentes)
-    escondidas, ocultas, oculta = set(), [], None
+    escondidas, ocultas, objetos, oculta = set(), [], set(), None
+    nomes = Counter()
     aba, linha, coluna = "", 0, 0
     with zipfile.ZipFile(path) as z:
         if "content.xml" not in z.namelist():
-            return []
-        with z.open("content.xml") as arquivo:
-            try:
+            return Ods([], set(), True)
+        try:
+            with z.open("content.xml") as arquivo:
                 for evento, el in iterparse(arquivo, events=("start", "end")):
                     if evento == "start":
                         if el.tag == f"{_ODS_TB}table":
                             aba, linha = el.get(f"{_ODS_TB}name") or "", 0
-                            oculta = _Oculta(aba) if el.get(f"{_ODS_TB}style-name") in escondidas else None
+                            nomes[aba] += 1
+                            if el.get(f"{_ODS_TB}style-name") in escondidas:
+                                oculta = _Oculta(aba)
+                                oculta.posicao = nomes[aba] - 1
+                            else:
+                                oculta = None
                         elif el.tag == f"{_ODS_TB}table-row":
                             coluna = 0
+                        elif el.tag == f"{_DRAW}object" and oculta is not None:
+                            objetos.add((el.get(_XLINK) or "").removeprefix("./").strip("/"))
                         continue
                     if el.tag == f"{_ODS_STYLE}style":
                         props = el.find(f"{_ODS_STYLE}table-properties")
                         if props is not None and props.get(f"{_ODS_TB}display") == "false":
                             escondidas.add(el.get(f"{_ODS_STYLE}name"))
-                    elif el.tag in (f"{_ODS_TB}table-cell", f"{_ODS_TB}covered-table-cell"):
+                        continue
+                    if el.tag in (f"{_ODS_TB}table-cell", f"{_ODS_TB}covered-table-cell"):
                         nota = el.find(f"{_ODS_OFFICE}annotation")
                         texto_nota = (
                             "\n".join("".join(p.itertext()) for p in nota.iter(f"{_ODS_TEXT}p")).strip()
@@ -504,20 +573,21 @@ def planilha_ods(path, extras, pendentes) -> list[tuple[str, str]]:
                             onde = f"{aba}!{get_column_letter(min(coluna, 16_383) + 1)}{linha + 1}"
                             saida.adicionar(onde, "nota: " + _literal(texto_nota))
                         coluna += _repeticao(el.get(f"{_ODS_TB}number-columns-repeated"))
-                        el.clear()
                     elif el.tag == f"{_ODS_TB}table-row":
                         repeticao = _repeticao(el.get(f"{_ODS_TB}number-rows-repeated"))
                         linha += repeticao
                         if oculta is not None:
                             oculta.linha(repeticao)
-                        el.clear()
                     elif el.tag == f"{_ODS_TB}table" and oculta is not None:
-                        ocultas.append((oculta.nome, oculta.texto()))
+                        ocultas.append((oculta.nome, oculta.posicao, oculta.texto()))
                         oculta = None
+                    if el.tag in _LIMPAR:  # o texto de um parágrafo é lido quando a célula fecha: ele não é limpo antes
                         el.clear()
-            except _Limite:
-                saida.avisar("limite de extração atingido", "anotações restantes omitidas")
-    return ocultas
+        except _Limite:
+            saida.avisar("limite de extração atingido", "anotações restantes omitidas")
+        except Exception:  # noqa: BLE001 — o parser recusou o XML: a varredura tolerante dá os nomes (ou recusa)
+            return Ods(ocultas_ods_tolerante(z.read("content.xml")), set(), False)
+    return Ods(ocultas, objetos, True)
 
 
 def _repeticao(valor):
