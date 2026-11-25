@@ -492,7 +492,11 @@ def _planilha_pelo_conteudo(caminho: str, ext: str) -> str | None:
     # parece zip
     if olefile.isOleFile(caminho):
         return None if ext == ".xls" else ".xls"
-    return None if ext in (".xlsx", ".xlsm", ".xlsb") else ".xlsx"
+    with zipfile.ZipFile(caminho) as z:  # o .xlsb guarda o livro em binário: o pacote diz qual dos dois é
+        binario = "xl/workbook.bin" in z.namelist()
+    if binario:
+        return None if ext == ".xlsb" else ".xlsb"
+    return None if ext in (".xlsx", ".xlsm") else ".xlsx"
 
 
 def _avisar_cache(e):

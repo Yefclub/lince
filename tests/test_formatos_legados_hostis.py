@@ -871,3 +871,24 @@ def test_ods_com_dtd_que_muda_o_namespace_e_recusado(tmp_path):
 
     with pytest.raises(DocumentoRecusado, match="DTD"):
         lince.ler(p)
+
+
+def test_xlsx_e_xlsb_sao_separados_pelo_pacote(tmp_path):
+    """O leitor do corpo chama os dois de "xlsx": o livro em XML ou em binário é que diz qual é."""
+    import shutil
+
+    wb = Workbook()
+    wb.active.append(["visível"])
+    wb.create_sheet("Oculta").append(["SEGREDO"])
+    wb["Oculta"].sheet_state = "hidden"
+    xlsx = tmp_path / "oculta.xlsb"  # um .xlsx com o nome do binário
+    wb.save(xlsx)
+
+    r = lince.ler(xlsx)
+
+    assert "SEGREDO" not in r.markdown
+    assert r.metadados["texto_oculto_removido"][0]["texto"] == "aba Oculta: SEGREDO"
+    xlsb = tmp_path / "binario.xlsx"  # e o binário com o nome do .xlsx
+    shutil.copy(REAIS / "testEXCEL.xlsb", xlsb)
+
+    assert lince.ler(xlsb).markdown == lince.ler(REAIS / "testEXCEL.xlsb").markdown
