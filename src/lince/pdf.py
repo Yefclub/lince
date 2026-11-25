@@ -31,6 +31,7 @@ from .limites import escala
 from .pdf_colunas import confundidas as colunas_confundidas
 from .pdf_colunas import fundidas as colunas_fundidas
 from .pdf_colunas import refazer as refazer_colunas
+from .pdf_colunas import refazer_em_colunas
 from .pdf_figuras import agrupar_figuras, faixa_ilustrada, paineis_panorama, papel_retangulo
 from .pdf_formulario import abrir_pdf, campos_visiveis, com_rotulos
 from .pdf_formulas import localizar_formulas
@@ -1116,11 +1117,19 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     if not (eh_ocr or rotacao or ocultos or campos) and all(tipo == c.FPDF_PAGEOBJ_TEXT for tipo, _ in objs):
         md = _duas_colunas(md, itens_pg, W)
     md, marcas_dagua = _sem_marca_dagua(md, itens_pg)
-    if not (eh_ocr or rotacao or campos) and (
-        colunas_confundidas(limpar_tabelas(md)[1]) or colunas_fundidas(md, itens_pg, W)
-    ):
-        if refeito := refazer_colunas(md, itens_pg, W, _tique):
-            md = refeito
+    if not (eh_ocr or rotacao or campos):
+        filetes_verticais = [
+            bx for tipo, bx in objs if tipo == c.FPDF_PAGEOBJ_PATH and bx[2] - bx[0] <= 2.5 < bx[3] - bx[1]
+        ]
+        fundidas = colunas_fundidas(md, itens_pg, W, filetes_verticais)
+        if fundidas or colunas_confundidas(limpar_tabelas(md)[1]):
+            # o corte XY (mais de duas colunas) com a prova de linhas de colunas emendadas no texto, ou com a "tabela"
+            # de prosa numa página sem traço vertical: com grade, a tabela de prosa é tabela de verdade
+            refeito = refazer_colunas(md, itens_pg, W, _tique)
+            if refeito is None and (fundidas or not filetes_verticais):
+                refeito = refazer_em_colunas(md, itens_pg, W, _tique)
+            if refeito:
+                md = refeito
     md = _bordas_soltas(md, itens_pg, H)
     dens = densidade_matematica(md)
     nativo = desifenizar(md)
@@ -1243,6 +1252,8 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     for g, desenho, figura_identificada in figuras:
         _tique()
         if any(_sobrepoe(g, rr) > 0.5 for tp, rr in regioes if tp == "imagem"):
+            continue
+        if not figura_identificada and parte_de_tabela(g, [rr for tp, rr in regioes if tp == "tabela"]):
             continue
         # Desenho sobre uma tabela duvidosa: conserva os rótulos como texto e deixa o desenho para a IA.
         for tp, rr in list(regioes):
@@ -1556,7 +1567,12 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                 if tipo == "formula":
                     ancora, indice_formula = formula_de[id(cx)]
                 acima = [x for x in itens if x.y >= t and not (l <= x.x <= r and b <= x.y <= t)]
-                linha_acima = min(acima, key=lambda x: x.y).text.strip()[:25] if acima else ""
+                # a linha acima na coluna da figura: a mais próxima da página inteira pode ser da coluna ao lado
+                acima = [x for x in acima if x.x < r and x.x + x.width > l and x.text.strip()] or acima
+                acima.sort(key=lambda x: x.y)
+                linha_acima = acima[0].text.strip()[:ANCORA_MAX] if acima else ""
+                # e a linha antes dela: a frase que fecha o parágrafo acima da figura pode se repetir na página
+                anterior = next((x.text.strip() for x in acima if x.y > acima[0].y + acima[0].height / 2), "")
                 tarefas.append(
                     {
                         "id": tid,
@@ -1570,6 +1586,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                     {
                         "tarefa": tid,
                         "depois_de": linha_acima,
+                        **({"linha_antes": anterior[-ANCORA_MAX:]} if anterior else {}),
                         "texto_dentro": ancora,
                         **({"desenho": True} if tipo == "desenho" else {}),
                         **(
@@ -1607,6 +1624,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     return info, (fator, recortar, bool(campos_visuais))
 
 
+ANCORA_MAX = 80  # caracteres da linha acima da figura que a montagem procura para pôr a figura depois dela
 TEXTO_FORA_MAX = 20_000  # caracteres do texto fora de um desenho guardados para a conferência dos rótulos
 
 
@@ -1617,6 +1635,12 @@ def _texto_fora(itens, dentro):
     ids = {id(x) for x in dentro}
     fora = " ".join(x.text for x in itens if id(x) not in ids)
     return fora if len(fora) <= TEXTO_FORA_MAX else None
+
+
+def parte_de_tabela(desenho, tabelas) -> bool:
+    """O sombreado de colunas, uma parte de uma tabela maior, já vai na leitura dela. O desenho do tamanho da "tabela"
+    é o gráfico cujos rótulos o extrator alinhou: fica, e a tabela duvidosa é que sai."""
+    return any(_sobrepoe(desenho, t) >= 0.9 and _sobrepoe(t, desenho) <= 0.5 for t in tabelas)
 
 
 def _sobrepoe(a, b):

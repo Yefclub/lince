@@ -11,12 +11,15 @@ import re
 from collections import Counter
 
 PALAVRAS_DE_PROSA = 5  # célula com isto ou mais de palavras é linha de parágrafo, não valor de tabela
+PALAVRAS_DE_LINHA_FUNDIDA = 4  # a linha da coluna lateral estreita tem umas quatro palavras ("aumentou em 1.316 mil
+# pessoas"); a emenda das duas linhas, ao menos duas vezes no texto do extrator, é que prova a fusão
 LINHAS_DE_PROSA_MIN = 3  # linhas da "tabela" com prosa nos dois lados para ela ser duas colunas de texto
 ITENS_POR_LADO_MIN = 6
 ITENS_MAX = 1500  # a remontagem compara cada item com as linhas de largura total
 TITULO_PRINCIPAL = 1.5  # o título com este tanto do corpo do texto é o da página (#); abaixo disso, de seção (##)
 _ITEM_DE_LISTA = re.compile(r"(\d{1,3}(\.\d{1,3}){0,3}[.)]|[a-z][.)]|[-•–▪◦])\s")  # "3.2.", "a)", "•": item novo
 CALHA_MIN = 5  # pontos: espaço em branco entre as colunas
+CALHA_LIMITE = 0.2  # fração da largura: a calha fica entre isso e 1 - isso (a coluna lateral tem uns 25% da página)
 
 
 def _prosa(texto) -> int:
@@ -33,11 +36,15 @@ def confundidas(tabelas) -> bool:
     return n >= LINHAS_DE_PROSA_MIN
 
 
-def fundidas(md, itens, W) -> bool:
+def fundidas(md, itens, W, filetes=()) -> bool:
     """O extrator emendou linhas das duas colunas: o texto traz, em sequência, uma linha de parágrafo da coluna da
     esquerda e a linha da direita que está na mesma altura, ao menos duas vezes."""
     itens = [x for x in itens if x.text.strip() and not x.text.startswith("[Image:") and not x.rotation and x.width > 0]
-    if not 2 * ITENS_POR_LADO_MIN <= len(itens) <= ITENS_MAX or (calha := _calha(itens, W)) is None:
+    if not 2 * ITENS_POR_LADO_MIN <= len(itens) <= ITENS_MAX:
+        return False
+    if _vizinhas_fundidas(md, itens, filetes):
+        return True
+    if (calha := _calha(itens, W)) is None:
         return False
     a, b = calha
     plano = " ".join(" ".join(ln for ln in md.splitlines() if not ln.lstrip().startswith("|")).split())
@@ -49,8 +56,10 @@ def fundidas(md, itens, W) -> bool:
     for x in itens:
         if x.x >= b - 1:
             par = next((esquerda[y] for y in (round(x.y), round(x.y) - 1, round(x.y) + 1) if y in esquerda), None)
-            if par is None or min(_prosa(par.text), _prosa(x.text)) < PALAVRAS_DE_PROSA:
+            if par is None or min(_prosa(par.text), _prosa(x.text)) < PALAVRAS_DE_LINHA_FUNDIDA:
                 continue  # dois valores curtos na mesma altura são células de uma tabela, não linhas de parágrafo
+            if _entre_celulas(par, x, filetes):
+                continue
             if f"{' '.join(par.text.split())} {' '.join(x.text.split())}" in plano:
                 n += 1
                 if n >= 2:
@@ -58,14 +67,48 @@ def fundidas(md, itens, W) -> bool:
     return False
 
 
+def _normal(texto):
+    return " ".join(re.findall(r"\w+", texto.lower()))
+
+
+def _entre_celulas(p, q, filetes) -> bool:
+    """Um traço vertical entre os dois itens, na altura deles: são células de uma tabela com grade, não colunas."""
+    meio_y = p.y + p.height / 2
+    return any(p.x + p.width <= f[0] and f[2] <= q.x and f[1] <= meio_y <= f[3] for f in filetes)
+
+
+def _vizinhas_fundidas(md, itens, filetes=()) -> bool:
+    """O extrator emendou, na mesma linha do texto, linhas de parágrafo de duas colunas vizinhas quaisquer (a faixa de
+    avisos lado a lado, com quatro colunas): ao menos duas vezes, a linha de uma coluna seguida da linha da coluna ao
+    lado, na mesma altura e separadas por uma calha. Comparado sem a marcação (o negrito do começo do aviso). Duas
+    células de uma tabela com grade, separadas por um traço vertical (`filetes`), não contam."""
+    plano = _normal(" ".join(ln for ln in md.splitlines() if not ln.lstrip().startswith("|")))  # a tabela é do extrator
+    n = 0
+    for ln in _linhas(itens):
+        for p, q in zip(ln["itens"], ln["itens"][1:], strict=False):
+            if q.x - (p.x + p.width) < 2 * CALHA_MIN:
+                continue
+            if min(_prosa(p.text), _prosa(q.text)) < PALAVRAS_DE_LINHA_FUNDIDA:
+                continue
+            if _entre_celulas(p, q, filetes):
+                continue
+            if f"{_normal(p.text)} {_normal(q.text)}" in plano:
+                n += 1
+                if n >= 2:
+                    return True
+    return False
+
+
 def _calha(itens, W):
-    """A faixa vertical em branco no meio da página, entre as duas colunas: (esquerda, direita) ou None. Procura o
-    intervalo sem nenhum item estreito (os de largura total, que atravessam o meio, não contam)."""
-    estreitos = [x for x in itens if x.width < 0.55 * W]
+    """A faixa vertical em branco entre as duas colunas: (esquerda, direita) ou None. Procura o intervalo sem nenhum
+    item estreito de texto (os de largura total, que atravessam o meio, não contam; nem os números e os rótulos girados
+    de um gráfico, que podem encostar na calha). A calha pode estar fora do meio: a coluna lateral estreita, ao lado
+    do corpo, também é coluna."""
+    estreitos = [x for x in itens if x.width < 0.55 * W and not x.rotation and _prosa(x.text) >= 2]
     bordas = sorted((x.x, x.x + x.width) for x in estreitos)
     melhor, fim = None, None
     for l, r in bordas:
-        if fim is not None and l - fim >= CALHA_MIN and 0.3 * W <= (fim + l) / 2 <= 0.7 * W:
+        if fim is not None and l - fim >= CALHA_MIN and CALHA_LIMITE * W <= (fim + l) / 2 <= (1 - CALHA_LIMITE) * W:
             if melhor is None or l - fim > melhor[1] - melhor[0]:
                 melhor = (fim, l)
         fim = r if fim is None else max(fim, r)
@@ -202,7 +245,8 @@ def refazer(md, itens, W, tique):
     """Markdown da página na ordem de leitura das duas colunas, ou None se a geometria não confirma duas colunas de
     texto (aí a saída do extrator fica como está). Nada some: se alguma letra do texto do extrator não estiver na
     página remontada (texto girado na margem, item sem largura, o endereço de um link), a remontagem é recusada."""
-    itens = [x for x in itens if x.text.strip() and not x.text.startswith("[Image:") and not x.rotation and x.width > 0]
+    # o item girado (o rótulo do eixo de um gráfico) entra pela posição, como os outros: fora, faltaria na remontagem
+    itens = [x for x in itens if x.text.strip() and not x.text.startswith("[Image:") and x.width > 0]
     if not 2 * ITENS_POR_LADO_MIN <= len(itens) <= ITENS_MAX or any(x.render_mode != 0 for x in itens):
         return None
     if (calha := _calha(itens, W)) is None:
@@ -272,3 +316,136 @@ def _intercalar(itens, inteiros, a, b, corpo, tique):
             teto = min(x.y for x in grupo)
     # todo item entra uma vez: se a conta não fecha, a geometria enganou e a saída do extrator fica como está
     return "\n\n".join(out) if usados == len(itens) else None
+
+
+XY_PROFUNDIDADE = 8  # cortes um dentro do outro: faixas da página, colunas da faixa, faixas da coluna
+ALINHADAS_DE_TABELA = 0.7  # fração das linhas de cada coluna na altura de uma linha da vizinha numa tabela
+FAIXA_VAO = 1.5  # corpos de letra: espaço entre duas linhas que separa duas faixas da página
+
+
+def _vaos(intervalos, minimo):
+    """Os espaços em branco entre os intervalos (esquerda, direita) juntos, com ao menos `minimo` de largura."""
+    vaos, fim = [], None
+    for l, r in sorted(intervalos):
+        if fim is not None and l - fim >= minimo:
+            vaos.append((fim, l))
+        fim = r if fim is None else max(fim, r)
+    return vaos
+
+
+def _em_colunas(itens, corpo, tique, prof, cortes_aceitos):
+    """Os blocos de um trecho da página na ordem de leitura, por cortes recursivos (o corte XY): as calhas do trecho
+    são os vãos verticais entre os itens estreitos de texto; o que atravessa uma calha é bloco de largura total e,
+    entre dois deles, lê-se cada coluna inteira, da esquerda para a direita, com o mesmo corte dentro dela. A coluna
+    só é aceita se for texto corrido; senão (células de tabela, rótulos) o trecho fica na ordem das linhas."""
+    tique()
+    l0, r0 = min(x.x for x in itens), max(x.x + x.width for x in itens)
+    estreitos = [x for x in itens if x.width < 0.55 * (r0 - l0) and not x.rotation and _prosa(x.text) >= 2]
+    if prof >= XY_PROFUNDIDADE:
+        return blocos_de_texto(itens, corpo)
+    vaos = _vaos([(x.x, x.x + x.width) for x in estreitos], CALHA_MIN)
+    if not vaos:  # só uma coluna de texto: a outra pode ser só de números (os rótulos de um gráfico ao lado)
+        largos = [x for x in itens if x.width < 0.55 * (r0 - l0) and not x.rotation]
+        vaos = _vaos([(x.x, x.x + x.width) for x in largos], CALHA_MIN)
+    # as faixas separadas por um espaço maior que uma linha (a faixa de avisos embaixo do mapa); o corte é o do vão
+    # maior, como no corte XY clássico: a faixa larga corta antes da calha estreita que só existe numa parte dela
+    linhas = _linhas(itens)
+    entre = [(anterior["b"] - ln["t"], k) for k, (anterior, ln) in enumerate(zip(linhas, linhas[1:], strict=False), 1)]
+    horizontais = [k for vao, k in entre if vao > FAIXA_VAO * corpo]
+    maior_h = max((vao for vao, _ in entre), default=0)
+    if horizontais and (not vaos or maior_h > max(b - a for a, b in vaos)):
+        faixas = [
+            [x for ln in linhas[a:b] for x in ln["itens"]]
+            for a, b in zip([0, *horizontais], [*horizontais, len(linhas)], strict=True)
+        ]
+        return [bloco for faixa in faixas for bloco in _em_colunas(faixa, corpo, tique, prof + 1, cortes_aceitos)]
+    if not vaos:
+        return blocos_de_texto(itens, corpo)
+    cheios = [x for x in itens if any(x.x < a - 1 and x.x + x.width > b + 1 for a, b in vaos)]
+    for x in itens:  # o item na altura de uma linha que atravessa a calha é dessa linha
+        meio_y = x.y + x.height / 2
+        if x not in cheios and any(v.y - 0.2 * v.height <= meio_y <= v.y + v.height for v in cheios):
+            cheios.append(x)
+    ids = {id(x) for x in cheios}
+    resto = [x for x in itens if id(x) not in ids]
+    cortes = [(a + b) / 2 for a, b in vaos]
+    colunas_por_faixa, grupos = [], []
+    for x in sorted(cheios, key=lambda x: -x.y):
+        if grupos and not any(x.y + x.height <= v.y + v.height / 2 <= grupos[-1][-1].y for v in resto):
+            grupos[-1].append(x)
+        else:
+            grupos.append([x])
+    teto = float("inf")
+    for grupo in [*grupos, None]:
+        piso = max(x.y + x.height for x in grupo) if grupo else float("-inf")
+        faixa = [x for x in resto if piso <= x.y + x.height / 2 < teto]
+        colunas = [[] for _ in range(len(cortes) + 1)]
+        for x in faixa:
+            colunas[sum(x.x + x.width / 2 >= c for c in cortes)].append(x)
+        colunas = [c for c in colunas if c]
+        colunas_por_faixa.append((colunas, grupo))
+        if grupo:
+            teto = min(x.y for x in grupo)
+    # cada coluna é texto corrido, e duas vizinhas não começam os blocos na mesma altura (as linhas de uma tabela de
+    # texto, "Risco | Mitigação", que ler coluna por coluna separaria do par)
+    if not all(
+        len(colunas) < 2
+        or (
+            all(_corrido(_linhas(c)) or _linhas_de_prosa(c) <= 3 for c in colunas)
+            and not any(_tabela_entre(e, d, corpo) for e, d in zip(colunas, colunas[1:], strict=False))
+        )
+        for colunas, _ in colunas_por_faixa
+    ):
+        return blocos_de_texto(itens, corpo)
+    out = []
+    for colunas, grupo in colunas_por_faixa:
+        if len(colunas) > 1:
+            cortes_aceitos.append(prof)
+        for c in colunas:
+            out += (
+                _em_colunas(c, corpo, tique, prof + 1, cortes_aceitos)
+                if len(colunas) > 1
+                else blocos_de_texto(c, corpo)
+            )
+        if grupo:
+            out += blocos_de_texto(grupo, corpo)
+    return out
+
+
+def _tabela_entre(esquerda, direita, corpo) -> bool:
+    """Duas colunas vizinhas que são colunas de uma tabela: os blocos de prosa começam na mesma altura dos dois lados
+    ("Risco | Mitigação"), ou uma delas não é prosa (valores) e as linhas dela estão na altura das linhas da outra. A
+    coluna de números fora do alinhamento é o eixo de um gráfico ao lado do texto, e se separa."""
+    a, b = _linhas(esquerda), _linhas(direita)
+    if _linhas_de_tabela(a, b, corpo):
+        return True
+    if all(2 * _linhas_de_prosa(c) >= len(ln) for c, ln in ((esquerda, a), (direita, b))):
+        return False
+    # as linhas de cada lado na altura de uma linha do outro (as duas contas: rótulos densos de um gráfico encostam
+    # em quase toda linha de uma caixa de texto ao lado, mas a maioria deles fica sem par)
+    return all(
+        sum(any(abs(ln["t"] - v["t"]) <= 2 for v in outro) for ln in uma) >= ALINHADAS_DE_TABELA * len(uma)
+        for uma, outro in ((a, b), (b, a))
+    )
+
+
+def _linhas_de_prosa(itens) -> int:
+    """Linhas com prosa (três palavras ou mais): a coluna com tão poucas não dá para julgar se é texto corrido."""
+    return sum(_prosa(_texto(ln["itens"])) >= 3 for ln in _linhas(itens))
+
+
+def refazer_em_colunas(md, itens, W, tique):
+    """O mesmo que `refazer`, para mais de duas colunas (a faixa de avisos lado a lado, a coluna lateral com caixas
+    ao lado do corpo): o corte XY recursivo. Nada some: se alguma letra do extrator faltar, None."""
+    itens = [x for x in itens if x.text.strip() and not x.text.startswith("[Image:") and x.width > 0]
+    if not 2 * ITENS_POR_LADO_MIN <= len(itens) <= ITENS_MAX or any(x.render_mode != 0 for x in itens):
+        return None
+    pesos = Counter()
+    for x in itens:
+        pesos[round(x.font_size * 2) / 2] += len(x.text)
+    cortes_aceitos = []
+    novo = "\n\n".join(_em_colunas(itens, pesos.most_common(1)[0][0], tique, 0, cortes_aceitos))
+    # sem nenhuma coluna aceita, não há ordem a corrigir: a saída do extrator fica (com as tabelas que ele achou)
+    if not cortes_aceitos or _letras(md) - _letras(novo):
+        return None
+    return novo
