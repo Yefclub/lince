@@ -209,22 +209,22 @@ def test_formula_cuja_caixa_leva_texto_vizinho_nao_vira_recorte(tmp_path, monkey
 
 def test_leitura_que_move_a_virgula_nao_substitui_a_tabela_nativa(tmp_path, monkeypatch):
     """ "1,5" e "15" têm os mesmos algarismos e são valores diferentes: a leitura que perdeu a vírgula não troca a
-    tabela nativa, que tem o número certo. O separador de milhar, esse sim, pode mudar."""
+    tabela nativa, que tem o número certo. O separador de milhar, esse sim, pode mudar ("12.345" e "12345")."""
     p = tmp_path / "contas.pdf"
-    md = _contas(p).replace("150", "1,5").replace("320", "1 234,5")
+    md = _contas(p).replace("150", "1,5").replace("320", "1 234,5").replace("210", "12.345")
     _extracao(monkeypatch, lambda i: md)
     leitor = lince.Leitor()
     plano = leitor.preparar(p)
     (t,) = plano.tarefas
     cabecalho = "| Período | 2022 | 2023 | 2024 |\n| --- | --- | --- | --- |\n"
     resto = "| Despesa | 211 | 222 | 243 |\n| Saldo | 61 | 12 | 77 |"
-    certa = cabecalho + "| Receita | 1,5 | 210 | 1.234,5 |\n" + resto
-    sem_virgula = cabecalho + "| Receita | 15 | 210 | 1.234,5 |\n" + resto
+    certa = cabecalho + "| Receita | 1,5 | 12345 | 1.234,5 |\n" + resto  # o milhar pode vir sem separador
+    sem_virgula = cabecalho + "| Receita | 15 | 12345 | 1.234,5 |\n" + resto
 
     boa = leitor.concluir(plano, {t.id: certa})
     ruim = leitor.concluir(plano, {t.id: sem_virgula})
 
-    assert boa.cobertura.pendentes == [] and "| Receita | 1,5 | 210 | 1.234,5 |" in boa.markdown
+    assert boa.cobertura.pendentes == [] and "| Receita | 1,5 | 12345 | 1.234,5 |" in boa.markdown
     assert ruim.cobertura.pendentes == [f"{t.id}: integralidade da transcrição da tabela não verificada"]
     assert "1,5" in ruim.markdown  # o valor do arquivo continua no texto
 

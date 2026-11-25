@@ -306,7 +306,9 @@ _NUMERO = re.compile(r"\d[\d.,\u00a0\u2009\u202f]*\d|\d")
 
 def _numero_canonico(n):
     """(algarismos, casas decimais) de um número escrito: "1.234,5", "1 234,5" e "1234.5" dão ("12345", 1). O último
-    separador seguido de três algarismos é de milhar; outro é a vírgula decimal. "1,5" e "15" são números diferentes."""
+    separador seguido de três algarismos é de milhar; outro é a vírgula decimal. "1,5" e "15" são números diferentes.
+    Ambiguidade aceita: "2,345" com três casas decimais é lido como milhar e casa com "2345"; separar os dois exigiria
+    saber o idioma de cada célula."""
     n = re.sub(r"[\s\u00a0\u2009\u202f]", "", n)
     if (m := re.search(r"[.,](\d+)$", n)) and len(m.group(1)) != 3:
         return re.sub(r"\D", "", n), len(m.group(1))
