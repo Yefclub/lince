@@ -28,11 +28,15 @@ from ._prazo import LIMITE, prazo_restante
 from ._trava import PDFIUM
 from .conferencia_visual import potencias
 from .limites import escala
+from .pdf_colunas import confundidas as colunas_confundidas
+from .pdf_colunas import fundidas as colunas_fundidas
+from .pdf_colunas import refazer as refazer_colunas
 from .pdf_figuras import agrupar_figuras, faixa_ilustrada, paineis_panorama, papel_retangulo
-from .pdf_formulario import abrir_pdf, campos_visiveis
+from .pdf_formulario import abrir_pdf, campos_visiveis, com_rotulos
 from .pdf_formulas import localizar_formulas
+from .pdf_grade import aplicar as aplicar_grades
 from .pdf_recortes import interseccao, janela_retangular, renderizar_regiao, validar_regiao
-from .pdf_tabelas import conferir_tabelas
+from .pdf_tabelas import caixa_do_bloco_principal, conferir_tabelas
 from .pdf_tabelas_layout import conferir_blocos, texto_de_rotulos
 from .seguranca import NAO_CONFERIDO, texto_oculto_pdf
 from .texto import densidade_matematica, desifenizar, limpar_tabelas, lixo
@@ -126,8 +130,8 @@ def texto_pdfium(page):
     return tp.get_text_bounded()
 
 
-def regioes_vetoriais(objs, W, H, itens=(), papeis=None, fundo=None):
-    return agrupar_figuras(objs, W, H, itens, papeis or {}, _tique, fundo)
+def regioes_vetoriais(objs, W, H, itens=(), papeis=None, fundo=None, grades=()):
+    return agrupar_figuras(objs, W, H, itens, papeis or {}, _tique, fundo, grades)
 
 
 def planejar_pdf(path, pasta):
@@ -1005,6 +1009,64 @@ def _duas_colunas(md, itens, largura):
     return "\n\n".join(saida)
 
 
+MARCA_DAGUA_CORPO_MIN = 24  # pontos: texto inclinado deste tamanho para cima atravessa a página, não é rótulo de eixo
+BORDA = 0.1  # fração da altura da página, em cima e embaixo, em que ficam o cabeçalho e o rodapé corridos
+
+
+def _sem_marca_dagua(md, itens):
+    """Tira do texto a marca d'água (texto grande em diagonal, como "MINUTA" ou "CONFIDENCIAL") e a devolve para os
+    metadados: o extrator a entrega como um título no meio do corpo. Só sai o bloco que é exatamente a marca."""
+    marcas = []
+    for x in itens:
+        texto = x.text.strip()
+        if not (x.rotation and 15 <= abs(x.rotation) % 90 <= 75 and x.font_size >= MARCA_DAGUA_CORPO_MIN):
+            continue
+        if not 0 < len(texto) <= 40:
+            continue
+        blocos = md.split("\n\n")
+        iguais = [k for k, b in enumerate(blocos) if re.sub(r"^#{1,6}[ \t]+|\*\*", "", b.strip()) == texto]
+        if len(iguais) == 1:
+            del blocos[iguais[0]]
+            md = "\n\n".join(blocos)
+            marcas.append(texto)
+    return md, marcas
+
+
+def _bordas_soltas(md, itens, H):
+    """Separa do parágrafo a linha de cabeçalho ou rodapé que o extrator colou nele ("…pro rata die. Empresa · Página
+    1 de 3"): a linha mais alta e a mais baixa da página, quando estão na faixa da borda, viram blocos próprios, e a
+    conferência de cabeçalho corrido entre as páginas decide depois se saem do corpo."""
+    textos = [x for x in itens if x.text.strip() and not x.text.startswith("[Image:") and not x.rotation]
+    if len(textos) < 4:
+        return md
+    for extremo, na_borda in ((min, lambda y: y < BORDA * H), (max, lambda y: y > (1 - BORDA) * H)):
+        y = extremo(x.y for x in textos)
+        if not na_borda(y):
+            continue
+        linha = sorted((x for x in textos if abs(x.y - y) <= 2), key=lambda x: x.x)
+        # o cabeçalho e o rodapé ficam afastados do corpo; a última linha de um texto de espaçamento regular é corpo
+        outras = [abs(x.y - y) for x in textos if abs(x.y - y) > 2]
+        if not outras or min(outras) < 2.5 * max(x.height for x in linha):
+            continue
+        s = " ".join(" ".join(x.text.split()) for x in linha)
+        if not 4 <= len(s) <= 80:
+            continue
+        blocos = md.split("\n\n")
+        if any(re.sub(r"^#{1,6}[ \t]+|\*\*", "", b.strip()) == s for b in blocos):
+            continue  # a linha da borda já é um bloco próprio (o título da página, por exemplo)
+        for k, b in enumerate(blocos):
+            if b.lstrip().startswith(("|", "#", "{{")):
+                continue
+            if b.rstrip().endswith((" " + s, "\n" + s)) and b.count(s) == 1:
+                blocos[k : k + 1] = [b.rstrip()[: -len(s)].rstrip(), s]
+                break
+            if b.startswith((s + " ", s + "\n")) and b.count(s) == 1:
+                blocos[k : k + 1] = [s, b[len(s) :].lstrip()]
+                break
+        md = "\n\n".join(blocos)
+    return md
+
+
 def _texto_das_celulas(doc, i, caixas):
     # O item do extrator às vezes abrange vários meses. Lê os caracteres entre os filetes do cabeçalho.
     with PDFIUM:
@@ -1046,17 +1108,28 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     origem_texto = "pdf-inspector"
     if eh_ocr and len(alt.strip()) > 200 and lixo(alt) < 0.02:
         md, origem_texto = alt, "pdfium"  # p.ex. a p.4 do manual da Falcon
-    campos, campos_visuais, erro_campos = col["formulario"]
+    campos, campos_visuais, erro_campos, posicoes_campos = col["formulario"]
+    if campos and not rotacao:
+        campos = com_rotulos(campos, posicoes_campos, itens_pg, W)
     if erro_campos:
         pendentes.append(f"página {i + 1}: {erro_campos}")
     if not (eh_ocr or rotacao or ocultos or campos) and all(tipo == c.FPDF_PAGEOBJ_TEXT for tipo, _ in objs):
         md = _duas_colunas(md, itens_pg, W)
+    md, marcas_dagua = _sem_marca_dagua(md, itens_pg)
+    if not (eh_ocr or rotacao or campos) and (
+        colunas_confundidas(limpar_tabelas(md)[1]) or colunas_fundidas(md, itens_pg, W)
+    ):
+        if refeito := refazer_colunas(md, itens_pg, W, _tique):
+            md = refeito
+    md = _bordas_soltas(md, itens_pg, H)
     dens = densidade_matematica(md)
     nativo = desifenizar(md)
     md, tabelas = limpar_tabelas(nativo)
+    caixas_de_grade = []
     if tabelas and not (rotacao or sobrou or eh_ocr):
         tracos = [bx for tipo, bx in objs if tipo == c.FPDF_PAGEOBJ_PATH]
         filetes = [bx for bx in tracos if bx[2] - bx[0] <= 2 < bx[3] - bx[1]]
+        caixas_de_grade = aplicar_grades(tabelas, tracos, itens_pg, _tique)
         if not ocultos:
             marcas = [bx for tipo, bx in objs if tipo in (c.FPDF_PAGEOBJ_PATH, c.FPDF_PAGEOBJ_IMAGE)]
             md = conferir_tabelas(md, tabelas, itens_pg, filetes, _tique, marcas)
@@ -1145,14 +1218,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
             and set(re.findall(r"\w+", x.text.lower()))
             and set(re.findall(r"\w+", x.text.lower())) <= tb["palavras"]
         ]
-        if len(dentro) >= 4:
-            ys = sorted(x.y for x in dentro)
-            lo, hi = ys[len(ys) // 20], ys[-1 - len(ys) // 20]
-            if itens_conferidos:
-                # A outra tabela posicionada já foi excluída da busca: preservar a primeira e a última linha.
-                lo, hi = ys[0], ys[-1]
-            caixa = [min(x.x for x in dentro) - 4, lo - 6, W - 30, hi + 14]
-            caixa[0] = max(20, min(caixa[0], 60))
+        if len(dentro) >= 4 and (caixa := caixa_do_bloco_principal(dentro)):
             tabela_de[id(caixa)] = k
             regioes.append(("tabela", caixa))
     papeis = col.get("papeis", {})
@@ -1164,7 +1230,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
         objetos_figuras = (
             [(tp, caminhos_visiveis.get(k, g)) for k, (tp, g) in enumerate(objs)] if caminhos_visiveis else objs
         )
-        figuras = regioes_vetoriais(objetos_figuras, W, H, itens_pg, papeis, col["fundo"])
+        figuras = regioes_vetoriais(objetos_figuras, W, H, itens_pg, papeis, col["fundo"], caixas_de_grade)
         if faixa := faixa_ilustrada(objs, W, H, itens_pg, papeis, imagens):
             base, corpo = faixa
             if len(figuras) == 1 and _sobrepoe(corpo, figuras[0][0]) >= 0.9:
@@ -1245,6 +1311,11 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                     continue
                 l, b = min(x.x for x in dentro), min(x.y for x in dentro)
                 r, t = max(x.x + x.width for x in dentro), max(x.y + x.height for x in dentro)
+                # Os pedaços achados podem estar espalhados (um título de outra coluna entrou no bloco): a caixa
+                # que os une leva o texto vizinho, cortado. Sem uma caixa só da fórmula, o texto nativo fica.
+                na_caixa = [x for x in itens_txt if l <= x.x + x.width / 2 <= r and b <= x.y + x.height / 2 <= t]
+                if len(dentro) < 0.7 * len(na_caixa):
+                    continue
             margem_formula = 2 if limites else 8
             caixa = [
                 max(0, l - margem_formula),
@@ -1269,6 +1340,19 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
         desenhos_legiveis = [
             g for tipo, g in regioes if tipo == "desenho" and (max(g[2] - g[0], g[3] - g[1]) + 12) * fator <= 1568
         ]
+        # a imagem quase toda dentro de um desenho é lida com ele: o desenho cresce até contê-la inteira
+        maiores = {}
+        for tipo, g in regioes:
+            if tipo == "imagem" and id(g) not in recortes_exatos:
+                for d in desenhos_legiveis:
+                    if 0.9 <= _sobrepoe(g, d) < 1 and id(d) not in recortes_exatos:
+                        d0 = maiores.get(id(d), d)
+                        maior = [min(d0[0], g[0]), min(d0[1], g[1]), max(d0[2], g[2]), max(d0[3], g[3])]
+                        # só cresce se continuar legível na escala do recorte; senão a imagem segue com a tarefa dela
+                        if (max(maior[2] - maior[0], maior[3] - maior[1]) + 12) * fator <= 1568:
+                            maiores[id(d)] = maior
+        regioes = [(tipo, maiores.get(id(g), g) if tipo == "desenho" else g) for tipo, g in regioes]
+        desenhos_legiveis = [maiores.get(id(d), d) for d in desenhos_legiveis]
         regioes = [
             (tipo, g)
             for tipo, g in regioes
@@ -1296,6 +1380,8 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
             info["potencias_visiveis"] = referencias
     if campos:
         info["campos"] = campos
+    if marcas_dagua:
+        info["marca_dagua"] = marcas_dagua
     if rota == "nativa":
         return info, None
     retrato = (H >= W) if rotacao in (0, 180) else (W >= H)  # como é exibida: a de pé ganha o dobro e é dividida
@@ -1486,6 +1572,11 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                         "depois_de": linha_acima,
                         "texto_dentro": ancora,
                         **({"desenho": True} if tipo == "desenho" else {}),
+                        **(
+                            {"texto_fora": fora}
+                            if tipo == "desenho" and (fora := _texto_fora(itens, dentro)) is not None
+                            else {}
+                        ),
                         # A legenda digital sobre uma foto de fundo é texto da página.
                         **(
                             {"preserva_texto": True}
@@ -1514,6 +1605,18 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                 )
 
     return info, (fator, recortar, bool(campos_visuais))
+
+
+TEXTO_FORA_MAX = 20_000  # caracteres do texto fora de um desenho guardados para a conferência dos rótulos
+
+
+def _texto_fora(itens, dentro):
+    """O texto da página que está fora do recorte de um desenho, para a montagem não tirar do corpo um bloco que pode
+    ser de fora dele ("" quando a página só tem o desenho). None quando não cabe no teto: sem a lista inteira, a
+    montagem não tira nada."""
+    ids = {id(x) for x in dentro}
+    fora = " ".join(x.text for x in itens if id(x) not in ids)
+    return fora if len(fora) <= TEXTO_FORA_MAX else None
 
 
 def _sobrepoe(a, b):

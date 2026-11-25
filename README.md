@@ -31,7 +31,9 @@ r.estrutura         # páginas, slides, abas (e quais são ocultas), seções co
 | Fluxograma de formas no PPTX | Mermaid com as setas e os rótulos (Sim/Não), sem IA |
 | Imagem, gráfico vetorial, diagrama | Recorte lido pela IA, com o texto nativo do trecho como âncora |
 | Títulos e legendas que são imagem | Agrupados numa folha numerada: uma chamada lê vários |
+| Tabela com grade desenhada no PDF | Células pelas linhas da própria tabela (mescladas em HTML), sem IA |
 | Tabela nativa com estrutura duvidosa | Recorte da tabela lido pela IA, com os valores nativos como âncora |
+| Campo de formulário (AcroForm) | Valor do campo com o rótulo impresso ao lado dele, sem IA |
 | Fórmula escrita como texto no PDF | Recorte do bloco de fórmulas → LaTeX |
 | Página escaneada ou com texto corrompido | Página lida pela IA (dividida em duas quando densa) |
 | GIF e WebP animados | Quadros em ordem, com origem nas tarefas e limites de extração. JPEG respeita a orientação EXIF antes dos recortes. |

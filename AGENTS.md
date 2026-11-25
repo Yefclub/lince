@@ -12,6 +12,7 @@ precisa. Biblioteca Python (`src/lince/`) e API HTTP (`lince.servidor`), empacot
 | --- | --- |
 | Orquestração, esforço máximo, pendências | `src/lince/leitor.py` |
 | Roteamento de PDF por página e por região | `src/lince/pdf.py` |
+| Tabela pela grade desenhada e ordem de leitura em duas colunas | `src/lince/pdf_grade.py`, `src/lince/pdf_colunas.py` |
 | Office, ODF, gráficos nativos, fluxogramas | `src/lince/office.py` |
 | Folha numerada de recortes (set-of-marks) | `src/lince/agrupamento.py` |
 | Montagem do Markdown e metadados | `src/lince/montagem.py`, `src/lince/metadados.py` |

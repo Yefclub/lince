@@ -10,11 +10,12 @@
 
 [[excecao]]
 pacote = "pypdfium2"
-versao = "5.14.0"
+versao = "5.15.2"
 licenca = "BSD-3-Clause OR Apache-2.0"
 motivo = "o metadado não traz expressão SPDX limpa"
 evidencia = """LICENSES/ do pacote; o binário do PDFium traz os textos de terceiros (FreeType FTL, libjpeg-turbo, \
-OpenJPEG, libpng, zlib, lcms, ICU, abseil...), todos permissivos"""
+OpenJPEG, libpng, libtiff, zlib, lcms, ICU, HarfBuzz, abseil...), todos permissivos; a 5.15.2 (pedida pelo pdfplumber) \
+traz o mesmo conjunto em BUILD_LICENSES/"""
 
 [[excecao]]
 pacote = "resvg_py"
