@@ -142,25 +142,33 @@ def _simbolos(linhas, itens, por_texto, tique):
 _FRAGMENTO = re.compile(r"(?:<sup>[+−–-]?\d+</sup>|\([\w]+\))(?:\s+(?:<sup>[+−–-]?\d+</sup>|\([\w]+\)))*")
 
 
-def _itens_da_tabela(linhas, fragmentos, itens, por_texto):
-    celulas = [c for j, ln in enumerate(linhas) if j != 1 for c in _celulas(ln)]
-    pos = por_texto.get(celulas[0], ())
+def _itens_da_tabela(linhas, fragmentos, itens, por_texto, *, por_linha=False):
+    primeira = _celulas(linhas[0])
+    pos = por_texto.get(primeira[0], ())
     if len(pos) != 1:
         return []
-    texto = re.sub(r"</?su[bp]>", " ", " ".join(celulas + fragmentos))
-    falta = Counter(_tokens(texto))
-    restantes = falta.total()
-    usados = []
-    for x in itens[pos[0] :]:
-        tokens = Counter(_tokens(x.text))
-        if not tokens or any(n > falta[t] for t, n in tokens.items()):
-            break
-        usados.append(x)
-        falta.subtract(tokens)
-        restantes -= tokens.total()
-        if restantes == 0:
-            return usados
-    return []
+    grupos = [" ".join(_celulas(ln)) for j, ln in enumerate(linhas) if j != 1]
+    if por_linha:
+        # O rótulo de abertura precisa ser distinto de uma unidade, ano ou número repetido nos gráficos.
+        if any(primeira[1:]) or len(set(re.findall(r"[^\W\d_]{2,}", primeira[0].casefold()))) < 2:
+            return []
+    else:
+        # Ao reconstruir expoentes, os fragmentos soltos podem pertencer a qualquer linha.
+        grupos = [" ".join(grupos + fragmentos)]
+    i = pos[0]
+    for texto in grupos:
+        falta = Counter(_tokens(re.sub(r"</?su[bp]>", " ", texto)))
+        restantes = falta.total()
+        while restantes:
+            if i == len(itens):
+                return []
+            tokens = Counter(_tokens(itens[i].text))
+            if not tokens or any(n > falta[t] for t, n in tokens.items()):
+                return []
+            falta.subtract(tokens)
+            restantes -= tokens.total()
+            i += 1
+    return itens[pos[0] : i]
 
 
 def _caixa(itens):
@@ -170,6 +178,41 @@ def _caixa(itens):
         max(v.x + v.width for v in itens),
         max(v.y + v.height for v in itens),
     ]
+
+
+def _caixa_do_bloco(usados, itens, marcas):
+    """Só delimita um bloco contínuo, com fim visível. Um cabeçalho reconhecido como tabela
+    separada não basta se as linhas de dados ou a nota continuam logo abaixo dele."""
+    if not usados or any(x.rotation or x.render_mode != 0 for x in usados):
+        return None
+    ordenados = sorted(usados, key=lambda x: x.y)
+    anterior = ordenados[0]
+    topo = anterior.y + anterior.height
+    for x in ordenados[1:]:
+        if x.y - topo > 2 * max(anterior.height, x.height):
+            return None
+        if x.y + x.height > topo:
+            anterior, topo = x, x.y + x.height
+    caixa = _caixa(usados)
+    esquerda, baixo, direita, alto = caixa
+    # A faixa textual pode cortar uma marca gráfica da própria linha, por exemplo um quadrado de cor.
+    # Retém o objeto inteiro. Se ele parece pertencer a outro quadro, a localização fica em aberto.
+    altura_linha = max(x.height for x in usados)
+    alcance = 4 * altura_linha
+    for x0, y0, x1, y1 in marcas:
+        if y1 < baixo - altura_linha or y0 > alto + altura_linha:
+            continue
+        if x0 > direita + alcance or x1 < esquerda - alcance or y0 < baixo - alcance or y1 > alto + alcance:
+            return None
+        caixa[0] = min(caixa[0], x0)
+        caixa[1] = min(caixa[1], y0)
+        caixa[2] = max(caixa[2], x1)
+        caixa[3] = max(caixa[3], y1)
+    for x in itens:
+        folga = baixo - (x.y + x.height)
+        if x.y < baixo and folga <= 2 * ordenados[0].height and x.x < caixa[2] and x.x + x.width > caixa[0]:
+            return None
+    return caixa
 
 
 def _reunir_linhas(itens, primeira):
@@ -250,13 +293,14 @@ def _expoentes_soltos(blocos, k, linhas, itens, por_texto, tb):
         tb["md"] += "\n\n" + "\n\n".join(fragmentos) + "\n\n[Correspondência entre linhas e expoentes a conferir.]"
 
 
-def conferir_tabelas(md, tabelas, itens, filetes, tique):
+def conferir_tabelas(md, tabelas, itens, filetes, tique, marcas=()):
     # A conferência geométrica é opcional, restrita a páginas de tamanho comum (poucos milhares de
     # itens/filetes). O leitor geral e seus limites continuam valendo para plantas e grades enormes.
     if not tabelas or len(itens) > 2048 or len(filetes) > 2048:
         return md
-    if any(x.rotation or x.render_mode != 0 for x in itens) or sum(len(x.text) for x in itens) > 128_000:
+    if sum(len(x.text) for x in itens) > 128_000:
         return md
+    conferir_conteudo = all(not x.rotation and x.render_mode == 0 for x in itens)
     por_texto = defaultdict(list)
     for i, x in enumerate(itens):
         por_texto[x.text.strip()].append(i)
@@ -270,6 +314,14 @@ def conferir_tabelas(md, tabelas, itens, filetes, tique):
             continue
         linhas = tb["md"].splitlines()
         if not linhas or len(linhas) > 256:
+            continue
+        # Localizar a tabela só exige geometria confiável dos seus próprios itens. Uma anotação de link
+        # em outra parte da página pode não ter modo de renderização.
+        if tb["complexa"] and len(marcas) <= 2048:
+            usados = _itens_da_tabela(linhas, [], itens, por_texto, por_linha=True)
+            if caixa := _caixa_do_bloco(usados, itens, marcas):
+                tb["caixa"] = caixa
+        if not conferir_conteudo:
             continue
         _cabecalho(linhas, itens, filetes)
         originais = linhas.copy()
