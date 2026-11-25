@@ -454,9 +454,13 @@ def montar(pasta, respostas, pendentes=None):
             if r.get("repetida") or "substitui_tabela" in r or "substitui_formula" in r:
                 continue
             alvo = -1
-            for k, b in enumerate(limpos):
-                if r["depois_de"] and r["depois_de"] in b:
-                    alvo = k
+            # as duas linhas acima da figura acham o parágrafo certo quando a última se repete na página; a última
+            # sozinha ou o começo dela, quando a linha foi emendada (hífen de fim de linha) e não aparece inteira
+            duas = f"{r['linha_antes']} {r['depois_de']}" if r.get("linha_antes") and r["depois_de"] else ""
+            for trecho in dict.fromkeys((duas, r["depois_de"], r["depois_de"][:25])):
+                if achados := [k for k, b in enumerate(limpos) if trecho and trecho in b]:
+                    alvo = achados[-1]
+                    break
             inserir.setdefault(alvo, []).append(bloco_ia(r["tarefa"], "figura"))
         paginas.append((cab, limpos, inserir))
     moveis = _sem_cabecalho_corrido([(k, pg[1]) for k, pg in enumerate(paginas) if not isinstance(pg, str)])

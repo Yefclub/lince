@@ -273,6 +273,9 @@ def _residuo_sem_tinta(g, molduras, textos, regras, fundo, W, H):
     return all(minimo >= 250 for minimo, _ in trecho.getextrema())
 
 
+FUNDO_AREA_MIN = 0.02  # fração da página: caminho desse tamanho que envolve só texto ou prosa é fundo de layout
+PROSA_DE_MOLDURA_MIN = 8  # linhas de prosa (5 palavras ou mais) dentro de um caminho para ele ser moldura de página
+FUNDOS_DE_TEXTO_MAX = 6  # faixas (de 2 até esse número) atrás de uma linha de texto cada: acima disso, é gráfico
 EIXOS_MAX = 512  # traços finos considerados como eixo ou linha de grade de um gráfico, por página
 
 
@@ -316,6 +319,27 @@ def _com_eixos(grupos, finos, tique, area_de_figura):
     return grupos
 
 
+def _fundo_de_layout(g, indice, objs, textos) -> bool:
+    """A caixa (de canto arredondado, que não é retângulo de quatro lados) atrás de um bloco de texto, ou a moldura
+    que envolve as seções de uma página: fundo de layout, não figura. A caixa de texto não tem desenho nenhum dentro;
+    a moldura tem parágrafos de prosa. O fundo de um gráfico tem os traços dos dados e só os rótulos dele."""
+    linhas = [texto for x, texto in textos if _contem(g, x)]
+    if any(_IDENTIFICADOR.match(texto) for texto in linhas):
+        return False  # "Figura 3." dentro: é o quadro da figura, com as notas dela
+    if len(linhas) >= 3 and not any(
+        k != indice and tipo == c.FPDF_PAGEOBJ_PATH and _contem(g, caixa) and _area(caixa) < _area(g) * 0.9
+        for k, (tipo, caixa) in enumerate(objs)
+    ):
+        return True
+    grade = sum(
+        tipo == c.FPDF_PAGEOBJ_PATH and _contem(g, caixa) and caixa[2] - caixa[0] <= 2.5 < caixa[3] - caixa[1]
+        for tipo, caixa in objs
+    )
+    if grade >= 2:
+        return False  # traços verticais dentro: é a grade de uma tabela, com prosa nas células
+    return sum(len(re.findall(r"[^\W\d_]{2,}", texto)) >= 5 for texto in linhas) >= PROSA_DE_MOLDURA_MIN
+
+
 def agrupar_figuras(objs, W, H, itens, papeis, tique, fundo=None, grades=()):
     """Devolve geometria, recorte com contexto e se o texto identifica cada figura. `grades`: as caixas das tabelas com
     grade desenhada, cujas linhas não são eixo de gráfico."""
@@ -344,6 +368,8 @@ def agrupar_figuras(objs, W, H, itens, papeis, tique, fundo=None, grades=()):
             bases = {round(x[1]) for x, texto in textos if len(texto) >= 12 and _contem(g, x)}
             if len(bases) >= 6 and max(bases) - min(bases) > h / 4:
                 continue  # painel de preenchimento que serve de fundo a um bloco de texto
+        elif papel is None and w * h >= FUNDO_AREA_MIN * area_pagina and _fundo_de_layout(g, i, objs, textos):
+            continue
         if w > 0.4 * W and h < 40:
             faixas[round(l / 4)].append(g)
         else:
@@ -373,8 +399,14 @@ def agrupar_figuras(objs, W, H, itens, papeis, tique, fundo=None, grades=()):
         grupos, [f for f in finos if not any(_contem(m, f, 1) for m in molduras)], tique, 0.03 * area_pagina
     )
     candidatos = [(g, True, False) for g in molduras]
+    centros = [((x[0] + x[2]) / 2, (x[1] + x[3]) / 2, x[3] - x[1]) for x, _ in textos]
     for g, partes in grupos:
         area = _area(g)
+        if 2 <= len(partes) <= FUNDOS_DE_TEXTO_MAX and all(
+            any(p[0] <= cx <= p[2] and p[1] <= cy <= p[3] and p[3] - p[1] <= 4 * alto for cx, cy, alto in centros)
+            for p in partes
+        ):
+            continue  # faixas de cabeçalho, cada uma da altura do texto que está nela: fundo de layout, não figura
         if area >= 0.03 * area_pagina:
             candidatos.append((g, False, False))
         elif area >= 0.012 * area_pagina and sum(_area(p) >= 0.45 * area for p in partes) >= 3:
@@ -406,7 +438,16 @@ def agrupar_figuras(objs, W, H, itens, papeis, tique, fundo=None, grades=()):
                     restantes.append((gg, outra, pertence, enquadrada))
             reunidos = restantes
         reunidos.append((g, caixa, identificada, moldura))
-    return [(g, caixa, identificada) for g, caixa, identificada, _ in reunidos]
+    # a figura dentro do recorte de outra (o quadro da área de traçado dentro do gráfico inteiro) já vai nele: uma
+    # segunda tarefa leria os mesmos dados, sem o título e os eixos
+    return [
+        (g, caixa, identificada)
+        for k, (g, caixa, identificada, _) in enumerate(reunidos)
+        if not any(
+            j != k and _contem(outra, caixa, 1) and _area(outra) > _area(caixa)
+            for j, (_, outra, _, _) in enumerate(reunidos)
+        )
+    ]
 
 
 def paineis_panorama(objs, W, H, itens, papeis, imagens, tique):
