@@ -154,3 +154,54 @@ def test_bloco_de_formula_misturado_com_a_coluna_vizinha_nao_vira_recorte(tmp_pa
     assert [t.tipo for t in plano.tarefas] == []
     assert "E = × 100 (1)" in r.markdown and "4. Conclusão" in r.markdown
     assert r.markdown.count("na coluna da esquerda") == 4 and r.markdown.count("na coluna da direita") == 4
+
+
+def test_colunas_com_link_no_texto_ficam_com_a_saida_do_extrator(tmp_path, monkeypatch):
+    """A remontagem das colunas é feita com o texto dos itens, sem os links que o extrator montou: com link na
+    página, a saída do extrator fica, para o endereço não sumir."""
+    p = tmp_path / "artigo.pdf"
+    c = canvas.Canvas(str(p), pagesize=(595, 842))
+    c.setFont("Helvetica", 9)
+    for k in range(8):
+        c.drawString(60, 700 - 12 * k, f"linha {k + 1} do texto corrido da esquerda sem ponto")
+        c.drawString(320, 700 - 12 * k, f"linha {k + 1} do texto corrido da direita sem ponto")
+    c.save()
+    emendado = " ".join(
+        f"linha {k + 1} do texto corrido da esquerda sem ponto linha {k + 1} do texto corrido da direita sem ponto"
+        for k in range(8)
+    )
+    _extracao(monkeypatch, lambda i: emendado + " [fonte dos dados](https://dados.example/serie)")
+
+    md = lince.ler(p).markdown
+
+    assert "[fonte dos dados](https://dados.example/serie)" in md
+
+
+def test_formula_cuja_caixa_leva_texto_vizinho_nao_vira_recorte(tmp_path, monkeypatch):
+    """Os pedaços que o extrator pôs no bloco da fórmula estão espalhados na linha: a caixa que os une levaria os
+    rótulos entre eles, cortados. Sem uma caixa só da fórmula, o texto nativo fica e a pendência diz por quê."""
+    p = tmp_path / "nota.pdf"
+    c = canvas.Canvas(str(p), pagesize=(595, 842))
+    c.setFont("Helvetica", 10)
+    c.drawString(60, 700, "A economia de cada rota é dada pela equação abaixo, em pontos percentuais.")
+    c.drawString(80, 600, "E = × 100 (1)")
+    for x, t in ((200, "ver nota"), (270, "fig. 2"), (330, "rota sul"), (400, "base 2025")):
+        c.drawString(x, 601, t)
+    c.drawString(480, 600, "Σ = ± 3")
+    c.drawString(60, 500, "O resultado vale para as três rotas principais da companhia.")
+    c.save()
+    _extracao(
+        monkeypatch,
+        lambda i: (
+            "A economia de cada rota é dada pela equação abaixo, em pontos percentuais.\n\n"
+            "E = × 100 (1) Σ = ± 3\n\nver nota fig. 2 rota sul base 2025\n\n"
+            "O resultado vale para as três rotas principais da companhia."
+        ),
+    )
+
+    plano = lince.Leitor().preparar(p)
+    r = lince.Leitor().concluir(plano, {})
+
+    assert plano.tarefas == []
+    assert "E = × 100 (1) Σ = ± 3" in r.markdown and "ver nota fig. 2 rota sul base 2025" in r.markdown
+    assert r.cobertura.pendentes == ["página 1: localização da fórmula não confirmada"]

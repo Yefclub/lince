@@ -3,11 +3,13 @@ ambiguidade (atributo hidden; display:none, opacity:0, visibility:hidden e fonte
 atributos de apresentação do SVG) sai do corpo e vira alerta, assim como o conteúdo que o navegador não desenha
 (<datalist>, <noembed>, <noframes>, <dialog> fechado), a não ser que o display do autor o mostre. O style é lido pelo
 tinycss2, com a cascata do CSS (última declaração válida, !important vence, valor inválido descartado) e herança de
-visibility e font-size. As regras de uma folha <style> entram na mesma cascata, abaixo do style da tag: o seletor é
-casado pelo cssselect2, na ordem de especificidade e de escrita (`.oculto{display:none}` esconde como o style).
+visibility e font-size. As regras de uma folha <style> entram na mesma cascata, abaixo do style da tag, quando o
+seletor se resolve no próprio elemento (tag, classe, id, atributo: `.oculto{display:none}` esconde como o style); o
+casamento é do cssselect2, na ordem de especificidade e de escrita.
 
 Limites (a página não é renderizada): cor do texto contra o fundo (branco sobre azul é visível, e a cor transparente
-também fica de fora), regra dentro de @media ou de outra regra-arroba e folha externa (não é baixada), valor com
+também fica de fora), regra de folha com combinador ou pseudo-classe (`div p`, `:not()`), dentro de regra-arroba ou
+aninhada (não é avaliada, e isso fica registrado nas partes ilegíveis), folha externa (não é baixada), valor com
 função (calc, var, min, max, clamp), opacidade
 quase zero, layout (fora da tela, text-indent negativo, tamanho zero com overflow, clip, zoom), font-size sem unidade
 do modo quirks, popover fechado e rp/title no corpo (ficam no corpo), hidden="until-found" e dialog fechado (vão para
@@ -377,21 +379,41 @@ FOLHA_MAX = 512 * 1024  # caracteres de CSS nas folhas <style> de uma página; a
 REGRAS_MAX = 5000
 
 
-CASAMENTOS_MAX = 1_000_000  # elementos × regras: o custo de casar seletor sem índice (atributo, universal)
+CASAMENTOS_MAX = 1_000_000  # elementos × regras: o custo de casar os seletores da folha com a página
 FOLHA_NAO_CONFERIDA = "html: folha <style> grande demais; o texto escondido por regra dela não foi conferido"
+REGRA_NAO_CONFERIDA = (
+    "html: regra de folha <style> não avaliada (seletor com combinador ou pseudo-classe, regra-arroba, regra aninhada"
+    " ou media); texto escondido por ela pode estar no corpo"
+)
+# o seletor que se resolve olhando só o próprio elemento: custo fixo por elemento, sem o retrocesso que o combinador
+# de descendente provoca numa árvore funda
+_SELETOR_SIMPLES = (
+    cssselect2.parser.LocalNameSelector,
+    cssselect2.parser.ClassSelector,
+    cssselect2.parser.IDSelector,
+    cssselect2.parser.AttributeSelector,
+)
+_ESCONDE = re.compile(r"(?<![\w-])(display|visibility|opacity|font(-size)?)\s*:", flags=re.I)
 
 
 def _regras_da_folha(raiz, avisos) -> dict:
     """Para cada elemento, as declarações das folhas <style> que valem para ele (só as propriedades que escondem), na
-    ordem da cascata: especificidade do seletor e, no empate, ordem de escrita. Regra-arroba (@media, @supports) fica
-    de fora: depende de onde a página é vista. Pseudo-elemento não é o elemento. O <style> dentro de <noscript> e de
-    <template> não vale (o navegador não o aplica). A folha acima dos tetos não é avaliada, e isso fica em `avisos`:
-    quem lê sabe que a conferência não cobriu a folha."""
-    folhas = [
-        e.text or "" for e in raiz.iter("style") if next(e.iterancestors("svg", "noscript", "template"), None) is None
-    ]
-    if not any(f.strip() for f in folhas):
-        return {}
+    ordem da cascata: especificidade do seletor e, no empate, ordem de escrita. Só entra a regra cujo seletor se
+    resolve no próprio elemento (tag, classe, id, atributo e combinações deles: `p.oculto`, `#aviso`, `[hidden-x]`).
+    A que depende de outro elemento (`div p`, `a > b`), de pseudo-classe, de regra-arroba (@media, @supports, @layer),
+    de aninhamento ou de um <style media="…"> que não seja a tela fica de fora, e se ela mexe numa propriedade que
+    esconde isso vai para `avisos`: quem lê sabe que a conferência não a cobriu. Pseudo-elemento não é o elemento. O
+    <style> dentro de <noscript> e de <template> não vale (o navegador não o aplica). A folha acima dos tetos não é
+    avaliada, com o mesmo aviso."""
+    folhas, incerta = [], False
+    for e in raiz.iter("style"):
+        if next(e.iterancestors("noscript", "template"), None) is not None:
+            continue
+        media = " ".join((e.get("media") or "").lower().split())
+        if media in ("", "all", "screen"):
+            folhas.append(e.text or "")
+        elif media != "print" and _ESCONDE.search(e.text or ""):
+            incerta = True  # "screen and (max-width: 600px)": depende de onde a página é vista
     if sum(map(len, folhas)) > FOLHA_MAX:
         avisos.append(FOLHA_NAO_CONFERIDA)
         return {}
@@ -399,21 +421,32 @@ def _regras_da_folha(raiz, avisos) -> dict:
     for folha in folhas:
         for regra in tinycss2.parse_stylesheet(folha, skip_comments=True, skip_whitespace=True):
             if regra.type != "qualified-rule":
+                incerta |= regra.type == "at-rule" and bool(_ESCONDE.search(tinycss2.serialize(regra.content or [])))
                 continue
-            declaracoes = [
-                d
-                for d in tinycss2.parse_blocks_contents(regra.content, skip_comments=True, skip_whitespace=True)
-                if d.type == "declaration" and d.lower_name in _PROPRIEDADES
-            ]
+            conteudo = tinycss2.parse_blocks_contents(regra.content, skip_comments=True, skip_whitespace=True)
+            declaracoes = [d for d in conteudo if d.type == "declaration" and d.lower_name in _PROPRIEDADES]
+            aninhadas = [d for d in conteudo if d.type in ("qualified-rule", "at-rule")]
+            incerta |= any(_ESCONDE.search(tinycss2.serialize(d.content or [])) for d in aninhadas)
             if not declaracoes:
                 continue
-            n += 1
             try:
+                arvores = list(cssselect2.parser.parse(regra.prelude))
                 seletores = cssselect2.compile_selector_list(regra.prelude)
             except cssselect2.SelectorError:
                 continue  # seletor que o navegador também descartaria
-            for seletor in seletores:
-                casador.add_selector(seletor, declaracoes)
+            for arvore, seletor in zip(arvores, seletores, strict=True):
+                partes = arvore.parsed_tree
+                if (
+                    arvore.pseudo_element is None
+                    and isinstance(partes, cssselect2.parser.CompoundSelector)
+                    and all(isinstance(x, _SELETOR_SIMPLES) for x in partes.simple_selectors)
+                ):
+                    casador.add_selector(seletor, declaracoes)
+                    n += 1
+                elif arvore.pseudo_element is None:
+                    incerta = True
+    if incerta:
+        avisos.append(REGRA_NAO_CONFERIDA)
     if not n:
         return {}
     if n > REGRAS_MAX or n * sum(1 for e in raiz.iter() if isinstance(e.tag, str)) > CASAMENTOS_MAX:

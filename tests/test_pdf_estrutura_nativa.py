@@ -339,23 +339,54 @@ def test_texto_girado_na_margem_fica_no_texto(tmp_path):
     assert "62 veículos de distribuição urbana" in md
 
 
-def test_tabela_de_duas_colunas_de_texto_com_grade_continua_tabela(tmp_path):
-    """Uma tabela "Risco | Mitigação" tem prosa nas duas células, como duas colunas de texto: cada linha é um par."""
-    p = tmp_path / "riscos.pdf"
+def _riscos(p, grade):
     linhas = [
-        ("Atraso na entrega dos módulos de telemetria pelo fornecedor", "Multa diária e segundo fornecedor em espera"),
-        ("Resistência dos motoristas ao acompanhamento da condução", "Treinamento em turmas pequenas e bônus mensal"),
-        ("Falha de comunicação com a rede dos veículos mais antigos", "Adaptador dedicado para os modelos anteriores"),
-        ("Perda de dados na passagem por trechos sem cobertura", "Armazenamento local com envio posterior ao servidor"),
+        (
+            "Atraso na entrega dos módulos de telemetria pelo fornecedor contratado para o programa de frota",
+            "Cláusula de multa diária no contrato e um segundo fornecedor homologado em espera desde o início",
+        ),
+        (
+            "Resistência dos motoristas ao acompanhamento contínuo da forma de condução nas rotas longas",
+            "Treinamento em turmas pequenas e bônus mensal atrelado à economia de combustível de cada um",
+        ),
+        (
+            "Falha de comunicação com a rede de dados dos veículos mais antigos da frota dedicada da empresa",
+            "Adaptador dedicado para os modelos anteriores ao ano de fabricação coberto pelo módulo padrão",
+        ),
+        (
+            "Perda de dados durante a passagem por trechos de serra sem cobertura da rede de telefonia",
+            "Armazenamento local no módulo embarcado com envio posterior ao servidor central da companhia",
+        ),
     ]
     t = Table([["Risco", "Mitigação"], *[[Paragraph(a, N), Paragraph(b, N)] for a, b in linhas]], colWidths=[240, 240])
-    t.setStyle(GRADE)
-    SimpleDocTemplate(str(p), pagesize=A4).build([Paragraph("Matriz de riscos do programa", H1), t])
+    if grade:
+        t.setStyle(GRADE)
+    SimpleDocTemplate(str(p), pagesize=A4).build([Paragraph("Riscos", H1), t])
+    return linhas
+
+
+def test_tabela_de_duas_colunas_de_texto_com_grade_continua_tabela(tmp_path):
+    """Uma tabela "Risco | Mitigação" tem prosa em várias linhas nas duas células, como duas colunas de texto, mas
+    cada linha dela é um par: a remontagem de colunas leria todos os riscos e depois todas as mitigações."""
+    p = tmp_path / "riscos.pdf"
+    linhas = _riscos(p, grade=True)
 
     md = lince.ler(p).markdown
 
     for a, b in linhas:
         assert f"| {a} | {b} |" in md  # o risco e a mitigação dele na mesma linha
+
+
+def test_tabela_de_duas_colunas_de_texto_sem_grade_nao_e_lida_como_duas_colunas(tmp_path):
+    """Sem grade, as células começam na mesma altura dos dois lados: são linhas de tabela, não texto corrido em
+    colunas. A mitigação de um risco vem antes do risco seguinte."""
+    p = tmp_path / "riscos.pdf"
+    _riscos(p, grade=False)
+
+    md = lince.ler(p).markdown
+
+    assert md.index("multa diária") < md.index("Resistência dos motoristas") < md.index("turmas pequenas")
+    assert md.index("turmas pequenas") < md.index("Falha de comunicação") < md.index("Adaptador dedicado")
 
 
 def test_malha_densa_de_tracos_nao_custa_a_leitura(tmp_path):
@@ -411,3 +442,97 @@ def test_titulo_com_as_palavras_do_rotulo_do_grafico_fica_no_corpo(tmp_path):
 
     assert "# Entregas por mês" in md  # o título da página
     assert md.count("Gráfico 3 – Entregas por mês (mil)") == 1  # e o rótulo de dentro do gráfico não se repete
+
+
+def test_imagem_que_passa_um_pouco_da_borda_do_desenho_entra_inteira_no_recorte(tmp_path):
+    """A foto dentro de um painel vetorial é lida com ele. Se ela passa um pouco da borda, o recorte do painel cresce
+    até contê-la: sem isso, ou a foto ia em duas tarefas, ou ficava cortada na leitura."""
+    import io
+
+    from PIL import Image
+    from reportlab.lib.utils import ImageReader
+
+    foto = io.BytesIO()
+    Image.effect_noise((120, 80), 60).convert("RGB").save(foto, "PNG")
+    p = tmp_path / "painel.pdf"
+    c = canvas.Canvas(str(p), pagesize=A4)
+    c.setFont("Helvetica", 10)
+    for k in range(8):
+        c.drawString(50, 800 - 14 * k, f"Parágrafo de contexto número {k + 1} do relatório trimestral de operações.")
+    c.setFont("Helvetica", 9)
+    c.drawString(60, 640, "Gráfico 1 – Volume por mês e foto do pátio")
+    c.rect(50, 380, 400, 250, stroke=1, fill=0)  # a moldura do painel
+    c.line(70, 400, 300, 400)
+    c.line(70, 400, 70, 600)
+    for k, v in enumerate([40, 80, 120, 150]):
+        c.setFillColor(colors.HexColor("#2f6fad"))
+        c.rect(90 + 50 * k, 400, 30, v, stroke=0, fill=1)
+        c.setFillColor(colors.black)
+        c.drawCentredString(105 + 50 * k, 388, ["Jan", "Fev", "Mar", "Abr"][k])
+    c.drawImage(ImageReader(foto), 340, 450, 120, 80)  # passa 10 pt da moldura, que termina em x=450
+    c.save()
+
+    (painel,) = lince.Leitor().preparar(p).tarefas
+
+    assert painel.tipo == "desenho"
+    assert painel.caixa[0] <= 50 and painel.caixa[2] >= 460  # da moldura até o fim da foto
+
+
+def test_dois_rotulos_iguais_so_saem_se_a_leitura_trouxer_os_dois(tmp_path):
+    """Cada trecho da leitura responde por um bloco do texto nativo: se o rótulo aparece duas vezes no desenho e a
+    leitura só o trouxe uma vez, uma das ocorrências fica."""
+    p = tmp_path / "painel.pdf"
+    c = canvas.Canvas(str(p), pagesize=A4)
+    c.setFont("Helvetica", 11)
+    c.drawString(50, 780, "Relatório de produção das duas unidades da empresa no trimestre.")
+    c.line(60, 400, 500, 400)
+    c.line(60, 400, 60, 640)
+    for k, v in enumerate([120, 180]):
+        c.setFillColor(colors.HexColor("#2f6fad"))
+        c.rect(120 + 200 * k, 400, 80, v, stroke=0, fill=1)
+        c.setFillColor(colors.black)
+        c.drawCentredString(160 + 200 * k, 410 + v, "Meta atingida no período")
+        c.drawCentredString(160 + 200 * k, 384, ["Unidade Norte", "Unidade Sul"][k])
+    c.save()
+    leitor = lince.Leitor()
+    plano = leitor.preparar(p)
+    (grafico,) = plano.tarefas
+    uma = "Gráfico (colunas)\n\n- Unidade Norte: Meta atingida no período\n- Unidade Sul: [ilegível]"
+
+    md = leitor.concluir(plano, {grafico.id: uma}).markdown
+
+    assert md.count("Meta atingida no período") == 2  # a da leitura e a nativa que a leitura não cobriu
+
+
+def test_pagina_com_muito_texto_fora_do_grafico_nao_perde_titulo_com_palavras_do_rotulo(tmp_path):
+    """Acima do teto do texto de fora guardado, a montagem não sabe se um bloco é de fora do gráfico: não tira nada.
+    Aqui o título da seção vem depois de 22 mil caracteres de apêndice e antes do rótulo de dentro do gráfico."""
+    p = tmp_path / "denso.pdf"
+    W, H = A4
+    c = canvas.Canvas(str(p), pagesize=A4)
+    c.setFont("Helvetica", 3)
+    linha = "do apêndice, com a descrição completa do lançamento e do responsável pela conferência final."
+    for k in range(200):  # da borda de cima até y=180, só na margem esquerda
+        c.drawString(30, H - 20 - 3.2 * k, f"Registro {k:03d} {linha}")
+    c.setFont("Helvetica-Bold", 9)
+    c.drawString(330, 172, "Entregas por mês")  # o título da seção, fora do gráfico
+    c.setFont("Helvetica", 7)
+    c.drawString(330, 152, "Entregas por mês")  # o rótulo de dentro do gráfico
+    c.line(320, 40, 560, 40)
+    c.line(320, 40, 320, 145)
+    for k, v in enumerate([62, 71, 88, 93]):
+        c.setFillColor(colors.HexColor("#2f6fad"))
+        c.rect(340 + 55 * k, 40, 30, v, stroke=0, fill=1)
+        c.setFillColor(colors.black)
+        c.drawCentredString(355 + 55 * k, 30, ["Jul", "Ago", "Set", "Out"][k])
+    c.save()
+    leitor = lince.Leitor()
+    plano = leitor.preparar(p)
+    graficos = [t for t in plano.tarefas if t.tipo == "desenho"]
+    assert len(graficos) == 1
+    leitura = "Gráfico (colunas): Entregas por mês\n\n| Mês | Valor |\n| --- | --- |\n| Jul | 62 |"
+
+    md = leitor.concluir(plano, {graficos[0].id: leitura}).markdown
+
+    assert md.count("Entregas por mês") == 3  # a leitura, o título de fora e o rótulo nativo: nada sai
+    assert md.count(linha) == 200

@@ -44,6 +44,8 @@ def test_cascata_da_folha_vale_como_no_navegador(tmp_path):
         assert fica in r.markdown
     for sai in ("escondido pela regra de tag", "que o important esconde", "bloco de opacidade zero"):
         assert sai not in r.markdown
+    # a regra dentro de @media não é avaliada (depende de onde a página é vista), e isso fica dito
+    assert any("regra de folha <style> não avaliada" in aviso for aviso in r.metadados["partes_ilegiveis"])
 
 
 def test_folha_sem_regra_que_esconde_nao_muda_nada(tmp_path):
@@ -73,7 +75,7 @@ def test_folha_grande_demais_para_conferir_fica_registrada(tmp_path):
     nos metadados em vez de passar em silêncio."""
     import time
 
-    regras = "".join(f"[data-a{k}] p:not(.z{k}){{display:none}}" for k in range(1200))
+    regras = "".join(f".c{k}{{display:none}}" for k in range(1200))
     corpo = "".join(f"<div><p>parágrafo {k}</p></div>" for k in range(1500))
     inicio = time.perf_counter()
 
@@ -82,3 +84,43 @@ def test_folha_grande_demais_para_conferir_fica_registrada(tmp_path):
     assert time.perf_counter() - inicio < 10
     assert "parágrafo 1499" in r.markdown
     assert any("folha <style> grande demais" in aviso for aviso in r.metadados["partes_ilegiveis"])
+
+
+def test_regra_que_depende_de_outro_elemento_nao_e_avaliada_e_fica_registrada(tmp_path):
+    """O seletor com descendente numa árvore funda fazia o casamento levar minutos (2 KB de HTML, 115 s, sem respeitar
+    o prazo). Só o seletor que se resolve no próprio elemento é avaliado; o resto vira aviso, nunca silêncio."""
+    import time
+
+    fundo = "<div>" * 200 + "<p>texto no fundo da árvore</p>" + "</div>" * 200
+    inicio = time.perf_counter()
+
+    r = _ler(
+        tmp_path, "section div div div div div div p{display:none} .x{display:none}", fundo + '<p class="x">some</p>'
+    )
+
+    assert time.perf_counter() - inicio < 5
+    assert "texto no fundo da árvore" in r.markdown and "some" not in r.markdown  # a regra simples continua valendo
+    assert any("regra de folha <style> não avaliada" in aviso for aviso in r.metadados["partes_ilegiveis"])
+
+
+def test_folha_de_impressao_nao_esconde_o_que_a_tela_mostra(tmp_path):
+    p = tmp_path / "pagina.html"
+    p.write_text(
+        '<!DOCTYPE html><html><head><style media="print">.menu{display:none}</style>'
+        '<style media="screen">.so-impressao{display:none}</style></head><body>'
+        '<p class="menu">menu visível na tela</p><p class="so-impressao">texto só da impressão</p></body></html>',
+        encoding="utf-8",
+    )
+
+    r = lince.ler(p)
+
+    assert "menu visível na tela" in r.markdown and "texto só da impressão" not in r.markdown
+    assert "partes_ilegiveis" not in r.metadados  # a folha de impressão não é dúvida: ela não vale na tela
+
+
+def test_style_dentro_de_svg_vale_para_a_pagina(tmp_path):
+    r = _ler(
+        tmp_path, "", f'<svg width="10" height="10"><style>.x{{display:none}}</style></svg><p class="x">{INJECAO}</p>'
+    )
+
+    assert "bônus" not in r.markdown and r.metadados["texto_oculto_removido"][0]["texto"] == INJECAO

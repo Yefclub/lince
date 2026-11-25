@@ -35,7 +35,6 @@ from .pdf_figuras import agrupar_figuras, faixa_ilustrada, paineis_panorama, pap
 from .pdf_formulario import abrir_pdf, campos_visiveis, com_rotulos
 from .pdf_formulas import localizar_formulas
 from .pdf_grade import aplicar as aplicar_grades
-from .pdf_grade import grades as grades_da_pagina
 from .pdf_recortes import interseccao, janela_retangular, renderizar_regiao, validar_regiao
 from .pdf_tabelas import caixa_do_bloco_principal, conferir_tabelas
 from .pdf_tabelas_layout import conferir_blocos, texto_de_rotulos
@@ -1120,10 +1119,7 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     if not (eh_ocr or rotacao or campos) and (
         colunas_confundidas(limpar_tabelas(md)[1]) or colunas_fundidas(md, itens_pg, W)
     ):
-        # a tabela de duas colunas de texto com grade é tabela: as linhas dela dão as células mais adiante
-        tracos_pg = [bx for tipo, bx in objs if tipo == c.FPDF_PAGEOBJ_PATH]
-        em_grade = set().union(*(g["itens"] for g in grades_da_pagina(tracos_pg, itens_pg, _tique)), set())
-        if len(em_grade) < 0.2 * len(itens_pg) and (refeito := refazer_colunas(md, itens_pg, W, _tique)):
+        if refeito := refazer_colunas(md, itens_pg, W, _tique):
             md = refeito
     md = _bordas_soltas(md, itens_pg, H)
     dens = densidade_matematica(md)
@@ -1351,7 +1347,10 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                 for d in desenhos_legiveis:
                     if 0.9 <= _sobrepoe(g, d) < 1 and id(d) not in recortes_exatos:
                         d0 = maiores.get(id(d), d)
-                        maiores[id(d)] = [min(d0[0], g[0]), min(d0[1], g[1]), max(d0[2], g[2]), max(d0[3], g[3])]
+                        maior = [min(d0[0], g[0]), min(d0[1], g[1]), max(d0[2], g[2]), max(d0[3], g[3])]
+                        # só cresce se continuar legível na escala do recorte; senão a imagem segue com a tarefa dela
+                        if (max(maior[2] - maior[0], maior[3] - maior[1]) + 12) * fator <= 1568:
+                            maiores[id(d)] = maior
         regioes = [(tipo, maiores.get(id(g), g) if tipo == "desenho" else g) for tipo, g in regioes]
         desenhos_legiveis = [maiores.get(id(d), d) for d in desenhos_legiveis]
         regioes = [
@@ -1572,11 +1571,8 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                         "tarefa": tid,
                         "depois_de": linha_acima,
                         "texto_dentro": ancora,
-                        **(
-                            {"desenho": True, "texto_fora": " ".join(x.text for x in itens if x not in dentro)[:20000]}
-                            if tipo == "desenho"
-                            else {}
-                        ),
+                        **({"desenho": True} if tipo == "desenho" else {}),
+                        **({"texto_fora": fora} if tipo == "desenho" and (fora := _texto_fora(itens, dentro)) else {}),
                         # A legenda digital sobre uma foto de fundo é texto da página.
                         **(
                             {"preserva_texto": True}
@@ -1605,6 +1601,17 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                 )
 
     return info, (fator, recortar, bool(campos_visuais))
+
+
+TEXTO_FORA_MAX = 20_000  # caracteres do texto fora de um desenho guardados para a conferência dos rótulos
+
+
+def _texto_fora(itens, dentro):
+    """O texto da página que está fora do recorte de um desenho, para a montagem não tirar do corpo um bloco que pode
+    ser de fora dele. Vazio quando não cabe no teto: sem a lista inteira, a montagem não tira nada."""
+    ids = {id(x) for x in dentro}
+    fora = " ".join(x.text for x in itens if id(x) not in ids)
+    return fora if len(fora) <= TEXTO_FORA_MAX else ""
 
 
 def _sobrepoe(a, b):

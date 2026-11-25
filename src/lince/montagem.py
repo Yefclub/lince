@@ -276,8 +276,9 @@ def _rotulos_lidos(regioes, blocos, lido):
     estão dentro do recorte e também na leitura, na mesma quantidade, e o bloco não pode ser um texto de fora do
     recorte (o título da seção com as mesmas palavras do rótulo fica). O extrator junta rótulos de caixas vizinhas
     numa linha sem sentido ("Custo por OTIF NPS Avarias entrega 93,9% 71 0,42%"); com a leitura completa, repetir
-    essa linha só suja o texto. Se faltar uma palavra na leitura, o bloco fica."""
-    lidos = set()
+    essa linha só suja o texto. Se faltar uma palavra na leitura, o bloco fica. Devolve quantas vezes cada texto
+    pode sair: dois blocos iguais só saem se a leitura trouxe o rótulo duas vezes."""
+    lidos = Counter()
     for r in regioes:
         if not r.get("desenho") or r.get("preserva_texto") or not (visual := lido(r["tarefa"])):
             continue
@@ -296,11 +297,11 @@ def _rotulos_lidos(regioes, blocos, lido):
             if palavras <= no_recorte and palavras <= na_leitura:
                 no_recorte -= palavras  # cada rótulo do recorte e cada trecho da leitura respondem por um bloco só
                 na_leitura -= palavras
-                lidos.add(texto)
+                lidos[texto] += 1
     return lidos
 
 
-_NUMERO = re.compile(r"\d[\d.,]*\d|\d")
+_NUMERO = re.compile(r"\d[\d.,\u00a0\u2009\u202f]*\d|\d")
 
 
 def _cobre_numeros(nativo, visual):
@@ -309,7 +310,11 @@ def _cobre_numeros(nativo, visual):
     valores que o arquivo tem."""
     if "[ilegível" in visual or "[illegible" in visual:
         return False
-    return not (Counter(_NUMERO.findall(nativo)) - Counter(_NUMERO.findall(visual)))
+
+    def algarismos(texto):  # "1.234,5", "1 234,5" e "1234.5" são o mesmo número escrito de outro jeito
+        return Counter(re.sub(r"\D", "", n) for n in _NUMERO.findall(texto))
+
+    return not (algarismos(nativo) - algarismos(visual))
 
 
 def montar(pasta, respostas, pendentes=None):
@@ -425,8 +430,17 @@ def montar(pasta, respostas, pendentes=None):
         blocos = [b for b in md.split("\n\n") if b.strip()]
         # Vocabulário coincidente não prova que a IA leu o trecho. Isso vale tanto para uma
         # foto com legenda digital quanto para o texto sobre um desenho.
-        copiados = _paragrafos_reproduzidos(p["regioes"], blocos, lido) | _rotulos_lidos(p["regioes"], blocos, lido)
-        limpos = [b for b in blocos if not copiados or _texto_do_bloco(b) not in copiados]
+        copiados = _paragrafos_reproduzidos(p["regioes"], blocos, lido)
+        rotulos = _rotulos_lidos(p["regioes"], blocos, lido)
+        limpos = []
+        for b in blocos:
+            texto = _texto_do_bloco(b)
+            if texto in copiados:
+                continue
+            if rotulos[texto] > 0:  # sai um bloco para cada vez que a leitura trouxe o rótulo
+                rotulos[texto] -= 1
+                continue
+            limpos.append(b)
         inserir = {}
         for r in p["regioes"]:
             if r.get("repetida") or "substitui_tabela" in r or "substitui_formula" in r:

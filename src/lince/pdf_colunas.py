@@ -174,14 +174,6 @@ def blocos_de_texto(itens, corpo):
     return out
 
 
-def _corrido(linhas) -> bool:
-    """Texto corrido: a maioria das linhas termina no meio da frase. Células de uma tabela são unidades fechadas."""
-    textos = [_texto(ln["itens"]) for ln in linhas]
-    textos = [t for t in textos if _prosa(t) >= 3]
-    abertas = sum(not t.rstrip("*").endswith((".", "!", "?", ":", ";")) for t in textos)
-    return len(textos) >= 4 and abertas >= 0.5 * len(textos)
-
-
 def _inicios(linhas, corpo):
     """A altura de cada começo de bloco: a primeira linha e as que vêm depois de um espaço maior que o da entrelinha."""
     return [ln["t"] for k, ln in enumerate(linhas) if not k or linhas[k - 1]["b"] - ln["t"] > 0.5 * corpo]
@@ -199,11 +191,8 @@ def _linhas_de_tabela(esquerda, direita, corpo) -> bool:
 
 def refazer(md, itens, W, tique):
     """Markdown da página na ordem de leitura das duas colunas, ou None se a geometria não confirma duas colunas de
-    texto corrido (aí a saída do extrator fica como está). Nada some: se alguma letra do texto do extrator não
-    estiver na página remontada (texto girado na margem, item sem largura), a remontagem é recusada; a marcação que
-    só o extrator tem (links) também a impede."""
-    if "](" in md:
-        return None
+    texto (aí a saída do extrator fica como está). Nada some: se alguma letra do texto do extrator não estiver na
+    página remontada (texto girado na margem, item sem largura, o endereço de um link), a remontagem é recusada."""
     itens = [x for x in itens if x.text.strip() and not x.text.startswith("[Image:") and not x.rotation and x.width > 0]
     if not 2 * ITENS_POR_LADO_MIN <= len(itens) <= ITENS_MAX or any(x.render_mode != 0 for x in itens):
         return None
@@ -216,7 +205,7 @@ def refazer(md, itens, W, tique):
     corpo = pesos.most_common(1)[0][0]
     esquerda = _linhas([x for x in itens if x.x + x.width <= a + 1])
     direita = _linhas([x for x in itens if x.x >= b - 1])
-    if not (_corrido(esquerda) and _corrido(direita)) or _linhas_de_tabela(esquerda, direita, corpo):
+    if _linhas_de_tabela(esquerda, direita, corpo):
         return None
     inteiros = sorted((x for x in itens if x.x < a - 1 and x.x + x.width > b + 1), key=lambda x: -x.y)
     novo = _intercalar(itens, inteiros, a, b, corpo, tique)
