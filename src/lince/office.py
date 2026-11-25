@@ -12,6 +12,7 @@ import secrets
 import zipfile
 from collections import Counter
 from typing import NamedTuple
+from urllib.parse import unquote
 from xml.etree import ElementTree as ET  # noqa: F401
 
 from lxml import etree
@@ -1117,6 +1118,8 @@ def _alvos(z, parte, nomes, *tipos, externos=False) -> dict:
     out = {}
     for r in raiz.iter(f"{_PKG}Relationship") if raiz is not None else ():
         alvo = r.get("Target") or ""
+        if not externos:
+            alvo = unquote(alvo)  # o alvo é URI (OPC): "%20" é o espaço do nome da parte, como o leitor do corpo lê
         if (r.get("TargetMode") == "External") == externos and (
             not tipos or r.get("Type", "").rsplit("/", 1)[-1] in tipos
         ):
@@ -1365,24 +1368,55 @@ def livros_do_pacote(z, nomes) -> list[str]:
     return alvos or ["xl/workbook.xml"]
 
 
+def _dtd_no_prologo(z, parte) -> bool:
+    """Se a parte é XML com DTD: o expat lê só até o primeiro elemento, onde o DTD já teria vindo (a parte binária
+    para no primeiro byte que não é XML)."""
+    from xml.parsers import expat
+
+    class _Pronto(Exception):
+        pass
+
+    achou = []
+
+    def doctype(*_):
+        achou.append(True)
+        raise _Pronto
+
+    def elemento(*_):
+        raise _Pronto
+
+    parser = expat.ParserCreate()
+    parser.StartDoctypeDeclHandler, parser.StartElementHandler = doctype, elemento
+    try:
+        with z.open(parte) as arquivo:
+            while bloco := arquivo.read(65_536):
+                parser.Parse(bloco, False)
+    except (_Pronto, expat.ExpatError):
+        pass
+    return bool(achou)
+
+
 def _partes_das_abas_ocultas(path) -> set[str]:
     """Os desenhos das abas ocultas do .xlsx e os gráficos e imagens deles: o que é da aba oculta fica fora do corpo
     como as células dela."""
     saida = set()
     with zipfile.ZipFile(path) as z:
         nomes = set(z.namelist())
-        # falha fechada: com DTD (entidade no estado da aba) ou XML que o parser recusa, em qualquer das partes que
-        # podem ser o livro, o anydoc pode ler a aba oculta como visível, e ela não pode ser separada do corpo
+        # falha fechada, sem depender de qual parte o leitor do corpo toma por livro: DTD em qualquer parte (a entidade
+        # no estado da aba) ou um livro que as relações apontam e não existe com esse nome
+        recusa = "planilha com XML fora do padrão que pode esconder aba: a aba oculta não pôde ser separada do corpo"
+        if any(_dtd_no_prologo(z, parte) for parte in sorted(nomes)):
+            raise DocumentoRecusado(recusa)
+        apontados = _alvos(z, "", nomes, "officeDocument").values()
+        if apontados and not any(a in nomes for a in apontados):
+            raise DocumentoRecusado(recusa)
         livro = lugar = None
         for parte in livros_do_pacote(z, nomes):
             bruto = z.read(parte) if parte in nomes else b""
             dtd = xlsx_anotacoes.menciona(bruto, "<!DOCTYPE")
             if dtd or (arvore := xml_ou_nada(bruto)) is None:
                 if dtd or xlsx_anotacoes.menciona(bruto, "state"):
-                    raise DocumentoRecusado(
-                        "planilha com XML fora do padrão que pode esconder aba: a aba oculta não pôde ser separada do"
-                        " corpo"
-                    )
+                    raise DocumentoRecusado(recusa)
             elif livro is None:
                 livro, lugar = arvore, parte
         if livro is None:

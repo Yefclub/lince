@@ -10,7 +10,7 @@ import pytest
 from openpyxl import Workbook
 
 import lince
-from lince import xlsx_anotacoes
+from lince import office, xlsx_anotacoes
 from lince.limites import DocumentoRecusado
 from lince.office import _tabelas_no_lugar_das_celulas
 
@@ -1001,3 +1001,51 @@ def test_duas_relacoes_de_livro_conferem_as_duas(tmp_path):
             r = lince.ler(p)
             assert "SEGREDO" not in r.markdown
             assert r.metadados["texto_oculto_removido"][0]["texto"] == "aba Oculta: SEGREDO"
+
+
+def test_alvo_do_livro_com_percent_encoding_e_lido_como_o_corpo_le(tmp_path):
+    """O alvo da relação é URI: "l%69vro" é a parte "livro", como o leitor do corpo a abre."""
+    for dtd in (True, False):
+        p = tmp_path / f"pct_{dtd}.xlsx"
+        _xlsx_oculto(p, dtd=dtd)
+        _mover_livro(p, "xl/livro.xml")
+        with zipfile.ZipFile(p) as z:
+            partes = {i.filename: z.read(i) for i in z.infolist()}
+        partes["_rels/.rels"] = partes["_rels/.rels"].replace(b"xl/livro.xml", b"xl/l%69vro.xml")
+        with zipfile.ZipFile(p, "w") as z:
+            for nome, dados in partes.items():
+                z.writestr(nome, dados)
+
+        if dtd:
+            with pytest.raises(DocumentoRecusado, match="aba oculta"):
+                lince.ler(p)
+        else:
+            assert lince.ler(p).metadados["texto_oculto_removido"][0]["texto"] == "aba Oculta: SEGREDO"
+
+
+def test_xlsx_com_dtd_em_qualquer_parte_ou_livro_que_nao_existe_e_recusado(tmp_path):
+    """A recusa não depende de qual parte o leitor do corpo toma por livro."""
+    p = tmp_path / "dtd_props.xlsx"
+    _xlsx_oculto(p)
+    with zipfile.ZipFile(p) as z:
+        partes = {i.filename: z.read(i) for i in z.infolist()}
+    partes["docProps/app.xml"] = b"<!DOCTYPE Properties>" + partes["docProps/app.xml"]
+    with zipfile.ZipFile(p, "w") as z:
+        for nome, dados in partes.items():
+            z.writestr(nome, dados)
+
+    with pytest.raises(DocumentoRecusado, match="aba oculta"):
+        lince.ler(p)
+
+    sem_livro = tmp_path / "sem_livro.xlsx"
+    _xlsx_oculto(sem_livro)
+    _mover_livro(sem_livro, "xl/livro.xml")
+    with zipfile.ZipFile(sem_livro) as z:
+        partes = {i.filename: z.read(i) for i in z.infolist()}
+    partes["_rels/.rels"] = partes["_rels/.rels"].replace(b"xl/livro.xml", b"xl/outro.xml")
+    with zipfile.ZipFile(sem_livro, "w") as z:
+        for nome, dados in partes.items():
+            z.writestr(nome, dados)
+
+    with pytest.raises(DocumentoRecusado, match="aba oculta"):
+        office._partes_das_abas_ocultas(sem_livro)
