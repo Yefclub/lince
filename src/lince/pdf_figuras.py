@@ -10,6 +10,7 @@ from PIL import ImageDraw
 
 _IDENTIFICADOR = re.compile(r"^(?:fig(?:ure|ura)?\.?|gráfico|chart)\s+\d+(?:\.\d+)*(?:\s*[:.]|\s*[–—-])", re.I)
 _NOTA = re.compile(r"^(?:notas?|notes?|fontes?|sources?):", re.I)
+_MARCA_DE_NOTA = re.compile(r"^(?:\(?[a-z0-9]{1,2}\)|\*|- =|(?:notas?|notes?|fontes?|sources?)\b)", re.I)
 
 
 def papel_retangulo(raw, caixa, W, H):
@@ -319,16 +320,45 @@ def _com_eixos(grupos, finos, tique, area_de_figura):
     return grupos
 
 
+def _empilhada(g, indice, objs, textos) -> bool:
+    """A caixa colada em cima ou embaixo de uma forma sem texto da mesma largura (a borda, o sombreado ou o fundo de
+    uma tabela): é o quadro das notas ou das fontes dela, parte da tabela. As caixas de texto de uma coluna lateral se
+    empilham umas nas outras, todas com texto."""
+    largura = g[2] - g[0]
+    for k, (tipo, caixa) in enumerate(objs):
+        if k == indice or tipo != c.FPDF_PAGEOBJ_PATH:
+            continue
+        outra = caixa[2] - caixa[0]
+        lado = min(g[2], caixa[2]) - max(g[0], caixa[0])
+        colada = min(abs(caixa[1] - g[3]), abs(g[1] - caixa[3])) <= 4
+        # debaixo da caixa (o sombreado de um grupo de colunas é mais estreito que as notas); a faixa mais larga que
+        # ela, como a do cabeçalho em cima da coluna lateral, não conta
+        if outra <= 1.25 * largura and lado >= 0.8 * outra and colada and sum(_contem(caixa, x) for x, _ in textos) < 3:
+            return True
+    return False
+
+
 def _fundo_de_layout(g, indice, objs, textos) -> bool:
     """A caixa (de canto arredondado, que não é retângulo de quatro lados) atrás de um bloco de texto, ou a moldura
     que envolve as seções de uma página: fundo de layout, não figura. A caixa de texto não tem desenho nenhum dentro;
     a moldura tem parágrafos de prosa. O fundo de um gráfico tem os traços dos dados e só os rótulos dele."""
-    linhas = [texto for x, texto in textos if _contem(g, x)]
+    dentro = sorted(((x, texto) for x, texto in textos if _contem(g, x)), key=lambda item: (-item[0][3], item[0][0]))
+    linhas = [texto for _, texto in dentro]
     if any(_IDENTIFICADOR.match(texto) for texto in linhas):
         return False  # "Figura 3." dentro: é o quadro da figura, com as notas dela
-    if len(linhas) >= 3 and not any(
-        k != indice and tipo == c.FPDF_PAGEOBJ_PATH and _contem(g, caixa) and _area(caixa) < _area(g) * 0.9
-        for k, (tipo, caixa) in enumerate(objs)
+    if linhas and _MARCA_DE_NOTA.match(linhas[0].strip()):
+        return False  # o quadro de notas ("(a) Inclui...", "Fonte:") é da tabela ou da figura acima dele
+    # a caixa atrás de um bloco de prosa; a de números (o sombreado de colunas de uma tabela) ou de rótulos curtos (a
+    # legenda de um gráfico) é parte da figura
+    prosa = sum(len(texto) for texto in linhas if len(re.findall(r"[^\W\d_]{2,}", texto)) >= 3)
+    if (
+        len(linhas) >= 3
+        and 2 * prosa >= sum(map(len, linhas))
+        and not any(
+            k != indice and tipo == c.FPDF_PAGEOBJ_PATH and _contem(g, caixa) and _area(caixa) < _area(g) * 0.9
+            for k, (tipo, caixa) in enumerate(objs)
+        )
+        and not _empilhada(g, indice, objs, textos)
     ):
         return True
     grade = sum(
@@ -402,9 +432,15 @@ def agrupar_figuras(objs, W, H, itens, papeis, tique, fundo=None, grades=()):
     centros = [((x[0] + x[2]) / 2, (x[1] + x[3]) / 2, x[3] - x[1]) for x, _ in textos]
     for g, partes in grupos:
         area = _area(g)
-        if 2 <= len(partes) <= FUNDOS_DE_TEXTO_MAX and all(
-            any(p[0] <= cx <= p[2] and p[1] <= cy <= p[3] and p[3] - p[1] <= 4 * alto for cx, cy, alto in centros)
-            for p in partes
+        # faixas de alturas diferentes (o título, o subtítulo, a data); barras de mesma altura são um gráfico com os
+        # rótulos dentro delas
+        if (
+            2 <= len(partes) <= FUNDOS_DE_TEXTO_MAX
+            and len({round(p[3] - p[1]) for p in partes}) == len(partes)
+            and all(
+                any(p[0] <= cx <= p[2] and p[1] <= cy <= p[3] and p[3] - p[1] <= 4 * alto for cx, cy, alto in centros)
+                for p in partes
+            )
         ):
             continue  # faixas de cabeçalho, cada uma da altura do texto que está nela: fundo de layout, não figura
         if area >= 0.03 * area_pagina:

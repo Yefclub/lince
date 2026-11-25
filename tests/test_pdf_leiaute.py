@@ -335,3 +335,106 @@ def test_desenho_que_e_parte_de_uma_tabela_vai_com_ela():
     assert parte_de_tabela([270, 420, 590, 755], [tabela])
     assert not parte_de_tabela([12, 292, 588, 778], [tabela])
     assert not parte_de_tabela([270, 100, 590, 300], [tabela])  # fora dela
+
+
+def test_tabela_com_grade_nao_passa_pela_remontagem_em_colunas(tmp_path, monkeypatch):
+    """A "tabela" de prosa com traços verticais de grade é tabela de verdade: sem prova de linhas emendadas, ela não
+    é reordenada como colunas de texto."""
+    import sys
+    from pathlib import Path
+
+    from lince import pdf
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_pdf_estrutura_nativa import _riscos
+
+    chamadas = []
+    monkeypatch.setattr(pdf, "refazer_em_colunas", lambda *a: chamadas.append(a))
+    p = tmp_path / "riscos.pdf"
+    _riscos(p, grade=True)
+
+    Leitor().ler(p)
+
+    assert chamadas == []
+
+
+def test_legenda_em_caixa_sem_amostra_de_cor_fica_no_grafico(tmp_path):
+    """A caixa da legenda dentro do gráfico tem só rótulos curtos (o nome de cada série): é parte do gráfico, não
+    fundo de layout."""
+    import math
+
+    p = tmp_path / "legenda.pdf"
+    c = canvas.Canvas(str(p), pagesize=(595, 842))
+    c.line(60, 450, 60, 750)
+    c.line(60, 450, 540, 450)
+    for serie, cor in enumerate(((1, 0, 0), (0, 0, 1), (0, 0.5, 0))):
+        c.setStrokeColorRGB(*cor)
+        traco = c.beginPath()
+        traco.moveTo(60, 500 + serie * 50)
+        for k in range(1, 20):
+            traco.lineTo(60 + k * 25, 500 + serie * 50 + 30 * math.sin(k / 2 + serie))
+        c.drawPath(traco)
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setFillColorRGB(0.96, 0.96, 0.96)
+    c.roundRect(380, 640, 150, 90, 8, fill=1, stroke=1)
+    c.setFillColorRGB(0, 0, 0)
+    _linhas(c, 395, 710, ["Série A observada", "Série B estimada", "Série C projetada"], 10, 20)
+    _linhas(c, 50, 400, [" ".join(CORPO)[:90] for _ in range(12)], 9, 12)
+    c.save()
+
+    (caixa,) = [t.caixa for t in Leitor().preparar(p).tarefas if t.tipo == "desenho"]
+
+    assert caixa[3] >= 725  # a legenda vai no recorte
+
+
+def test_barras_com_o_rotulo_dentro_continuam_grafico(tmp_path):
+    """Barras de mesma altura, cada uma com o nome e o valor dentro, são um gráfico, não faixas de cabeçalho."""
+    p = tmp_path / "barras.pdf"
+    c = canvas.Canvas(str(p), pagesize=(595, 842))
+    setores = (("Agropecuária", 220), ("Indústria", 260), ("Construção", 180), ("Comércio", 340), ("Serviços", 420))
+    for k, (nome, valor) in enumerate(setores):
+        y = 650 - 30 * k
+        c.setFillColorRGB(0, 0, 0.5)
+        c.rect(80, y, valor, 20, fill=1, stroke=0)
+        c.setFillColorRGB(1, 1, 1)
+        _linhas(c, 85, y + 6, [f"{nome} {valor / 10:.1f}%"], 9, fonte="Helvetica-Bold")
+    c.setFillColorRGB(0, 0, 0)
+    _linhas(c, 50, 480, [" ".join(CORPO)[:90] for _ in range(10)], 9, 12)
+    c.save()
+
+    assert [t.tipo for t in Leitor().preparar(p).tarefas] == ["desenho"]
+
+
+NOTAS = [
+    "Os valores históricos aparecem sem sombra e as estimativas aparecem em cinza.",
+    "Os totais podem não somar por causa do arredondamento de cada componente.",
+    "As séries anteriores a dois mil e vinte foram revistas com a nova metodologia.",
+]
+
+
+def _caixa_de_texto(g, linhas):
+    return [
+        ((g[0] + 6, g[3] - 14 * (k + 1), g[2] - 6, g[3] - 14 * (k + 1) + 8), texto) for k, texto in enumerate(linhas)
+    ]
+
+
+def test_quadro_de_notas_da_tabela_nao_e_fundo_de_layout():
+    """O quadro de notas colado na borda de baixo de uma tabela, ou começando pela marca "(a)", é da tabela: no
+    recorte dela, as notas e a ligação com os rótulos das linhas. A caixa de texto de uma coluna lateral, empilhada em
+    outra caixa de texto, é fundo de layout."""
+    import pypdfium2.raw as c
+
+    from lince.pdf_figuras import _fundo_de_layout
+
+    caminho = c.FPDF_PAGEOBJ_PATH
+    notas = [18, 278, 590, 336]
+    borda = [18, 338, 590, 339]  # a linha de baixo da tabela, colada no quadro
+
+    assert not _fundo_de_layout(notas, 0, [(caminho, notas), (caminho, borda)], _caixa_de_texto(notas, NOTAS))
+    assert _fundo_de_layout(notas, 0, [(caminho, notas)], _caixa_de_texto(notas, NOTAS))
+    com_marca = ["(a) " + texto for texto in NOTAS]
+    assert not _fundo_de_layout(notas, 0, [(caminho, notas)], _caixa_de_texto(notas, com_marca))
+    de_cima, de_baixo = [25, 407, 180, 583], [25, 229, 180, 405]
+    objs = [(caminho, de_cima), (caminho, de_baixo)]
+    textos = _caixa_de_texto(de_cima, NOTAS) + _caixa_de_texto(de_baixo, NOTAS)
+    assert _fundo_de_layout(de_cima, 0, objs, textos)
