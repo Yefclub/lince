@@ -180,6 +180,31 @@ def _caixa(itens):
     ]
 
 
+def caixa_do_bloco_principal(itens, W):
+    """Caixa da tabela que o extrator não deixou localizar célula a célula: o maior bloco contínuo dos itens que têm
+    as palavras dela. Um item solto com as mesmas palavras em outro canto da página (o total de outra tabela, o rótulo
+    de um gráfico) fica de fora pela distância, e não por um corte fixo que levava junto a primeira e a última linha;
+    a largura é a dos itens, não a da página, para o recorte não invadir o que está ao lado."""
+
+    def maior_bloco(candidatos, inicio, fim, folga):
+        blocos = []
+        for x in sorted(candidatos, key=inicio):
+            if blocos and inicio(x) - blocos[-1][0] <= folga:
+                blocos[-1][0] = max(blocos[-1][0], fim(x))
+                blocos[-1][1].append(x)
+            else:
+                blocos.append([fim(x), [x]])
+        return max(blocos, key=lambda b: len(b[1]))[1]
+
+    altura = sorted(x.height for x in itens)[len(itens) // 2] or 10
+    bloco = maior_bloco(itens, lambda x: x.y, lambda x: x.y + x.height, 3 * altura)
+    bloco = maior_bloco(bloco, lambda x: x.x, lambda x: x.x + x.width, 0.12 * W)
+    if len(bloco) < 4:
+        return None
+    l, b, r, t = _caixa(bloco)
+    return [l - 4, b - 0.5 * altura, r + 4, t + 0.5 * altura]
+
+
 def _caixa_do_bloco(usados, itens, marcas):
     """Só delimita um bloco contínuo, com fim visível. Um cabeçalho reconhecido como tabela
     separada não basta se as linhas de dados ou a nota continuam logo abaixo dele."""
@@ -310,7 +335,7 @@ def conferir_tabelas(md, tabelas, itens, filetes, tique, marcas=()):
         posicoes[bloco.strip()].append(k)
     for n, tb in enumerate(tabelas):
         tique()
-        if len(tb["md"]) > 128_000:
+        if len(tb["md"]) > 128_000 or tb.get("grade"):  # a grade desenhada já deu as células
             continue
         linhas = tb["md"].splitlines()
         if not linhas or len(linhas) > 256:

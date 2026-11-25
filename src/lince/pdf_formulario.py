@@ -36,9 +36,12 @@ class _Limite(Exception):
 
 
 def campos_visiveis(doc, page):
+    """(campos em linhas "- nome: valor", caixas dos campos só visuais, falha, posição de cada linha). A posição é
+    (caixa do campo, é de marcar, tem nome de exibição próprio, tamanho do nome): `com_rotulos` usa para trocar o
+    nome interno pelo rótulo impresso ao lado."""
     falha = getattr(doc, "erro_formulario", None)
     if not doc.formenv:
-        return "", [], falha
+        return "", [], falha, []
 
     saldo = BYTES_CAMPOS_MAX
     opcoes = OPCOES_MAX
@@ -59,7 +62,7 @@ def campos_visiveis(doc, page):
         # Delimitadores do resultado (marcas de metadados e comentários da IA) permanecem dados.
         return html.escape("\n  ".join(valor.splitlines()), quote=False).replace("[[", "&#91;&#91;")
 
-    linhas, visuais = [], []
+    linhas, visuais, posicoes = [], [], []
     l, b, r, t = page.get_bbox()
     total = c.FPDFPage_GetAnnotCount(page)
     for k in range(min(total, ANOTACOES_MAX)):
@@ -102,7 +105,8 @@ def campos_visiveis(doc, page):
             flags = c.FPDFAnnot_GetFormFieldFlags(env, a)
             if flags & c.FPDF_FORMFLAG_TEXT_PASSWORD and tipo == c.FPDF_FORMFIELD_TEXTFIELD:
                 continue
-            nome = texto(c.FPDFAnnot_GetFormFieldAlternateName, a) or texto(c.FPDFAnnot_GetFormFieldName, a) or "Campo"
+            exibicao = texto(c.FPDFAnnot_GetFormFieldAlternateName, a)
+            nome = exibicao or texto(c.FPDFAnnot_GetFormFieldName, a) or "Campo"
             if tipo in (c.FPDF_FORMFIELD_CHECKBOX, c.FPDF_FORMFIELD_RADIOBUTTON):
                 valor = "[x]" if c.FPDFAnnot_IsChecked(env, a) else "[ ]"
                 if tipo == c.FPDF_FORMFIELD_RADIOBUTTON:
@@ -119,6 +123,15 @@ def campos_visiveis(doc, page):
             else:
                 valor = texto(c.FPDFAnnot_GetFormFieldValue, a)
             linhas.append(f"- {nome}: {valor or '(em branco)'}")
+            marcavel = tipo in (c.FPDF_FORMFIELD_CHECKBOX, c.FPDF_FORMFIELD_RADIOBUTTON)
+            posicoes.append(
+                (
+                    [caixa.left - l, caixa.bottom - b, caixa.right - l, caixa.top - b],
+                    marcavel,
+                    bool(exibicao),
+                    len(nome),
+                )
+            )
         except _Limite:
             falha = "teto de leitura dos campos do formulário"
             break
@@ -128,4 +141,34 @@ def campos_visiveis(doc, page):
             c.FPDFPage_CloseAnnot(a)
     if total > ANOTACOES_MAX:
         falha = "teto de anotações do formulário"
-    return "\n".join(linhas), visuais, falha
+    return "\n".join(linhas), visuais, falha, posicoes
+
+
+ROTULO_MAX = 80  # caracteres: o rótulo de um campo é curto; texto maior ao lado é parágrafo
+
+
+def com_rotulos(campos, posicoes, itens, W):
+    """Troca o nome interno do campo ("ie", "Text12") pelo rótulo impresso junto dele ("Inscrição estadual"): o texto
+    na mesma linha à esquerda da caixa (ou logo acima dela) e, na caixa de marcar, o texto à direita. O campo que já
+    tem nome de exibição no PDF fica com ele, e o que não tem rótulo por perto fica com o nome interno."""
+    linhas = campos.split("\n") if campos else []
+    if len(linhas) != len(posicoes):  # um valor com quebra de linha: a correspondência não é segura
+        return campos
+    textos = [x for x in itens if x.text.strip() and not x.text.startswith("[Image:") and x.width > 0]
+    for k, ((l, b, r, t), marcavel, exibicao, tamanho) in enumerate(posicoes):
+        if exibicao:
+            continue
+        na_linha = [x for x in textos if b - 2 <= x.y + x.height / 2 <= t + 2]
+        esquerda = [x for x in na_linha if x.x + x.width <= l + 2 and l - (x.x + x.width) <= 0.6 * W]
+        direita = [x for x in na_linha if x.x >= r - 2 and x.x - r <= 24]
+        acima = [x for x in textos if x.x < r and x.x + x.width > l and 0 <= x.y - t <= 20]
+        if marcavel:
+            achado = min(direita, key=lambda x: x.x, default=None) or max(esquerda, key=lambda x: x.x, default=None)
+        else:
+            achado = max(esquerda, key=lambda x: x.x + x.width, default=None) or min(
+                acima, key=lambda x: x.y, default=None
+            )
+        rotulo = html.escape(achado.text.strip().rstrip(":").strip(), quote=False) if achado else ""
+        if rotulo and len(rotulo) <= ROTULO_MAX and any(ch.isalpha() for ch in rotulo) and "\n" not in rotulo:
+            linhas[k] = f"- {rotulo.replace('[[', '&#91;&#91;')}" + linhas[k][2 + tamanho :]
+    return "\n".join(linhas)

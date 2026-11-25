@@ -35,6 +35,9 @@ def _metadados(pasta, plano, corpo, moveis):
         por_tipo.setdefault(tipo, set()).add(txt.strip())
     if moveis:
         por_tipo.setdefault("cabeçalho/rodapé", set()).update(moveis)
+    for p in plano.get("paginas", []):  # a marca d'água que a página do PDF traz como texto em diagonal
+        if p.get("marca_dagua"):
+            por_tipo.setdefault("marca d'água", set()).update(p["marca_dagua"])
     for k, v in por_tipo.items():  # junta com o que o arquivo já declara (cabeçalho/rodapé nativo)
         meta[k] = sorted(set(meta.get(k, [])) | v)
     if plano.get("texto_oculto"):
@@ -264,6 +267,34 @@ def _paragrafos_reproduzidos(regioes, blocos, lido):
     return copiados
 
 
+_PALAVRA = re.compile(r"\d[\d.,]*\d|\w+")
+ROTULO_MAX = 300  # caracteres: acima disso o bloco é um parágrafo, conferido por `_paragrafos_reproduzidos`
+
+
+def _rotulos_lidos(regioes, blocos, lido):
+    """Os blocos curtos do texto nativo que são rótulos de um desenho já lido: todas as palavras e números do bloco
+    estão dentro do recorte e também na leitura, na mesma quantidade. O extrator junta rótulos de caixas vizinhas
+    numa linha sem sentido ("Custo por OTIF NPS Avarias entrega 93,9% 71 0,42%"); com a leitura completa, repetir
+    essa linha só suja o texto. Se faltar uma palavra na leitura, o bloco fica."""
+    lidos = set()
+    for r in regioes:
+        if not r.get("desenho") or r.get("preserva_texto") or not (visual := lido(r["tarefa"])):
+            continue
+        if max(len(visual), len(r["texto_dentro"])) > 128_000:
+            continue
+        # o que a leitura mandou para os metadados ([[cabeçalho: …]]) sai do corpo: não cobre o texto nativo
+        corpo_lido = re.sub(r"\[\[(cabeçalho|rodapé|marca d'água|controle):.*?\]\]", " ", visual)
+        na_leitura = Counter(_PALAVRA.findall(corpo_lido.lower()))
+        no_recorte = Counter(_PALAVRA.findall(r["texto_dentro"].lower()))
+        for b in blocos:
+            texto = _texto_do_bloco(b)
+            palavras = Counter(_PALAVRA.findall(texto.lower()))
+            if palavras and len(texto) <= ROTULO_MAX and palavras <= no_recorte and palavras <= na_leitura:
+                no_recorte -= palavras  # cada rótulo do recorte responde por um bloco só
+                lidos.add(texto)
+    return lidos
+
+
 def montar(pasta, respostas, pendentes=None):
     plano = json.load(open(f"{pasta}/plano.json", encoding="utf-8"))
     R = _lidas(plano, respostas, lambda chave: _textos(plano, chave, respostas[chave]))
@@ -373,7 +404,7 @@ def montar(pasta, respostas, pendentes=None):
         blocos = [b for b in md.split("\n\n") if b.strip()]
         # Vocabulário coincidente não prova que a IA leu o trecho. Isso vale tanto para uma
         # foto com legenda digital quanto para o texto sobre um desenho.
-        copiados = _paragrafos_reproduzidos(p["regioes"], blocos, lido)
+        copiados = _paragrafos_reproduzidos(p["regioes"], blocos, lido) | _rotulos_lidos(p["regioes"], blocos, lido)
         limpos = [b for b in blocos if not copiados or _texto_do_bloco(b) not in copiados]
         inserir = {}
         for r in p["regioes"]:
@@ -505,7 +536,12 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
     n = len(nativas)
     minimo = max(3, 0.6 * n)
     freq = Counter(c for i, _ in nativas for c in {c for _, _, ln in bordas[i] for c in chaves(ln, i + 1)})
-    moveis = {c for c, v in freq.items() if n >= 3 and v >= minimo}
+    # em duas páginas, só a linha que diz o total ("Página 1 de 2" e "Página 2 de 2") prova a paginação
+    moveis = {
+        c
+        for c, v in freq.items()
+        if (n >= 3 and v >= minimo) or (n == 2 and v == 2 and re.search(r"#\s*(de|of|/)\s*2(?!\d)", c[0], flags=re.I))
+    }
     # cabeçalho fixo: em cada posição da borda, a linha que se repete idêntica; se a parte idêntica entra no corpo
     # além das 2 linhas da borda (3ª linha do começo ou do fim também igual), são páginas iguais, e isso é conteúdo
     por_posicao = {}
@@ -515,7 +551,11 @@ def _sem_cabecalho_corrido(nativas) -> set[str]:
             if -len(cheias) <= pos < len(cheias):
                 por_posicao.setdefault(pos, Counter())[cheias[pos][2].strip()] += 1
     repetidas = {
-        pos: t for pos, c in por_posicao.items() for t, v in c.most_common(1) if n >= 3 and v >= max(3, FIXA_MIN * n)
+        pos: t
+        for pos, c in por_posicao.items()
+        for t, v in c.most_common(1)
+        # com duas páginas, a linha fixa só sai se a paginação já ficou provada pela linha do número
+        if (n >= 3 and v >= max(3, FIXA_MIN * n)) or (n == 2 and v == 2 and moveis)
     }
     terceira = {0: 2, 1: 2, -1: -3, -2: -3}  # de cada posição da borda, a primeira linha do corpo
     # o título que se repete só sai num documento com seções de verdade: outros títulos, distintos, em número que

@@ -273,14 +273,58 @@ def _residuo_sem_tinta(g, molduras, textos, regras, fundo, W, H):
     return all(minimo >= 250 for minimo, _ in trecho.getextrema())
 
 
-def agrupar_figuras(objs, W, H, itens, papeis, tique, fundo=None):
-    """Devolve geometria, recorte com contexto e se o texto identifica cada figura."""
+EIXOS_MAX = 512  # traços finos considerados como eixo ou linha de grade de um gráfico, por página
+
+
+def _com_eixos(grupos, finos, tique, area_de_figura):
+    """Junta aos grupos de formas os traços finos que são eixo ou linha de grade do gráfico: o traço que encosta em
+    duas formas (o eixo sob as barras, a linha de grade que as cruza) e o traço ao lado de uma forma só que a
+    acompanha de ponta a ponta (o eixo de um gráfico de linha). Sem isso as barras ficam soltas, pequenas demais
+    para serem figura, e o gráfico de linha perde a altura do eixo. O traço que só passa perto de uma forma continua
+    sendo filete, sublinhado ou linha de tabela. A forma que já tem tamanho de figura não cresce pelos traços: dois
+    gráficos emoldurados, um sobre o outro, não se unem por uma linha entre eles."""
+    finos = list(finos)
+    mudou = True
+    while mudou and finos:
+        mudou = False
+        for f in list(finos):
+            tique()
+            horizontal = f[2] - f[0] >= f[3] - f[1]
+            a, b = (0, 2) if horizontal else (1, 3)
+            pequenos = [k for k, (g, _) in enumerate(grupos) if _area(g) < area_de_figura]
+            tocados = [k for k in pequenos if _proximas(f, grupos[k][0], 4)]
+            if len(tocados) < 2:
+                # uma forma só: o traço tem de cobrir a extensão dela e não ser muito maior que ela
+                tocados = [
+                    k
+                    for k in pequenos
+                    for g in [grupos[k][0]]
+                    if _proximas(f, g, 16)
+                    and f[a] <= g[a] + 4
+                    and f[b] >= g[b] - 4
+                    and f[b] - f[a] <= 3 * (g[b] - g[a])
+                ][:1]
+            if not tocados:
+                continue
+            g, partes = f, []
+            for k in tocados:
+                g = _uniao(g, grupos[k][0])
+                partes.extend(grupos[k][1])
+            grupos = [x for k, x in enumerate(grupos) if k not in tocados] + [(g, partes)]
+            finos.remove(f)
+            mudou = True
+    return grupos
+
+
+def agrupar_figuras(objs, W, H, itens, papeis, tique, fundo=None, grades=()):
+    """Devolve geometria, recorte com contexto e se o texto identifica cada figura. `grades`: as caixas das tabelas com
+    grade desenhada, cujas linhas não são eixo de gráfico."""
     textos = [
         ((x.x, x.y, x.x + x.width, x.y + x.height), x.text.strip())
         for x in itens
         if x.width > 0 and x.height > 0 and not x.text.startswith("[Image:")
     ]
-    caminhos, faixas, regras = [], defaultdict(list), []
+    caminhos, faixas, regras, finos = [], defaultdict(list), [], []
     area_pagina = W * H
     for i, (tipo, (l, b, r, t)) in enumerate(objs):
         if tipo != c.FPDF_PAGEOBJ_PATH:
@@ -289,6 +333,9 @@ def agrupar_figuras(objs, W, H, itens, papeis, tique, fundo=None):
         if h < 2.5 and w >= 0.65 * W:
             regras.append((l, b, r, t))
         if w < 2.5 or h < 2.5 or (w > 0.9 * W and h > 0.9 * H):
+            if max(w, h) >= 12 and min(w, h) < 2.5 and w <= 0.9 * W and len(finos) < EIXOS_MAX:
+                if not any(_contem(q, (l, b, r, t), 4) for q in grades):
+                    finos.append([l, b, r, t])
             continue  # filete, sublinhado ou moldura da página
         g = [l, b, r, t]
         papel = papeis.get(i)
@@ -322,6 +369,9 @@ def agrupar_figuras(objs, W, H, itens, papeis, tique, fundo=None):
             else:
                 break
         grupos.append((g, partes))
+    grupos = _com_eixos(
+        grupos, [f for f in finos if not any(_contem(m, f, 1) for m in molduras)], tique, 0.03 * area_pagina
+    )
     candidatos = [(g, True, False) for g in molduras]
     for g, partes in grupos:
         area = _area(g)

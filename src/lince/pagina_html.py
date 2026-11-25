@@ -3,10 +3,12 @@ ambiguidade (atributo hidden; display:none, opacity:0, visibility:hidden e fonte
 atributos de apresentação do SVG) sai do corpo e vira alerta, assim como o conteúdo que o navegador não desenha
 (<datalist>, <noembed>, <noframes>, <dialog> fechado), a não ser que o display do autor o mostre. O style é lido pelo
 tinycss2, com a cascata do CSS (última declaração válida, !important vence, valor inválido descartado) e herança de
-visibility e font-size.
+visibility e font-size. As regras de uma folha <style> entram na mesma cascata, abaixo do style da tag: o seletor é
+casado pelo cssselect2, na ordem de especificidade e de escrita (`.oculto{display:none}` esconde como o style).
 
 Limites (a página não é renderizada): cor do texto contra o fundo (branco sobre azul é visível, e a cor transparente
-também fica de fora), estilo de classe numa folha <style>, valor com função (calc, var, min, max, clamp), opacidade
+também fica de fora), regra dentro de @media ou de outra regra-arroba e folha externa (não é baixada), valor com
+função (calc, var, min, max, clamp), opacidade
 quase zero, layout (fora da tela, text-indent negativo, tamanho zero com overflow, clip, zoom), font-size sem unidade
 do modo quirks, popover fechado e rp/title no corpo (ficam no corpo), hidden="until-found" e dialog fechado (vão para
 o alerta, embora a pessoa possa abri-los), altura de linha em unidade de tela e oblique com ângulo no atalho font
@@ -23,6 +25,7 @@ import io
 import re
 import secrets
 
+import cssselect2
 import html_to_markdown
 import tinycss2
 from lxml import etree
@@ -370,10 +373,53 @@ def _px_do_atalho(tokens, pai_px, raiz_px):
     return tamanho
 
 
-def _efetivas(el, em_svg, pai_px, raiz_px) -> dict:
-    """Valor que vale para cada propriedade no próprio elemento, pela cascata do CSS."""
+FOLHA_MAX = 512 * 1024  # caracteres de CSS nas folhas <style> de uma página; acima disso só vale o style da tag
+REGRAS_MAX = 5000
+
+
+def _regras_da_folha(raiz) -> dict:
+    """Para cada elemento, as declarações das folhas <style> que valem para ele (só as propriedades que escondem), na
+    ordem da cascata: especificidade do seletor e, no empate, ordem de escrita. Regra-arroba (@media, @supports) fica
+    de fora: depende de onde a página é vista. Pseudo-elemento não é o elemento."""
+    folhas = [e.text or "" for e in raiz.iter("style") if next(e.iterancestors("svg"), None) is None]
+    if not any(f.strip() for f in folhas) or sum(map(len, folhas)) > FOLHA_MAX:
+        return {}
+    casador, n = cssselect2.Matcher(), 0
+    for folha in folhas:
+        for regra in tinycss2.parse_stylesheet(folha, skip_comments=True, skip_whitespace=True):
+            if regra.type != "qualified-rule":
+                continue
+            declaracoes = [
+                d
+                for d in tinycss2.parse_blocks_contents(regra.content, skip_comments=True, skip_whitespace=True)
+                if d.type == "declaration" and d.lower_name in _PROPRIEDADES
+            ]
+            if not declaracoes:
+                continue
+            n += 1
+            if n > REGRAS_MAX:
+                return {}
+            try:
+                seletores = cssselect2.compile_selector_list(regra.prelude)
+            except cssselect2.SelectorError:
+                continue  # seletor que o navegador também descartaria
+            for seletor in seletores:
+                casador.add_selector(seletor, declaracoes)
+    if not n:
+        return {}
+    regras = {}
+    for w in cssselect2.ElementWrapper.from_html_root(raiz).iter_subtree():
+        if achadas := [(esp, ordem, d) for esp, ordem, pseudo, d in casador.match(w) if pseudo is None]:
+            regras[w.etree_element] = [d for _, _, ds in sorted(achadas, key=lambda a: a[:2]) for d in ds]
+    return regras
+
+
+def _efetivas(el, em_svg, pai_px, raiz_px, folha=()) -> dict:
+    """Valor que vale para cada propriedade no próprio elemento, pela cascata do CSS: as regras da folha <style>
+    primeiro, o style da tag depois (a última declaração válida vence, e o !important vence as normais)."""
     normais, importantes = {}, {}
-    for d in tinycss2.parse_blocks_contents(el.get("style") or "", skip_comments=True, skip_whitespace=True):
+    proprias = tinycss2.parse_blocks_contents(el.get("style") or "", skip_comments=True, skip_whitespace=True)
+    for d in [*folha, *proprias]:
         if d.type != "declaration" or d.lower_name not in _PROPRIEDADES or not (tokens := _tokens(d.value)):
             continue
         nome = "font-size" if d.lower_name == "font" else d.lower_name
@@ -398,6 +444,7 @@ def _tirar_oculto(raiz, svgs=None) -> list:
     árvore, o SVG só mostra texto que ficou no corpo. Em `svgs` (opcional) fica, para cada <svg> mais externo, se ele
     herda o invisível do HTML."""
     ocultos, raiz_px = [], 16.0
+    folha = _regras_da_folha(raiz) if raiz.tag != "svg" else {}
     pilha = [(raiz, 16.0, False, None)]  # (elemento, fonte herdada em px, invisível, <svg> mais externo ou None)
     while pilha:
         el, px, invisivel, dono = pilha.pop()
@@ -414,7 +461,7 @@ def _tirar_oculto(raiz, svgs=None) -> list:
             else:
                 _esvaziar(el)
             continue
-        efetivas = _efetivas(el, em_svg, px, raiz_px)
+        efetivas = _efetivas(el, em_svg, px, raiz_px, () if em_svg else folha.get(el, ()))
         tecnica = None
         if el.get("hidden") is not None and not em_svg and efetivas.get("display") != "outro":
             tecnica = "atributo hidden"  # display do autor vence o hidden; revert volta a ele; no SVG não vale

@@ -8,6 +8,7 @@ license = "MIT"
 dependencies = [
   "firecrawl-anydoc==0.2.4",   # MIT — Office, ODF, RTF, EPUB, CSV, legados
   "pdf-inspector==1.25.2",     # MIT — texto e tabelas do PDF, posições
+  "pdfplumber>=0.11.8,<0.12",  # MIT (pdfminer.six MIT) — células da tabela pelas linhas de grade desenhadas no PDF
   "pypdfium2>=5.14,<6",        # Apache-2.0/BSD-3 — objetos da página, recorte, renderização
   "openpyxl>=3.1.5,<4",        # MIT — imagens e gráficos de XLSX
   "xlformat==0.5.0",           # MIT — exibição de números com o formato do Excel na leitura em fluxo
@@ -17,6 +18,7 @@ dependencies = [
   "lxml>=6.1",                 # BSD-3 — edição cirúrgica de OOXML (documento como código)
   "olefile>=0.47,<1",          # BSD-2 — cabeçalho, rodapé e macro dos binários do Office (DOC, XLS, PPT)
   "html-to-markdown>=3.20,<4", # MIT — HTML para Markdown (núcleo em Rust, sem dependências)
+  "cssselect2>=0.8,<1",        # BSD-3 — casa os seletores da folha <style> com os elementos (texto escondido por classe)
   "tinycss2>=1.4,<2",          # BSD-3 — style do HTML com a sintaxe e a cascata do CSS
   "resvg-py>=0.5,<0.6",        # MIT (no LICENSE do pacote; o PyPI não traz o campo) — desenha o SVG
   "msoffcrypto-tool>=6.1,<7",  # MIT (cryptography Apache-2.0/BSD-3, olefile BSD-2) — Office com senha
