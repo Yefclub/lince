@@ -3,6 +3,7 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 from reportlab.pdfgen import canvas
 
 from lince import Leitor, pdf
@@ -95,6 +96,115 @@ def test_cabecalho_composto_exige_divisorias_e_palavras_identicas():
     for insuficientes in ([], [filetes[0]]):
         _, duvida = conferir(texto, itens, insuficientes)
         assert "| Antes | Depois |  |" in duvida["md"]
+
+
+def test_caixa_da_tabela_complexa_inclui_nota_e_exclui_numeros_de_outro_bloco():
+    texto = (
+        "| Índice regional | | |\n| --- | --- | --- |\n| Período | 2023 | 2024 |\n"
+        "| Taxa | 4 4 | 6 |\n| Nota: valores estimados. | | |"
+    )
+    itens = [
+        item("2023", 14, 190, 18),
+        item("4", 14, 180, 5),
+        item("Índice regional", 35, 110, 75),
+        item("Período", 35, 96, 35),
+        item("2023", 95, 96, 18),
+        item("2024", 135, 96, 18),
+        item("Taxa", 35, 80, 22),
+        item("4", 95, 80, 5),
+        item("4", 103, 80, 5),
+        item("6", 135, 80, 5),
+        item("Nota: valores estimados.", 35, 64, 128),
+        item("4", 20, 10, 5),
+    ]
+    link = item("Link externo", 15, 200, 70)
+    link.render_mode = None
+    _, tabela = conferir(texto, [link, *itens])
+    assert tabela["complexa"] and tabela["caixa"] == [35, 64, 163, 120]
+    # Uma âncora repetida ou um valor não localizado não justificam esta caixa.
+    for duvidosos in ([item("Índice regional", 20, 200, 75), *itens], itens[:8] + itens[9:]):
+        _, tabela = conferir(texto, duvidosos)
+        assert "caixa" not in tabela
+    # Mesmo texto na ordem correta não deve ligar o corpo a um rodapé distante.
+    nota_distante = item("Nota: valores estimados.", 35, 5, 128)
+    assert "caixa" not in conferir(texto, [*itens[:-2], nota_distante])[1]
+    # O extrator pode ter dividido uma tabela real em dois blocos Markdown (Fed, p. 72).
+    # A continuação pode começar à esquerda da coluna ou sobrepor verticalmente a última linha.
+    for x, y in ((35, 48), (28, 48), (35, 55)):
+        continuacao = item("Outros valores", x, y, 78)
+        assert "caixa" not in conferir(texto, [*itens[:-1], continuacao])[1]
+    md, tabelas = limpar_tabelas(texto)
+    conferir_tabelas(md, tabelas, itens, [], lambda: None, marcas=[(400, 78, 420, 88)])
+    assert "caixa" not in tabelas[0]
+    itens[4].render_mode = None
+    assert "caixa" not in conferir(texto, itens)[1]
+
+
+def test_preparar_recorta_o_bloco_completo_apesar_dos_rotulos_do_grafico(tmp_path, monkeypatch):
+    arq = tmp_path / "indicadores.pdf"
+    c = canvas.Canvas(str(arq))
+    c.setFont("Helvetica", 10)
+    for i in range(8):
+        c.drawString(75 + 28 * i, 710, "2023")
+    c.drawString(65, 390, "Indicadores locais")
+    for x, texto in [(65, "Ano"), (190, "2023"), (260, "2024")]:
+        c.drawString(x, 372, texto)
+    for x, texto in [(65, "Taxa"), (190, "4"), (206, "4"), (260, "6")]:
+        c.drawString(x, 354, texto)
+    c.drawString(65, 336, "Nota: estimativas preliminares.")
+    c.save()
+    extrair = pdf._extrair
+
+    def tabela_com_celulas_fundidas(dados, inicio):
+        mds, ocr, itens = extrair(dados, inicio)
+        mds[inicio] = (
+            "| Indicadores locais | | |\n| --- | --- | --- |\n| Ano | 2023 | 2024 |\n"
+            "| Taxa | 4 4 | 6 |\n| Nota: estimativas preliminares. | | |"
+        )
+        return mds, ocr, itens
+
+    monkeypatch.setattr(pdf, "_extrair", tabela_com_celulas_fundidas)
+    (tarefa,) = Leitor().preparar(arq).tarefas
+    assert tarefa.tipo == "tabela"
+    x0, y0, x1, y1 = tarefa.caixa
+    assert x0 < 65 < 260 < x1 and y0 < 336 < 390 < y1 < 420
+    assert "Nota: estimativas preliminares." in tarefa.instrucao
+
+
+@pytest.mark.parametrize("y_marca", [360, 393])
+def test_marca_visual_da_tabela_nao_some_do_png(tmp_path, y_marca):
+    from io import BytesIO
+
+    from PIL import Image
+
+    arq = tmp_path / "marca.pdf"
+    c = canvas.Canvas(str(arq), pagesize=(420, 540))
+    c.setFont("Helvetica", 8)
+    c.drawString(65, 390, "Indicadores locais")
+    for y, linha in zip(
+        range(376, 305, -14),
+        (
+            ("Ano", "2023", "2024"),
+            ("Taxa A", "4 4", "6"),
+            ("Taxa B", "2", "3"),
+            ("Taxa C", "7", "8"),
+            ("Taxa D", "9", "5"),
+            ("Taxa E", "3", "1"),
+        ),
+        strict=True,
+    ):
+        for x, celula in zip((65, 190, 260), linha, strict=True):
+            c.drawString(x, y, celula)
+    c.drawString(65, 292, "Nota: vermelho marca dados iniciais.")
+    c.setFillColorRGB(1, 0, 0)
+    c.rect(304, y_marca, 12, 8, fill=1, stroke=0)
+    c.save()
+
+    (tarefa,) = Leitor().preparar(arq).tarefas
+    assert tarefa.tipo == "tabela" and tarefa.caixa[2] >= 316
+    with Image.open(BytesIO(tarefa.imagem)) as im:
+        cores = im.convert("RGB").getcolors(im.width * im.height)
+        assert any(cor == (255, 0, 0) and qtd >= 300 for qtd, cor in cores)
 
 
 def test_leitura_do_pdf_com_subtitulos_deslocados(tmp_path, monkeypatch):

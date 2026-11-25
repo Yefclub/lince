@@ -1063,7 +1063,8 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
     md, tabelas = limpar_tabelas(nativo)
     if tabelas and not (rotacao or ocultos or eh_ocr):
         filetes = [bx for tipo, bx in objs if tipo == c.FPDF_PAGEOBJ_PATH and bx[2] - bx[0] <= 2 < bx[3] - bx[1]]
-        md = conferir_tabelas(md, tabelas, itens_pg, filetes, _tique)
+        marcas = [bx for tipo, bx in objs if tipo in (c.FPDF_PAGEOBJ_PATH, c.FPDF_PAGEOBJ_IMAGE)]
+        md = conferir_tabelas(md, tabelas, itens_pg, filetes, _tique, marcas)
     # só tabela nativa CONFIÁVEL anula um desenho; tabela duvidosa pode ser rótulo de gráfico
     palavras_tabela = set().union(*[tb["palavras"] for tb in tabelas if not tb["complexa"]]) if tabelas else set()
     tabela_de = {}
