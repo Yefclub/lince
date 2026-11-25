@@ -642,3 +642,178 @@ def test_tabela_dentro_de_celula_nao_conta_como_aba(tmp_path):
 
     assert "SEGREDO" not in r.markdown and "visível" in r.markdown and "fim" in r.markdown
     assert r.metadados["abas_ocultas"] == ["Oculta"]
+
+
+def test_planilha_com_nome_de_outro_formato_e_lida_como_planilha(tmp_path):
+    """O leitor do corpo segue o conteúdo; a separação das abas ocultas também: renomear não as traz de volta."""
+    import shutil
+
+    ods = tmp_path / "base.ods"
+    _ods(ods, [("Resumo", False, _linha("visível")), ("Oculta", True, _linha("SEGREDO"))])
+    for ext in (".docx", ".xlsx", ".xls", ".odt", ".odp"):
+        p = tmp_path / f"ods{ext}"
+        shutil.copy(ods, p)
+
+        r = lince.ler(p)
+
+        assert "SEGREDO" not in r.markdown and "visível" in r.markdown, ext
+        assert r.metadados["abas_ocultas"] == ["Oculta"], ext
+    xls = tmp_path / "xls.doc"
+    shutil.copy(REAIS / "lince_aba_oculta_grafico.xls", xls)
+
+    r = lince.ler(xls)
+
+    assert "SEGREDO" not in r.markdown and "Vendas visíveis" in r.markdown and "{{IA:" not in r.markdown
+
+
+def test_xlsx_com_grafico_na_aba_oculta_renomeado_nao_poe_o_grafico_no_corpo(tmp_path):
+    from openpyxl.chart import BarChart, Reference
+
+    wb = Workbook()
+    wb.active.append(["visível"])
+    oculta = wb.create_sheet("Oculta")
+    for linha in (["Mês", "Valor"], ["SEGREDO1", 5]):
+        oculta.append(linha)
+    g = BarChart()
+    g.title = "TITULOSEGREDO"
+    g.add_data(Reference(oculta, min_col=2, min_row=1, max_row=2), titles_from_data=True)
+    oculta.add_chart(g, "D2")
+    oculta.sheet_state = "hidden"
+    p = tmp_path / "grafico.docx"
+    wb.save(p)
+
+    r = lince.ler(p)
+
+    assert "SEGREDO" not in r.markdown and "visível" in r.markdown
+    assert r.metadados["texto_oculto_removido"][0]["texto"].startswith("aba Oculta: Mês Valor SEGREDO1")
+
+
+def test_xml_em_utf16_que_o_parser_recusa_tambem_e_recusado(tmp_path):
+    """A palavra que denuncia a aba oculta é procurada em todas as codificações que o expat lê."""
+    tabelas = _tabela("Resumo", "ta1", _linha("visível") + "<x:y/>") + _tabela("Oculta", "ta2", _linha("SEGREDO"))
+    p = tmp_path / "utf16.ods"
+    _ods_cru(p, _conteudo_ods(tabelas).replace('encoding="UTF-8"', 'encoding="UTF-16"').encode("utf-16"))
+
+    with pytest.raises(DocumentoRecusado, match="aba oculta"):
+        lince.ler(p)
+
+    base, xlsx = tmp_path / "base.xlsx", tmp_path / "dtd16.xlsx"
+    wb = Workbook()
+    wb.active.append(["visível"])
+    wb.create_sheet("Oculta").append(["SEGREDO"])
+    wb["Oculta"].sheet_state = "hidden"
+    wb.save(base)
+    with zipfile.ZipFile(base) as entrada, zipfile.ZipFile(xlsx, "w") as saida:
+        for parte in entrada.infolist():
+            dados = entrada.read(parte)
+            if parte.filename == "xl/workbook.xml":
+                texto = dados.decode().replace('encoding="UTF-8"', 'encoding="UTF-16"')
+                texto = texto.replace("?>", '?><!DOCTYPE workbook [<!ENTITY h "hidden">]>', 1)
+                dados = texto.replace('state="hidden"', 'state="&h;"').encode("utf-16")
+            saida.writestr(parte, dados)
+
+    with pytest.raises(DocumentoRecusado, match="aba oculta"):
+        lince.ler(xlsx)
+
+
+def test_estilo_com_dois_table_properties_esconde_se_algum_esconde(tmp_path):
+    p = tmp_path / "duas.ods"
+    _ods_cru(
+        p,
+        _conteudo_ods(
+            _tabela("Resumo", "ta1", _linha("visível")) + _tabela("Oculta", "ta3", _linha("SEGREDO"))
+        ).replace(
+            "</office:automatic-styles>",
+            '<style:style style:name="ta3" style:family="table"><style:table-properties table:display="true"/>'
+            '<style:table-properties table:display="false"/></style:style></office:automatic-styles>',
+        ),
+    )
+
+    r = lince.ler(p)
+
+    assert "SEGREDO" not in r.markdown and r.metadados["abas_ocultas"] == ["Oculta"]
+
+
+def test_aba_oculta_vazia_e_com_sinal_de_maior_no_atributo_saem_inteiras(tmp_path):
+    """O trecho cortado é o da aba, achado pelos bytes: a tag vazia e o "/>" entre aspas não deslocam o corte."""
+    tabelas = (
+        _tabela("Resumo", "ta1", _linha("visível"))
+        + '<table:table table:name="Vazia" table:style-name="ta2"/>'
+        + _tabela("a/>b", "ta2", _linha("SEGREDO"))
+        + _tabela("Fim", "ta1", _linha("fim"))
+    )
+    p = tmp_path / "cortes.ods"
+    _ods_cru(p, _conteudo_ods(tabelas))  # o ">" fica literal entre as aspas, como o XML permite
+
+    r = lince.ler(p)
+
+    assert "SEGREDO" not in r.markdown and "visível" in r.markdown and "fim" in r.markdown
+    assert r.metadados["abas_ocultas"] == ["Vazia", "a/>b"]
+    assert "partes_ilegiveis" not in r.metadados
+
+
+def test_copia_sem_as_abas_ocultas_recusa_se_as_contagens_divergem(tmp_path):
+    p = tmp_path / "duas.ods"
+    _ods(p, [("Resumo", False, _linha("visível")), ("Oculta", True, _linha("SEGREDO"))])
+
+    with zipfile.ZipFile(p) as z, pytest.raises(DocumentoRecusado, match="contam diferente"):
+        xlsx_anotacoes._sem_abas_ods(z, {1}, abas=3)
+
+
+def test_grafico_que_nenhuma_aba_do_ods_mostra_fica_fora_do_corpo(tmp_path):
+    c = "urn:oasis:names:tc:opendocument:xmlns:chart:1.0"
+    grafico = (
+        f'<?xml version="1.0" encoding="UTF-8"?><office:document-content xmlns:office="{O}" xmlns:chart="{c}"'
+        f' xmlns:text="{X}"><office:body><office:chart><chart:chart chart:class="chart:bar"><chart:title>'
+        "<text:p>{}</text:p></chart:title></chart:chart></office:chart></office:body></office:document-content>"
+    )
+    objeto = '<table:shapes><draw:frame><draw:object xlink:href="./Object 1"/></draw:frame></table:shapes>'
+    p = tmp_path / "orfao.ods"
+    _ods_cru(
+        p,
+        _conteudo_ods(_tabela("Resumo", "ta1", objeto + _linha("v"))),
+        [
+            ("Object 1/content.xml", grafico.format("Vendas visíveis")),
+            ("Object 2/content.xml", grafico.format("TITULOSEGREDO")),
+        ],
+    )
+
+    md = lince.ler(p).markdown
+
+    assert "Vendas visíveis" in md and "SEGREDO" not in md
+
+
+def test_xls_com_duas_abas_no_mesmo_lugar_nao_poe_grafico_no_corpo(tmp_path):
+    """Duas entradas do BOUNDSHEET apontando o mesmo trecho: não dá para saber de qual aba é cada gráfico."""
+    import shutil
+    import struct
+
+    import olefile
+
+    p = tmp_path / "mesmo.xls"
+    shutil.copy(REAIS / "lince_aba_oculta_grafico.xls", p)
+    with olefile.OleFileIO(str(p), write_mode=True) as o:
+        b = bytearray(o.openstream("Workbook").read())
+        i, folhas = 0, []
+        while i + 4 <= len(b):
+            tipo, n = struct.unpack_from("<HH", b, i)
+            if tipo == 0x0085:
+                folhas.append(i)
+            i += 4 + n
+        struct.pack_into("<I", b, folhas[1] + 4, struct.unpack_from("<I", b, folhas[0] + 4)[0])
+        o.write_stream("Workbook", bytes(b))
+
+    r = lince.ler(p)
+
+    assert "SEGREDO" not in r.markdown and "Gráfico" not in r.markdown
+    assert "gráficos: ValueError" in r.metadados["partes_ilegiveis"]
+
+
+def test_aba_oculta_em_xml_utf16_valido_e_recusada(tmp_path):
+    """O corte é pelos bytes, que só batem com o texto em XML de um byte por caractere ASCII."""
+    tabelas = _tabela("Resumo", "ta1", _linha("visível")) + _tabela("Oculta", "ta2", _linha("SEGREDO"))
+    p = tmp_path / "utf16.ods"
+    _ods_cru(p, _conteudo_ods(tabelas).replace('encoding="UTF-8"', 'encoding="UTF-16"').encode("utf-16"))
+
+    with pytest.raises(DocumentoRecusado, match="UTF-16"):
+        lince.ler(p)

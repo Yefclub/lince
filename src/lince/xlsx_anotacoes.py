@@ -471,8 +471,8 @@ _ODS_REPETICAO_MAX = 1_048_576  # linhas e colunas que uma repetição pode pula
 
 class Ods(NamedTuple):
     """O que a passada pelo content.xml do .ods diz das abas ocultas: (nome, posição entre as abas, começo do texto)
-    de cada uma, os objetos embutidos dentro delas (gráficos, "Object 3") e o .ods sem elas (None se não há), que é o
-    que o leitor do corpo e o das imagens recebem."""
+    de cada uma, os objetos embutidos (gráficos, "Object 3") que as abas visíveis mostram e o .ods sem as ocultas
+    (None se não há), que é o que o leitor do corpo e o das imagens recebem."""
 
     ocultas: list
     objetos: set
@@ -523,12 +523,15 @@ def planilha_ods(path, extras, pendentes) -> Ods:
                                 oculta = None
                         elif el.tag == f"{_ODS_TB}table-row" and dentro == 1:
                             coluna = 0
-                        elif el.tag == f"{_DRAW}object" and oculta is not None:
+                        elif el.tag == f"{_DRAW}object" and oculta is None:
                             objetos.add((el.get(_XLINK) or "").removeprefix("./").strip("/"))
                         continue
                     if el.tag == f"{_ODS_STYLE}style":
-                        props = el.find(f"{_ODS_STYLE}table-properties")
-                        if props is not None and props.get(f"{_ODS_TB}display") == "false":
+                        # mais de um table-properties: basta um esconder (o LibreOffice usa o último)
+                        if any(
+                            props.get(f"{_ODS_TB}display") == "false"
+                            for props in el.findall(f"{_ODS_STYLE}table-properties")
+                        ):
                             escondidas.add(el.get(f"{_ODS_STYLE}name"))
                         continue
                     if el.tag == f"{_ODS_TB}table":
@@ -564,8 +567,10 @@ def planilha_ods(path, extras, pendentes) -> Ods:
                             oculta.linha(repeticao)
                     if el.tag in _LIMPAR and dentro <= 1:  # o parágrafo é lido quando a célula fecha: não é limpo antes
                         el.clear()
-        except Exception as e:
-            if isinstance(e, MemoryError) or b"display" in z.read("content.xml"):
+        except MemoryError:
+            raise
+        except Exception:
+            if menciona(z.read("content.xml"), "display"):
                 raise DocumentoRecusado(
                     "planilha com XML fora do padrão que pode esconder aba: a aba oculta não pôde ser separada do corpo"
                 ) from None
@@ -575,68 +580,94 @@ def planilha_ods(path, extras, pendentes) -> Ods:
         return Ods(ocultas, objetos, _sem_abas_ods(z, posicoes, abas))
 
 
-def _sem_abas_ods(z, posicoes, abas) -> bytes:
-    """O .ods com o content.xml sem as abas nas `posicoes`, contadas como em `planilha_ods` (com namespaces, pelo
-    mesmo expat): o XML é reescrito em fluxo e as outras partes são copiadas como estão. Se as duas passadas não
-    contam as mesmas `abas`, a aba oculta não pode ser separada com certeza, e o documento é recusado."""
-    import io
-    from xml.sax.handler import feature_namespaces
-    from xml.sax.saxutils import XMLGenerator
+def menciona(xml: bytes, palavra: str) -> bool:
+    """`palavra` no XML em qualquer codificação que o expat lê sem declaração externa (UTF-8, Latin-1, UTF-16): a
+    busca nos bytes de uma só codificação deixa passar o arquivo gravado em outra."""
+    return any(palavra.encode(c) in xml for c in ("utf-8", "utf-16-le", "utf-16-be"))
 
-    from defusedxml.sax import make_parser
+
+def _sem_abas_ods(z, posicoes, abas) -> bytes:
+    """O .ods com o content.xml sem as abas nas `posicoes`, contadas como em `planilha_ods`: o expat dá onde cada aba
+    começa e termina nos bytes, e só esses trechos saem; o resto do XML e as outras partes ficam como estão. Os trechos
+    são achados pelos bytes, então o XML tem de ser de um byte por caractere ASCII (UTF-8 ou Latin-1). Se as duas
+    passadas não contam as mesmas `abas`, a aba oculta não pode ser separada com certeza: o documento é recusado."""
+    import io
+    from xml.parsers import expat
 
     from .limites import DocumentoRecusado
 
-    tabela = (_ODS_TB[1:-1], "table")
+    xml = z.read("content.xml")
+    if xml[:2] in (b"\xff\xfe", b"\xfe\xff") or b"\x00" in xml[:4]:
+        raise DocumentoRecusado("planilha com aba oculta em XML UTF-16: a aba oculta não foi separada do corpo")
+    tabela = f"{_ODS_TB[1:-1]} table"
+    estado = {"abas": 0, "dentro": 0, "inicio": None}
+    cortes = []
 
-    class _Copia(XMLGenerator):
-        abas = dentro = 0
-        pulando = False
+    def abre(nome, _atributos):
+        if nome == tabela:
+            estado["dentro"] += 1
+            if estado["dentro"] == 1:
+                estado["abas"] += 1
+                if estado["abas"] - 1 in posicoes:
+                    inicio = parser.CurrentByteIndex
+                    fim = _fim_da_tag(xml, inicio)
+                    if xml[fim - 2 : fim] == b"/>":  # aba vazia: o trecho é a própria tag
+                        cortes.append((inicio, fim))
+                    else:
+                        estado["inicio"] = inicio
 
-        def startElementNS(self, nome, qnome, atributos):
-            if nome == tabela:
-                self.dentro += 1
-                if self.dentro == 1:
-                    self.abas += 1
-                    self.pulando = self.abas - 1 in posicoes
-            if not self.pulando:
-                super().startElementNS(nome, qnome, atributos)
+    def fecha(nome):
+        if nome != tabela:
+            return
+        estado["dentro"] -= 1
+        if not estado["dentro"] and estado["inicio"] is not None:
+            onde = parser.CurrentByteIndex  # o "</" da marca de fim, que não tem atributo
+            if not xml.startswith(b"</", onde):
+                raise DocumentoRecusado("planilha com XML fora do padrão: a aba oculta não foi separada do corpo")
+            cortes.append((estado["inicio"], _fim_da_tag(xml, onde)))
+            estado["inicio"] = None
 
-        def endElementNS(self, nome, qnome):
-            pulou = self.pulando
-            if nome == tabela:
-                self.dentro -= 1
-                if not self.dentro:
-                    self.pulando = False
-            if not pulou:
-                super().endElementNS(nome, qnome)
+    def recusa(*_):
+        raise DocumentoRecusado("planilha com entidade no XML: a aba oculta não foi separada do corpo")
 
-        def characters(self, texto):
-            if not self.pulando:
-                super().characters(texto)
-
-        def ignorableWhitespace(self, texto):
-            if not self.pulando:
-                super().ignorableWhitespace(texto)
-
-        def processingInstruction(self, alvo, dados):
-            if not self.pulando:
-                super().processingInstruction(alvo, dados)
-
-    xml = io.BytesIO()
-    copia = _Copia(xml, "utf-8", short_empty_elements=True)
-    parser = make_parser()
-    parser.setFeature(feature_namespaces, True)
-    parser.setContentHandler(copia)
-    with z.open("content.xml") as arquivo:
-        parser.parse(arquivo)
-    if copia.abas != abas:
+    parser = expat.ParserCreate(namespace_separator=" ")
+    parser.StartElementHandler, parser.EndElementHandler = abre, fecha
+    parser.EntityDeclHandler = parser.UnparsedEntityDeclHandler = parser.ExternalEntityRefHandler = recusa
+    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    parser.Parse(xml, True)
+    if estado["abas"] != abas:
         raise DocumentoRecusado("planilha com abas que as leituras contam diferente: a aba oculta não foi separada")
+    partes, pos = [], 0
+    for inicio, fim in cortes:
+        partes.append(xml[pos:inicio])
+        pos = fim
+    conteudo = b"".join(partes) + xml[pos:]
     saida = io.BytesIO()
     with zipfile.ZipFile(saida, "w", zipfile.ZIP_DEFLATED) as nova:
         for parte in z.infolist():
-            nova.writestr(parte, xml.getvalue() if parte.filename == "content.xml" else z.read(parte))
+            if parte.filename == "content.xml":  # a cópia só vive na memória, até o leitor do corpo: compressão leve
+                nova.writestr(parte, conteudo, compresslevel=1)
+            else:
+                nova.writestr(parte, z.read(parte))
     return saida.getvalue()
+
+
+def _fim_da_tag(xml: bytes, inicio: int) -> int:
+    """Posição logo depois do ">" que fecha a tag que começa em `inicio`, pulando o que está entre aspas."""
+    from .limites import DocumentoRecusado
+
+    aspas, k = None, inicio
+    while k < len(xml):
+        c = xml[k : k + 1]
+        if aspas:
+            if c == aspas:
+                aspas = None
+        elif c in (b'"', b"'"):
+            aspas = c
+        elif c == b">":
+            return k + 1
+        k += 1
+    raise DocumentoRecusado("planilha com XML cortado: a aba oculta não foi separada do corpo")
 
 
 def _repeticao(valor):

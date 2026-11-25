@@ -50,9 +50,20 @@ def _link(alvo):
     return _reg(0x1027, struct.pack("<HHH", alvo, 0, 0))
 
 
+def _folha(pos, estado=0):
+    return _reg(0x0085, struct.pack("<IBB", pos, estado, 2) + bytes([1, 0]) + b"G")
+
+
 class _Ole:
     def __init__(self, *graficos, versao=0x0600, antes=b""):
-        self.b = _bof(0x0005, versao) + antes + EOF_ + b"".join(_bof(0x0020) + g + EOF_ for g in graficos)
+        # cada folha de gráfico com o seu BOUNDSHEET, que diz onde ela começa: a que nada aponta o Excel não mostra
+        folhas = [_bof(0x0020) + g + EOF_ for g in graficos]
+        pos = len(_bof(0x0005, versao) + antes + EOF_) + len(graficos) * len(_folha(0))
+        lugares = []
+        for f in folhas:
+            lugares.append(_folha(pos))
+            pos += len(f)
+        self.b = _bof(0x0005, versao) + antes + b"".join(lugares) + EOF_ + b"".join(folhas)
 
     def exists(self, nome):
         return nome == "Workbook"
@@ -105,3 +116,13 @@ def test_xls_que_nao_e_ole_nao_ganha_parte_ilegivel(tmp_path):
     p.write_bytes((REAIS / "lince_imagem_planilha.ods").read_bytes())
     r = lince.ler(p)
     assert "Pedidos" in r.markdown and not any("gráficos" in x for x in r.metadados.get("partes_ilegiveis", []))
+
+
+def test_folha_de_grafico_que_nenhuma_aba_aponta_conta_como_oculta():
+    """O Excel só mostra o que o BOUNDSHEET aponta: o gráfico num trecho solto não vai para o corpo."""
+    ole = _Ole()
+    ole.b += _bof(0x0020) + BAR + EOF_
+
+    [g], _ = legados.graficos_xls(ole, len(ole.b))
+
+    assert g["oculto"] is True

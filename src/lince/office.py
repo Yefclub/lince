@@ -104,7 +104,8 @@ def _valores_sem_cache(path, refs) -> dict:
     out, por_aba = {}, {}
     for r in refs:
         por_aba.setdefault(r[0], set()).add(r)
-    wb = load_workbook(path, read_only=True, data_only=True)
+    # pelo arquivo aberto: o openpyxl recusa pelo nome a planilha gravada com a extensão de outro formato
+    wb = load_workbook(arquivo := open(path, "rb"), read_only=True, data_only=True)  # noqa: SIM115
     try:
         for aba, rs in por_aba.items():
             c1, l1 = min(r[1] for r in rs), min(r[2] for r in rs)
@@ -119,6 +120,7 @@ def _valores_sem_cache(path, refs) -> dict:
                     out[r] = [v for linha in linhas for v in linha]
     finally:
         wb.close()
+        arquivo.close()
     return out
 
 
@@ -274,13 +276,14 @@ def _celulas(linha, teto, cortes, saldo) -> tuple[list[str], bool]:
     return out, False
 
 
-def graficos_odf(path, ilegiveis, ocultos=frozenset()) -> list[dict]:
+def graficos_odf(path, ilegiveis, mostrados=None) -> list[dict]:
     """Gráfico do LibreOffice (.ods, .odp, .odt): cada objeto embutido com office:chart traz tipo, título e a tabela
-    local com os dados que ele desenha. Mesmo formato de graficos_ooxml."""
+    local com os dados que ele desenha. Mesmo formato de graficos_ooxml. Com `mostrados`, só os objetos de nível de
+    cima ("Object 3") que o documento mostra: o de uma aba oculta e o que nada referencia ficam fora do corpo."""
     out, saldo = [], [_CARACTERES_GRAFICOS_MAX]
     with zipfile.ZipFile(path) as z:
         for nome in sorted(n for n in z.namelist() if re.fullmatch(r"(?:[^/]+/)*Object \d+/content\.xml", n)):
-            if nome.rsplit("/", 1)[0] in ocultos:  # o gráfico de uma aba oculta fica fora do corpo, como ela
+            if mostrados is not None and nome.split("/", 1)[0] not in mostrados:
                 continue
             try:
                 g = _grafico_odf(z, nome, ilegiveis, saldo)
@@ -585,7 +588,7 @@ def planejar_office(path, pasta, ext=None):
     tarefas, pendentes = [], []  # pendentes: o que entra em cobertura.pendentes, com o motivo
     # o conteúdo da aba oculta não vai para o corpo (como o texto oculto): vai para os metadados, conferido como ele.
     # No .xls e no .ods a mesma passada lê as notas de célula, que o anydoc não entrega (o .xlsx as tem mais adiante)
-    ocultas, anotacoes, objetos_ocultos, partes_ocultas, ods_lido = [], [], set(), set(), path
+    ocultas, anotacoes, objetos_mostrados, partes_ocultas, ods_lido = [], [], None, set(), path
     if ext == ".ods":
         # o anydoc entrega a aba oculta do LibreOffice no corpo: ela sai do próprio arquivo antes, pela posição. Fora
         # do _complemento: a recusa (aba oculta que não pôde ser separada) derruba o documento
@@ -597,7 +600,7 @@ def planejar_office(path, pasta, ext=None):
             ilegiveis.append(f"notas de célula: {type(e).__name__}")
         else:
             ocultas.extend(ods.ocultas)
-            objetos_ocultos = ods.objetos
+            objetos_mostrados = ods.objetos
             if ods.sem_ocultas is not None:
                 ods_lido = io.BytesIO(ods.sem_ocultas)
     if grande:
@@ -866,7 +869,7 @@ def planejar_office(path, pasta, ext=None):
         _complemento(graficos_xls, "gráficos", ilegiveis)
     if ext in ODF:  # o leitor do corpo não entrega o gráfico do LibreOffice: tipo, título e os dados que ele desenha
         _complemento(
-            lambda: extras.extend(grafico_md(g) for g in graficos_odf(path, ilegiveis, objetos_ocultos)),
+            lambda: extras.extend(grafico_md(g) for g in graficos_odf(path, ilegiveis, objetos_mostrados)),
             "gráficos",
             ilegiveis,
         )
@@ -1332,7 +1335,8 @@ def _abas_ocultas_xlsx(path) -> list[tuple[str, str]]:
     from openpyxl import load_workbook
 
     out = []
-    wb = load_workbook(path, read_only=True, data_only=True)
+    # pelo arquivo aberto: o openpyxl recusa pelo nome a planilha gravada com a extensão de outro formato
+    wb = load_workbook(arquivo := open(path, "rb"), read_only=True, data_only=True)  # noqa: SIM115
     try:
         for ws in wb.worksheets:
             if ws.sheet_state == "visible":
@@ -1349,6 +1353,7 @@ def _abas_ocultas_xlsx(path) -> list[tuple[str, str]]:
             out.append((ws.title, 0, oculta.texto()))
     finally:
         wb.close()
+        arquivo.close()
     return out
 
 
@@ -1361,8 +1366,9 @@ def _partes_das_abas_ocultas(path) -> set[str]:
         bruto = z.read("xl/workbook.xml") if "xl/workbook.xml" in nomes else b""
         # falha fechada: com DTD (entidade no estado da aba) ou XML que o parser recusa, o anydoc pode ler a aba oculta
         # como visível, e ela não pode ser separada do corpo
-        if b"<!DOCTYPE" in bruto or (livro := xml_ou_nada(bruto)) is None:
-            if b"<!DOCTYPE" in bruto or b"state" in bruto:
+        dtd = xlsx_anotacoes.menciona(bruto, "<!DOCTYPE")
+        if dtd or (livro := xml_ou_nada(bruto)) is None:
+            if dtd or xlsx_anotacoes.menciona(bruto, "state"):
                 raise DocumentoRecusado(
                     "planilha com XML fora do padrão que pode esconder aba: a aba oculta não pôde ser separada do corpo"
                 )
@@ -1460,7 +1466,8 @@ def _xlsx_em_fluxo(path, ilegiveis, limites_formulas=None) -> tuple[str, list[di
     from openpyxl import load_workbook
 
     partes, perfis, total, varridas, esgotado = [], [], 0, 0, None
-    wb = load_workbook(path, read_only=True, data_only=True)
+    # pelo arquivo aberto: o openpyxl recusa pelo nome a planilha gravada com a extensão de outro formato
+    wb = load_workbook(arquivo := open(path, "rb"), read_only=True, data_only=True)  # noqa: SIM115
     try:
         visiveis = [ws for ws in wb.worksheets if ws.sheet_state == "visible"]
         for ws in visiveis:
@@ -1534,6 +1541,7 @@ def _xlsx_em_fluxo(path, ilegiveis, limites_formulas=None) -> tuple[str, list[di
             partes.append(texto)
     finally:
         wb.close()
+        arquivo.close()
     return "\n\n".join(partes), perfis
 
 

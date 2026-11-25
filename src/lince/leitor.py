@@ -464,6 +464,8 @@ def _extensao_lida(caminho: str) -> str:
     """A extensão que decide a leitura. Fora da lista, o conteúdo decide (marcador do formato: PDF, RTF, OLE, pacote
     Office ou ODF); sem marcador conhecido, o formato não é suportado."""
     ext = os.path.splitext(caminho)[1].lower()
+    if ext in OFFICE:
+        return _planilha_pelo_conteudo(caminho, ext) or ext
     if ext in FORMATOS:
         return ext
     if zipfile.is_zipfile(caminho):  # a detecção abre o pacote: conferido antes de qualquer descompactação
@@ -473,6 +475,24 @@ def _extensao_lida(caminho: str) -> str:
     if detectado is None:
         raise FormatoNaoSuportado(f"formato {ext or '(sem extensão)'} não suportado")
     return f".{detectado}"
+
+
+def _planilha_pelo_conteudo(caminho: str, ext: str) -> str | None:
+    """A planilha gravada com o nome de outro formato (um .ods chamado .docx, um .xls chamado .doc) é lida como a
+    planilha que é: o leitor do corpo segue o conteúdo, e a separação das abas ocultas tem de seguir também."""
+    if zipfile.is_zipfile(caminho):
+        with zipfile.ZipFile(caminho) as z:
+            if "xl/workbook.xml" in z.namelist():
+                return None if ext in (".xlsx", ".xlsm") else ".xlsx"
+        with open(caminho, "rb") as f:
+            return ".ods" if ext != ".ods" and anydoc.format_from_bytes(f.read()) == "ods" else None
+    import olefile
+
+    if ext != ".xls" and olefile.isOleFile(caminho):
+        with olefile.OleFileIO(caminho) as o:
+            if o.exists("Workbook") or o.exists("Book"):
+                return ".xls"
+    return None
 
 
 def _avisar_cache(e):

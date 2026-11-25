@@ -308,27 +308,31 @@ def graficos_xls(o, teto) -> tuple[list[dict], str | None]:
     if len(b) < 8 or struct.unpack_from("<H", b, 0)[0] != _BOF or struct.unpack_from("<H", b, 4)[0] != 0x0600:
         return [], None  # só BIFF8: o Excel 5/95 grava gráfico de outro jeito
     saida, atual, profundidade, blocos, anterior, pendente = [], None, 0, [], None, None
-    estados, na_oculta, fim = {}, False, 0  # estados: início de cada aba (BOUNDSHEET.lbPlyPos) → hsState
+    estados, aberta, na_oculta, fim = {}, False, False, 0  # estados: início de cada aba (BOUNDSHEET.lbPlyPos) → hsState
     for tipo, d in _registros(b, 0, Orcamento(len(b))):
         inicio, fim = fim, fim + 4 + len(d)
         if tipo == _FILEPASS:
             return saida, None  # protegida por senha: o resto é cifrado
         if tipo == _BOUNDSHEET and len(d) >= 5:
-            estados[struct.unpack_from("<I", d, 0)[0]] = d[4] & 3
+            if (onde := struct.unpack_from("<I", d, 0)[0]) in estados:
+                raise ValueError("duas abas no mesmo lugar do arquivo")  # não dá para saber de qual é cada gráfico
+            estados[onde] = d[4] & 3
         if tipo == _BOF:
             if atual is not None:
                 profundidade += 1
             elif len(d) >= 4 and struct.unpack_from("<H", d, 2)[0] == _CHART_BOF:
                 if len(saida) >= GRAFICOS_XLS_MAX:
                     return saida, f"mais de {GRAFICOS_XLS_MAX} gráficos; o resto ficou de fora"
-                # a folha de gráfico é uma aba; o gráfico embutido é da aba em que está
-                oculto = bool(estados[inicio]) if inicio in estados else na_oculta
+                # a folha de gráfico é uma aba; o gráfico embutido é da aba em que está. Trecho que nenhuma aba aponta
+                # o Excel não mostra: conta como oculto
+                oculto = na_oculta if aberta else bool(estados.get(inicio, 1))
                 atual = {"tipo": "", "titulo": "", "series": [], "oculto": oculto}
                 profundidade, blocos, pendente = 0, [], None
             else:
-                na_oculta = bool(estados.get(inicio, 0))
+                aberta, na_oculta = True, bool(estados.get(inicio, 1)) if inicio else False  # o primeiro é o livro
         elif atual is None:
-            pass
+            if tipo == _EOF:
+                aberta = False
         elif tipo == _EOF:
             if profundidade:
                 profundidade -= 1

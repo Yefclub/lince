@@ -11,7 +11,10 @@ Correções que vieram do benchmark contra o Docling (issue 150), nos formatos f
   leitura, como no Excel, e o nome vai para `abas_ocultas`. Gráfico e imagem de aba oculta também ficam fora do corpo (e a
   imagem não vai para a IA). No `.xls`, cuja imagem não diz de que aba é, as imagens de um arquivo com aba oculta
   ficam de fora, com o motivo em `partes_ilegiveis`. Planilha com XML que o leitor seguro recusa e que pode esconder
-  aba (DTD com entidade, prefixo sem namespace) é recusada, em vez de lida com a aba oculta dentro.
+  aba (DTD com entidade, prefixo sem namespace, em qualquer codificação) é recusada, em vez de lida com a aba oculta
+  dentro; a aba oculta do `.ods` em XML UTF-16 também. A planilha gravada com o nome de outro formato (um `.ods`
+  chamado `.docx`, um `.xls` chamado `.doc`) é lida como planilha, e o gráfico do `.ods` que nenhuma aba visível
+  mostra fica fora do corpo.
 - **Nota de célula** do `.xls` e do `.ods` sai como a do `.xlsx`, com o endereço da célula.
 - **Tabela do `.ppt`** sai como tabela, pela posição das células no slide, no lugar dos parágrafos soltos.
 - **Fluxograma do `.odp`** sai com as ligações, a direção das setas e os rótulos Sim/Não, em Mermaid e em lista, como
