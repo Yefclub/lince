@@ -492,11 +492,28 @@ def _planilha_pelo_conteudo(caminho: str, ext: str) -> str | None:
     # parece zip
     if olefile.isOleFile(caminho):
         return None if ext == ".xls" else ".xls"
-    with zipfile.ZipFile(caminho) as z:  # o .xlsb guarda o livro em binário: o pacote diz qual dos dois é
-        binario = "xl/workbook.bin" in z.namelist()
-    if binario:
+    if _livro_binario(caminho):
         return None if ext == ".xlsb" else ".xlsb"
     return None if ext in (".xlsx", ".xlsm") else ".xlsx"
+
+
+def _livro_binario(caminho: str) -> bool:
+    """Se o livro do pacote é o binário do .xlsb: pelo alvo officeDocument do _rels/.rels, o mesmo que o leitor do
+    corpo segue (uma parte .bin a mais ao lado do livro em XML não muda o formato). Sem relação, pelas partes: o
+    livro binário e nenhum em XML."""
+    from .limites import xml_ou_nada
+
+    with zipfile.ZipFile(caminho) as z:
+        nomes = set(z.namelist())
+        relacoes = xml_ou_nada(z.read("_rels/.rels")) if "_rels/.rels" in nomes else None
+    alvos = [
+        r.get("Target", "")
+        for r in (relacoes.iter() if relacoes is not None else ())
+        if r.get("Type", "").endswith("/officeDocument")
+    ]
+    if not alvos:
+        return "xl/workbook.bin" in nomes and "xl/workbook.xml" not in nomes
+    return all(a.lower().endswith(".bin") for a in alvos)
 
 
 def _avisar_cache(e):

@@ -892,3 +892,22 @@ def test_xlsx_e_xlsb_sao_separados_pelo_pacote(tmp_path):
     shutil.copy(REAIS / "testEXCEL.xlsb", xlsb)
 
     assert lince.ler(xlsb).markdown == lince.ler(REAIS / "testEXCEL.xlsb").markdown
+
+
+def test_parte_binaria_a_mais_nao_faz_do_xlsx_um_xlsb(tmp_path):
+    """O formato é o do livro que o pacote aponta (_rels/.rels), o que o leitor do corpo lê."""
+    base, p = tmp_path / "base.xlsx", tmp_path / "com_bin.xlsx"
+    wb = Workbook()
+    wb.active.append(["visível"])
+    wb.create_sheet("Oculta").append(["SEGREDO"])
+    wb["Oculta"].sheet_state = "hidden"
+    wb.save(base)
+    with zipfile.ZipFile(base) as entrada, zipfile.ZipFile(p, "w") as saida:
+        for parte in entrada.infolist():
+            saida.writestr(parte, entrada.read(parte))
+        saida.writestr("xl/workbook.bin", b"")
+
+    r = lince.ler(p)
+
+    assert "SEGREDO" not in r.markdown
+    assert r.metadados["texto_oculto_removido"][0]["texto"] == "aba Oculta: SEGREDO"
