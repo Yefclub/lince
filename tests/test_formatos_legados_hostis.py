@@ -911,3 +911,93 @@ def test_parte_binaria_a_mais_nao_faz_do_xlsx_um_xlsb(tmp_path):
 
     assert "SEGREDO" not in r.markdown
     assert r.metadados["texto_oculto_removido"][0]["texto"] == "aba Oculta: SEGREDO"
+
+
+def _xlsx_oculto(p, dtd=False):
+    wb = Workbook()
+    wb.active.append(["visível"])
+    wb.create_sheet("Oculta").append(["SEGREDO"])
+    wb["Oculta"].sheet_state = "hidden"
+    wb.save(p)
+    if not dtd:
+        return
+    with zipfile.ZipFile(p) as z:
+        partes = {i.filename: z.read(i) for i in z.infolist()}
+    livro = partes["xl/workbook.xml"].replace(b"?>", b'?><!DOCTYPE workbook [<!ENTITY h "hidden">]>', 1)
+    partes["xl/workbook.xml"] = livro.replace(b'state="hidden"', b'state="&h;"')
+    with zipfile.ZipFile(p, "w") as z:
+        for nome, dados in partes.items():
+            z.writestr(nome, dados)
+
+
+def _mover_livro(p, para, extras=()):
+    """O livro em outro lugar do pacote, com o _rels/.rels e as relações dele apontando para lá."""
+    with zipfile.ZipFile(p) as z:
+        partes = {i.filename: z.read(i) for i in z.infolist()}
+    partes[para] = partes.pop("xl/workbook.xml")
+    partes[para.replace("xl/", "xl/_rels/") + ".rels"] = partes.pop("xl/_rels/workbook.xml.rels")
+    partes["_rels/.rels"] = partes["_rels/.rels"].replace(b"xl/workbook.xml", para.encode())
+    partes["[Content_Types].xml"] = partes["[Content_Types].xml"].replace(b"/xl/workbook.xml", b"/" + para.encode())
+    partes.update(extras)
+    with zipfile.ZipFile(p, "w") as z:
+        for nome, dados in partes.items():
+            z.writestr(nome, dados)
+
+
+def test_livro_em_outro_lugar_do_pacote_e_conferido_como_o_corpo_o_le(tmp_path):
+    """O leitor do corpo segue o _rels/.rels: a recusa do DTD e a separação das abas ocultas seguem também, e o
+    livro em XML gravado com o nome .bin continua .xlsx."""
+    for para in ("xl/livro.xml", "xl/workbook.bin"):
+        p = tmp_path / f"dtd_{para.rsplit('/', 1)[1]}.xlsx"
+        _xlsx_oculto(p, dtd=True)
+        _mover_livro(p, para)
+
+        with pytest.raises(DocumentoRecusado, match="aba oculta"):
+            lince.ler(p)
+
+        limpo = tmp_path / f"limpo_{para.rsplit('/', 1)[1]}.xlsx"
+        _xlsx_oculto(limpo)
+        _mover_livro(limpo, para)
+
+        r = lince.ler(limpo)
+
+        assert "SEGREDO" not in r.markdown, para
+        assert r.metadados["texto_oculto_removido"][0]["texto"] == "aba Oculta: SEGREDO", para
+
+
+def test_deteccao_da_planilha_confere_o_pacote_antes_de_descompactar(tmp_path):
+    from lince.leitor import imagens_das_paginas
+
+    p = tmp_path / "bomba.xlsx"
+    _xlsx_oculto(p)
+    with zipfile.ZipFile(p, "a", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("xl/enorme.xml", b" " * 200_000_000)
+
+    with pytest.raises(DocumentoRecusado, match="descompacta"):
+        imagens_das_paginas(p, [1])
+
+
+def test_duas_relacoes_de_livro_conferem_as_duas(tmp_path):
+    """Com um alvo binário e outro em XML, o livro em XML é conferido e o pacote não vira .xlsb."""
+    for dtd in (True, False):
+        p = tmp_path / f"duas_{dtd}.xlsx"
+        _xlsx_oculto(p, dtd=dtd)
+        with zipfile.ZipFile(p) as z:
+            partes = {i.filename: z.read(i) for i in z.infolist()}
+        relacao = (
+            b'<Relationship Id="rBin" Target="xl/workbook.bin" Type="http://schemas.openxmlformats.org/'
+            b'officeDocument/2006/relationships/officeDocument"/>'
+        )
+        partes["_rels/.rels"] = partes["_rels/.rels"].replace(b"<Relationship ", relacao + b"<Relationship ", 1)
+        partes["xl/workbook.bin"] = b"\x83\x01\x00"  # o começo de um livro BIFF12
+        with zipfile.ZipFile(p, "w") as z:
+            for nome, dados in partes.items():
+                z.writestr(nome, dados)
+
+        if dtd:
+            with pytest.raises(DocumentoRecusado, match="aba oculta"):
+                lince.ler(p)
+        else:
+            r = lince.ler(p)
+            assert "SEGREDO" not in r.markdown
+            assert r.metadados["texto_oculto_removido"][0]["texto"] == "aba Oculta: SEGREDO"

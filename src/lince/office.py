@@ -1219,10 +1219,11 @@ def _imagens_xlsx(path, ilegiveis, ocultas=frozenset()) -> list[tuple[str, str, 
     achadas, vistos = [], set()
     with zipfile.ZipFile(path) as z:
         nomes = set(z.namelist())
-        livro = xml_ou_nada(z.read("xl/workbook.xml")) if "xl/workbook.xml" in nomes else None
+        lugar = livros_do_pacote(z, nomes)[0]
+        livro = xml_ou_nada(z.read(lugar)) if lugar in nomes else None
         if livro is None:
             return []
-        abas = _alvos(z, "xl/workbook.xml", nomes)
+        abas = _alvos(z, lugar, nomes)
         for aba in livro.iter():
             if aba.tag.rsplit("}", 1)[-1] != "sheet" or (parte := abas.get(aba.get(f"{_REL}id"))) not in nomes:
                 continue
@@ -1357,23 +1358,36 @@ def _abas_ocultas_xlsx(path) -> list[tuple[str, str]]:
     return out
 
 
+def livros_do_pacote(z, nomes) -> list[str]:
+    """As partes que podem ser o livro: os alvos officeDocument do _rels/.rels, que o leitor do corpo segue; sem
+    nenhum, o lugar de sempre."""
+    alvos = [a for a in _alvos(z, "", nomes, "officeDocument").values() if a in nomes]
+    return alvos or ["xl/workbook.xml"]
+
+
 def _partes_das_abas_ocultas(path) -> set[str]:
     """Os desenhos das abas ocultas do .xlsx e os gráficos e imagens deles: o que é da aba oculta fica fora do corpo
     como as células dela."""
     saida = set()
     with zipfile.ZipFile(path) as z:
         nomes = set(z.namelist())
-        bruto = z.read("xl/workbook.xml") if "xl/workbook.xml" in nomes else b""
-        # falha fechada: com DTD (entidade no estado da aba) ou XML que o parser recusa, o anydoc pode ler a aba oculta
-        # como visível, e ela não pode ser separada do corpo
-        dtd = xlsx_anotacoes.menciona(bruto, "<!DOCTYPE")
-        if dtd or (livro := xml_ou_nada(bruto)) is None:
-            if dtd or xlsx_anotacoes.menciona(bruto, "state"):
-                raise DocumentoRecusado(
-                    "planilha com XML fora do padrão que pode esconder aba: a aba oculta não pôde ser separada do corpo"
-                )
+        # falha fechada: com DTD (entidade no estado da aba) ou XML que o parser recusa, em qualquer das partes que
+        # podem ser o livro, o anydoc pode ler a aba oculta como visível, e ela não pode ser separada do corpo
+        livro = lugar = None
+        for parte in livros_do_pacote(z, nomes):
+            bruto = z.read(parte) if parte in nomes else b""
+            dtd = xlsx_anotacoes.menciona(bruto, "<!DOCTYPE")
+            if dtd or (arvore := xml_ou_nada(bruto)) is None:
+                if dtd or xlsx_anotacoes.menciona(bruto, "state"):
+                    raise DocumentoRecusado(
+                        "planilha com XML fora do padrão que pode esconder aba: a aba oculta não pôde ser separada do"
+                        " corpo"
+                    )
+            elif livro is None:
+                livro, lugar = arvore, parte
+        if livro is None:
             return saida
-        abas = _alvos(z, "xl/workbook.xml", nomes)
+        abas = _alvos(z, lugar, nomes)
         for aba in livro.iter():
             if aba.tag.rsplit("}", 1)[-1] != "sheet" or aba.get("state", "visible") == "visible":
                 continue

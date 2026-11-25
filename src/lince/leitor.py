@@ -480,6 +480,8 @@ def _extensao_lida(caminho: str) -> str:
 def _planilha_pelo_conteudo(caminho: str, ext: str) -> str | None:
     """A planilha gravada com o nome de outro formato (um .ods chamado .docx, um .xls chamado .doc) é lida como a
     planilha que é: o leitor do corpo segue o conteúdo, e a separação das abas ocultas tem de seguir também."""
+    if zipfile.is_zipfile(caminho):  # a detecção abre o pacote: conferido antes de qualquer descompactação
+        conferir_zip(caminho)
     with open(caminho, "rb") as f:
         detectado = anydoc.format_from_bytes(f.read())  # o mesmo critério do leitor do corpo
     if detectado == "ods":
@@ -498,22 +500,26 @@ def _planilha_pelo_conteudo(caminho: str, ext: str) -> str | None:
 
 
 def _livro_binario(caminho: str) -> bool:
-    """Se o livro do pacote é o binário do .xlsb: pelo alvo officeDocument do _rels/.rels, o mesmo que o leitor do
-    corpo segue (uma parte .bin a mais ao lado do livro em XML não muda o formato). Sem relação, pelas partes: o
-    livro binário e nenhum em XML."""
-    from .limites import xml_ou_nada
+    """Se o livro do pacote é o binário do .xlsb, pelo conteúdo da parte que o _rels/.rels aponta (o que o leitor do
+    corpo segue): o XML começa por "<" (depois do BOM e de espaço), o BIFF12 não. Uma parte .bin a mais, ou o XML
+    gravado com o nome .bin, não fazem do .xlsx um .xlsb. Sem relação, pelas partes: o livro binário e nenhum em
+    XML."""
+    from .office import livros_do_pacote
 
     with zipfile.ZipFile(caminho) as z:
         nomes = set(z.namelist())
-        relacoes = xml_ou_nada(z.read("_rels/.rels")) if "_rels/.rels" in nomes else None
-    alvos = [
-        r.get("Target", "")
-        for r in (relacoes.iter() if relacoes is not None else ())
-        if r.get("Type", "").endswith("/officeDocument")
-    ]
-    if not alvos:
-        return "xl/workbook.bin" in nomes and "xl/workbook.xml" not in nomes
-    return all(a.lower().endswith(".bin") for a in alvos)
+        lugares = [p for p in livros_do_pacote(z, nomes) if p in nomes] or (
+            ["xl/workbook.bin"] if "xl/workbook.bin" in nomes else []
+        )
+        inicios = []
+        for lugar in lugares:
+            with z.open(lugar) as parte:
+                inicios.append(parte.read(64))
+    # binário só se nenhuma das partes que podem ser o livro é XML (o XML em UTF-16 começa pelo BOM)
+    return bool(inicios) and not any(
+        i[:2] in (b"\xff\xfe", b"\xfe\xff") or i.removeprefix(b"\xef\xbb\xbf").lstrip(b" \t\r\n").startswith(b"<")
+        for i in inicios
+    )
 
 
 def _avisar_cache(e):
