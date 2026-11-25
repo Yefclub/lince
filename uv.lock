@@ -396,19 +396,6 @@ wheels = [
 ]
 
 [[package]]
-name = "cssselect2"
-version = "0.10.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "tinycss2" },
-    { name = "webencodings" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/06/00/2456b6b664c7a770989cbe3c352aac4eb962c938486f03a2e1255ae963c6/cssselect2-0.10.1.tar.gz", hash = "sha256:83b0d820ef589dabaf693289b647c2f5b410f76d285f56deba911ffa75a7b9d1", size = 35653, upload-time = "2026-08-31T21:57:42.59Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/bd/59/6b1daa3b94de8970e2a2787ba73616c2d0675d2f948ef4cad8bef7f21bc6/cssselect2-0.10.1-py3-none-any.whl", hash = "sha256:25cc4494d55985d6a6da359be48da6ce98c28dcbafa2314c383ace3fc32ec868", size = 15489, upload-time = "2026-08-31T21:57:41.162Z" },
-]
-
-[[package]]
 name = "cyclonedx-python-lib"
 version = "11.12.0"
 source = { registry = "https://pypi.org/simple" }
@@ -675,7 +662,6 @@ name = "lince"
 version = "0.9.0"
 source = { editable = "." }
 dependencies = [
-    { name = "cssselect2" },
     { name = "defusedxml" },
     { name = "firecrawl-anydoc" },
     { name = "html-to-markdown" },
@@ -721,7 +707,6 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cssselect2", specifier = ">=0.8,<1" },
     { name = "defusedxml", specifier = ">=0.7" },
     { name = "firecrawl-anydoc", specifier = "==0.2.4" },
     { name = "html-to-markdown", specifier = ">=3.20,<4" },

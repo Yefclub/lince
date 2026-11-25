@@ -1,6 +1,6 @@
 ---
 tipo: fix
-titulo: Tabelas com grade, colunas, gráficos e rodapés do PDF lidos pela estrutura do próprio arquivo
+titulo: Tabelas com grade, colunas, gráficos, rodapés e formulários do PDF lidos pela estrutura do próprio arquivo
 ---
 
 Correções que vieram do benchmark contra o Docling (issue 150) e da auditoria em PDFs reais (issue 151).
@@ -20,8 +20,7 @@ Correções que vieram do benchmark contra o Docling (issue 150) e da auditoria 
   interno ("ie").
 - **Fórmula**: sem uma caixa só dela, o texto nativo fica; some o recorte que cortava a coluna vizinha.
 - **Rótulos de um desenho já lido** pela IA não se repetem embaralhados no texto quando a leitura traz todos eles.
-- **HTML**: texto escondido por regra de uma folha `<style>` (classe, id, seletor composto) sai do corpo e gera alerta,
-  com a cascata do CSS.
+- **Tabela lida pela IA** só substitui a tabela nativa duvidosa quando traz todos os números dela, com a mesma casa
+  decimal; senão as duas ficam e a pendência é registrada.
 
-Dependências novas: `pdfplumber` (MIT), pelo algoritmo de detecção de grade, e `cssselect2` (BSD-3), pelo casamento de
-seletores.
+Dependência nova: `pdfplumber` (MIT), pelo algoritmo de detecção de grade.

@@ -205,3 +205,55 @@ def test_formula_cuja_caixa_leva_texto_vizinho_nao_vira_recorte(tmp_path, monkey
     assert plano.tarefas == []
     assert "E = × 100 (1) Σ = ± 3" in r.markdown and "ver nota fig. 2 rota sul base 2025" in r.markdown
     assert r.cobertura.pendentes == ["página 1: localização da fórmula não confirmada"]
+
+
+def test_leitura_que_move_a_virgula_nao_substitui_a_tabela_nativa(tmp_path, monkeypatch):
+    """ "1,5" e "15" têm os mesmos algarismos e são valores diferentes: a leitura que perdeu a vírgula não troca a
+    tabela nativa, que tem o número certo. O separador de milhar, esse sim, pode mudar."""
+    p = tmp_path / "contas.pdf"
+    md = _contas(p).replace("150", "1,5").replace("320", "1 234,5")
+    _extracao(monkeypatch, lambda i: md)
+    leitor = lince.Leitor()
+    plano = leitor.preparar(p)
+    (t,) = plano.tarefas
+    cabecalho = "| Período | 2022 | 2023 | 2024 |\n| --- | --- | --- | --- |\n"
+    resto = "| Despesa | 211 | 222 | 243 |\n| Saldo | 61 | 12 | 77 |"
+    certa = cabecalho + "| Receita | 1,5 | 210 | 1.234,5 |\n" + resto
+    sem_virgula = cabecalho + "| Receita | 15 | 210 | 1.234,5 |\n" + resto
+
+    boa = leitor.concluir(plano, {t.id: certa})
+    ruim = leitor.concluir(plano, {t.id: sem_virgula})
+
+    assert boa.cobertura.pendentes == [] and "| Receita | 1,5 | 210 | 1.234,5 |" in boa.markdown
+    assert ruim.cobertura.pendentes == [f"{t.id}: integralidade da transcrição da tabela não verificada"]
+    assert "1,5" in ruim.markdown  # o valor do arquivo continua no texto
+
+
+def test_tabela_sem_grade_ao_lado_de_um_grafico_nao_leva_o_grafico_no_recorte(tmp_path, monkeypatch):
+    """A caixa da tabela que o extrator não localizou célula a célula ia até a margem direita da página e levava o
+    gráfico vizinho junto; agora vai da primeira à última coluna da tabela."""
+    p = tmp_path / "contas.pdf"
+    c = canvas.Canvas(str(p), pagesize=(595, 842))
+    c.setFont("Helvetica", 8)
+    c.drawString(57, 730, "Tabela 1 – Contas externas")
+    for k, linha in enumerate(
+        (("Período", "2022", "2023", "2024"), ("Receita", "150", "210", "320"), ("Despesa", "211", "222", "243"))
+    ):
+        for x, texto in zip((57, 140, 190, 240), linha, strict=True):
+            c.drawString(x, 700 - 20 * k, texto)
+    c.drawString(380, 730, "Gráfico 1 – Saldo")  # o gráfico ao lado, de x=380 em diante
+    c.line(380, 640, 540, 640)
+    c.line(380, 640, 380, 720)
+    c.save()
+    _extracao(
+        monkeypatch,
+        lambda i: (
+            "**Tabela 1 – Contas externas** Gráfico 1 – Saldo\n\n| Período | 2022 2023 | 2024 |\n| --- | --- | --- |\n"
+            "| Receita | 150 210 | 320 |\n| Despesa | 211 222 | 243 |"
+        ),
+    )
+
+    (t,) = lince.Leitor().preparar(p).tarefas
+
+    assert t.tipo == "tabela" and t.caixa[0] <= 57 and t.caixa[2] >= 255  # da primeira à última coluna
+    assert t.caixa[2] < 380  # sem o gráfico

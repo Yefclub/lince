@@ -1572,7 +1572,11 @@ def _pagina(doc, i, col, md, eh_ocr, itens_pg, pasta, tarefas, cache, seguranca,
                         "depois_de": linha_acima,
                         "texto_dentro": ancora,
                         **({"desenho": True} if tipo == "desenho" else {}),
-                        **({"texto_fora": fora} if tipo == "desenho" and (fora := _texto_fora(itens, dentro)) else {}),
+                        **(
+                            {"texto_fora": fora}
+                            if tipo == "desenho" and (fora := _texto_fora(itens, dentro)) is not None
+                            else {}
+                        ),
                         # A legenda digital sobre uma foto de fundo é texto da página.
                         **(
                             {"preserva_texto": True}
@@ -1608,10 +1612,11 @@ TEXTO_FORA_MAX = 20_000  # caracteres do texto fora de um desenho guardados para
 
 def _texto_fora(itens, dentro):
     """O texto da página que está fora do recorte de um desenho, para a montagem não tirar do corpo um bloco que pode
-    ser de fora dele. Vazio quando não cabe no teto: sem a lista inteira, a montagem não tira nada."""
+    ser de fora dele ("" quando a página só tem o desenho). None quando não cabe no teto: sem a lista inteira, a
+    montagem não tira nada."""
     ids = {id(x) for x in dentro}
     fora = " ".join(x.text for x in itens if id(x) not in ids)
-    return fora if len(fora) <= TEXTO_FORA_MAX else ""
+    return fora if len(fora) <= TEXTO_FORA_MAX else None
 
 
 def _sobrepoe(a, b):

@@ -536,3 +536,106 @@ def test_pagina_com_muito_texto_fora_do_grafico_nao_perde_titulo_com_palavras_do
 
     assert md.count("Entregas por mês") == 3  # a leitura, o título de fora e o rótulo nativo: nada sai
     assert md.count(linha) == 200
+
+
+def test_tabela_de_perguntas_e_respostas_sem_espaco_entre_as_linhas_mantem_os_pares(tmp_path):
+    """Com a margem de célula do Word (sem espaço entre uma linha e outra), o alinhamento dos começos não aparece; as
+    células fechadas ("?" e ".") dizem que é tabela, e a remontagem de colunas não separa pergunta e resposta."""
+    p = tmp_path / "perguntas.pdf"
+    pares = [
+        (
+            "Qual o prazo para pedir o reembolso das despesas de viagem?",
+            "O pedido deve ser feito em até trinta dias corridos depois da volta, com os comprovantes.",
+        ),
+        (
+            "Quem aprova as despesas acima do limite do cartão corporativo?",
+            "O diretor da área aprova, e a controladoria confere o lançamento antes do pagamento.",
+        ),
+        (
+            "Posso usar o carro próprio em vez do carro da frota da empresa?",
+            "Sim, com reembolso por quilômetro rodado, desde que a rota seja informada antes da viagem.",
+        ),
+        (
+            "O que fazer se perder um comprovante de despesa no caminho?",
+            "Preencha a declaração de extravio e peça ao gestor que assine; vale para duas ocorrências.",
+        ),
+        (
+            "Como é calculada a diária de alimentação nas viagens internacionais?",
+            "Pela tabela do país de destino, convertida pela cotação do dia da partida da viagem.",
+        ),
+        (
+            "Há limite de valor para a hospedagem em hotel nas capitais?",
+            "Sim, o teto da política vale para a diária com café, e o excedente fica com o colaborador.",
+        ),
+    ]
+    estreito = ParagraphStyle("e", parent=N, leading=11, spaceAfter=0)
+    t = Table([[Paragraph(a, estreito), Paragraph(b, estreito)] for a, b in pares], colWidths=[200, 280])
+    t.setStyle(TableStyle([("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 1)]))
+    SimpleDocTemplate(str(p), pagesize=A4).build([Paragraph("Perguntas frequentes", H1), t])
+
+    plano = " ".join(lince.ler(p).markdown.replace("|", " ").split())
+
+    for k, (pergunta, resposta) in enumerate(pares):  # cada resposta antes da pergunta seguinte
+        seguinte = plano.find(pares[k + 1][0][:30]) if k + 1 < len(pares) else len(plano)
+        assert plano.find(pergunta[:30]) < plano.find(resposta[:30]) < seguinte
+
+
+def test_pagina_so_com_o_grafico_nao_repete_os_rotulos_lidos(tmp_path):
+    """Sem texto fora do gráfico, nenhum bloco pode ser de fora dele: os rótulos lidos saem como nas outras páginas."""
+    W, H = landscape(A4)
+    p = tmp_path / "so_grafico.pdf"
+    c = canvas.Canvas(str(p), pagesize=(W, H))
+    c.setFont("Helvetica", 9)
+    c.drawString(480, H - 90, "Gráfico 3 – Entregas por mês (mil)")
+    c.line(470, H - 260, 760, H - 260)
+    c.line(470, H - 260, 470, H - 110)
+    for k, (mes, v) in enumerate([("Jul", 62), ("Ago", 71), ("Set", 88), ("Out", 93)]):
+        x = 495 + k * 68
+        c.setFillColor(colors.HexColor("#2f6fad"))
+        c.rect(x, H - 260, 30, v * 1.4, stroke=0, fill=1)
+        c.setFillColor(colors.black)
+        c.drawCentredString(x + 15, H - 257 + v * 1.4, str(v))
+        c.drawCentredString(x + 15, H - 272, mes)
+    c.save()
+    leitor = lince.Leitor()
+    plano = leitor.preparar(p)
+    leitura = (
+        "Gráfico (colunas): Gráfico 3 – Entregas por mês (mil)\n\n"
+        "| Mês | Entregas |\n| --- | --- |\n| Jul | 62 |\n| Ago | 71 |\n| Set | 88 |\n| Out | 93 |"
+    )
+
+    md = leitor.concluir(plano, {t.id: leitura for t in plano.tarefas}).markdown
+
+    assert md.count("Jul") == 1 and md.count("93") == 1
+
+
+def test_desenho_nao_cresce_para_conter_imagem_se_ficaria_ilegivel(tmp_path):
+    """Crescer o recorte do painel até a foto que passa da borda faria ele passar do lado que o provedor lê sem
+    reduzir: aí a foto continua com a leitura própria, inteira, e o painel fica como estava."""
+    import io
+
+    from PIL import Image
+    from reportlab.lib.utils import ImageReader
+
+    foto = io.BytesIO()
+    Image.effect_noise((200, 100), 60).convert("RGB").save(foto, "PNG")
+    p = tmp_path / "painel_largo.pdf"
+    c = canvas.Canvas(str(p), pagesize=(1000, 700))
+    c.setFont("Helvetica", 10)
+    c.drawString(100, 640, "Painel de volumes por centro de distribuição, com a foto do pátio principal.")
+    c.rect(100, 100, 760, 400, stroke=1, fill=0)  # o painel: 760 pt, no limite do que é lido sem reduzir
+    c.line(130, 130, 600, 130)
+    c.line(130, 130, 130, 470)
+    for k, v in enumerate([80, 140, 200, 260]):
+        c.setFillColor(colors.HexColor("#2f6fad"))
+        c.rect(170 + 100 * k, 130, 50, v, stroke=0, fill=1)
+        c.setFillColor(colors.black)
+        c.drawCentredString(195 + 100 * k, 118, ["CD 1", "CD 2", "CD 3", "CD 4"][k])
+    c.drawImage(ImageReader(foto), 680, 250, 200, 100)  # 90% dentro do painel, passa 20 pt da borda direita
+    c.save()
+
+    tarefas = lince.Leitor().preparar(p).tarefas
+
+    assert sorted(t.tipo for t in tarefas) == ["desenho", "imagem"]
+    (imagem,) = [t for t in tarefas if t.tipo == "imagem"]
+    assert imagem.caixa[0] <= 680 and imagem.caixa[2] >= 880  # a foto inteira

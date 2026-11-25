@@ -304,17 +304,23 @@ def _rotulos_lidos(regioes, blocos, lido):
 _NUMERO = re.compile(r"\d[\d.,\u00a0\u2009\u202f]*\d|\d")
 
 
+def _numero_canonico(n):
+    """(algarismos, casas decimais) de um número escrito: "1.234,5", "1 234,5" e "1234.5" dão ("12345", 1). O último
+    separador seguido de três algarismos é de milhar; outro é a vírgula decimal. "1,5" e "15" são números diferentes."""
+    n = re.sub(r"[\s\u00a0\u2009\u202f]", "", n)
+    if (m := re.search(r"[.,](\d+)$", n)) and len(m.group(1)) != 3:
+        return re.sub(r"\D", "", n), len(m.group(1))
+    return re.sub(r"\D", "", n), 0
+
+
 def _cobre_numeros(nativo, visual):
     """A leitura de uma tabela traz todos os números que a tabela nativa tem, e não marca nada como ilegível. Sem
-    isso (recorte que cortou uma linha, leitura que parou no meio), trocar a tabela nativa pela leitura perderia
-    valores que o arquivo tem."""
+    isso (recorte que cortou uma linha, leitura que parou no meio ou moveu a vírgula), trocar a tabela nativa pela
+    leitura perderia valores que o arquivo tem."""
     if "[ilegível" in visual or "[illegible" in visual:
         return False
-
-    def algarismos(texto):  # "1.234,5", "1 234,5" e "1234.5" são o mesmo número escrito de outro jeito
-        return Counter(re.sub(r"\D", "", n) for n in _NUMERO.findall(texto))
-
-    return not (algarismos(nativo) - algarismos(visual))
+    nativos = Counter(_numero_canonico(n) for n in _NUMERO.findall(nativo))
+    return not (nativos - Counter(_numero_canonico(n) for n in _NUMERO.findall(visual)))
 
 
 def montar(pasta, respostas, pendentes=None):
