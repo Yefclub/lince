@@ -447,11 +447,12 @@ _CELULAS_MAX = 4096  # células de todas as tabelas de uma apresentação
 _CELULA_TEXTO_MAX = 2048  # caracteres por célula
 
 
-def tabelas_ppt(o, teto) -> list[list[list[str]]]:
+def tabelas_ppt(o, teto) -> tuple[list[list[list[str]]], bool]:
     """Tabelas dos slides do .ppt, linha a linha: o PowerPoint 97-2003 guarda a tabela como um grupo de formas, uma por
     célula, com a posição dela no grupo (ChildAnchor) e o texto (TextCharsAtom ou TextBytesAtom). O grupo é tabela
     quando as formas com área ocupam uma grade completa (cada linha com as mesmas colunas); as linhas de borda não têm
-    área e ficam de fora. O stream é percorrido sem recursão, com o mesmo orçamento dos metadados."""
+    área e ficam de fora. O stream é percorrido sem recursão, com o mesmo orçamento dos metadados. Devolve também se
+    todas foram lidas: acima de _CELULAS_MAX células, as tabelas seguintes ficam como o leitor do corpo as entregou."""
     b = ler_stream(o, "PowerPoint Document", teto)
     orcamento = Orcamento(len(b))
     tabelas, celulas_lidas = [], 0
@@ -468,14 +469,14 @@ def tabelas_ppt(o, teto) -> list[list[list[str]]]:
                 if (tabela := _grade(formas)) is not None:
                     celulas_lidas += sum(map(len, tabela))
                     if celulas_lidas > _CELULAS_MAX:
-                        raise ValueError("células de tabela demais")
+                        return tabelas, False
                     tabelas.append(tabela)
                 else:  # grupo que não é tabela pode conter outro grupo que é
                     pilha.append((corpo, prox, None))
             elif ver & 0xF == _CONTEINER:
                 pilha.append((corpo, prox, grupo))
             i = corpo + tam
-    return tabelas
+    return tabelas, True
 
 
 def _formas_do_grupo(b, i, fim, formas, orcamento):
@@ -738,49 +739,76 @@ def rtf(dados: bytes, ler_rtf) -> tuple[list[str], bool]:
     return saida, True
 
 
-_ESTILO = re.compile(rb"\{\\s(\d{1,4})(?![0-9])")
-_NOME_DE_TITULO = re.compile(r"(heading|t[ií]tulo|titre|[uü]berschrift|encabezado|kop)\s*([1-6])\b", re.I)
-_TITULOS_MAX = 512  # parágrafos de título lidos por arquivo; o texto de cada um passa pelo leitor do corpo
+_NOME_DE_TITULO = re.compile(r"\b(heading|t[ií]tulo|titre|[uü]berschrift|encabezado|kop)\s*([1-6])\b", re.I)
+TITULOS_MAX = 512  # parágrafos de título lidos por arquivo; o texto de cada um passa pelo leitor do corpo
+_PARAGRAFO_TITULO_MAX = 8192  # bytes de um parágrafo de título; maior que isso não é título, e não é copiado
+_CHAVES = re.compile(rb"[{}]")
+_USO_DE_ESTILO = re.compile(rb"\\s(\d{1,4})(?![0-9])")
 
 
-def titulos_rtf(dados: bytes, ler_rtf) -> list[tuple[int, str]]:
-    """(nível, texto) de cada parágrafo com estilo de título, na ordem do documento. O nível vem da folha de estilos:
-    \\outlinelevelN ou o nome do estilo ("Heading 2", "Título 2"). O texto do parágrafo é lido pelo mesmo leitor do
-    corpo (`ler_rtf`), num RTF mínimo com o prólogo e a tabela de fontes do original, como os cabeçalhos."""
+def _entradas_do_grupo(dados, inicio, fim):
+    """Os grupos filhos diretos do grupo que começa em `inicio`, numa passada só sobre as chaves (sem buscar o fim de
+    cada um de novo): (início, fim) de cada `{...}` de profundidade 1. A barra invertida antes da chave a escapa."""
+    profundidade, abre = 0, None
+    for m in _CHAVES.finditer(dados, inicio, fim):
+        if m.start() and dados[m.start() - 1 : m.start()] == b"\\":
+            continue
+        if m.group() == b"{":
+            profundidade += 1
+            if profundidade == 2:
+                abre = m.start()
+        else:
+            if profundidade == 2 and abre is not None:
+                yield abre, m.end()
+            profundidade -= 1
+            if profundidade <= 0:
+                return
+
+
+def titulos_rtf(dados: bytes, ler_rtf) -> tuple[list[tuple[int, str]], bool]:
+    """(nível, texto) de cada parágrafo com estilo de título, na ordem do documento, e se todos foram lidos. O nível
+    vem do nome do estilo na folha de estilos ("Heading 2", "Título 2"), de 1 a 6; o estilo com \\outlinelevelN o
+    leitor do corpo já marca como título. O texto do
+    parágrafo é lido pelo mesmo leitor do corpo (`ler_rtf`), num RTF mínimo com o prólogo e a tabela de fontes do
+    original, como os cabeçalhos. Tudo em passadas lineares: as chaves da folha de estilos uma vez, os \\pard e
+    os \\par do corpo uma vez cada."""
     m = re.search(rb"\{\\stylesheet", dados)
     if not m or (fim_estilos := _fim_do_grupo(dados, m.end())) < 0:
-        return []
+        return [], True
     niveis = {}
-    for e in _ESTILO.finditer(dados, m.end(), fim_estilos):
-        fim = _fim_do_grupo(dados, e.end())
-        if fim < 0:
-            break
-        entrada = dados[e.end() : fim]
-        if contorno := re.search(rb"\\outlinelevel(\d)(?![0-9])", entrada):
-            niveis[int(e.group(1))] = int(contorno.group(1)) + 1
-        elif titulo := _NOME_DE_TITULO.search(re.sub(r"\\[a-z]+-?\d* ?", " ", entrada.decode("latin-1"))):
-            niveis[int(e.group(1))] = int(titulo.group(2))
+    for a, b in _entradas_do_grupo(dados, m.start(), fim_estilos):
+        entrada = dados[a : min(b, a + 4096)]
+        estilo = re.match(rb"\{\\s(\d{1,4})(?![0-9])", entrada)
+        if not estilo:
+            continue
+        # o \\outlinelevel o leitor do corpo já usa; o nome do estilo, não
+        if not re.search(rb"\\outlinelevel\d", entrada) and (
+            titulo := _NOME_DE_TITULO.search(re.sub(r"\\[a-z]+-?\d* ?", " ", entrada.decode("latin-1")))
+        ):
+            niveis[int(estilo.group(1))] = int(titulo.group(2))
     if not niveis:
-        return []
+        return [], True
     cab = re.match(rb"\{\\rtf1(?:\\[a-z]+-?\d* ?)*", dados)
     prologo = cab.group(0) if cab else b"{\\rtf1"
     if (f := re.search(rb"\{\\fonttbl", dados)) and (fim := _fim_do_grupo(dados, f.end())) > 0:
         prologo += dados[f.start() : fim]
+    fins = re.compile(rb"\\par(?![a-z])").finditer(dados, fim_estilos)
+    proximo_fim = next(fins, None)
     saida, lidos = [], 0
-    for p in re.finditer(rb"\\pard(?![a-z])", dados[fim_estilos:]):
-        inicio = fim_estilos + p.start()
-        fim_par = re.compile(rb"\\par(?![a-z])").search(dados, inicio + 5)
-        trecho = dados[inicio : fim_par.start() if fim_par else len(dados)]
-        estilo = re.search(rb"\\s(\d{1,4})(?![0-9])", trecho[:400])
-        if not estilo or int(estilo.group(1)) not in niveis:
+    for p in re.compile(rb"\\pard(?![a-z])").finditer(dados, fim_estilos):
+        while proximo_fim is not None and proximo_fim.start() <= p.start():
+            proximo_fim = next(fins, None)
+        fim_par = proximo_fim.start() if proximo_fim is not None else len(dados)
+        estilo = _USO_DE_ESTILO.search(dados, p.end(), min(fim_par, p.end() + 400))
+        if not estilo or int(estilo.group(1)) not in niveis or fim_par - p.start() > _PARAGRAFO_TITULO_MAX:
             continue
-        lidos += len(prologo) + len(trecho)
-        if len(saida) >= _TITULOS_MAX or lidos > _RELEITURA_MAX * len(dados):
-            break
-        texto = " ".join(" ".join(ler_rtf(prologo + trecho + b"\\par}")).split())
+        lidos += len(prologo) + fim_par - p.start()
+        if len(saida) >= TITULOS_MAX or lidos > _RELEITURA_MAX * len(dados):
+            return saida, False
+        texto = " ".join(" ".join(ler_rtf(prologo + dados[p.start() : fim_par] + b"\\par}")).split())
         if texto:
             saida.append((niveis[int(estilo.group(1))], texto))
-    return saida
+    return saida, True
 
 
 # ---------------------------------------------------------------------------------------------------- XLSB tolerante

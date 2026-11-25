@@ -312,19 +312,12 @@ def _texto_odf(el) -> str:
 
 
 def _abas_ocultas_ods(path) -> list[str]:
-    """Nomes das abas ocultas do .ods, pelo calamine (o mesmo leitor que tira o conteúdo delas do corpo)."""
-    import python_calamine
+    """Nomes das abas ocultas do .ods, pela mesma passada que tira o conteúdo delas do corpo."""
+    from .xlsx_anotacoes import planilha_ods
 
     try:
-        wb = python_calamine.CalamineWorkbook.from_path(path)
-        try:
-            visivel = python_calamine.SheetVisibleEnum.Visible
-            return [m.name for m in wb.sheets_metadata if m.visible != visivel]
-        finally:
-            wb.close()
-    except (MemoryError, KeyboardInterrupt, SystemExit):
-        raise
-    except BaseException:  # noqa: BLE001 — inclui o pânico do calamine; a falha já fica registrada pelo leitor do corpo
+        return [nome for nome, _ in planilha_ods(path, None, [])]
+    except Exception:  # noqa: BLE001 — a falha de leitura das abas ocultas já fica registrada pelo leitor do corpo
         return []
 
 

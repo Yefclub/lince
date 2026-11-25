@@ -113,7 +113,10 @@ def test_nota_de_celula_do_xls_sai_como_a_do_xlsx_e_a_da_aba_oculta_nao():
 
     assert "- ` Estoque!C3 ` — nota: ` Diferença acima da tolerância: recontar. `" in r.markdown
     assert "Comentário de aba oculta" not in r.markdown  # a aba oculta fica fora do corpo, com as notas dela
-    assert r.metadados["texto_oculto_removido"] == [{"tecnicas": ["aba oculta"], "texto": "aba Apoio: Nota escondida"}]
+    # a nota da aba oculta vai com o texto dela para o registro, conferida contra injeção
+    assert r.metadados["texto_oculto_removido"] == [
+        {"tecnicas": ["aba oculta"], "texto": "aba Apoio: Nota escondida nota: Comentário de aba oculta."}
+    ]
     assert r.cobertura.pendentes == []
 
 

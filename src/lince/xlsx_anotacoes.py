@@ -384,68 +384,140 @@ def _recortar(ref, teto):
     return " ".join(lidos)
 
 
-def notas_xls(path, ocultas, extras, pendentes):
-    """Notas de célula do .xls (BIFF8), pelo xlrd, no mesmo formato das do .xlsx. A aba oculta fica de fora, como no
-    corpo."""
+OCULTA_TEXTO_MAX = 500  # caracteres guardados de cada aba oculta, o mesmo registro do texto oculto
+OCULTA_LINHAS_MAX = 20_000  # linhas varridas de cada aba oculta até juntar esse texto (as vazias também contam)
+OCULTA_CELULAS_MAX = 20_000  # células varridas de cada aba oculta
+
+
+class _Oculta:
+    """O começo do texto de uma aba oculta, com os tetos: o registro guarda só isso, e a varredura para nele."""
+
+    def __init__(self, nome):
+        self.nome, self.partes, self.tamanho, self.linhas, self.celulas = nome, [], 0, 0, 0
+
+    def cheia(self):
+        return self.tamanho > OCULTA_TEXTO_MAX or self.linhas > OCULTA_LINHAS_MAX or self.celulas > OCULTA_CELULAS_MAX
+
+    def linha(self, n=1):
+        self.linhas += n
+
+    def celula(self, valor, nota=""):
+        self.celulas += 1
+        for texto, prefixo in ((valor, ""), (nota, "nota: ")):
+            if not self.cheia() and texto is not None and (t := " ".join(str(texto).split())):
+                self.partes.append(prefixo + t)
+                self.tamanho += len(t) + 1
+
+    def texto(self):
+        return " ".join(self.partes)[:OCULTA_TEXTO_MAX]
+
+
+def planilha_xls(path, extras, pendentes) -> list[tuple[str, str]]:
+    """Notas de célula das abas visíveis do .xls, no formato das do .xlsx, e (nome, começo do texto, com as notas) de
+    cada aba oculta, pelo xlrd. Uma aba por vez é carregada e descarregada; o .xls tem no máximo 65.536 linhas por
+    aba, e o leitor do corpo já recusou a grade grande demais. A aba que o xlrd não lê fica registrada pelo nome."""
     import xlrd
 
-    saida = _Saida(extras, pendentes)
+    saida, ocultas = _Saida(extras, pendentes), []
     livro = xlrd.open_workbook(path, on_demand=True)
     try:
-        for aba in livro.sheets():
-            if aba.name in ocultas:
+        for k in range(livro.nsheets):
+            try:
+                aba = livro.sheet_by_index(k)
+            except Exception as e:  # noqa: BLE001 — registro fora do padrão numa aba: as outras seguem
+                pendentes.append(f"notas de célula: aba {k + 1} não lida ({type(e).__name__})")
                 continue
-            for (linha, coluna), nota in sorted(aba.cell_note_map.items()):
-                if texto := (nota.text or "").strip():
-                    saida.adicionar(
-                        f"{aba.name}!{get_column_letter(coluna + 1)}{linha + 1}", "nota: " + _literal(texto)
-                    )
+            try:
+                if aba.visibility:  # 1 oculta, 2 muito oculta
+                    oculta = _Oculta(aba.name)
+                    notas = aba.cell_note_map
+                    for r in range(aba.nrows):
+                        oculta.linha()
+                        for c, valor in enumerate(aba.row_values(r)):
+                            nota = notas.get((r, c))
+                            oculta.celula(valor if valor != "" else None, nota.text if nota else "")
+                            if oculta.cheia():
+                                break
+                        if oculta.cheia():
+                            break
+                    ocultas.append((aba.name, oculta.texto()))
+                    continue
+                for (linha, coluna), nota in sorted(aba.cell_note_map.items()):
+                    if texto := (nota.text or "").strip():
+                        onde = f"{aba.name}!{get_column_letter(coluna + 1)}{linha + 1}"
+                        saida.adicionar(onde, "nota: " + _literal(texto))
+            finally:
+                livro.unload_sheet(k)
     except _Limite:
         saida.avisar("limite de extração atingido", "anotações restantes omitidas")
     finally:
         livro.release_resources()
+    return ocultas
 
 
 _ODS_TB = "{urn:oasis:names:tc:opendocument:xmlns:table:1.0}"
 _ODS_OFFICE = "{urn:oasis:names:tc:opendocument:xmlns:office:1.0}"
 _ODS_TEXT = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
+_ODS_STYLE = "{urn:oasis:names:tc:opendocument:xmlns:style:1.0}"
 _ODS_REPETICAO_MAX = 1_048_576  # linhas e colunas que uma repetição pode pular (o tamanho máximo de uma aba)
 
 
-def notas_ods(path, ocultas, extras, pendentes):
-    """Comentários de célula (office:annotation) do .ods, no mesmo formato das notas do .xlsx. content.xml é lido em
-    fluxo, limpando cada linha; a posição conta as repetições de linha e de coluna. Autor e data ficam de fora, como no
-    .xlsx. A aba oculta fica de fora, como no corpo."""
+def planilha_ods(path, extras, pendentes) -> list[tuple[str, str]]:
+    """O mesmo que `planilha_xls`, para o .ods, numa passada em fluxo pelo content.xml: a aba é oculta quando o estilo
+    dela tem table:display="false"; a nota de célula é o office:annotation, sem o autor e a data. A posição conta as
+    repetições de linha e de coluna. Cada célula é limpa ao fechar: a planilha pode ser enorme. Com `extras` None,
+    só os nomes das abas ocultas importam (os metadados)."""
     from defusedxml.ElementTree import iterparse
 
-    saida = _Saida(extras, pendentes)
+    saida = _Saida(extras if extras is not None else [], pendentes)
+    escondidas, ocultas, oculta = set(), [], None
     aba, linha, coluna = "", 0, 0
     with zipfile.ZipFile(path) as z:
         if "content.xml" not in z.namelist():
-            return
+            return []
         with z.open("content.xml") as arquivo:
             try:
                 for evento, el in iterparse(arquivo, events=("start", "end")):
                     if evento == "start":
                         if el.tag == f"{_ODS_TB}table":
                             aba, linha = el.get(f"{_ODS_TB}name") or "", 0
+                            oculta = _Oculta(aba) if el.get(f"{_ODS_TB}style-name") in escondidas else None
                         elif el.tag == f"{_ODS_TB}table-row":
                             coluna = 0
                         continue
-                    if el.tag in (f"{_ODS_TB}table-cell", f"{_ODS_TB}covered-table-cell"):
+                    if el.tag == f"{_ODS_STYLE}style":
+                        props = el.find(f"{_ODS_STYLE}table-properties")
+                        if props is not None and props.get(f"{_ODS_TB}display") == "false":
+                            escondidas.add(el.get(f"{_ODS_STYLE}name"))
+                    elif el.tag in (f"{_ODS_TB}table-cell", f"{_ODS_TB}covered-table-cell"):
                         nota = el.find(f"{_ODS_OFFICE}annotation")
-                        if nota is not None and aba not in ocultas:
-                            texto = "\n".join("".join(p.itertext()) for p in nota.iter(f"{_ODS_TEXT}p")).strip()
-                            if texto:
-                                onde = f"{aba}!{get_column_letter(min(coluna, 16_383) + 1)}{linha + 1}"
-                                saida.adicionar(onde, "nota: " + _literal(texto))
+                        texto_nota = (
+                            "\n".join("".join(p.itertext()) for p in nota.iter(f"{_ODS_TEXT}p")).strip()
+                            if nota is not None
+                            else ""
+                        )
+                        if oculta is not None:
+                            if not oculta.cheia():
+                                valor = " ".join("".join(p.itertext()) for p in el.findall(f"{_ODS_TEXT}p")).strip()
+                                oculta.celula(valor or None, texto_nota)
+                        elif texto_nota and extras is not None:
+                            onde = f"{aba}!{get_column_letter(min(coluna, 16_383) + 1)}{linha + 1}"
+                            saida.adicionar(onde, "nota: " + _literal(texto_nota))
                         coluna += _repeticao(el.get(f"{_ODS_TB}number-columns-repeated"))
                         el.clear()
                     elif el.tag == f"{_ODS_TB}table-row":
-                        linha += _repeticao(el.get(f"{_ODS_TB}number-rows-repeated"))
+                        repeticao = _repeticao(el.get(f"{_ODS_TB}number-rows-repeated"))
+                        linha += repeticao
+                        if oculta is not None:
+                            oculta.linha(repeticao)
+                        el.clear()
+                    elif el.tag == f"{_ODS_TB}table" and oculta is not None:
+                        ocultas.append((oculta.nome, oculta.texto()))
+                        oculta = None
                         el.clear()
             except _Limite:
                 saida.avisar("limite de extração atingido", "anotações restantes omitidas")
+    return ocultas
 
 
 def _repeticao(valor):
