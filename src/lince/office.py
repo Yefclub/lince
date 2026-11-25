@@ -459,6 +459,88 @@ def fluxos_pptx(path):
     return out
 
 
+_ODF_DRAW = "{urn:oasis:names:tc:opendocument:xmlns:drawing:1.0}"
+_ODF_SVG = "{urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0}"
+_ODF_STYLE = "{urn:oasis:names:tc:opendocument:xmlns:style:1.0}"
+_ODF_OFFICE = "{urn:oasis:names:tc:opendocument:xmlns:office:1.0}"
+_ODF_XML_ID = "{http://www.w3.org/XML/1998/namespace}id"
+_CM = {"cm": 1.0, "mm": 0.1, "in": 2.54, "pt": 2.54 / 72, "pc": 2.54 / 6, "px": 2.54 / 96}
+_ROTULO_DISTANCIA_CM = 2.03  # 0,8 polegada, a mesma distância do rótulo de seta do .pptx
+
+
+def _cm(valor):
+    m = re.fullmatch(r"\s*(-?[\d.]+)\s*([a-z]*)\s*", valor or "")
+    try:
+        return float(m[1]) * _CM.get(m[2] or "cm", 1.0) if m else None
+    except ValueError:
+        return None
+
+
+def fluxos_odp(path):
+    """Diagrama de formas do Impress: as formas com id e os conectores ligados a elas (draw:start-shape e
+    draw:end-shape) viram arestas, com a direção pela ponta de seta do estilo do conector e o rótulo pelo texto do
+    próprio conector ou por uma forma curta, sem ligação, perto dele (Sim/Não). Mesmo formato de `fluxos_pptx`."""
+    with zipfile.ZipFile(path) as z:
+        if "content.xml" not in z.namelist():
+            return {}
+        raiz = xml_ou_nada(z.read("content.xml"))
+    if raiz is None:
+        return {}
+    setas = {}
+    for estilo in raiz.iter(f"{_ODF_STYLE}style"):
+        props = estilo.find(f"{_ODF_STYLE}graphic-properties")
+        if props is not None:
+            setas[estilo.get(f"{_ODF_STYLE}name")] = (
+                bool(props.get(f"{_ODF_DRAW}marker-start")),
+                bool(props.get(f"{_ODF_DRAW}marker-end")),
+            )
+
+    def texto(el):
+        return " ".join(" ".join(el.itertext()).split())
+
+    out = {}
+    for n, pagina in enumerate(raiz.iter(f"{_ODF_DRAW}page"), 1):
+        nomes, conectores, soltas = {}, [], []
+        for el in pagina:
+            if not isinstance(el.tag, str) or not el.tag.startswith(_ODF_DRAW):
+                continue
+            if el.tag == f"{_ODF_DRAW}connector":
+                a_, b_ = el.get(f"{_ODF_DRAW}start-shape"), el.get(f"{_ODF_DRAW}end-shape")
+                pontos = [_cm(el.get(f"{_ODF_SVG}{k}")) for k in ("x1", "y1", "x2", "y2")]
+                if a_ and b_ and None not in pontos:
+                    conectores.append((el, a_, b_, pontos))
+                continue
+            ident = el.get(f"{_ODF_DRAW}id") or el.get(_ODF_XML_ID)
+            if ident:
+                nomes[ident] = texto(el) or ident
+            elif 0 < len(t := texto(el)) <= 15:
+                x, y, w, h = (_cm(el.get(f"{_ODF_SVG}{k}")) for k in ("x", "y", "width", "height"))
+                if None not in (x, y, w, h):
+                    soltas.append((t, x + w / 2, y + h / 2))
+        if not conectores:
+            continue
+        rotulos = {}
+        for t, cx, cy in soltas:
+
+            def dist(c):
+                x1, y1, x2, y2 = c[3]
+                return max(min(x1, x2) - cx, 0, cx - max(x1, x2)) + max(min(y1, y2) - cy, 0, cy - max(y1, y2))
+
+            perto = min(conectores, key=dist)
+            if dist(perto) < _ROTULO_DISTANCIA_CM:
+                rotulos.setdefault(id(perto[0]), t)
+        arestas = []
+        for el, a_, b_, _ in conectores:
+            inicio, fim = setas.get(el.get(f"{_ODF_DRAW}style-name"), (False, False))
+            if inicio and not fim:
+                a_, b_ = b_, a_
+            seta = "↔" if inicio and fim else "→" if inicio or fim else "—"
+            rotulo = texto(el) or rotulos.get(id(el))
+            arestas.append((nomes.get(a_, a_), seta, nomes.get(b_, b_), rotulo))
+        out[n] = arestas
+    return out
+
+
 def mermaid_do_fluxo(arestas):
     """Diagrama Mermaid com a direção e o rótulo de cada ligação."""
     ids, linhas = {}, ["```mermaid", "flowchart LR"]
@@ -528,6 +610,8 @@ def planejar_office(path, pasta, ext=None):
                 raise
             except Exception:  # noqa: BLE001 — o leitor tolerante também não abre: vale o erro do leitor do corpo
                 raise recusa from None
+    # o conteúdo da aba oculta não vai para o corpo (como o texto oculto): vai para os metadados, conferido como ele
+    ocultas = _abas_ocultas(path, ext, ilegiveis) if ext in PLANILHAS - {".csv", ".tsv"} else []
     tarefas, pendentes = [], []  # pendentes: o que entra em cobertura.pendentes, com o motivo
     svgs, sentinela = [], f"LINCE{secrets.token_hex(8)}S"  # desenhos vetoriais, juntos no fim, num lote só
     vistas = set()  # imagens já lidas (sha256): o armazém dos binários não as repete
@@ -561,6 +645,8 @@ def planejar_office(path, pasta, ext=None):
     elif doc is None:
         (md, perfis), ilegiveis[:0] = md_xlsb, ilegiveis_xlsb
     else:
+        if ext == ".ods" and ocultas:  # o anydoc entrega a aba oculta do LibreOffice no corpo; a do Excel, não
+            doc = _sem_abas(doc, {nome for nome, _ in ocultas})
         md = serializar(doc, ler_imagem, formato=formato, marca_slide=marca if ext in PPTX else None, letras=letras)[0]
         perfis = _perfis(doc) if ext in PLANILHAS - {".xlsx", ".xlsm"} else []
         if limpeza is not None:  # a rede de segurança: o que o anydoc leu e a conferência não viu é falha
@@ -595,6 +681,18 @@ def planejar_office(path, pasta, ext=None):
             md = re.sub(rf"(?m)^{marca}G(\d+)X$", substituir_grafico, md)
             md = re.sub(r"(?m)^(<!-- slide \d+ -->)$", r"\\\1", md)
             md = re.sub(rf"(?m)^{marca}(\d+)X$", r'<!-- slide \1 -->\n\n<a id="slide-\1"></a>', md)
+    if ext in (".ppt", ".pps", ".pot") and doc is not None:  # o leitor do corpo entrega cada célula como parágrafo
+
+        def tabelas_legado():
+            nonlocal md
+            import olefile
+
+            if olefile.isOleFile(path):
+                with olefile.OleFileIO(path) as o:
+                    for tabela in legados.tabelas_ppt(o, os.path.getsize(path)):
+                        md = _tabela_no_lugar_das_celulas(md, tabela)
+
+        _complemento(tabelas_legado, "tabelas dos slides", ilegiveis)
     if ext in BINARIOS_OLE:  # o leitor do corpo quase não entrega as imagens do .doc, .xls e .ppt: o armazém, sim
 
         def imagens_legado():
@@ -613,6 +711,15 @@ def planejar_office(path, pasta, ext=None):
                 md += "\n\n".join(ler_imagem(d, m, f"imagem do documento {n}") for n, (m, d) in enumerate(novas, 1))
 
         _complemento(imagens_legado, "imagens do documento", ilegiveis)
+    if ext == ".rtf":  # o leitor do corpo não usa o estilo de título do RTF: o parágrafo sai como texto comum
+
+        def titulos():
+            nonlocal md
+            from .metadados import _linhas_rtf
+
+            md = _com_titulos(md, legados.titulos_rtf(open(path, "rb").read(), _linhas_rtf))
+
+        _complemento(titulos, "títulos", ilegiveis)
     if ext in (".docx", ".docm", ".rtf") or ext in ODF:  # o leitor do corpo não entrega a imagem do cabeçalho
 
         def imagens_bordas():
@@ -638,7 +745,13 @@ def planejar_office(path, pasta, ext=None):
             seguranca.append(
                 {"tecnicas": sorted({m for m, _ in ocultos}), "texto": " ".join(t for _, t in ocultos)[:500]}
             )
+    for nome, texto in ocultas:
+        seguranca.append({"tecnicas": ["aba oculta"], "texto": f"aba {nome}: {texto}"[:500]})
     extras, anotacoes = [], []
+    if ext in (".xls", ".ods"):  # notas de célula: o anydoc não as entrega, e o .xlsx as tem pelo leitor dele
+        notas = xlsx_anotacoes.notas_xls if ext == ".xls" else xlsx_anotacoes.notas_ods
+        nomes_ocultos = {nome for nome, _ in ocultas}
+        _complemento(lambda: notas(path, nomes_ocultos, anotacoes, pendentes), "notas de célula", pendentes)
     if ext in (".xlsx", ".xlsm"):  # o anydoc não extrai imagem de planilha: as partes de desenho, com aba e célula
 
         def anotacoes_planilha():
@@ -708,6 +821,18 @@ def planejar_office(path, pasta, ext=None):
         _complemento(graficos_xls, "gráficos", ilegiveis)
     if ext in ODF:  # o leitor do corpo não entrega o gráfico do LibreOffice: tipo, título e os dados que ele desenha
         _complemento(lambda: extras.extend(grafico_md(g) for g in graficos_odf(path, ilegiveis)), "gráficos", ilegiveis)
+    if ext == ".odp":  # o leitor do corpo entrega as caixas soltas, sem as ligações
+
+        def diagramas_odp():
+            for n, arestas in fluxos_odp(path).items():
+                extras.append(
+                    f"**Diagrama do slide {n}:**\n\n"
+                    + mermaid_do_fluxo(arestas)
+                    + "\n\n"
+                    + "\n".join(f"- {a} {seta} {b}" + (f" ({rot})" if rot else "") for a, seta, b, rot in arestas)
+                )
+
+        _complemento(diagramas_odp, "diagramas", ilegiveis)
     if ext in PPTX:
 
         def diagramas():
@@ -1070,6 +1195,111 @@ def _imagens_xlsx(path, ilegiveis) -> list[tuple[str, str, bytes]]:
 
 
 PPTX = {".pptx", ".pptm", ".ppsx", ".ppsm"}
+OCULTA_TEXTO_MAX = 500  # caracteres guardados de cada aba oculta, o mesmo registro do texto oculto
+OCULTA_CELULAS_MAX = 20_000  # células varridas de cada aba oculta até juntar esse texto (a vazia não conta)
+
+
+def _com_titulos(md, titulos):
+    """Marca como título, na ordem do documento, o bloco do Markdown que tem exatamente o texto de cada título (sem a
+    ênfase que o leitor do corpo pôs), com ou sem a numeração de lista antes. O título que não for achado depois do
+    anterior fica como está."""
+    blocos, k = md.split("\n\n"), 0
+    for nivel, texto in titulos:
+        for j in range(k, len(blocos)):
+            if "\n" in blocos[j].strip():
+                continue
+            limpo = " ".join(re.sub(r"^#{1,6}\s+|[*_]", "", blocos[j]).split())
+            # a numeração da lista ("1. ", "2.3 ") vem da tabela de listas, fora do parágrafo: ela fica no título
+            if limpo == texto or re.fullmatch(rf"\d{{1,3}}(?:\.\d{{1,3}})*[.)]?\s+{re.escape(texto)}", limpo):
+                blocos[j] = "#" * nivel + " " + limpo
+                k = j + 1
+                break
+    return "\n\n".join(blocos)
+
+
+def _tabela_no_lugar_das_celulas(md, tabela):
+    """Troca a sequência de parágrafos com as células da tabela, na ordem das linhas, pela tabela Markdown. Só quando a
+    sequência aparece uma vez, inteira e com o mesmo texto: senão o texto do leitor do corpo fica como está."""
+    celulas = [c for linha in tabela for c in linha if c]
+    blocos = md.split("\n\n")
+    normal = [" ".join(re.sub(r"[*_\\]", "", b).split()) for b in blocos]
+    achados = [k for k in range(len(blocos) - len(celulas) + 1) if normal[k : k + len(celulas)] == celulas]
+    if len(achados) != 1:
+        return md
+    k = achados[0]
+    linhas = [[c.replace("|", "\\|") for c in linha] for linha in tabela]
+    texto = "\n".join(
+        ["| " + " | ".join(linhas[0]) + " |", "|" + " --- |" * len(linhas[0])]
+        + ["| " + " | ".join(ln) + " |" for ln in linhas[1:]]
+    )
+    return "\n\n".join(blocos[:k] + [texto] + blocos[k + len(celulas) :])
+
+
+def _abas_ocultas(path, ext, ilegiveis) -> list[tuple[str, str]]:
+    """(nome, começo do texto) de cada aba oculta ou muito oculta com conteúdo. O XLSX é lido em fluxo pelo openpyxl;
+    o XLS, o XLSB e o ODS pelo calamine, porque o anydoc não diz quais abas são ocultas. A aba que não abre fica em
+    `ilegiveis` com o nome: a conferência dela não passa em silêncio."""
+    out = []
+    try:
+        if ext in (".xlsx", ".xlsm"):
+            from openpyxl import load_workbook
+
+            wb = load_workbook(path, read_only=True, data_only=True)
+            try:
+                abas = [
+                    (ws.title, ws.iter_rows(values_only=True)) for ws in wb.worksheets if ws.sheet_state != "visible"
+                ]
+                out = [(nome, _texto_de_linhas(linhas)) for nome, linhas in abas]
+            finally:
+                wb.close()
+        else:
+            import python_calamine
+
+            wb = python_calamine.CalamineWorkbook.from_path(path)
+            try:
+                visivel = python_calamine.SheetVisibleEnum.Visible
+                for m in wb.sheets_metadata:
+                    if m.visible != visivel and m.typ == python_calamine.SheetTypeEnum.WorkSheet:
+                        out.append((m.name, _texto_de_linhas(wb.get_sheet_by_name(m.name).iter_rows())))
+            finally:
+                wb.close()
+    except (MemoryError, KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as e:  # noqa: BLE001 — o calamine entra em pânico (PanicException, uma BaseException) com
+        # arquivo fora da especificação: o corpo segue, e a falha fica registrada
+        ilegiveis.append(f"abas ocultas: não conferidas ({type(e).__name__})")
+        return []
+    return [(nome, texto) for nome, texto in out if texto]
+
+
+def _texto_de_linhas(linhas) -> str:
+    partes, tamanho, varridas = [], 0, 0
+    for linha in linhas:
+        for valor in linha:
+            varridas += 1
+            if varridas > OCULTA_CELULAS_MAX or tamanho > OCULTA_TEXTO_MAX:
+                return " ".join(partes)
+            if valor is not None and (texto := " ".join(str(valor).split())):
+                partes.append(texto)
+                tamanho += len(texto) + 1
+    return " ".join(partes)
+
+
+def _sem_abas(doc, nomes):
+    """O documento do anydoc sem as abas de `nomes`: cada aba do .ods é um título de nível 2 com o nome dela e os
+    blocos até o próximo título desse nível."""
+    from types import SimpleNamespace
+
+    blocos, pulando = [], False
+    for b in doc.blocks:
+        if b.kind == "heading" and b.level == 2:
+            nome = "".join(x.text or "" for x in b.content or [] if x.kind == "text").strip()
+            pulando = nome in nomes
+        if not pulando:
+            blocos.append(b)
+    return SimpleNamespace(blocks=blocos, assets=doc.assets, notes=doc.notes)
+
+
 PLANILHAS = {".xlsx", ".xlsm", ".xlsb", ".xls", ".ods", ".csv", ".tsv"}  # as que ganham perfil tabular
 
 # Planilha grande, lida em fluxo (openpyxl read_only), com os mesmos tetos do conversor que o Orbital usava

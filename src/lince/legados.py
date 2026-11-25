@@ -441,6 +441,89 @@ def ppt(o, teto) -> dict:
     return saida
 
 
+_GRUPO, _FORMA, _ANCORA_FILHA, _CAIXA_DE_TEXTO = 0xF003, 0xF004, 0xF00F, 0xF00D
+_TEXTO_UTF16, _TEXTO_BYTES = 0x0FA0, 0x0FA8
+_CELULAS_MAX = 4096  # células de todas as tabelas de uma apresentação
+_CELULA_TEXTO_MAX = 2048  # caracteres por célula
+
+
+def tabelas_ppt(o, teto) -> list[list[list[str]]]:
+    """Tabelas dos slides do .ppt, linha a linha: o PowerPoint 97-2003 guarda a tabela como um grupo de formas, uma por
+    célula, com a posição dela no grupo (ChildAnchor) e o texto (TextCharsAtom ou TextBytesAtom). O grupo é tabela
+    quando as formas com área ocupam uma grade completa (cada linha com as mesmas colunas); as linhas de borda não têm
+    área e ficam de fora. O stream é percorrido sem recursão, com o mesmo orçamento dos metadados."""
+    b = ler_stream(o, "PowerPoint Document", teto)
+    orcamento = Orcamento(len(b))
+    tabelas, celulas_lidas = [], 0
+    pilha = [(0, len(b), None)]  # (início, fim, formas do grupo em que está ou None)
+    while pilha:
+        i, fim, grupo = pilha.pop()
+        while i + 8 <= fim:
+            orcamento.gastar(8)
+            ver, tipo, tam = struct.unpack_from("<HHI", b, i)
+            corpo, prox = i + 8, min(i + 8 + tam, fim)
+            if tipo == _GRUPO and ver & 0xF == _CONTEINER:
+                formas = []
+                _formas_do_grupo(b, corpo, prox, formas, orcamento)
+                if (tabela := _grade(formas)) is not None:
+                    celulas_lidas += sum(map(len, tabela))
+                    if celulas_lidas > _CELULAS_MAX:
+                        raise ValueError("células de tabela demais")
+                    tabelas.append(tabela)
+                else:  # grupo que não é tabela pode conter outro grupo que é
+                    pilha.append((corpo, prox, None))
+            elif ver & 0xF == _CONTEINER:
+                pilha.append((corpo, prox, grupo))
+            i = corpo + tam
+    return tabelas
+
+
+def _formas_do_grupo(b, i, fim, formas, orcamento):
+    """(esquerda, topo, direita, base, texto) de cada forma filha direta do grupo."""
+    while i + 8 <= fim:
+        orcamento.gastar(8)
+        ver, tipo, tam = struct.unpack_from("<HHI", b, i)
+        corpo, prox = i + 8, min(i + 8 + tam, fim)
+        if tipo == _FORMA and ver & 0xF == _CONTEINER:
+            ancora, textos, j = None, [], corpo
+            pilha = [(corpo, prox)]
+            while pilha:
+                j, fim_j = pilha.pop()
+                while j + 8 <= fim_j:
+                    orcamento.gastar(8)
+                    v, t, n = struct.unpack_from("<HHI", b, j)
+                    dados = b[j + 8 : min(j + 8 + n, fim_j)]
+                    if t == _ANCORA_FILHA and len(dados) >= 16:
+                        ancora = struct.unpack_from("<iiii", dados)
+                    elif t in (_TEXTO_UTF16, _TEXTO_BYTES):
+                        orcamento.gastar(len(dados))
+                        bruto = dados[: 2 * _CELULA_TEXTO_MAX]
+                        textos.append(bruto.decode("utf-16-le" if t == _TEXTO_UTF16 else "cp1252", "replace"))
+                    elif v & 0xF == _CONTEINER and t == _CAIXA_DE_TEXTO:
+                        pilha.append((j + 8, min(j + 8 + n, fim_j)))
+                    j += 8 + n
+            if ancora is not None:
+                texto = " ".join(" ".join(textos).replace("\r", " ").replace("\x0b", " ").split())
+                formas.append((*ancora, texto[:_CELULA_TEXTO_MAX]))
+        i = corpo + tam
+
+
+def _grade(formas):
+    """As linhas de texto da grade que as formas com área ocupam, ou None se não formam uma tabela de ao menos duas
+    linhas e duas colunas, com texto em alguma célula."""
+    celulas = [f for f in formas if f[2] - f[0] > 0 and f[3] - f[1] > 0]
+    if len(celulas) < 4 or not any(f[4] for f in celulas):
+        return None
+    topos = sorted({f[1] for f in celulas})
+    esquerdas = sorted({f[0] for f in celulas})
+    if len(topos) < 2 or len(esquerdas) < 2 or len(celulas) != len(topos) * len(esquerdas):
+        return None
+    lugar = {(f[1], f[0]): f[4] for f in celulas}
+    if len(lugar) != len(celulas):
+        return None  # duas formas no mesmo canto: não é uma grade
+    return [[lugar[(t, e)] for e in esquerdas] for t in topos]
+
+
 # ---------- Word 97-2003 ----------
 
 _ANINHAMENTO_MAX = 64  # o Word aninha poucos níveis; acima disso é arquivo hostil
@@ -653,6 +736,51 @@ def rtf(dados: bytes, ler_rtf) -> tuple[list[str], bool]:
             return saida, False  # grupos aninhados ou prólogo enorme de propósito: custo proporcional ao arquivo
         saida += ler_rtf(prologo + corpo + b"}")
     return saida, True
+
+
+_ESTILO = re.compile(rb"\{\\s(\d{1,4})(?![0-9])")
+_NOME_DE_TITULO = re.compile(r"(heading|t[ií]tulo|titre|[uü]berschrift|encabezado|kop)\s*([1-6])\b", re.I)
+_TITULOS_MAX = 512  # parágrafos de título lidos por arquivo; o texto de cada um passa pelo leitor do corpo
+
+
+def titulos_rtf(dados: bytes, ler_rtf) -> list[tuple[int, str]]:
+    """(nível, texto) de cada parágrafo com estilo de título, na ordem do documento. O nível vem da folha de estilos:
+    \\outlinelevelN ou o nome do estilo ("Heading 2", "Título 2"). O texto do parágrafo é lido pelo mesmo leitor do
+    corpo (`ler_rtf`), num RTF mínimo com o prólogo e a tabela de fontes do original, como os cabeçalhos."""
+    m = re.search(rb"\{\\stylesheet", dados)
+    if not m or (fim_estilos := _fim_do_grupo(dados, m.end())) < 0:
+        return []
+    niveis = {}
+    for e in _ESTILO.finditer(dados, m.end(), fim_estilos):
+        fim = _fim_do_grupo(dados, e.end())
+        if fim < 0:
+            break
+        entrada = dados[e.end() : fim]
+        if contorno := re.search(rb"\\outlinelevel(\d)(?![0-9])", entrada):
+            niveis[int(e.group(1))] = int(contorno.group(1)) + 1
+        elif titulo := _NOME_DE_TITULO.search(re.sub(r"\\[a-z]+-?\d* ?", " ", entrada.decode("latin-1"))):
+            niveis[int(e.group(1))] = int(titulo.group(2))
+    if not niveis:
+        return []
+    cab = re.match(rb"\{\\rtf1(?:\\[a-z]+-?\d* ?)*", dados)
+    prologo = cab.group(0) if cab else b"{\\rtf1"
+    if (f := re.search(rb"\{\\fonttbl", dados)) and (fim := _fim_do_grupo(dados, f.end())) > 0:
+        prologo += dados[f.start() : fim]
+    saida, lidos = [], 0
+    for p in re.finditer(rb"\\pard(?![a-z])", dados[fim_estilos:]):
+        inicio = fim_estilos + p.start()
+        fim_par = re.compile(rb"\\par(?![a-z])").search(dados, inicio + 5)
+        trecho = dados[inicio : fim_par.start() if fim_par else len(dados)]
+        estilo = re.search(rb"\\s(\d{1,4})(?![0-9])", trecho[:400])
+        if not estilo or int(estilo.group(1)) not in niveis:
+            continue
+        lidos += len(prologo) + len(trecho)
+        if len(saida) >= _TITULOS_MAX or lidos > _RELEITURA_MAX * len(dados):
+            break
+        texto = " ".join(" ".join(ler_rtf(prologo + trecho + b"\\par}")).split())
+        if texto:
+            saida.append((niveis[int(estilo.group(1))], texto))
+    return saida
 
 
 # ---------------------------------------------------------------------------------------------------- XLSB tolerante

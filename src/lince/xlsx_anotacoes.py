@@ -382,3 +382,74 @@ def _recortar(ref, teto):
         elif c1 and c2:
             lidos.append(f"{get_column_letter(c1)}{l1 or 1}:{get_column_letter(c2)}{teto}")
     return " ".join(lidos)
+
+
+def notas_xls(path, ocultas, extras, pendentes):
+    """Notas de célula do .xls (BIFF8), pelo xlrd, no mesmo formato das do .xlsx. A aba oculta fica de fora, como no
+    corpo."""
+    import xlrd
+
+    saida = _Saida(extras, pendentes)
+    livro = xlrd.open_workbook(path, on_demand=True)
+    try:
+        for aba in livro.sheets():
+            if aba.name in ocultas:
+                continue
+            for (linha, coluna), nota in sorted(aba.cell_note_map.items()):
+                if texto := (nota.text or "").strip():
+                    saida.adicionar(
+                        f"{aba.name}!{get_column_letter(coluna + 1)}{linha + 1}", "nota: " + _literal(texto)
+                    )
+    except _Limite:
+        saida.avisar("limite de extração atingido", "anotações restantes omitidas")
+    finally:
+        livro.release_resources()
+
+
+_ODS_TB = "{urn:oasis:names:tc:opendocument:xmlns:table:1.0}"
+_ODS_OFFICE = "{urn:oasis:names:tc:opendocument:xmlns:office:1.0}"
+_ODS_TEXT = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
+_ODS_REPETICAO_MAX = 1_048_576  # linhas e colunas que uma repetição pode pular (o tamanho máximo de uma aba)
+
+
+def notas_ods(path, ocultas, extras, pendentes):
+    """Comentários de célula (office:annotation) do .ods, no mesmo formato das notas do .xlsx. content.xml é lido em
+    fluxo, limpando cada linha; a posição conta as repetições de linha e de coluna. Autor e data ficam de fora, como no
+    .xlsx. A aba oculta fica de fora, como no corpo."""
+    from defusedxml.ElementTree import iterparse
+
+    saida = _Saida(extras, pendentes)
+    aba, linha, coluna = "", 0, 0
+    with zipfile.ZipFile(path) as z:
+        if "content.xml" not in z.namelist():
+            return
+        with z.open("content.xml") as arquivo:
+            try:
+                for evento, el in iterparse(arquivo, events=("start", "end")):
+                    if evento == "start":
+                        if el.tag == f"{_ODS_TB}table":
+                            aba, linha = el.get(f"{_ODS_TB}name") or "", 0
+                        elif el.tag == f"{_ODS_TB}table-row":
+                            coluna = 0
+                        continue
+                    if el.tag in (f"{_ODS_TB}table-cell", f"{_ODS_TB}covered-table-cell"):
+                        nota = el.find(f"{_ODS_OFFICE}annotation")
+                        if nota is not None and aba not in ocultas:
+                            texto = "\n".join("".join(p.itertext()) for p in nota.iter(f"{_ODS_TEXT}p")).strip()
+                            if texto:
+                                onde = f"{aba}!{get_column_letter(min(coluna, 16_383) + 1)}{linha + 1}"
+                                saida.adicionar(onde, "nota: " + _literal(texto))
+                        coluna += _repeticao(el.get(f"{_ODS_TB}number-columns-repeated"))
+                        el.clear()
+                    elif el.tag == f"{_ODS_TB}table-row":
+                        linha += _repeticao(el.get(f"{_ODS_TB}number-rows-repeated"))
+                        el.clear()
+            except _Limite:
+                saida.avisar("limite de extração atingido", "anotações restantes omitidas")
+
+
+def _repeticao(valor):
+    try:
+        return min(max(int(valor or 1), 1), _ODS_REPETICAO_MAX)
+    except ValueError:
+        return 1

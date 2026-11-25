@@ -11,6 +11,8 @@ dependencies = [
   "pdfplumber>=0.11.8,<0.12",  # MIT (pdfminer.six MIT) — células da tabela pelas linhas de grade desenhadas no PDF
   "pypdfium2>=5.14,<6",        # Apache-2.0/BSD-3 — objetos da página, recorte, renderização
   "openpyxl>=3.1.5,<4",        # MIT — imagens e gráficos de XLSX
+  "python-calamine>=0.9.1,<0.10",  # MIT — conteúdo das abas ocultas do XLS, XLSB e ODS (o anydoc não as expõe)
+  "xlrd>=2.0.2,<3",            # BSD-3 — notas de célula do XLS binário (nem o anydoc nem o calamine as entregam)
   "xlformat==0.5.0",           # MIT — exibição de números com o formato do Excel na leitura em fluxo
   "python-pptx>=1.0.2,<2",     # MIT — setas de fluxograma em PPTX
   "Pillow>=13",                # MIT-CMU — imagem

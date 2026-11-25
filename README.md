@@ -28,7 +28,8 @@ r.estrutura         # páginas, slides, abas (e quais são ocultas), seções co
 | Texto, listas e tabelas nativas | Direto do arquivo, sem IA |
 | Equação do Word | LaTeX exato, sem IA |
 | Gráfico nativo de PPTX/XLSX | Tipo, título e séries lidos do arquivo |
-| Fluxograma de formas no PPTX | Mermaid com as setas e os rótulos (Sim/Não), sem IA |
+| Fluxograma de formas no PPTX e no ODP | Mermaid com as setas e os rótulos (Sim/Não), sem IA |
+| Tabela do PPT binário | Linhas e colunas pela posição das células no slide, sem IA |
 | Imagem, gráfico vetorial, diagrama | Recorte lido pela IA, com o texto nativo do trecho como âncora |
 | Títulos e legendas que são imagem | Agrupados numa folha numerada: uma chamada lê vários |
 | Tabela com grade desenhada no PDF | Células pelas linhas da própria tabela (mescladas em HTML), sem IA |
@@ -420,7 +421,9 @@ Documento como código e edição: `.pptx` e `.pptm` (`.ppsx` só na leitura do 
 
 Cabeçalho e rodapé de `.docx`, `.docm`, `.doc`, `.rtf`, `.xlsx`, `.xlsm`, `.xls`, `.ppt`, `.pps`, `.pot`, `.odt`, `.ods` e `.odp`
 saem do corpo e ficam nos metadados, em `cabeçalho/rodapé`, com número de página e data legíveis
-(`Página [página] de [páginas]`). Abas ocultas do `.xlsx` e do `.xls` ficam em `abas_ocultas`. Arquivo com macro
+(`Página [página] de [páginas]`). Abas ocultas do `.xlsx`, do `.xls` e do `.ods` ficam em `abas_ocultas`, e o começo do
+conteúdo delas (até 500 caracteres) vai para `texto_oculto_removido`, fora do corpo e conferido contra prompt
+injection. As notas de célula do `.xls` e do `.ods` saem como as do `.xlsx`. Arquivo com macro
 ganha `macros: true`: VBA no Office (OOXML, inclusive `.xlsb`, e `.doc`, `.xls`, `.ppt`, `.pps` e `.pot`), macro do Excel 4.0
 (`.xlsx`, `.xlsm`, `.xlsb` e `.xls`) e macro do LibreOffice. A macro nunca é executada.
 

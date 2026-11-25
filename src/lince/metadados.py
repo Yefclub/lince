@@ -20,13 +20,15 @@ from .seguranca import bordas_sem_oculto
 
 
 def metadados_arquivo(path, ext=None):
-    """Metadados que a empresa precisa e que não estão no corpo: propriedades do arquivo,
-    comentários e alterações rastreadas (DOCX), abas ocultas (XLSX). `ext` é o formato já decidido. As propriedades do
-    PDF saem do plano (`planejar_pdf`), lidas na mesma vez da PDFium que abre o documento."""
+    """Metadados que a empresa precisa e que não estão no corpo: propriedades do arquivo, comentários e alterações
+    rastreadas (DOCX), abas ocultas (XLSX, XLS e ODS). `ext` é o formato já decidido. As propriedades do PDF saem do
+    plano (`planejar_pdf`), lidas na mesma vez da PDFium que abre o documento."""
     meta = {}
     ext = ext or os.path.splitext(path)[1].lower()
     if ext in ODF:
         meta = _metadados_odf(path, meta, ext)
+        if ext == ".ods" and (ocultas := _abas_ocultas_ods(path)):
+            meta["abas_ocultas"] = ocultas
         if estrutura := estrutura_arquivo(path, ext):
             meta["estrutura"] = estrutura
         return meta
@@ -307,6 +309,23 @@ def _texto_odf(el) -> str:
             pilha.append(("el", f))
         partes.append(x.text or "")
     return "".join(partes)
+
+
+def _abas_ocultas_ods(path) -> list[str]:
+    """Nomes das abas ocultas do .ods, pelo calamine (o mesmo leitor que tira o conteúdo delas do corpo)."""
+    import python_calamine
+
+    try:
+        wb = python_calamine.CalamineWorkbook.from_path(path)
+        try:
+            visivel = python_calamine.SheetVisibleEnum.Visible
+            return [m.name for m in wb.sheets_metadata if m.visible != visivel]
+        finally:
+            wb.close()
+    except (MemoryError, KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:  # noqa: BLE001 — inclui o pânico do calamine; a falha já fica registrada pelo leitor do corpo
+        return []
 
 
 def _metadados_odf(path, meta, ext):
