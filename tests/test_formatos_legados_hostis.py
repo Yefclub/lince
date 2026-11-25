@@ -817,3 +817,57 @@ def test_aba_oculta_em_xml_utf16_valido_e_recusada(tmp_path):
 
     with pytest.raises(DocumentoRecusado, match="UTF-16"):
         lince.ler(p)
+
+
+def test_deteccao_da_planilha_segue_o_leitor_do_corpo(tmp_path):
+    """Uma parte a mais não muda o formato: o .ods com um xl/workbook.xml continua .ods (é o que o corpo lê), e o
+    .pptx com ele continua apresentação."""
+    import shutil
+
+    ods = tmp_path / "base.ods"
+    _ods(ods, [("Resumo", False, _linha("visível")), ("Oculta", True, _linha("SEGREDO"))])
+    with zipfile.ZipFile(ods, "a") as z:
+        z.writestr("xl/workbook.xml", "<workbook/>")
+    for ext in (".ods", ".xlsx", ".docx"):
+        p = tmp_path / f"ods{ext}"
+        shutil.copy(ods, p)
+
+        r = lince.ler(p)
+
+        assert "SEGREDO" not in r.markdown and r.metadados["abas_ocultas"] == ["Oculta"], ext
+    pptx = tmp_path / "apresentacao.pptx"
+    shutil.copy(REAIS / "testPPT.pptx", pptx)
+    antes = lince.ler(pptx).markdown
+    with zipfile.ZipFile(pptx, "a") as z:
+        z.writestr("xl/workbook.xml", "<workbook/>")
+
+    assert lince.ler(pptx).markdown == antes
+
+
+def test_ods_com_aba_oculta_e_parte_que_nao_abre_e_recusado(tmp_path):
+    """A cópia sem a aba oculta precisa de todas as partes; sem ela, o leitor do corpo leria o original."""
+    p = tmp_path / "crc.ods"
+    _ods_cru(
+        p,
+        _conteudo_ods(_tabela("Resumo", "ta1", _linha("visível")) + _tabela("Oculta", "ta2", _linha("SEGREDO"))),
+    )
+    with zipfile.ZipFile(p, "a") as z:
+        z.writestr("Thumbnails/thumbnail.png", b"x" * 64, compress_type=zipfile.ZIP_STORED)
+    dados = bytearray(p.read_bytes())
+    k = dados.rindex(b"x" * 64)
+    dados[k] = ord("y")  # o CRC da miniatura não bate mais
+    p.write_bytes(bytes(dados))
+
+    with pytest.raises(DocumentoRecusado, match="aba oculta"):
+        lince.ler(p)
+
+
+def test_ods_com_dtd_que_muda_o_namespace_e_recusado(tmp_path):
+    """Sem entidade nenhuma, o DTD dá à tabela outro namespace para o parser, e o leitor do corpo o ignora."""
+    tabelas = _tabela("Resumo", "ta1", _linha("visível")) + _tabela("Oculta", "ta2", _linha("SEGREDO"))
+    dtd = '<!DOCTYPE office:document-content [<!ATTLIST table:table xmlns:table CDATA "urn:outro">]>'
+    p = tmp_path / "attlist.ods"
+    _ods_cru(p, _conteudo_ods(tabelas, antes=dtd))
+
+    with pytest.raises(DocumentoRecusado, match="DTD"):
+        lince.ler(p)

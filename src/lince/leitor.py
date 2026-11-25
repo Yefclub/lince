@@ -480,19 +480,19 @@ def _extensao_lida(caminho: str) -> str:
 def _planilha_pelo_conteudo(caminho: str, ext: str) -> str | None:
     """A planilha gravada com o nome de outro formato (um .ods chamado .docx, um .xls chamado .doc) é lida como a
     planilha que é: o leitor do corpo segue o conteúdo, e a separação das abas ocultas tem de seguir também."""
-    if zipfile.is_zipfile(caminho):
-        with zipfile.ZipFile(caminho) as z:
-            if "xl/workbook.xml" in z.namelist():
-                return None if ext in (".xlsx", ".xlsm") else ".xlsx"
-        with open(caminho, "rb") as f:
-            return ".ods" if ext != ".ods" and anydoc.format_from_bytes(f.read()) == "ods" else None
+    with open(caminho, "rb") as f:
+        detectado = anydoc.format_from_bytes(f.read())  # o mesmo critério do leitor do corpo
+    if detectado == "ods":
+        return None if ext == ".ods" else ".ods"
+    if detectado != "xlsx":
+        return None
     import olefile
 
-    if ext != ".xls" and olefile.isOleFile(caminho):
-        with olefile.OleFileIO(caminho) as o:
-            if o.exists("Workbook") or o.exists("Book"):
-                return ".xls"
-    return None
+    # o anydoc chama de "xlsx" também o .xls e o .xlsb; o OLE vem antes, porque um .xls com um zip embutido também
+    # parece zip
+    if olefile.isOleFile(caminho):
+        return None if ext == ".xls" else ".xls"
+    return None if ext in (".xlsx", ".xlsm", ".xlsb") else ".xlsx"
 
 
 def _avisar_cache(e):

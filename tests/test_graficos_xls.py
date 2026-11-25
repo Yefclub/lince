@@ -126,3 +126,17 @@ def test_folha_de_grafico_que_nenhuma_aba_aponta_conta_como_oculta():
     [g], _ = legados.graficos_xls(ole, len(ole.b))
 
     assert g["oculto"] is True
+
+
+def test_folha_de_grafico_oculta_depois_de_aba_sem_fim_continua_oculta():
+    """A aba anterior sem EOF não faz a folha que o BOUNDSHEET aponta como oculta herdar o estado dela."""
+    aba = _bof(0x0010)  # aba comum, sem o EOF
+    inicio = len(_bof(0x0005)) + 2 * len(_folha(0)) + len(EOF_)
+    folha = inicio + len(aba)
+    globais = _bof(0x0005) + _folha(inicio) + _folha(folha, estado=1) + EOF_
+    ole = _Ole()
+    ole.b = globais + aba + _bof(0x0020) + BAR + EOF_
+
+    [g], _ = legados.graficos_xls(ole, len(ole.b))
+
+    assert g["oculto"] is True

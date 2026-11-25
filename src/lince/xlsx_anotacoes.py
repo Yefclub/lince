@@ -506,6 +506,11 @@ def planilha_ods(path, extras, pendentes) -> Ods:
     with zipfile.ZipFile(path) as z:
         if "content.xml" not in z.namelist():
             return Ods([], set(), None)
+        # DTD no XML que fala em display: o DTD muda o XML (o namespace padrão de um atributo, a entidade) para o
+        # parser e não para o leitor do corpo, e a aba oculta não pode ser separada com certeza
+        if menciona(xml := z.read("content.xml"), "<!DOCTYPE") and menciona(xml, "display"):
+            raise DocumentoRecusado("planilha com DTD no XML: a aba oculta não pôde ser separada do corpo")
+        del xml
         try:
             with z.open("content.xml") as arquivo:
                 for evento, el in iterparse(arquivo, events=("start", "end")):
@@ -577,7 +582,14 @@ def planilha_ods(path, extras, pendentes) -> Ods:
             raise
         if not posicoes:
             return Ods(ocultas, objetos, None)
-        return Ods(ocultas, objetos, _sem_abas_ods(z, posicoes, abas))
+        try:
+            return Ods(ocultas, objetos, _sem_abas_ods(z, posicoes, abas))
+        except (DocumentoRecusado, MemoryError):
+            raise
+        except Exception as e:  # noqa: BLE001 — parte que não sai (CRC, cifra): o original levaria a aba ao corpo
+            raise DocumentoRecusado(
+                f"planilha com aba oculta e pacote que não pôde ser copiado sem ela ({type(e).__name__})"
+            ) from None
 
 
 def menciona(xml: bytes, palavra: str) -> bool:
@@ -627,13 +639,9 @@ def _sem_abas_ods(z, posicoes, abas) -> bytes:
             cortes.append((estado["inicio"], _fim_da_tag(xml, onde)))
             estado["inicio"] = None
 
-    def recusa(*_):
-        raise DocumentoRecusado("planilha com entidade no XML: a aba oculta não foi separada do corpo")
-
     parser = expat.ParserCreate(namespace_separator=" ")
     parser.StartElementHandler, parser.EndElementHandler = abre, fecha
-    parser.EntityDeclHandler = parser.UnparsedEntityDeclHandler = parser.ExternalEntityRefHandler = recusa
-    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)  # o XML com DTD já foi recusado antes
     parser.Parse(xml, True)
     if estado["abas"] != abas:
         raise DocumentoRecusado("planilha com abas que as leituras contam diferente: a aba oculta não foi separada")

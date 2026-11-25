@@ -325,7 +325,7 @@ def graficos_xls(o, teto) -> tuple[list[dict], str | None]:
                     return saida, f"mais de {GRAFICOS_XLS_MAX} gráficos; o resto ficou de fora"
                 # a folha de gráfico é uma aba; o gráfico embutido é da aba em que está. Trecho que nenhuma aba aponta
                 # o Excel não mostra: conta como oculto
-                oculto = na_oculta if aberta else bool(estados.get(inicio, 1))
+                oculto = bool(estados[inicio]) if inicio in estados else (na_oculta if aberta else True)
                 atual = {"tipo": "", "titulo": "", "series": [], "oculto": oculto}
                 profundidade, blocos, pendente = 0, [], None
             else:
