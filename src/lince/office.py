@@ -648,7 +648,11 @@ def planejar_office(path, pasta, ext=None):
         except DocumentoRecusado:
             raise
         except Exception as e:  # noqa: BLE001 — pacote fora do padrão: o corpo segue, e a falha fica registrada
-            ilegiveis.append(f"abas ocultas: {type(e).__name__}")
+            # falha fechada: sem saber o que é da aba oculta, nenhum gráfico nem imagem vai para o corpo ou para a IA
+            partes_ocultas = None
+            ilegiveis.append(
+                f"abas ocultas: {type(e).__name__}; sem saber o que é delas, os gráficos e as imagens ficaram de fora"
+            )
         _complemento(lambda: ocultas.extend(_abas_ocultas_xlsx(path)), "abas ocultas", ilegiveis)
     elif ext == ".xls":
         leitor_xls = xlsx_anotacoes.planilha_xls
@@ -813,6 +817,8 @@ def planejar_office(path, pasta, ext=None):
 
         def imagens_planilha():
             nonlocal md
+            if partes_ocultas is None:
+                return
             for onde, mime, dados in _imagens_xlsx(path, ilegiveis, partes_ocultas):
                 md += f"\n\n**Imagem ({onde}):**\n\n" + ler_imagem(dados, mime, onde)
 
@@ -831,6 +837,8 @@ def planejar_office(path, pasta, ext=None):
     if ext in (".xlsx", ".xlsm", ".docx"):
 
         def graficos_visiveis():
+            if partes_ocultas is None:
+                return []
             with zipfile.ZipFile(path) as z:
                 partes = sorted(n for n in z.namelist() if re.search(r"/charts/chart\d+\.xml$", n))
             return graficos_ooxml(path, [p for p in partes if p not in partes_ocultas])

@@ -1051,31 +1051,33 @@ def test_xlsx_com_dtd_em_qualquer_parte_ou_livro_que_nao_existe_e_recusado(tmp_p
         office._partes_das_abas_ocultas(sem_livro)
 
 
+def _quebrar(p, nome):
+    """Grava a parte sem compressão e troca um byte dela: o CRC não bate mais."""
+    with zipfile.ZipFile(p) as z:
+        partes = {i.filename: z.read(i) for i in z.infolist()}
+    partes[nome] = partes.get(nome, b"<a/>") + b"<!--" + b"x" * 64 + b"-->"
+    with zipfile.ZipFile(p, "w") as z:
+        for n, dados in partes.items():
+            z.writestr(n, dados, compress_type=zipfile.ZIP_STORED if n == nome else zipfile.ZIP_DEFLATED)
+    dados = bytearray(p.read_bytes())
+    dados[dados.rindex(b"x" * 64)] = ord("y")
+    p.write_bytes(bytes(dados))
+
+
 def test_xlsx_com_parte_que_nao_abre_ou_estado_fora_da_especificacao_e_recusado(tmp_path):
     """A parte quebrada ao lado do livro não interrompe a conferência dele; o livro quebrado não pode ser conferido;
     o estado "Hidden" o leitor do corpo lê como visível."""
 
-    def quebrar(p, nome):  # grava a parte sem compressão e troca um byte: o CRC não bate mais
-        with zipfile.ZipFile(p) as z:
-            partes = {i.filename: z.read(i) for i in z.infolist()}
-        partes[nome] = partes.get(nome, b"<a/>") + b"<!--" + b"x" * 64 + b"-->"
-        with zipfile.ZipFile(p, "w") as z:
-            for n, dados in partes.items():
-                z.writestr(n, dados, compress_type=zipfile.ZIP_STORED if n == nome else zipfile.ZIP_DEFLATED)
-        dados = bytearray(p.read_bytes())
-        dados[dados.rindex(b"x" * 64)] = ord("y")
-        p.write_bytes(bytes(dados))
-
     p = tmp_path / "crc.xlsx"
     _xlsx_oculto(p, dtd=True)
-    quebrar(p, "0lixo.xml")
+    _quebrar(p, "0lixo.xml")
 
     with pytest.raises(DocumentoRecusado, match="aba oculta"):
         lince.ler(p)
 
     livro = tmp_path / "livro_crc.xlsx"
     _xlsx_oculto(livro)
-    quebrar(livro, "xl/workbook.xml")
+    _quebrar(livro, "xl/workbook.xml")
 
     with pytest.raises(DocumentoRecusado, match="que não abre"):
         office._partes_das_abas_ocultas(livro)
@@ -1110,3 +1112,27 @@ def test_xlsx_com_as_relacoes_do_pacote_quebradas_e_recusado(tmp_path):
 
     with pytest.raises(DocumentoRecusado, match="relações que não abrem"):
         lince.ler(p)
+
+
+def test_sem_conferir_as_partes_das_abas_ocultas_graficos_e_imagens_ficam_de_fora(tmp_path):
+    """As relações do desenho da aba oculta não abrem: sem saber o que é dela, nenhum gráfico vai para o corpo."""
+    from openpyxl.chart import BarChart, Reference
+
+    wb = Workbook()
+    wb.active.append(["visível"])
+    oculta = wb.create_sheet("Oculta")
+    for linha in (["Mês", "Valor"], ["SEGREDO1", 5]):
+        oculta.append(linha)
+    g = BarChart()
+    g.title = "TITULOSEGREDO"
+    g.add_data(Reference(oculta, min_col=2, min_row=1, max_row=2), titles_from_data=True)
+    oculta.add_chart(g, "D2")
+    oculta.sheet_state = "hidden"
+    p = tmp_path / "desenho.xlsx"
+    wb.save(p)
+    _quebrar(p, "xl/drawings/_rels/drawing1.xml.rels")
+
+    r = lince.ler(p)
+
+    assert "SEGREDO" not in r.markdown and "visível" in r.markdown
+    assert any("os gráficos e as imagens ficaram de fora" in i for i in r.metadados["partes_ilegiveis"])
