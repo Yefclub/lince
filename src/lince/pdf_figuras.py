@@ -10,7 +10,8 @@ from PIL import ImageDraw
 
 _IDENTIFICADOR = re.compile(r"^(?:fig(?:ure|ura)?\.?|gráfico|chart)\s+\d+(?:\.\d+)*(?:\s*[:.]|\s*[–—-])", re.I)
 _NOTA = re.compile(r"^(?:notas?|notes?|fontes?|sources?):", re.I)
-_MARCA_DE_NOTA = re.compile(r"^(?:\(?[a-z0-9]{1,2}\)|\*|- =|(?:notas?|notes?|fontes?|sources?)\b)", re.I)
+# "(a)", "a)", "(1)", "*", "- =", "Nota", "Fonte"; "1)" sozinho começa um item de lista numerada
+_MARCA_DE_NOTA = re.compile(r"^(?:\([a-z0-9]{1,2}\)|[a-z]\)|\*|- =|(?:notas?|notes?|fontes?|sources?)\b)", re.I)
 
 
 def papel_retangulo(raw, caixa, W, H):

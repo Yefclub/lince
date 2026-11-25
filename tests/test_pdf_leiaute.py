@@ -438,3 +438,5 @@ def test_quadro_de_notas_da_tabela_nao_e_fundo_de_layout():
     objs = [(caminho, de_cima), (caminho, de_baixo)]
     textos = _caixa_de_texto(de_cima, NOTAS) + _caixa_de_texto(de_baixo, NOTAS)
     assert _fundo_de_layout(de_cima, 0, objs, textos)
+    lista = ["1) " + texto for texto in NOTAS]  # o item de lista numerada não é marca de nota
+    assert _fundo_de_layout(de_cima, 0, [(caminho, de_cima)], _caixa_de_texto(de_cima, lista))
