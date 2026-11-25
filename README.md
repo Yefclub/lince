@@ -100,7 +100,12 @@ olhar o original só onde precisa, a estrutura do PDF traz:
 - `estrutura.paginas_visuais`: as páginas em que o Markdown traz a transcrição de algo que se vê (imagem, desenho,
   tabela, fórmula, página escaneada) e o que a leitura não garante (`estimado`, `ilegivel`, `nao_lida`).
 - `lince.imagens_das_paginas(arquivo, [12, 13], lado=1568, senha=None)`: as páginas pedidas em PNG, como são exibidas,
-  para mandar ao modelo junto com o Markdown na hora da pergunta. O arquivo não é guardado.
+  para mandar ao modelo junto com o Markdown na hora da pergunta. Para ampliar um detalhe diretamente do original,
+  passe `regiao=(x0, y0, x1, y1)`, com coordenadas de 0 a 1 sobre a página como exibida e origem no canto superior
+  esquerdo. Por exemplo, `imagens_das_paginas(arquivo, [62], lado=2048, regiao=(0.095, 0.704, 0.918, 0.728))[62]`
+  devolve a nota da tabela de inflação do BCB de dezembro de 2024. A aplicação escolhe o documento e os limites da
+  releitura. O parâmetro `lado` é um máximo: para regiões minúsculas, o limite de escala da página (10.000 px no maior lado)
+  pode devolver menos pixels. O Lince aplica os mesmos tetos de página e renderização. O arquivo não é guardado.
 
 O Markdown não muda: o mapa é só um guia sobre ele.
 
@@ -119,6 +124,13 @@ Cada `TarefaVisual` traz a imagem (PNG), a instrução, o tipo (imagem, página 
 lote de recortes), onde ela está (página e caixa no PDF, `imagem 3` no Office), `chave` (hash da imagem, da instrução
 e da versão do prompt, para o seu cache) e `tokens_estimados`. A tarefa sem resposta fica em `cobertura.pendentes`
 com o texto nativo no lugar. `plano.para_json()` e `lince.Plano.de_json()` levam o plano entre processos.
+
+### Conferência de PDFs escaneados
+
+Para scans sem camada textual confiável, `cobertura.pendentes` distingue tarefa sem resposta, indício de transcrição
+parcial e integralidade ainda não verificada. Uma estimativa do volume de texto pelos pixels sinaliza déficits
+grandes na página ou na faixa enviada ao modelo.
+A verificação fica em aberto quando o volume da resposta é plausível.
 
 ## API HTTP
 

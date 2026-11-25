@@ -35,7 +35,7 @@ class Cobertura:
     rotas: dict = field(default_factory=dict)  # página → nativa | regioes | pagina
     leituras_ia: int = 0
     leituras_cache: int = 0
-    pendentes: list = field(default_factory=list)  # tarefas que a IA não leu (sem IA, erro, teto)
+    pendentes: list = field(default_factory=list)  # leituras ausentes ou que pedem conferência da fonte
 
 
 @dataclass
