@@ -1,11 +1,11 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'emscripten'",
     "python_full_version >= '3.14' and sys_platform != 'emscripten'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "python_full_version < '3.12' or (python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform != 'emscripten')",
+    "(python_full_version < '3.14' and sys_platform != 'emscripten') or (python_full_version < '3.12' and sys_platform == 'emscripten')",
 ]
 
 [options]
@@ -677,6 +677,7 @@ dependencies = [
     { name = "resvg-py" },
     { name = "tinycss2" },
     { name = "xlformat" },
+    { name = "xlrd" },
 ]
 
 [package.optional-dependencies]
@@ -728,6 +729,7 @@ requires-dist = [
     { name = "tinycss2", specifier = ">=1.4,<2" },
     { name = "uvicorn", marker = "extra == 'servidor'", specifier = ">=0.54" },
     { name = "xlformat", specifier = "==0.6.0" },
+    { name = "xlrd", specifier = ">=2.0.2,<3" },
 ]
 provides-extras = ["servidor", "redis", "emf"]
 
@@ -2184,6 +2186,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/bb/ab/18e4e1dad419b62c86822be3dda4d8b7b527bb4a367b88508c0ade7c34ec/xlformat-0.6.0.tar.gz", hash = "sha256:b91584de328e4dd890a4cdfa481f93a9c6b1ba1453e490b0e0e499d8e4b4e360", size = 4814016, upload-time = "2026-11-22T04:20:13Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/99/c8/35fca2d7c171c199ef10e51792bff578bdc5cf4715fed0169881d81a9bb8/xlformat-0.6.0-py3-none-any.whl", hash = "sha256:12b30789e78d0306516ab53e1e3b669ac159d69334c74576300526aed6e315e5", size = 77527, upload-time = "2026-11-22T04:20:11.929Z" },
+]
+
+[[package]]
+name = "xlrd"
+version = "2.0.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/07/5a/377161c2d3538d1990d7af382c79f3b2372e880b65de21b01b1a2b78691e/xlrd-2.0.2.tar.gz", hash = "sha256:08b5e25de58f21ce71dc7db3b3b8106c1fa776f3024c54e45b45b374e89234c9", size = 100167, upload-time = "2025-06-14T08:46:39.039Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1a/62/c8d562e7766786ba6587d09c5a8ba9f718ed3fa8af7f4553e8f91c36f302/xlrd-2.0.2-py2.py3-none-any.whl", hash = "sha256:ea762c3d29f4cca48d82df517b6d89fbce4db3107f9d78713e48cd321d5c9aa9", size = 96555, upload-time = "2025-06-14T08:46:37.766Z" },
 ]
 
 [[package]]

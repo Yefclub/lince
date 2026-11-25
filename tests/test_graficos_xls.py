@@ -50,9 +50,20 @@ def _link(alvo):
     return _reg(0x1027, struct.pack("<HHH", alvo, 0, 0))
 
 
+def _folha(pos, estado=0):
+    return _reg(0x0085, struct.pack("<IBB", pos, estado, 2) + bytes([1, 0]) + b"G")
+
+
 class _Ole:
     def __init__(self, *graficos, versao=0x0600, antes=b""):
-        self.b = _bof(0x0005, versao) + antes + EOF_ + b"".join(_bof(0x0020) + g + EOF_ for g in graficos)
+        # cada folha de gráfico com o seu BOUNDSHEET, que diz onde ela começa: a que nada aponta o Excel não mostra
+        folhas = [_bof(0x0020) + g + EOF_ for g in graficos]
+        pos = len(_bof(0x0005, versao) + antes + EOF_) + len(graficos) * len(_folha(0))
+        lugares = []
+        for f in folhas:
+            lugares.append(_folha(pos))
+            pos += len(f)
+        self.b = _bof(0x0005, versao) + antes + b"".join(lugares) + EOF_ + b"".join(folhas)
 
     def exists(self, nome):
         return nome == "Workbook"
@@ -74,7 +85,7 @@ def test_titulo_de_eixo_e_rotulo_de_dado_nao_viram_titulo_nem_serie():
     titulo_sem_texto = TEXT + BEGIN + _link(1) + END
     rotulo = SERIES + BEGIN + _texto("Norte") + TEXT + BEGIN + _texto("42") + _link(4) + END + END
     [g], corte = _ler(BAR + rotulo + eixo + titulo_sem_texto)
-    assert g == {"tipo": "barras", "titulo": "", "series": ["Norte"]} and corte is None
+    assert g == {"tipo": "barras", "titulo": "", "series": ["Norte"], "oculto": False} and corte is None
     [g], _ = _ler(BAR + eixo + TEXT + BEGIN + _texto("Receita") + _link(1) + END)
     assert g["titulo"] == "Receita"
     sem_link = TEXT + BEGIN + _texto("Mês") + END  # texto sem OBJECTLINK não fica esperando o próximo TEXT
@@ -105,3 +116,27 @@ def test_xls_que_nao_e_ole_nao_ganha_parte_ilegivel(tmp_path):
     p.write_bytes((REAIS / "lince_imagem_planilha.ods").read_bytes())
     r = lince.ler(p)
     assert "Pedidos" in r.markdown and not any("gráficos" in x for x in r.metadados.get("partes_ilegiveis", []))
+
+
+def test_folha_de_grafico_que_nenhuma_aba_aponta_conta_como_oculta():
+    """O Excel só mostra o que o BOUNDSHEET aponta: o gráfico num trecho solto não vai para o corpo."""
+    ole = _Ole()
+    ole.b += _bof(0x0020) + BAR + EOF_
+
+    [g], _ = legados.graficos_xls(ole, len(ole.b))
+
+    assert g["oculto"] is True
+
+
+def test_folha_de_grafico_oculta_depois_de_aba_sem_fim_continua_oculta():
+    """A aba anterior sem EOF não faz a folha que o BOUNDSHEET aponta como oculta herdar o estado dela."""
+    aba = _bof(0x0010)  # aba comum, sem o EOF
+    inicio = len(_bof(0x0005)) + 2 * len(_folha(0)) + len(EOF_)
+    folha = inicio + len(aba)
+    globais = _bof(0x0005) + _folha(inicio) + _folha(folha, estado=1) + EOF_
+    ole = _Ole()
+    ole.b = globais + aba + _bof(0x0020) + BAR + EOF_
+
+    [g], _ = legados.graficos_xls(ole, len(ole.b))
+
+    assert g["oculto"] is True

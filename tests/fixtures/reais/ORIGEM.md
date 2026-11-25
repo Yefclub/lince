@@ -66,6 +66,26 @@ montada com openpyxl e convertida pelo LibreOffice. Sem dado de pessoa ou empres
 `lince_grafico.xls`: a mesma planilha de `lince_grafico.ods` (dados fictícios e gráfico "Vendas por região"),
 convertida para Excel 97-2003 pelo LibreOffice.
 
+`lince_fluxo.odp`: um slide com um fluxograma fictício de aprovação de despesa (quatro formas, três conectores com
+seta e os rótulos Sim e Não em caixas de texto soltas), montado com python-pptx (autor "Autor teste") e convertido
+para o Impress pelo LibreOffice 24.2. Serve para provar a leitura das ligações, que o leitor do corpo não entrega.
+
+`lince_titulos.rtf`: um manual fictício com um título de nível 1, dois de nível 2 e três parágrafos, montado com
+python-docx (autor "Autor teste") e convertido para RTF pelo LibreOffice 24.2. Serve para provar a leitura dos
+títulos pela folha de estilos do RTF.
+
+`lince_tabela.ppt`: um slide com o título "Cronograma de implantação", uma tabela fictícia de três linhas (Etapa,
+Início, Fim) e uma caixa de texto, montado com python-pptx (autor "Autor teste") e convertido para PowerPoint 97-2003
+pelo LibreOffice 24.2. Serve para provar a leitura da tabela, que o formato guarda como um grupo de formas.
+
+`lince_nota_celula.xls`: planilha com dados fictícios (Parafuso M8, Arruela 8 mm), uma nota de célula em C3 e uma
+aba oculta com outra nota, montada com openpyxl e convertida para Excel 97-2003 pelo LibreOffice 24.2. O autor das
+notas sai como "Unknown Author". Sem dado de pessoa ou empresa.
+
+`lince_aba_oculta_grafico.xls`: planilha com dados fictícios (Janeiro, Fevereiro), um gráfico de barras na aba
+visível e outro gráfico, uma imagem de ruído e valores marcados "SEGREDO" numa aba oculta, montada com openpyxl e
+convertida para Excel 97-2003 pelo LibreOffice 24.2, com perfil de usuário vazio. Sem dado de pessoa ou empresa.
+
 `lince_protegido.odt`, `lince_protegido.ods`, `lince_protegido.doc` e `lince_protegido.xls`: um texto fictício
 ("Relatório protegido do Lince: a leitura só sai com a senha.", e na planilha com o valor 42) gravado com a senha
 `Girafa-Azul-26` pelo LibreOffice 24.2, com perfil de usuário vazio (sem autor). O ODF sai cifrado no padrão ODF 1.2

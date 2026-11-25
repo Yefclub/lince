@@ -130,6 +130,8 @@ class Leitor:
         plano["meta_arquivo"] = metadados_arquivo(caminho, ext)
         if plano.get("propriedades"):  # HTML, SVG e PDF já tiram as propriedades na leitura do corpo
             plano["meta_arquivo"]["propriedades"] = plano.pop("propriedades")
+        if plano.get("abas_ocultas"):  # as do .ods saem da mesma passada que as tira do corpo
+            plano["meta_arquivo"]["abas_ocultas"] = plano.pop("abas_ocultas")
         if plano.get("ilegiveis"):
             plano["meta_arquivo"].setdefault("partes_ilegiveis", []).extend(plano["ilegiveis"])
         if perfis := plano.pop("perfil_tabular", None):
@@ -462,6 +464,8 @@ def _extensao_lida(caminho: str) -> str:
     """A extensão que decide a leitura. Fora da lista, o conteúdo decide (marcador do formato: PDF, RTF, OLE, pacote
     Office ou ODF); sem marcador conhecido, o formato não é suportado."""
     ext = os.path.splitext(caminho)[1].lower()
+    if ext in OFFICE:
+        return _planilha_pelo_conteudo(caminho, ext) or ext
     if ext in FORMATOS:
         return ext
     if zipfile.is_zipfile(caminho):  # a detecção abre o pacote: conferido antes de qualquer descompactação
@@ -471,6 +475,51 @@ def _extensao_lida(caminho: str) -> str:
     if detectado is None:
         raise FormatoNaoSuportado(f"formato {ext or '(sem extensão)'} não suportado")
     return f".{detectado}"
+
+
+def _planilha_pelo_conteudo(caminho: str, ext: str) -> str | None:
+    """A planilha gravada com o nome de outro formato (um .ods chamado .docx, um .xls chamado .doc) é lida como a
+    planilha que é: o leitor do corpo segue o conteúdo, e a separação das abas ocultas tem de seguir também."""
+    if zipfile.is_zipfile(caminho):  # a detecção abre o pacote: conferido antes de qualquer descompactação
+        conferir_zip(caminho)
+    with open(caminho, "rb") as f:
+        detectado = anydoc.format_from_bytes(f.read())  # o mesmo critério do leitor do corpo
+    if detectado == "ods":
+        return None if ext == ".ods" else ".ods"
+    if detectado != "xlsx":
+        return None
+    import olefile
+
+    # o anydoc chama de "xlsx" também o .xls e o .xlsb; o OLE vem antes, porque um .xls com um zip embutido também
+    # parece zip
+    if olefile.isOleFile(caminho):
+        return None if ext == ".xls" else ".xls"
+    if _livro_binario(caminho):
+        return None if ext == ".xlsb" else ".xlsb"
+    return None if ext in (".xlsx", ".xlsm") else ".xlsx"
+
+
+def _livro_binario(caminho: str) -> bool:
+    """Se o livro do pacote é o binário do .xlsb, pelo conteúdo da parte que o _rels/.rels aponta (o que o leitor do
+    corpo segue): o XML começa por "<" (depois do BOM e de espaço), o BIFF12 não. Uma parte .bin a mais, ou o XML
+    gravado com o nome .bin, não fazem do .xlsx um .xlsb. Sem relação, pelas partes: o livro binário e nenhum em
+    XML."""
+    from .office import livros_do_pacote
+
+    with zipfile.ZipFile(caminho) as z:
+        nomes = set(z.namelist())
+        lugares = [p for p in livros_do_pacote(z, nomes) if p in nomes] or (
+            ["xl/workbook.bin"] if "xl/workbook.bin" in nomes else []
+        )
+        inicios = []
+        for lugar in lugares:
+            with z.open(lugar) as parte:
+                inicios.append(parte.read(64))
+    # binário só se nenhuma das partes que podem ser o livro é XML (o XML em UTF-16 começa pelo BOM)
+    return bool(inicios) and not any(
+        i[:2] in (b"\xff\xfe", b"\xfe\xff") or i.removeprefix(b"\xef\xbb\xbf").lstrip(b" \t\r\n").startswith(b"<")
+        for i in inicios
+    )
 
 
 def _avisar_cache(e):

@@ -20,9 +20,9 @@ from .seguranca import bordas_sem_oculto
 
 
 def metadados_arquivo(path, ext=None):
-    """Metadados que a empresa precisa e que não estão no corpo: propriedades do arquivo,
-    comentários e alterações rastreadas (DOCX), abas ocultas (XLSX). `ext` é o formato já decidido. As propriedades do
-    PDF saem do plano (`planejar_pdf`), lidas na mesma vez da PDFium que abre o documento."""
+    """Metadados que a empresa precisa e que não estão no corpo: propriedades do arquivo, comentários e alterações
+    rastreadas (DOCX), abas ocultas (XLSX e XLS; as do ODS vêm do plano). `ext` é o formato já decidido. As
+    propriedades do PDF saem do plano (`planejar_pdf`), lidas na mesma vez da PDFium que abre o documento."""
     meta = {}
     ext = ext or os.path.splitext(path)[1].lower()
     if ext in ODF:
